@@ -1,0 +1,12 @@
+PyQt6>=6.11.0
+faster-whisper>=1.2.1
+ctranslate2>=4.8.3
+onnxruntime>=1.31.0
+PyAudioWPatch>=0.2.12.9
+sounddevice>=0.5.6
+pywin32>=312
+numpy>=2.5.0
+scipy>=1.18.0
+av>=11.0.0
+pillow>=10.0.0
+pyinstaller>=6.22.0

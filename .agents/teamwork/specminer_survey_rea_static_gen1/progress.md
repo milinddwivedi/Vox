@@ -1,0 +1,40 @@
+# Progress
+Last visited: 2026-11-12T00:45:00Z
+- [x] Read ORIGINAL_REQUEST.md
+- [x] Locate installed Wispr Flow desktop application on Windows:
+  - App path: C:\Users\milin\AppData\Local\WisprFlow (version app-1.6.1457)
+  - Data path: C:\Users\milin\AppData\Roaming\Wispr Flow
+  - Unpacked app.asar resources and native modules
+  - Package.json scripts, dependencies, build targets
+  - All 10 HTML windows/renderers identified
+  - Preload scripts examined (window.electron, window.zubridge Zustand bridge, __zubridge_subscriptionValidator)
+  - Complete IPC channel registry mapped: Module 8771 (52 enum groups, 634 total channels)
+- [x] Enumerate Window definitions:
+  - Status indicator (floating pill widget): BrowserWindow dimensions (docked bottom: 440x320 centered, side: 490x440), transparent, alwaysOnTop screen-saver, click-through forwarding with dynamic shape report (max 128 rects), focusable: allowBubbleFocus
+  - Flow Hub (main onboarding/settings/dictionary): 1350x850 (min 1140x750), center: true, resizable, frame: false, autoHideMenuBar on Win32
+  - Flow Context Menu: workArea dimensions, transparent, screen-saver alwaysOnTop, ignoreMouseEvents
+  - Scratchpad / Notetaker: default_width x default_height, min_width x min_height, transparent, frame: false
+  - Meeting Recorder: minWidth x 600, frame: false, titleBarStyle: hidden
+  - Feature Tour, Overlay, Accessibility Drop, Meeting AX Inspector, Extension Screen Recorder
+- [x] Inspect Audio pipeline & dictation lifecycle:
+  - AudioWorklet: recorderWorklet.js (RecorderProcessor registered as "recorder-processor", chunkSize: 640 samples = 40ms at 16kHz, quantum: 128, start/stop/measure dB protocol)
+  - Opus Encoder Workers: incrementalOpusEncoder.worker.js and opusEncoder.worker.js (2 channels, 16000 Hz, frame size 320 samples / 20ms, 64kbps, OpusScript WASM)
+  - Dictation State Machine: 16 states (hidden, resting, context-menu, initializing, ready, active_ptt, active_popo, processing, polish_processing, polish_completed_action, polish_completed_na, polish_failed, auto_cleanup_completed, hotkey_reminder, instruct_completed, error)
+  - Transcription routing: WebSocket streaming wss://api.wisprflow.ai/ (api/v1/meetings/transcribe, sync/ws, realtime), fallback POST /llm/asr_audio_chunks and OpenAI Whisper
+- [x] Inspect SQLite Database schemas:
+  - Extracted live schema from flow.sqlite (28 tables)
+  - Key tables: History (63 columns, transcriptEntityId PK), Dictionary (16 columns), Polish (20 columns), UserVoicePreferences (6 columns), Meetings (62 columns), Notes (11 columns), Automations (6 columns), UserContext (4 columns)
+- [x] Inspect Configuration & Storage:
+  - config.json (prefs, voiceProfile, notifications, nudge, syncCoordinator, helperLaunch)
+  - prefs.user: UUID, email, pagesCompleted (17 onboarding steps), shortcuts (Windows CapsLock / Ctrl), statusDockEdge ("bottom"/"right"), sound feedback, theme, audio capture flags
+  - session.json: workosSession (accessToken, refreshToken, userId, email, expiresAt, clientId)
+  - feature-flags-cache.json: anonymous & identified PostHog flags
+- [x] Inspect External endpoints and service contracts:
+  - Production APIs: https://api.wisprflow.ai, https://api-east.wisprflow.ai, http://127.0.0.1:8000
+  - WebSockets: wss://api.wisprflow.ai/, wss://api-east.wisprflow.ai/, ws://127.0.0.1:8300/
+  - Sentry DSN, PostHog key, Supabase endpoints and anon key, WorkOS auth
+  - 80+ REST endpoints mapped across auth, user, dictionary, meetings, notes, transform, voice actions
+- [x] Inspect Asset inventory:
+  - 653 total files across 11 categories: sounds (91 files, themes v1-v12), fonts (7 variable fonts), tray icons (6), lottie animations (2), videos (17), icons (48), illustrations (68), logos (27), transparentLogos (38), appLogos (103), images (246)
+- [x] Synthesize and document complete forensic specification report in handoff.md
+- [x] Send completion message to orchestrator

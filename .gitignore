@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+.venv/
+venv/
+ENV/
+
+# Distribution & Build
+build/
+dist/
+*.manifest
+*.spec.bak
+
+# Local VOX Application Data (Recordings, User DB, Logs, Exported Files)
+data/recordings/
+data/exports/
+data/logs/
+data/*.db
+data/config.json
+data/*.tmp
+
+# AI Model Weights & Cache
+data/models/
+models/
+small/
+*.bin
+*.onnx
+
+# IDEs & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# Scratch files
+scratch/
+
+# Local user data (recordings, DB, logs, models) - never commit
+data/
+large-v3-turbo/
+.pyenv/
+.pytest_cache/
+
+# Large reference media
+External References/
+*.mp4
+*.mov
+*.wav
+*.mp3
+*.webm
+*.pt
+*.safetensors
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key

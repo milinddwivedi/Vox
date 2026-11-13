@@ -1,0 +1,4045 @@
+"""
+Central Application Controller (QObject) for VoxLocal.
+Coordinates:
+- Universal Voice Typing (independent state machine & audio pipeline)
+- Meeting Recording & Progressive/Offline Transcription (independent state machine & audio pipeline)
+- Win32 Focus Tracking, Global Hotkeys, and Cross-Application Text Insertion
+- Thread-safe Qt Signals to update Floating Widget, System Tray, and Main Window without blocking UI.
+"""
+
+from __future__ import annotations
+
+import collections
+import enum
+import os
+import queue
+import shutil
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+import ctypes
+from ctypes import wintypes
+import numpy as np
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+def is_pid_alive(pid: Optional[int]) -> bool:
+    if not pid or pid <= 0:
+        return False
+    h = kernel32.OpenProcess(0x1000, False, pid)
+    if h:
+        kernel32.CloseHandle(h)
+        return True
+    return False
+
+from voxlocal.audio.call_detector import CallDetector, MeetingLifecycleState
+from voxlocal.audio.dictation_recorder import DictationRecorder
+from voxlocal.audio.meeting_recorder import MeetingRecorder
+from voxlocal.audio.streaming_typer import StreamingVoiceTyper
+from voxlocal.core.config import AppConfig
+from voxlocal.core.logger import (
+    check_disk_space_mb,
+    generate_correlation_id,
+    get_logger,
+    get_system_resource_snapshot,
+    operation_context,
+)
+from voxlocal.engine.dictation_processor import DictationProcessor
+from voxlocal.engine.meeting_intelligence import MeetingIntelligenceEngine
+from voxlocal.engine.transcriber import (
+    LocalWhisperTranscriber,
+    PersistentSpeakerDiarizer,
+    is_likely_person_name,
+    TranscribeProfile,
+    clean_repetition_tail,
+    is_hallucination,
+    load_wav_as_16k_f32,
+)
+from voxlocal.storage.database import LocalDatabase
+from voxlocal.storage.exporter import LocalMeetingSummarizer, format_seconds_hms
+from voxlocal.video.screen_recorder import ScreenRecorder
+from voxlocal.win32.hotkeys import GlobalHotkeyManager
+from voxlocal.win32.startup import StartupManager
+from voxlocal.win32.text_inserter import TextInserter
+from voxlocal.win32.window_focus import TargetWindowInfo, WindowFocusTracker
+
+logger = get_logger("controller")
+
+
+class DictationState(str, enum.Enum):
+    """Canonical 9-state dictation lifecycle enum for Wispr Flow parity."""
+    IDLE = "idle"
+    INITIALIZING = "initializing"
+    LISTENING = "listening"
+    STOPPING = "stopping"
+    PROCESSING = "processing"
+    ERROR = "error"
+    DISMISSED = "dismissed"
+    RETRYING = "retrying"
+    TESTING = "testing"
+
+
+class AppController(QObject):
+    """Central orchestrator exposing Qt signals for all UI components."""
+
+    # Milestone 2 Interface Contract Signals
+    state_changed = pyqtSignal(object)                    # (DictationState)
+    audio_level_changed = pyqtSignal(float, list)         # (rms_level: float, equalizer_levels: list[float])
+    mode_changed = pyqtSignal(str)                        # ('verbatim' | 'clean' | 'polished' | 'structured' | 'email')
+
+    # Voice Typing Signals (retained for backward compatibility)
+    dictation_state_changed = pyqtSignal(str, str)  # (state, status_message)
+    dictation_level_changed = pyqtSignal(float)     # mic RMS level [0..1]
+    dictation_completed = pyqtSignal(str, str, str) # (final_text, target_window, method_used)
+    dictation_interim_updated = pyqtSignal(str, str) # (provisional_text, stable_prefix)
+    transcribe_profile_changed = pyqtSignal(str)     # (profile: 'fast' | 'balanced' | 'max_accuracy')
+    writing_mode_changed = pyqtSignal(str)           # (mode: 'verbatim' | 'clean' | 'polished' | 'structured' | 'email')
+
+    # Meeting Recording & Transcription Signals (Core Feature 3)
+    meeting_state_changed = pyqtSignal(str, str)    # (state, status_message)
+    meeting_lifecycle_changed = pyqtSignal(str, str)  # (lifecycle_state, status_message)
+    meeting_tick = pyqtSignal(float, float, float, bool, bool)  # (elapsed, mic_lvl, sys_lvl, mic_ok, sys_ok)
+    meeting_progressive_segment = pyqtSignal(int, dict)         # (meeting_id, segment_dict)
+    meeting_about_to_mux = pyqtSignal(int)                      # meeting_id (releases UI media player handle)
+    meeting_saved_and_transcribed = pyqtSignal(int)             # meeting_id
+    call_detected = pyqtSignal(str, str)                        # (app_name, suggested_title) - for explicit user consent popup
+    call_ended = pyqtSignal(str)                                # (app_name)
+    history_updated = pyqtSignal()
+
+    # PC Screen Recording Signals (Core Feature 2)
+    screen_recording_state_changed = pyqtSignal(str, str)  # (state: 'idle' | 'recording' | 'paused' | 'saving', message)
+    screen_recording_tick = pyqtSignal(float, int)         # (elapsed_sec, frame_count)
+    screen_recordings_updated = pyqtSignal()
+    screen_recording_saved = pyqtSignal(str, str)          # (video_path, title)
+    annotation_mode_changed = pyqtSignal(bool)             # (is_active)
+
+    # General & Diagnostics Signals
+    model_status_changed = pyqtSignal(str)
+    notification_requested = pyqtSignal(str, str)   # (title, message)
+    target_window_changed = pyqtSignal(str, str)    # (window_title, process_name)
+    theme_changed = pyqtSignal(str)                 # (theme_name: 'dark' | 'light')
+    flow_bar_edge_changed = pyqtSignal(str)         # ('bottom' | 'left' | 'right')
+    open_scratchpad_requested = pyqtSignal()
+    open_notetaker_drawer_requested = pyqtSignal()
+    polish_toast_requested = pyqtSignal(str, str, str)
+    notes_updated = pyqtSignal()
+    snippets_updated = pyqtSignal()
+    vocabulary_updated = pyqtSignal()
+    calendar_upcoming_changed = pyqtSignal(list)
+    hotkey_copy_last_requested = pyqtSignal()
+    hotkey_paste_last_requested = pyqtSignal()
+    hotkey_transform_last_requested = pyqtSignal()
+
+    # Ask Vox Semantic Intelligence Streaming Signals
+    ask_vox_token_streamed = pyqtSignal(int, str)   # (query_id, incremental chunk)
+    ask_vox_citations_ready = pyqtSignal(int, list) # (query_id, citations list)
+    ask_vox_stream_finished = pyqtSignal(int, dict) # (query_id, full response dict)
+
+    def __init__(self, config: Optional[AppConfig] = None) -> None:
+        super().__init__()
+        self.config = config or AppConfig.load()
+        self.db = LocalDatabase(self.config.db_path)
+
+        # Initialize Local LLM engine lazily
+        try:
+            from voxlocal.engine.llm_engine import LocalLLMEngine
+            self.llm_engine = LocalLLMEngine(
+                model_dir=self.config.llm_model_path,
+                device=self.config.llm_device,
+            )
+        except Exception as exc:
+            logger.debug("LocalLLMEngine initialization: %s", exc)
+            self.llm_engine = None
+
+        self.intelligence = MeetingIntelligenceEngine(self.db, llm_engine=self.llm_engine)
+        self._cancel_ask_vox: bool = False
+        self._ask_vox_query_id: int = 0
+        self._ask_vox_thread: Optional[threading.Thread] = None
+
+        # Apply data retention policy on startup if configured
+        if self.config.retention_days > 0:
+            self.db.apply_retention_policy(self.config.retention_days)
+
+        # Sync startup registry state with config if registry is accessible
+        if StartupManager.is_available():
+            if self.config.launch_at_login != StartupManager.is_enabled():
+                StartupManager.set_enabled(
+                    self.config.launch_at_login,
+                    minimized=self.config.start_minimized_to_tray,
+                )
+        else:
+            logger.debug("Windows startup registry is not accessible; skipping login sync.")
+
+        # Win32 Subsystems
+        self.focus_tracker = WindowFocusTracker()
+        self.text_inserter = TextInserter(self.focus_tracker)
+        self.hotkey_manager = GlobalHotkeyManager()
+
+        # Audio & Screen Capture Subsystems (100% independent pipelines)
+        self.dictation_recorder = DictationRecorder()
+        self.streaming_typer = StreamingVoiceTyper()
+        self.meeting_recorder = MeetingRecorder()
+        self.screen_recorder = ScreenRecorder(fps=getattr(self.config, "screen_fps", 15))
+        self.call_detector = CallDetector()
+        self._dismissed_call_keys = set()
+        self._meeting_prompt_popup: Optional[Any] = None
+
+        # Dedicated PC Screen Recording Subsystem (Core Feature 2)
+        self.pc_screen_recorder = ScreenRecorder(fps=30)
+        self.pc_screen_audio = MeetingRecorder()
+        self._screen_rec_state = "idle"  # idle | recording | paused | saving
+        self._active_screen_rec_id: Optional[int] = None
+        self._active_screen_rec_title: str = ""
+        self._active_screen_rec_video_path: Optional[Path] = None
+        self._active_screen_rec_audio_dir: Optional[Path] = None
+        self._screen_rec_timer = QTimer(self)
+        self._screen_rec_timer.setInterval(250)
+        self._screen_rec_timer.timeout.connect(self._on_screen_rec_tick)
+
+        # Unified Live Screen Annotation & Markup Engine (Core Feature 2)
+        from voxlocal.annotation.engine import AnnotationEngine
+        self.annotation_engine = AnnotationEngine()
+        self.pc_screen_recorder.set_annotation_engine(self.annotation_engine)
+        self._annotation_overlay: Optional[Any] = None
+        self._annotation_toolbar: Optional[Any] = None
+        self._active_markup_studios: list[Any] = []
+        self._active_snipping_overlays: list[Any] = []
+
+        # Speech Recognition Engine
+        self.transcriber = LocalWhisperTranscriber(
+            models_dir=self.config.models_dir,
+            model_name=self.config.whisper_model,
+            compute_device=self.config.compute_device,
+            compute_type=self.config.compute_type,
+            cpu_threads=self.config.cpu_threads,
+            profile=getattr(self.config, "transcribe_profile", "balanced"),
+        )
+
+        # Independent State Variables
+        self._state_lock = threading.RLock()
+        self._dictation_state = DictationState.IDLE.value  # idle, initializing, listening, stopping, processing, error, etc.
+        self._dictation_session_id: int = 0
+        self._dictation_cancelled: bool = False
+        self._cancel_startup_requested: bool = False
+        self._ptt_stop_pending: bool = False
+        # Milestone 5: Decoupled Dual-Track Meeting State Machine
+        self._capture_state: str = "idle"  # "idle" | "recording" | "paused"
+        self._finalizing_jobs: Set[int] = set()  # set of meeting_ids undergoing background finalization
+        self._meeting_lifecycle_state: MeetingLifecycleState = MeetingLifecycleState.NO_MEETING_DETECTED
+        self._meeting_lifecycle_message: str = ""
+        self._active_recording_mode: str = getattr(self.config, "meeting_recording_mode", "audio_video")
+        self._active_meeting_session_id: str = ""
+        self._active_meeting_platform: str = ""
+        self._manual_target_lost_since: Optional[float] = None
+        self._hands_free_active: bool = False
+        self._last_inserted_len: int = 0
+        self._last_dictation_ended_sentence: bool = True
+        self._last_dictation_time: float = 0.0
+        self._last_target_hwnd: int = 0
+        self._recent_utterance_history: collections.deque[str] = collections.deque(maxlen=6)
+        self._explicit_in_app_widget_ref: Any = None
+        self._explicit_in_app_title: str = "VOX"
+        self._in_app_session_requested: bool = False
+        self._active_in_app_target: Optional[TargetWindowInfo] = None
+        self._session_committed_any: bool = False
+        self._active_meeting_id: Optional[int] = None
+        self._active_meeting_title: str = ""
+        self._active_meeting_target_hwnd: Optional[int] = None
+        self._active_meeting_pid: Optional[int] = None
+        self._active_meeting_diarizer: Optional[PersistentSpeakerDiarizer] = None
+        self._active_meeting_corr_id: str = "-"
+        self._active_screen_rec_corr_id: str = "-"
+        self._active_meeting_calendar_event_id: str = ""
+        self._active_meeting_calendar_join_url: str = ""
+        self._active_meeting_calendar_attendees: str = ""
+        self._active_meeting_calendar_organizer: str = ""
+        self._active_meeting_calendar_provider: str = ""
+        self._pending_video_bind: bool = False
+        self._pending_video_folder: Optional[Path] = None
+        self._pending_video_fps: int = 15
+        self._pending_video_res: Optional[str] = None
+        self._progressive_cursor_sec: float = 0.0
+        self._progressive_segment_idx: int = 0
+        self._progressive_worker_busy: bool = False
+        self._cancel_finalization_event: threading.Event = threading.Event()
+        self._finalize_thread: Optional[threading.Thread] = None
+
+        # Dedicated sequential queue for streaming dictation jobs to prevent state inversion/races
+        self._streaming_queue: queue.Queue = queue.Queue()
+        self._streaming_worker_thread = threading.Thread(
+            target=self._streaming_transcription_loop,
+            name="StreamingTranscriptionLoop",
+            daemon=True,
+        )
+        self._streaming_worker_thread.start()
+
+        # Dedicated thread for low-latency provisional interim transcription
+        self._interim_lock = threading.Lock()
+        self._latest_interim_audio: Optional[Tuple[np.ndarray, float]] = None
+        self._interim_worker_running: bool = True
+        self._interim_worker_thread = threading.Thread(
+            target=self._interim_transcription_loop,
+            name="InterimTranscriptionLoop",
+            daemon=True,
+        )
+        self._interim_worker_thread.start()
+
+        # Wire callbacks
+        self.dictation_recorder.on_level_change = self._on_dictation_level_change
+        self.dictation_recorder.on_error = self._on_dictation_error
+
+        self.streaming_typer.on_segment_ready = self._on_streaming_segment_ready
+        self.streaming_typer.on_interim_audio = self._on_streaming_interim_audio
+        self.streaming_typer.on_level_change = self._on_dictation_level_change
+        self.streaming_typer.on_state_change = self._on_streaming_state_change
+        self.streaming_typer.on_error = self._on_dictation_error
+
+        self.meeting_recorder.on_status_tick = self._on_meeting_recorder_tick
+        self.meeting_recorder.on_device_warning = lambda msg: self.notification_requested.emit(
+            "Audio Device Notice", msg
+        )
+
+        self.hotkey_manager.on_dictation_toggle = self.toggle_dictation
+        self.hotkey_manager.on_hands_free_toggle = self.toggle_hands_free_typing
+        self.hotkey_manager.on_ptt_start = self.start_dictation
+        self.hotkey_manager.on_ptt_stop = self.stop_dictation_and_insert
+        self.hotkey_manager.on_cancel_dictation = self.cancel_dictation
+        self.hotkey_manager.on_meeting_toggle = self.toggle_meeting_recording
+        self.hotkey_manager.on_mode_switch = self.set_writing_mode
+        self.hotkey_manager.on_open_scratchpad = self.open_scratchpad_requested.emit
+        self.hotkey_manager.on_transform_last = self.hotkey_transform_last_requested.emit
+        self.hotkey_manager.on_paste_last = self.paste_last_dictation
+        self.hotkey_manager.on_copy_last = self.copy_last_dictation
+        self.hotkey_manager.is_dictation_active_fn = lambda: (
+            self._hands_free_active
+            or self._dictation_state in ("starting", "listening", "speaking", "processing")
+        )
+
+        self._last_dictation_id: Optional[int] = None
+        self._last_dictation_raw: str = ""
+        self._last_dictation_final: str = ""
+        self.calendar_manager: Optional[Any] = None
+        self._init_calendar_subsystem()
+
+        if not getattr(self.config, "disable_hotkeys", False):
+            self.apply_hotkey_config()
+            self.hotkey_manager.start()
+
+        # Foreground window polling timer (every 150ms on main thread)
+        self._focus_timer = QTimer(self)
+        self._focus_timer.setInterval(150)
+        self._focus_timer.timeout.connect(self._poll_foreground_window)
+        self._focus_timer.start()
+
+        # Read AI-style call detection polling timer (every 2000ms on main thread)
+        self._call_timer = QTimer(self)
+        self._call_timer.setInterval(2000)
+        self._call_timer.timeout.connect(self._poll_call_detector)
+        self._call_timer.start()
+
+        # OS WinEvent hook for instant event-driven detection on call window creation/rename
+        if hasattr(self.call_detector, "start_winevent_listener"):
+            self.call_detector.start_winevent_listener(self._poll_call_detector)
+
+        # Pre-warm Whisper model in background so first dictation is instantaneous
+        if not getattr(self.config, "disable_model_preload", False):
+            threading.Thread(target=self._preload_model_bg, name="WhisperPreloadThread", daemon=True).start()
+
+        # Enterprise crash recovery: auto-detect and rescue interrupted/unfinalized meetings
+        self._recover_unfinalized_meetings()
+
+    def _recover_unfinalized_meetings(self) -> None:
+        """
+        Scan SQLite for meetings left in 'recording' or 'transcribing' state due to an
+        unexpected system crash, hard power loss, or abrupt application kill.
+        Inspects disk for WAV audio files, measures actual recorded duration,
+        and safely transitions the record to 'interrupted' so users can re-transcribe or view it.
+        """
+        import wave
+        try:
+            unfinalized = self.db.list_unfinalized_meetings()
+        except Exception as exc:
+            logger.debug("Failed querying unfinalized meetings: %s", exc)
+            return
+
+        for m in unfinalized:
+            m_id = m.get("id")
+            audio_path = m.get("audio_path", "")
+            mic_path = m.get("mic_audio_path", "")
+            sys_path = m.get("sys_audio_path", "")
+            vid_path = m.get("video_path", "")
+
+            # If audio_path is not found or empty, search disk recordings_dir
+            if not audio_path or not Path(audio_path).exists():
+                if vid_path and Path(vid_path).parent.exists():
+                    cand = Path(vid_path).parent / "mixed.wav"
+                    if cand.exists():
+                        audio_path = str(cand)
+                        if (Path(vid_path).parent / "mic.wav").exists():
+                            mic_path = str(Path(vid_path).parent / "mic.wav")
+                        if (Path(vid_path).parent / "sys.wav").exists():
+                            sys_path = str(Path(vid_path).parent / "sys.wav")
+
+                if not audio_path or not Path(audio_path).exists():
+                    created_slug = str(m.get("created_at", "")).replace("-", "").replace(":", "").replace(" ", "_")
+                    for folder in self.config.recordings_dir.glob("meeting_*"):
+                        if folder.is_dir() and (folder / "mixed.wav").exists():
+                            if created_slug and created_slug[:13] in folder.name:
+                                audio_path = str(folder / "mixed.wav")
+                                if (folder / "mic.wav").exists():
+                                    mic_path = str(folder / "mic.wav")
+                                if (folder / "sys.wav").exists():
+                                    sys_path = str(folder / "sys.wav")
+                                if (folder / "meeting_screen.mp4").exists() and not vid_path:
+                                    vid_path = str(folder / "meeting_screen.mp4")
+                                break
+
+            # Determine duration from WAV file if available
+            duration_sec = float(m.get("duration_sec", 0.0))
+            if audio_path and Path(audio_path).exists():
+                try:
+                    with wave.open(audio_path, "rb") as wf:
+                        frames = wf.getnframes()
+                        rate = wf.getframerate()
+                        if rate > 0:
+                            duration_sec = round(float(frames) / float(rate), 2)
+                except Exception as exc:
+                    logger.debug("Could not read WAV header for meeting #%d: %s", m_id, exc)
+
+            update_fields: Dict[str, Any] = {
+                "status": "interrupted",
+                "duration_sec": max(duration_sec, float(m.get("duration_sec", 0.0))),
+            }
+            if audio_path:
+                update_fields["audio_path"] = audio_path
+            if mic_path:
+                update_fields["mic_audio_path"] = mic_path
+            if sys_path:
+                update_fields["sys_audio_path"] = sys_path
+            if vid_path:
+                update_fields["video_path"] = vid_path
+
+            self.db.update_meeting(m_id, **update_fields)
+            logger.warning(
+                "Recovered unfinalized meeting #%d ('%s', status set to 'interrupted', duration=%.1fs, audio=%s)",
+                m_id,
+                m.get("title", "Meeting"),
+                duration_sec,
+                audio_path or "none",
+            )
+
+    @property
+    def is_hands_free_active(self) -> bool:
+        return self._hands_free_active
+
+    @property
+    def dictation_state(self) -> str:
+        return self._dictation_state
+
+    @property
+    def capture_state(self) -> str:
+        """Immediate hardware capture state: 'idle' | 'recording' | 'paused'."""
+        with self._state_lock:
+            return self._capture_state
+
+    @property
+    def meeting_state(self) -> str:
+        """
+        Backward-compatible unified meeting state.
+        Returns 'recording' or 'paused' if capture engine is active;
+        'transcribing' if capture is idle but background finalization jobs are running;
+        else 'idle'.
+        """
+        with self._state_lock:
+            if self._capture_state in ("recording", "paused"):
+                return self._capture_state
+            if self._finalizing_jobs:
+                return "transcribing"
+            if getattr(self, "meeting_recorder", None) and getattr(self.meeting_recorder, "is_recording", False):
+                return "recording"
+            return "idle"
+
+    @property
+    def _meeting_state(self) -> str:
+        """Backward-compatibility property for legacy internal attribute access."""
+        return self.meeting_state
+
+    @_meeting_state.setter
+    def _meeting_state(self, val: str) -> None:
+        """Backward-compatibility setter for legacy tests or internal calls."""
+        with self._state_lock:
+            if val in ("idle", "recording", "paused"):
+                self._capture_state = val
+                if val == "idle":
+                    self._finalizing_jobs.discard(-1)
+            elif val == "transcribing":
+                self._capture_state = "idle"
+                self._finalizing_jobs.add(-1)
+            else:
+                self._capture_state = "idle"
+
+    def _safe_emit_finalization_progress(self, state: str, msg: str) -> None:
+        """Safely emit finalization state only if capture engine is not actively recording."""
+        with self._state_lock:
+            if self._capture_state in ("recording", "paused"):
+                # Active meeting in progress; suppress background progress so UI is not disrupted
+                return
+        self._safe_emit(self.meeting_state_changed, state, msg)
+
+    @property
+    def meeting_lifecycle_state(self) -> str:
+        with self._state_lock:
+            return self._meeting_lifecycle_state.value if isinstance(self._meeting_lifecycle_state, MeetingLifecycleState) else str(self._meeting_lifecycle_state)
+
+    @property
+    def meeting_lifecycle_message(self) -> str:
+        with self._state_lock:
+            return self._meeting_lifecycle_message
+
+    @property
+    def active_recording_mode(self) -> str:
+        with self._state_lock:
+            return self._active_recording_mode
+
+    def _safe_emit(self, sig: Any, *args: Any) -> None:
+        """Safely emit a Qt signal, ignoring RuntimeError if C/C++ object has been deleted."""
+        try:
+            sig.emit(*args)
+        except RuntimeError:
+            pass
+
+    def set_meeting_lifecycle_state(self, state: MeetingLifecycleState | str, message: str = "") -> None:
+        try:
+            st_enum = state if isinstance(state, MeetingLifecycleState) else MeetingLifecycleState(str(state))
+        except Exception:
+            st_enum = MeetingLifecycleState.NO_MEETING_DETECTED
+        with self._state_lock:
+            self._meeting_lifecycle_state = st_enum
+            self._meeting_lifecycle_message = message
+        self._safe_emit(self.meeting_lifecycle_changed, st_enum.value, message)
+
+    @property
+    def is_meeting_recording(self) -> bool:
+        with self._state_lock:
+            return self._capture_state in ("recording", "paused")
+
+    def _on_meeting_capture_ended(self) -> None:
+        logger.info("Meeting capture provider reported call stage closed -> auto-stopping meeting.")
+        self.set_meeting_lifecycle_state(MeetingLifecycleState.MEETING_ENDING, "Meeting call window closed — ending recording...")
+        try:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, self.stop_meeting_recording)
+        except Exception:
+            self.stop_meeting_recording()
+
+    def _on_video_source_state_changed(self, reason: str, message: str) -> None:
+        logger.info("Meeting video source state changed: %s -> %s", reason, message)
+        with self._state_lock:
+            if self._capture_state != "recording":
+                return
+            title = self._active_meeting_title or "Meeting"
+            rec_mode = self._active_recording_mode
+        if reason == "window_minimized":
+            self.meeting_state_changed.emit("recording", f"Recording (Video Paused - Window Minimized): {title}")
+        elif reason == "healthy":
+            badge = "Audio + Video" if rec_mode == "audio_video" else "Audio Only"
+            self.meeting_state_changed.emit("recording", f"Recording ({badge}): {title}")
+
+    def _on_audio_device_warning(self, warning_msg: str) -> None:
+        logger.warning("Meeting audio device warning: %s", warning_msg)
+        self.notification_requested.emit("Audio Device Advisory", warning_msg)
+
+    @property
+    def active_meeting_id(self) -> Optional[int]:
+        return self._active_meeting_id
+
+    def _on_dictation_level_change(self, lvl: float) -> None:
+        """Process incoming audio level and emit both raw RMS and 10-bar equalizer levels."""
+        self.dictation_level_changed.emit(lvl)
+        weights = [0.35, 0.55, 0.75, 0.95, 1.0, 1.0, 0.95, 0.75, 0.55, 0.35]
+        eq_levels = [round(min(1.0, max(0.05, lvl * w)), 3) for w in weights]
+        self.audio_level_changed.emit(lvl, eq_levels)
+
+    def _set_dictation_state(self, new_state: DictationState | str, message: str = "") -> None:
+        """Centralized, thread-safe state transition method for dictation state machine."""
+        with self._state_lock:
+            if isinstance(new_state, DictationState):
+                state_enum = new_state
+                legacy_str = "starting" if state_enum == DictationState.INITIALIZING else (
+                    "failed" if state_enum == DictationState.ERROR else state_enum.value
+                )
+            else:
+                normalized = str(new_state).lower().strip()
+                legacy_str = normalized
+                if normalized == "starting":
+                    state_enum = DictationState.INITIALIZING
+                elif normalized in ("failed", "error"):
+                    state_enum = DictationState.ERROR
+                elif normalized in ("speaking", "listening"):
+                    state_enum = DictationState.LISTENING
+                elif normalized in ("completed", "idle"):
+                    state_enum = DictationState.IDLE
+                elif normalized in ("dismissed", "cancelled"):
+                    state_enum = DictationState.DISMISSED
+                elif normalized == "stopping":
+                    state_enum = DictationState.STOPPING
+                elif normalized == "processing":
+                    state_enum = DictationState.PROCESSING
+                elif normalized == "retrying":
+                    state_enum = DictationState.RETRYING
+                elif normalized == "testing":
+                    state_enum = DictationState.TESTING
+                else:
+                    try:
+                        state_enum = DictationState(normalized)
+                    except ValueError:
+                        state_enum = DictationState.IDLE
+
+            self._dictation_state = state_enum.value
+            self.state_changed.emit(state_enum)
+            self.dictation_state_changed.emit(legacy_str, message)
+
+    def handle_hotkey_action(self, action: str, is_release: bool = False) -> None:
+        """
+        Milestone 2 Contract Method: Dispatch global hotkey triggers to state machine actions.
+        - 'ptt', is_release=False -> start_dictation()
+        - 'ptt', is_release=True -> stop_dictation_and_insert()
+        - 'popo', is_release=False -> toggle_dictation()
+        - 'dismiss', is_release=False -> cancel_dictation()
+        - 'mode_1'..'mode_5', is_release=False -> set_writing_mode(...)
+        """
+        act = (action or "").lower().strip()
+        if act == "ptt":
+            if is_release:
+                self.stop_dictation_and_insert()
+            else:
+                self.start_dictation()
+        elif act in ("popo", "toggle") and not is_release:
+            self.toggle_dictation()
+        elif act in ("dismiss", "cancel") and not is_release:
+            self.cancel_dictation()
+        elif act.startswith("mode_") and not is_release:
+            mode_map = {
+                "mode_1": "verbatim",
+                "mode_2": "clean",
+                "mode_3": "polished",
+                "mode_4": "structured",
+                "mode_5": "email",
+            }
+            if act in mode_map:
+                self.set_writing_mode(mode_map[act])
+
+    def start_audio_test(self) -> bool:
+        """Enter non-inserting testing state for microphone calibration and onboarding."""
+        with self._state_lock:
+            self._set_dictation_state(DictationState.TESTING, "Microphone test active")
+            ok, msg = self.dictation_recorder.start(include_system_audio=False)
+            return ok
+
+    def stop_audio_test(self) -> None:
+        """Exit testing state and return to idle."""
+        with self._state_lock:
+            self.dictation_recorder.stop()
+            self._set_dictation_state(DictationState.IDLE, "Test completed")
+
+    def _on_dictation_error(self, msg: str) -> None:
+        self._hands_free_active = False
+        self._set_dictation_state(DictationState.ERROR, msg)
+        self.notification_requested.emit("Voice Typing Error", f"Capture error: {msg}")
+
+    def register_ui_hwnd(self, hwnd: int) -> None:
+        self.focus_tracker.register_own_hwnd(hwnd)
+
+    def _poll_foreground_window(self) -> None:
+        info = self.focus_tracker.poll_foreground()
+        if info:
+            self.target_window_changed.emit(info.title or "Untitled Window", info.process_name)
+
+    def _safe_emit_model_status(self, msg: str) -> None:
+        try:
+            if getattr(self, "_shutting_down", False):
+                return
+            self.model_status_changed.emit(msg)
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _preload_model_bg(self) -> None:
+        if getattr(self, "_shutting_down", False):
+            return
+        self._safe_emit_model_status(f"Loading local model '{self.config.whisper_model}'...")
+        ok, msg = self.transcriber.ensure_loaded(
+            self.config.whisper_model,
+            status_callback=self._safe_emit_model_status,
+        )
+        self._safe_emit_model_status(msg)
+
+    def switch_whisper_model(self, model_name: str, compute_device: str = "auto") -> None:
+        self.config.whisper_model = model_name
+        self.config.compute_device = compute_device
+        self.config.save()
+        self.transcriber.model_name = model_name
+        self.transcriber.compute_device = compute_device
+        threading.Thread(
+            target=self._preload_model_bg, name="WhisperModelSwitchThread", daemon=True
+        ).start()
+
+    def set_language_mode(self, language: str) -> None:
+        """Set dictation/meeting language mode and ensure a multilingual model is active when needed."""
+        self.config.language = language
+        if language != "en" and self.config.whisper_model.endswith(".en"):
+            multilingual_model = self.config.whisper_model[:-3]  # e.g. base.en -> base, small.en -> small
+            self.switch_whisper_model(multilingual_model, self.config.compute_device)
+        else:
+            self.config.save()
+
+    def set_mic_gain(self, gain: float) -> None:
+        """Set digital microphone gain boost multiplier (0.5x to 10.0x) and apply live."""
+        clamped = max(0.5, min(10.0, round(float(gain), 2)))
+        self.config.mic_gain = clamped
+        self.config.save()
+        self.dictation_recorder.mic_gain = clamped
+        self.streaming_typer.mic_gain = clamped
+        self.meeting_recorder.mic_gain = clamped
+        logger.info("Microphone volume gain updated to %.2fx", clamped)
+
+    def set_pause_threshold(self, pause_sec: float) -> None:
+        """Set silence pause threshold (0.4s to 2.5s) and apply live to streaming voice typer."""
+        clamped = max(0.4, min(3.0, round(float(pause_sec), 2)))
+        self.config.pause_to_type_sec = clamped
+        self.config.save()
+        if hasattr(self, "streaming_typer") and self.streaming_typer:
+            self.streaming_typer.pause_threshold_sec = clamped
+        logger.info("Silence pause threshold updated to %.2fs", clamped)
+
+    @staticmethod
+    def _resolve_system_theme() -> str:
+        """Query Windows AppsUseLightTheme registry value gracefully."""
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            ) as key:
+                val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                return "light" if int(val) == 1 else "dark"
+        except Exception:
+            return "light"
+
+    @property
+    def theme(self) -> str:
+        raw = (getattr(self.config, "theme", "light") or "light").lower().strip()
+        if raw == "system":
+            return self._resolve_system_theme()
+        return raw if raw in ("light", "dark") else "light"
+
+    def set_theme(self, theme_name: str) -> None:
+        """Switch between 'light', 'dark', and 'system' themes."""
+        theme_val = (theme_name or "").lower().strip()
+        if theme_val not in ("dark", "light", "system"):
+            theme_val = "light"
+        self.config.theme = theme_val
+        self.config.save()
+        effective = self.theme
+        self.theme_changed.emit(effective)
+        logger.info("Theme switched to: %s (effective=%s)", theme_val, effective)
+
+    def toggle_theme(self) -> str:
+        """Toggle between dark and light theme and return new active theme."""
+        next_theme = "light" if self.theme == "dark" else "dark"
+        self.set_theme(next_theme)
+        return next_theme
+
+    def set_flow_bar_edge(self, edge: str) -> None:
+        """Set Flow Bar docking edge ('bottom', 'left', or 'right')."""
+        val = (edge or "bottom").lower().strip()
+        if val not in ("bottom", "left", "right"):
+            val = "bottom"
+        self.config.flow_bar_edge = val
+        self.config.save()
+        self.flow_bar_edge_changed.emit(val)
+        fp = getattr(self, "floating_pill", None)
+        if fp is not None and hasattr(fp, "set_dock_edge"):
+            try:
+                fp.set_dock_edge(val)
+            except Exception:
+                pass
+
+    def update_setting(self, key: str, value: Any) -> None:
+        """Persist a single config field from UI controls and apply runtime side effects."""
+        if key == "flow_bar_edge":
+            self.set_flow_bar_edge(str(value))
+            return
+        if key == "theme":
+            self.set_theme(str(value))
+            return
+        if not hasattr(self.config, key):
+            logger.warning("Ignoring unknown setting key: %s", key)
+            return
+        setattr(self.config, key, value)
+        self.config.save()
+        if key in (
+            "hands_free_double_tap",
+            "dictation_hotkey",
+            "ptt_hotkey",
+            "meeting_hotkey",
+            "hotkey_mode",
+            "hotkeys_enabled",
+        ):
+            try:
+                self.apply_hotkey_config()
+            except Exception as e:
+                logger.warning("Failed reapplying hotkeys after %s update: %s", key, e)
+
+    def hide_flow_bar_temporarily(self, hours: float = 1.0) -> None:
+        self.config.flow_bar_hidden_until = time.time() + max(60.0, hours * 3600.0)
+        self.config.save()
+        fp = getattr(self, "floating_pill", None)
+        if fp is not None:
+            fp.hide()
+
+    def mute_reminders_temporarily(self, hours: float = 12.0) -> None:
+        self.config.reminder_muted_until = time.time() + max(60.0, hours * 3600.0)
+        self.config.save()
+
+    def get_active_meeting_count(self) -> int:
+        """Return count of active meeting windows / sessions for the FlowBar stack badge."""
+        try:
+            if hasattr(self.call_detector, "get_active_meeting_count"):
+                return int(self.call_detector.get_active_meeting_count())
+        except Exception:
+            pass
+        return 1 if self._capture_state in ("recording", "paused") else 0
+
+    def _init_calendar_subsystem(self) -> None:
+        """Initialize UnifiedCalendarEngine aggregating Microsoft 365, Google Calendar, Zoom, and ICS."""
+        try:
+            from voxlocal.calendar.unified_engine import UnifiedCalendarEngine
+            from voxlocal.calendar.base import CalendarProviderType
+            from voxlocal.calendar.graph_provider import MsGraphCalendarProvider
+            from voxlocal.calendar.google_provider import GoogleCalendarProvider
+            from voxlocal.calendar.zoom_provider import ZoomCalendarProvider
+            from voxlocal.calendar.ics_provider import IcsCalendarProvider
+
+            storage_dir = Path(self.config.storage_dir or "data")
+            storage_dir.mkdir(parents=True, exist_ok=True)
+
+            self.calendar_engine = UnifiedCalendarEngine(parent=self)
+            self.calendar_manager = self.calendar_engine  # 100% backward-compatibility alias
+
+            # 1. Restore Microsoft Graph if token exists or enabled
+            ms_auth = storage_dir / "calendar_auth.dat"
+            if ms_auth.exists() or getattr(self.config, "ms_graph_enabled", False):
+                try:
+                    ms_prov = MsGraphCalendarProvider(
+                        client_id=(getattr(self.config, "calendar_client_id", "") or None),
+                        tenant_id=(getattr(self.config, "calendar_tenant_id", "common") or "common"),
+                        auth_file_path=ms_auth,
+                    )
+                    if ms_prov.is_authenticated():
+                        self.calendar_engine.register_provider(CalendarProviderType.MS_GRAPH.value, ms_prov)
+                except Exception as exc:
+                    logger.debug("Failed restoring MS Graph provider: %s", exc)
+
+            # 2. Restore Google Calendar if token exists or enabled
+            google_auth = storage_dir / "calendar_google.dat"
+            if google_auth.exists() or getattr(self.config, "google_calendar_enabled", False):
+                try:
+                    g_prov = GoogleCalendarProvider(
+                        client_id=(getattr(self.config, "google_calendar_client_id", "") or None),
+                        client_secret=(getattr(self.config, "google_calendar_client_secret", "") or None),
+                        auth_file_path=google_auth,
+                    )
+                    if g_prov.is_authenticated():
+                        self.calendar_engine.register_provider(CalendarProviderType.GOOGLE.value, g_prov)
+                except Exception as exc:
+                    logger.debug("Failed restoring Google Calendar provider: %s", exc)
+
+            # 3. Restore Zoom Meetings if token exists or enabled
+            zoom_auth = storage_dir / "calendar_zoom.dat"
+            if zoom_auth.exists() or getattr(self.config, "zoom_enabled", False):
+                try:
+                    z_prov = ZoomCalendarProvider(
+                        client_id=(getattr(self.config, "zoom_client_id", "") or None),
+                        client_secret=(getattr(self.config, "zoom_client_secret", "") or None),
+                        auth_file_path=zoom_auth,
+                    )
+                    if z_prov.is_authenticated():
+                        self.calendar_engine.register_provider(CalendarProviderType.ZOOM.value, z_prov)
+                except Exception as exc:
+                    logger.debug("Failed restoring Zoom provider: %s", exc)
+
+            # 4. Restore ICS feed if configured
+            ics_path = storage_dir / "calendar_ics.dat"
+            ics_url = str(getattr(self.config, "calendar_ics_url", "") or "")
+            if ics_url or (getattr(self.config, "calendar_provider", "") == "ics" and ics_path.exists()):
+                try:
+                    ics_prov = IcsCalendarProvider(feed_url=ics_url, auth_file_path=ics_path)
+                    if ics_prov.is_authenticated():
+                        self.calendar_engine.register_provider(CalendarProviderType.ICS.value, ics_prov)
+                except Exception as exc:
+                    logger.debug("Failed restoring ICS provider: %s", exc)
+
+            # 5. Restore Classic MAPI if configured
+            if getattr(self.config, "calendar_provider", "") == "mapi":
+                try:
+                    from voxlocal.calendar.mapi_provider import LocalMapiCalendarProvider
+                    mapi_prov = LocalMapiCalendarProvider()
+                    if mapi_prov.authenticate(interactive=False):
+                        self.calendar_engine.register_provider(CalendarProviderType.LOCAL_MAPI.value, mapi_prov)
+                except Exception as exc:
+                    logger.debug("Failed restoring MAPI provider: %s", exc)
+
+            # Wire engine signals
+            self.calendar_engine.upcoming_meetings_updated.connect(self.calendar_upcoming_changed.emit)
+            self.calendar_engine.meeting_alert.connect(self._on_calendar_meeting_alert)
+            self.calendar_engine.start_capture_requested.connect(self.start_meeting_from_calendar)
+
+            # Start polling timer
+            poll_interval = int(getattr(self.config, "calendar_sync_interval_sec", 60) or 60)
+            self.calendar_engine.start_polling(interval_sec=poll_interval)
+        except Exception as exc:
+            logger.error("Failed to initialize UnifiedCalendarEngine: %s", exc, exc_info=True)
+            self.calendar_engine = None
+            self.calendar_manager = None
+
+    def _on_calendar_meeting_alert(self, meeting: Any, mins_until: int, alert_type: str) -> None:
+        """Handle calendar alerts and route directly to unified FlowBar."""
+        title = getattr(meeting, "title", "Upcoming Meeting")
+        plat = getattr(meeting, "platform", "generic_meeting")
+        fp = getattr(self, "floating_pill", None)
+        if fp is not None and hasattr(fp, "set_pill_state"):
+            if mins_until <= 5:
+                fp.set_pill_state(
+                    "CARD_NOTIFICATION",
+                    metadata={
+                        "title": title,
+                        "platform": plat,
+                        "minutes_until_start": mins_until,
+                        "alert_type": alert_type,
+                    },
+                )
+            else:
+                fp.set_pill_state(
+                    "MINI_MEETING",
+                    metadata={
+                        "title": title,
+                        "platform": plat,
+                        "countdown_text": f"in {mins_until}m",
+                        "minutes_until_start": mins_until,
+                    },
+                )
+
+    def connect_microsoft_calendar(
+        self,
+        on_complete: Optional[Callable[[bool, str], None]] = None,
+        on_device_code: Optional[Callable[[str, str], None]] = None,
+        client_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        use_device_code: bool = True,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
+        """
+        Connect Microsoft Outlook / Microsoft 365 calendar.
+        Default to RFC 8628 Device Code Flow (supported by all Entra ID tenants including WFX corporate accounts without redirect URI restrictions).
+        """
+        eff_client_id = (client_id if client_id is not None else getattr(self.config, "calendar_client_id", "")) or None
+        eff_tenant_id = (tenant_id if tenant_id is not None else getattr(self.config, "calendar_tenant_id", "common")) or "common"
+        if eff_client_id != (getattr(self.config, "calendar_client_id", "") or None) or eff_tenant_id != getattr(self.config, "calendar_tenant_id", "common"):
+            self.config.calendar_client_id = eff_client_id or ""
+            self.config.calendar_tenant_id = eff_tenant_id
+            self.config.save()
+
+        def _worker() -> None:
+            ok = False
+            msg = "Could not connect Microsoft 365 Calendar."
+            try:
+                from voxlocal.calendar.graph_provider import MsGraphCalendarProvider
+                from voxlocal.calendar.base import CalendarProviderType
+                auth_path = Path(self.config.storage_dir or "data") / "calendar_auth.dat"
+                ms_prov = MsGraphCalendarProvider(
+                    client_id=eff_client_id,
+                    tenant_id=eff_tenant_id,
+                    auth_file_path=auth_path,
+                )
+                if use_device_code:
+                    code_info = ms_prov.request_device_code()
+                    if not code_info:
+                        err_detail = ms_prov.get_provider_status().get("error_detail", "Failed initiating device code flow.")
+                        if callable(on_complete):
+                            on_complete(False, err_detail)
+                        return
+
+                    user_code = code_info["user_code"]
+                    verification_uri = code_info.get("verification_uri", "https://microsoft.com/devicelogin")
+                    
+                    if callable(on_device_code):
+                        on_device_code(user_code, verification_uri)
+                    
+                    ok = bool(ms_prov.poll_device_code_tokens(
+                        device_code=code_info["device_code"],
+                        interval=code_info.get("interval", 5),
+                        expires_in=code_info.get("expires_in", 900),
+                        cancel_event=cancel_event,
+                    ))
+                else:
+                    ok = bool(ms_prov.authenticate(interactive=True, cancel_event=cancel_event))
+
+                status = ms_prov.get_provider_status()
+                if ok:
+                    upn = str(status.get("account_upn") or "Microsoft 365")
+                    self.config.calendar_provider = "graph"
+                    self.config.ms_graph_enabled = True
+                    self.config.calendar_account_email = upn
+                    self.config.save()
+                    if self.calendar_engine is not None:
+                        self.calendar_engine.register_provider(CalendarProviderType.MS_GRAPH.value, ms_prov)
+                        self.calendar_engine.poll_all_now()
+                    msg = f"Connected as {upn}"
+                else:
+                    msg = str(
+                        status.get("error_detail")
+                        or status.get("error_state")
+                        or "Authentication cancelled or failed."
+                    )
+            except Exception as exc:
+                msg = str(exc)
+            if callable(on_complete):
+                on_complete(ok, msg)
+
+        threading.Thread(target=_worker, daemon=True, name="vox-calendar-ms").start()
+
+    def connect_google_calendar(
+        self,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        on_complete: Optional[Callable[[bool, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
+        """Connect Google Calendar via OAuth 2.0 PKCE / loopback."""
+        if client_id is not None:
+            self.config.google_calendar_client_id = client_id
+        if client_secret is not None:
+            self.config.google_calendar_client_secret = client_secret
+        self.config.save()
+
+        def _worker() -> None:
+            ok = False
+            msg = "Could not connect Google Calendar."
+            try:
+                from voxlocal.calendar.google_provider import GoogleCalendarProvider
+                from voxlocal.calendar.base import CalendarProviderType
+                auth_path = Path(self.config.storage_dir or "data") / "calendar_google.dat"
+                g_prov = GoogleCalendarProvider(
+                    client_id=client_id or getattr(self.config, "google_calendar_client_id", "") or None,
+                    client_secret=client_secret or getattr(self.config, "google_calendar_client_secret", "") or None,
+                    auth_file_path=auth_path,
+                )
+                ok = bool(g_prov.authenticate(interactive=True, cancel_event=cancel_event))
+                status = g_prov.get_provider_status()
+                if ok:
+                    acct = str(status.get("account_email") or "Google Calendar")
+                    self.config.google_calendar_enabled = True
+                    self.config.google_calendar_account_email = acct
+                    self.config.save()
+                    if self.calendar_engine is not None:
+                        self.calendar_engine.register_provider(CalendarProviderType.GOOGLE.value, g_prov)
+                        self.calendar_engine.poll_all_now()
+                    msg = f"Connected as {acct}"
+                else:
+                    msg = str(status.get("error_detail") or status.get("error_state") or "Google authentication cancelled or failed.")
+            except Exception as exc:
+                msg = str(exc)
+            if callable(on_complete):
+                on_complete(ok, msg)
+
+        threading.Thread(target=_worker, daemon=True, name="vox-calendar-google").start()
+
+    def connect_zoom_calendar(
+        self,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        on_complete: Optional[Callable[[bool, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
+        """Connect Zoom account via OAuth 2.0 to retrieve scheduled & upcoming meetings."""
+        if client_id is not None:
+            self.config.zoom_client_id = client_id
+        if client_secret is not None:
+            self.config.zoom_client_secret = client_secret
+        self.config.save()
+
+        def _worker() -> None:
+            ok = False
+            msg = "Could not connect Zoom."
+            try:
+                from voxlocal.calendar.zoom_provider import ZoomCalendarProvider
+                from voxlocal.calendar.base import CalendarProviderType
+                auth_path = Path(self.config.storage_dir or "data") / "calendar_zoom.dat"
+                z_prov = ZoomCalendarProvider(
+                    client_id=client_id or getattr(self.config, "zoom_client_id", "") or None,
+                    client_secret=client_secret or getattr(self.config, "zoom_client_secret", "") or None,
+                    auth_file_path=auth_path,
+                )
+                ok = bool(z_prov.authenticate(interactive=True, cancel_event=cancel_event))
+                status = z_prov.get_provider_status()
+                if ok:
+                    acct = str(status.get("account_email") or "Zoom Account")
+                    self.config.zoom_enabled = True
+                    self.config.zoom_account_email = acct
+                    self.config.save()
+                    if self.calendar_engine is not None:
+                        self.calendar_engine.register_provider(CalendarProviderType.ZOOM.value, z_prov)
+                        self.calendar_engine.poll_all_now()
+                    msg = f"Connected as {acct}"
+                else:
+                    msg = str(status.get("error_detail") or status.get("error_state") or "Zoom authentication cancelled or failed.")
+            except Exception as exc:
+                msg = str(exc)
+            if callable(on_complete):
+                on_complete(ok, msg)
+
+        threading.Thread(target=_worker, daemon=True, name="vox-calendar-zoom").start()
+
+    def connect_ics_calendar(
+        self,
+        feed_url: str,
+        on_complete: Optional[Callable[[bool, str], None]] = None,
+    ) -> None:
+        """Validate and connect an Outlook / Microsoft 365 / Google .ics calendar link or file."""
+        def _worker() -> None:
+            ok = False
+            msg = "Could not connect ICS calendar."
+            try:
+                from voxlocal.calendar.ics_provider import IcsCalendarProvider
+                from voxlocal.calendar.base import CalendarProviderType
+                ics_path = Path(self.config.storage_dir or "data") / "calendar_ics.dat"
+                prov = IcsCalendarProvider(feed_url=feed_url, auth_file_path=ics_path)
+                ok = bool(prov.authenticate(interactive=True))
+                status = prov.get_provider_status()
+                if ok:
+                    label = str(status.get("account_upn") or "Outlook ICS Calendar")
+                    self.config.calendar_provider = "ics"
+                    self.config.calendar_account_email = label
+                    self.config.calendar_ics_url = prov._feed_url
+                    self.config.save()
+                    if self.calendar_engine is not None:
+                        self.calendar_engine.register_provider(CalendarProviderType.ICS.value, prov)
+                        self.calendar_engine.poll_all_now()
+                    msg = f"Connected to {label}"
+                else:
+                    msg = str(status.get("error_detail") or status.get("error_state") or "Invalid ICS feed.")
+            except Exception as exc:
+                msg = str(exc)
+            if callable(on_complete):
+                on_complete(ok, msg)
+
+        threading.Thread(target=_worker, daemon=True, name="vox-calendar-ics").start()
+
+    def connect_local_outlook_calendar(
+        self,
+        on_complete: Optional[Callable[[bool, str], None]] = None,
+    ) -> None:
+        """Connect to locally installed Classic Windows Outlook Desktop via COM MAPI."""
+        def _worker() -> None:
+            ok = False
+            msg = "Classic Outlook desktop profile not found."
+            try:
+                from voxlocal.calendar.mapi_provider import LocalMapiCalendarProvider
+                from voxlocal.calendar.base import CalendarProviderType
+                prov = LocalMapiCalendarProvider()
+                ok = bool(prov.authenticate(interactive=True))
+                status = prov.get_provider_status()
+                if ok:
+                    acct = str(status.get("account_upn") or "Outlook Desktop (MAPI)")
+                    self.config.calendar_provider = "mapi"
+                    self.config.calendar_account_email = acct
+                    self.config.save()
+                    if self.calendar_engine is not None:
+                        self.calendar_engine.register_provider(CalendarProviderType.LOCAL_MAPI.value, prov)
+                        self.calendar_engine.poll_all_now()
+                    msg = f"Connected to {acct}"
+                else:
+                    err = str(status.get("error_state") or "MAPI_UNAVAILABLE")
+                    msg = (
+                        "Classic Outlook desktop MAPI is unavailable (New Outlook & web Outlook do not expose COM MAPI). "
+                        "Use the Outlook Device Code or ICS Link tab."
+                        if err in ("OUTLOOK_NOT_INSTALLED", "OUTLOOK_PROFILE_UNAVAILABLE", "MAPI_UNAVAILABLE")
+                        else err
+                    )
+            except Exception as exc:
+                msg = str(exc)
+            if callable(on_complete):
+                on_complete(ok, msg)
+
+        threading.Thread(target=_worker, daemon=True, name="vox-calendar-mapi").start()
+
+    def disconnect_calendar_provider(self, provider_type: str) -> bool:
+        """Disconnect a specific calendar provider (e.g. 'ms_graph', 'google', 'zoom', 'ics')."""
+        try:
+            pt = str(provider_type).lower()
+            storage_dir = Path(self.config.storage_dir or "data")
+            if pt in ("ms_graph", "graph"):
+                self.config.ms_graph_enabled = False
+                self.config.calendar_provider = "none"
+                self.config.calendar_account_email = ""
+                auth_f = storage_dir / "calendar_auth.dat"
+                if auth_f.exists():
+                    auth_f.unlink(missing_ok=True)
+            elif pt in ("google", "google_calendar"):
+                self.config.google_calendar_enabled = False
+                self.config.google_calendar_account_email = ""
+                auth_f = storage_dir / "calendar_google.dat"
+                if auth_f.exists():
+                    auth_f.unlink(missing_ok=True)
+            elif pt == "zoom":
+                self.config.zoom_enabled = False
+                self.config.zoom_account_email = ""
+                auth_f = storage_dir / "calendar_zoom.dat"
+                if auth_f.exists():
+                    auth_f.unlink(missing_ok=True)
+            elif pt == "ics":
+                self.config.calendar_ics_url = ""
+                auth_f = storage_dir / "calendar_ics.dat"
+                if auth_f.exists():
+                    auth_f.unlink(missing_ok=True)
+            self.config.save()
+
+            if self.calendar_engine is not None:
+                self.calendar_engine.unregister_provider(pt)
+                self.calendar_engine.poll_all_now()
+            return True
+        except Exception as exc:
+            logger.warning("Error disconnecting calendar provider %s: %s", provider_type, exc)
+            return False
+
+    def disconnect_calendar(self) -> bool:
+        """Disconnect all calendar providers and revert to offline state."""
+        try:
+            if self.calendar_engine is not None:
+                self.calendar_engine.disconnect_provider()
+            self.disconnect_calendar_provider("ms_graph")
+            self.disconnect_calendar_provider("google")
+            self.disconnect_calendar_provider("zoom")
+            self.disconnect_calendar_provider("ics")
+            self.config.calendar_provider = "none"
+            self.config.calendar_account_email = ""
+            self.config.calendar_ics_url = ""
+            self.config.save()
+            self.calendar_upcoming_changed.emit([])
+            return True
+        except Exception as exc:
+            logger.warning("Calendar disconnect all failed: %s", exc)
+            return False
+
+    def start_meeting_from_calendar(self, meeting: Any) -> Tuple[bool, str]:
+        """One-click Join Meeting & Start Notetaker."""
+        try:
+            join_url = getattr(meeting, "join_url", "")
+            title = getattr(meeting, "title", "Calendar Meeting")
+            if join_url:
+                import webbrowser
+                webbrowser.open(join_url)
+
+            # Record calendar metadata for active session
+            self._active_meeting_calendar_event_id = getattr(meeting, "id", "")
+            self._active_meeting_calendar_join_url = join_url
+            self._active_meeting_calendar_attendees = getattr(meeting, "attendees_str", "")
+            self._active_meeting_calendar_organizer = getattr(meeting, "organizer", "")
+            self._active_meeting_calendar_provider = str(getattr(meeting, "provider_type", ""))
+            self._active_meeting_platform = str(getattr(meeting, "platform", "Meeting"))
+
+            # Start Notetaker recording
+            ok, msg = self.start_meeting_recording(title=title)
+            if ok:
+                self.notification_requested.emit(
+                    "Meeting Started",
+                    f"Joined {title}. Recording and transcribing meeting notes.",
+                )
+            return ok, msg
+        except Exception as exc:
+            logger.error("Failed to start meeting from calendar: %s", exc)
+            return False, str(exc)
+
+    def _build_style_preferences(self) -> Dict[str, Any]:
+        return {
+            "auto_cleanup_level": getattr(self.config, "auto_cleanup_level", "light"),
+            "style_work": getattr(self.config, "style_work", "formal"),
+            "style_email": getattr(self.config, "style_email", "formal"),
+            "style_personal": getattr(self.config, "style_personal", "casual"),
+            "style_other": getattr(self.config, "style_other", "formal"),
+            "vibe_coding_variable_recognition": getattr(self.config, "vibe_coding_variable_recognition", True),
+            "vibe_coding_file_tagging": getattr(self.config, "vibe_coding_file_tagging", True),
+        }
+
+    def transform_text(self, text: str, instruction: str = "polish") -> str:
+        """Transform text locally using LocalLLMEngine when ready or deterministic rules."""
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+        if self.llm_engine and hasattr(self.llm_engine, "is_ready") and self.llm_engine.is_ready():
+            try:
+                res = self.llm_engine.generate_text(
+                    prompt=f"Instruction: {instruction}\nRewrite ONLY the following text concisely without preamble:\n{cleaned}",
+                    max_tokens=320,
+                )
+                if res and str(res).strip():
+                    return str(res).strip()
+            except Exception as exc:
+                logger.debug("LLM transform fallback to deterministic rules: %s", exc)
+        return DictationProcessor.transform_preset(cleaned, instruction=instruction)
+
+    def copy_last_dictation(self) -> str:
+        """Copy most recent dictation output to clipboard without changing focus."""
+        text = self._last_dictation_final
+        if not text:
+            hist = self.db.list_dictation_history(limit=1)
+            if hist:
+                text = str(hist[0].get("final_text", ""))
+        if text:
+            try:
+                from voxlocal.win32.clipboard import set_clipboard_text
+                set_clipboard_text(text)
+            except Exception:
+                from PyQt6.QtWidgets import QApplication
+                cb = QApplication.clipboard()
+                if cb:
+                    cb.setText(text)
+            self.notification_requested.emit("VOX", "Copied last transcript to clipboard.")
+        self.hotkey_copy_last_requested.emit()
+        return text
+
+    def paste_last_dictation(self) -> bool:
+        """Paste the most recent dictation output directly into the active window."""
+        text = self._last_dictation_final
+        if not text:
+            hist = self.db.list_dictation_history(limit=1)
+            if hist:
+                text = str(hist[0].get("final_text", ""))
+        if not text:
+            return False
+        target = self.focus_tracker.get_active_target()
+        ok, _ = self.text_inserter.insert_text(
+            text + " ",
+            method=self.config.insertion_method,
+            restore_clipboard=self.config.restore_clipboard,
+            target=target,
+        )
+        self.hotkey_paste_last_requested.emit()
+        return ok
+
+    def undo_ai_edit(self, entry_id: int) -> Optional[str]:
+        """Revert a dictation entry back to its raw ASR transcript (Wispr 'Undo AI edit')."""
+        rows = self.db.list_dictation_history(limit=200)
+        for row in rows:
+            if int(row.get("id", -1)) == int(entry_id):
+                raw_val = str(row.get("raw_text", "") or row.get("final_text", "")).strip()
+                if self.db.update_dictation_entry(entry_id, final_text=raw_val, undone=True):
+                    self.history_updated.emit()
+                    return raw_val
+        return None
+
+    def apply_dictation_correction(self, entry_id: int, corrected_text: str) -> bool:
+        """Save user's manual edit to a dictation item and auto-learn corrected terms into Dictionary."""
+        rows = self.db.list_dictation_history(limit=200)
+        orig_text = ""
+        for row in rows:
+            if int(row.get("id", -1)) == int(entry_id):
+                orig_text = str(row.get("final_text", ""))
+                break
+        ok = self.db.update_dictation_entry(entry_id, final_text=corrected_text.strip(), edited_text=corrected_text.strip())
+        if ok and getattr(self.config, "auto_add_dictionary", True) and orig_text and corrected_text.strip() != orig_text.strip():
+            # Auto-learn single differing token pairs cleanly into personal Dictionary
+            old_words = [w.strip(".,!?;:\"'") for w in orig_text.split()]
+            new_words = [w.strip(".,!?;:\"'") for w in corrected_text.split()]
+            if len(old_words) == len(new_words):
+                learned = 0
+                for ow, nw in zip(old_words, new_words):
+                    if ow.lower() != nw.lower() and 2 <= len(ow) <= 32 and 2 <= len(nw) <= 32:
+                        try:
+                            self.db.upsert_vocabulary(ow, nw, category="Auto-learned", is_active=1, auto_learned=1)
+                            learned += 1
+                        except Exception:
+                            pass
+                if learned > 0:
+                    self.vocabulary_updated.emit()
+        if ok:
+            self.history_updated.emit()
+        return ok
+
+    def toggle_hands_free_typing(self) -> None:
+        """Dedicated double-tap toggle for Hands-Free mode regardless of default PTT preference."""
+        if self._hands_free_active or self.streaming_typer.is_running:
+            self.stop_hands_free_typing()
+        else:
+            if self._dictation_state in ("listening", "speaking") and self.dictation_recorder.is_recording:
+                self.cancel_dictation()
+            self.start_hands_free_typing()
+
+    @property
+    def active_writing_mode(self) -> str:
+        return getattr(self.config, "dictation_writing_mode", "clean")
+
+    def set_writing_mode(self, mode: str | TransformationMode) -> None:
+        mode_val = str(getattr(mode, "value", mode)).lower().strip()
+        prev_mode = getattr(self.config, "dictation_writing_mode", "")
+        self.config.dictation_writing_mode = mode_val
+        if prev_mode != mode_val:
+            logger.info("Writing mode switched to: %s", mode_val)
+            try:
+                self.writing_mode_changed.emit(mode_val)
+                self.mode_changed.emit(mode_val)
+            except Exception:
+                pass
+        fp = getattr(self, "floating_pill", None)
+        if fp is not None:
+            try:
+                from PyQt6.QtCore import QThread
+                if QThread.currentThread() == fp.thread():
+                    if hasattr(fp, "_on_controller_mode_changed"):
+                        fp._on_controller_mode_changed(mode_val)
+                    elif hasattr(fp, "set_mode"):
+                        fp.set_mode(mode_val)
+            except Exception:
+                pass
+
+    def apply_hotkey_config(self) -> Tuple[bool, str]:
+        return self.hotkey_manager.configure(
+            dictation_mode=self.config.dictation_mode,
+            dictation_hotkey=getattr(self.config, "dictation_hotkey", "ctrl+shift+space"),
+            ptt_hotkey=self.config.ptt_hotkey,
+            meeting_hotkey=self.config.meeting_hotkey,
+            enable_dictation_hotkey=getattr(self.config, "enable_voice_typing_hotkey", True),
+            hands_free_double_tap=getattr(self.config, "hands_free_double_tap", True),
+            notetaker_triple_tap=getattr(self.config, "notetaker_triple_tap", False),
+            scratchpad_hotkey=getattr(self.config, "scratchpad_hotkey", ""),
+            transform_hotkey=getattr(self.config, "transform_hotkey", ""),
+            paste_last_hotkey=getattr(self.config, "paste_last_hotkey", ""),
+            copy_last_hotkey=getattr(self.config, "copy_last_hotkey", ""),
+        )
+
+    # ==================================================================
+    # CORE FEATURE B: UNIVERSAL VOICE TYPING (Hands-Free Zero-Click + PTT)
+    # ==================================================================
+    def set_in_app_dictation_target(self, widget: Any, title: str = "VOX") -> None:
+        """Register an in-app VOX Qt widget as a candidate target for live dictation."""
+        self._explicit_in_app_widget_ref = widget
+        self._explicit_in_app_title = (title or "VOX").strip()
+
+    def clear_in_app_dictation_target(self, widget: Any = None) -> None:
+        """Clear registered in-app dictation target if matching (or unconditionally)."""
+        if widget is None or self._explicit_in_app_widget_ref is widget:
+            self._explicit_in_app_widget_ref = None
+            self._explicit_in_app_title = "VOX"
+            self._in_app_session_requested = False
+            self._active_in_app_target = None
+
+    @staticmethod
+    def _is_in_app_target(target: Any) -> bool:
+        return bool(
+            target
+            and getattr(target, "process_name", "") == "VOX"
+            and int(getattr(target, "hwnd", 0) or 0) == 0
+        )
+
+    def _clear_dictation_target(self) -> None:
+        self._active_in_app_target = None
+        self._in_app_session_requested = False
+        self.focus_tracker.clear_locked_target()
+
+    def _get_current_dictation_target(self) -> Any:
+        if self._active_in_app_target is not None:
+            return self._active_in_app_target
+        return self.focus_tracker.get_active_target()
+
+    def _resolve_dictation_target(self) -> Optional[TargetWindowInfo]:
+        """Resolve either an internal VOX Qt editor target or the active external Win32 window."""
+        if self._in_app_session_requested:
+            self._in_app_session_requested = False
+            widget = self._explicit_in_app_widget_ref
+            title = self._explicit_in_app_title or "VOX"
+            try:
+                if widget is not None and hasattr(widget, "window"):
+                    win = widget.window()
+                    if win is not None and hasattr(win, "windowTitle") and win.windowTitle():
+                        title = win.windowTitle()
+            except RuntimeError:
+                pass
+            in_app = TargetWindowInfo(
+                hwnd=0,
+                title=title,
+                process_id=os.getpid(),
+                thread_id=0,
+                process_name="VOX",
+                focus_child_hwnd=0,
+            )
+            self._active_in_app_target = in_app
+            return in_app
+
+        try:
+            if self.focus_tracker.is_foreground_own_process():
+                from PyQt6.QtWidgets import QApplication, QLineEdit, QPlainTextEdit, QTextEdit
+
+                app = QApplication.instance()
+                if app is not None:
+                    active_win = app.activeWindow()
+                    fw = app.focusWidget()
+                    if active_win is not None and active_win.isVisible():
+                        is_editable = isinstance(fw, (QTextEdit, QPlainTextEdit, QLineEdit))
+                        is_onboarding = active_win.objectName() == "voxOnboardingWizard"
+                        if is_editable or is_onboarding:
+                            title = active_win.windowTitle() or self._explicit_in_app_title or "VOX"
+                            in_app = TargetWindowInfo(
+                                hwnd=0,
+                                title=title,
+                                process_id=os.getpid(),
+                                thread_id=0,
+                                process_name="VOX",
+                                focus_child_hwnd=0,
+                            )
+                            self._active_in_app_target = in_app
+                            return in_app
+        except Exception:
+            pass
+
+        self._active_in_app_target = None
+        return self.focus_tracker.lock_current_target()
+
+    def toggle_in_app_dictation(self, widget: Any, title: str = "VOX") -> None:
+        """Toggle live voice typing directly into an internal VOX Qt editor."""
+        if self._dictation_state in ("idle", "completed", "failed"):
+            self.set_in_app_dictation_target(widget, title=title)
+            self._in_app_session_requested = True
+        self.toggle_dictation()
+
+    def toggle_dictation(self) -> None:
+        """
+        Primary Voice Typing Action:
+        Toggles voice typing (hands-free continuous or PTT depending on mode).
+        Synchronized across the floating bar and global keyboard shortcuts.
+        """
+        if self._dictation_state == "starting":
+            logger.info("Voice typing cancel requested during startup")
+            self._cancel_startup_requested = True
+            self._dictation_state = "stopping"
+            self.dictation_state_changed.emit("stopping", "Cancelling startup...")
+            return
+
+        if self._dictation_state == "stopping":
+            return
+
+        if self._hands_free_active or self.streaming_typer.is_running:
+            self.stop_hands_free_typing()
+        elif self._dictation_state in ("listening", "speaking", "processing") and self.dictation_recorder.is_recording:
+            self.stop_dictation_and_insert()
+        else:
+            if getattr(self.config, "dictation_mode", "toggle") == "ptt":
+                self.start_dictation()
+            else:
+                self.start_hands_free_typing()
+
+    def start_hands_free_typing(self) -> bool:
+        """Start continuous hands-free voice typing."""
+        if self._capture_state in ("recording", "paused"):
+            self.notification_requested.emit(
+                "Voice Typing Unavailable",
+                "Continuous voice typing is paused while an active corporate meeting is being recorded.",
+            )
+            return False
+        if self._screen_rec_state in ("recording", "paused"):
+            self.notification_requested.emit(
+                "Voice Typing Unavailable",
+                "Continuous voice typing is paused while a PC screen recording is active.",
+            )
+            return False
+        if self._hands_free_active or self._dictation_state in ("starting", "listening", "speaking", "processing"):
+            return True
+
+        if self.dictation_recorder.is_recording:
+            self.dictation_recorder.stop()
+
+        self._dictation_state = "starting"
+        self._cancel_startup_requested = False
+        self._session_committed_any = False
+        self.dictation_state_changed.emit("starting", "Starting voice typing...")
+
+        target = self._resolve_dictation_target()
+        if self._is_in_app_target(target):
+            target_desc = "VOX In-App Editor"
+        else:
+            target_desc = f"{target.process_name}" if target and target.process_name else "Active App"
+        if target:
+            self.target_window_changed.emit(target.title or "Untitled Window", target.process_name or "")
+
+        ok, msg = self.streaming_typer.start(
+            preferred_device_index=self.config.mic_device_index,
+            preferred_device_name=self.config.mic_device_name,
+            pause_threshold_sec=self.config.pause_to_type_sec,
+            include_system_audio=self.config.dictation_include_system_audio,
+            preferred_loopback_index=self.config.loopback_device_index,
+            preferred_loopback_name=self.config.loopback_device_name,
+            mic_gain=self.config.mic_gain,
+        )
+
+        if self._cancel_startup_requested:
+            logger.info("Voice typing startup was cancelled by stop command")
+            self.streaming_typer.stop()
+            self._hands_free_active = False
+            self._clear_dictation_target()
+            self._dictation_state = "idle"
+            self.dictation_state_changed.emit("idle", "Voice typing stopped")
+            return False
+
+        if not ok:
+            self._hands_free_active = False
+            self._clear_dictation_target()
+            self._dictation_state = "failed"
+            self.dictation_state_changed.emit("failed", msg)
+            return False
+
+        self._hands_free_active = True
+        self._last_dictation_ended_sentence = True
+        self._last_dictation_time = 0.0
+        self._dictation_state = "listening"
+        self.dictation_state_changed.emit("listening", f"Listening -> {target_desc}...")
+        return True
+
+    def stop_hands_free_typing(self) -> None:
+        """Stop continuous hands-free voice typing."""
+        if self._dictation_state == "starting":
+            self._cancel_startup_requested = True
+            self._dictation_state = "stopping"
+            self.dictation_state_changed.emit("stopping", "Stopping voice typing...")
+            return
+
+        if self._dictation_state in ("stopping", "idle"):
+            return
+
+        self._hands_free_active = False
+        self._last_dictation_ended_sentence = True
+        self.dictation_interim_updated.emit("", "")
+        self._dictation_state = "stopping"
+        self.dictation_state_changed.emit("stopping", "Finalizing speech...")
+        self.streaming_typer.stop()
+        if self._streaming_queue.empty():
+            self._clear_dictation_target()
+            self._dictation_state = "idle"
+            if self._session_committed_any:
+                self.dictation_state_changed.emit("idle", "Voice typing stopped")
+            else:
+                self.dictation_state_changed.emit("idle", "No speech detected — speak closer to the mic and try again")
+
+    def _on_streaming_state_change(self, state: str) -> None:
+        if state == "speaking":
+            self.dictation_state_changed.emit("speaking", "Speaking...")
+        elif state == "transcribing":
+            self.dictation_state_changed.emit("processing", "Transcribing locally...")
+        elif state == "listening":
+            self.dictation_interim_updated.emit("", "")
+            if self._streaming_queue.empty():
+                self.dictation_state_changed.emit("listening", "Listening...")
+            else:
+                self.dictation_state_changed.emit("processing", "Transcribing locally...")
+
+    def _on_streaming_interim_audio(self, audio_16k: np.ndarray, duration_sec: float) -> None:
+        if audio_16k.size < 4000 or not self._streaming_queue.empty():
+            return
+        with self._interim_lock:
+            self._latest_interim_audio = (audio_16k, duration_sec)
+
+    def _interim_transcription_loop(self) -> None:
+        """Worker thread loop computing non-blocking speculative partials during ongoing speech."""
+        while getattr(self, "_interim_worker_running", True):
+            try:
+                audio_item = None
+                with self._interim_lock:
+                    if self._latest_interim_audio is not None:
+                        audio_item = self._latest_interim_audio
+                        self._latest_interim_audio = None
+
+                if audio_item is None or not self._hands_free_active or not self._streaming_queue.empty():
+                    time.sleep(0.06)
+                    continue
+
+                audio_16k, duration_sec = audio_item
+                engine_lang = "en+hi" if self.config.language == "hi_latn" else self.config.language
+                out_script = "roman" if self.config.language == "hi_latn" else "auto"
+
+                raw_interim, conf = self.transcriber.transcribe_interim(
+                    audio_16k,
+                    language=engine_lang,
+                )
+                if raw_interim and self._hands_free_active and self._streaming_queue.empty():
+                    vocab = self.db.list_vocabulary(active_only=True)
+                    processed_interim = DictationProcessor.process_interim(
+                        raw_interim,
+                        vocabulary=vocab,
+                        capitalize_first=self._last_dictation_ended_sentence,
+                        output_script=out_script,
+                    )
+                    if processed_interim:
+                        self.dictation_interim_updated.emit(processed_interim, "")
+            except Exception as exc:
+                logger.debug("Interim transcription error: %s", exc)
+            time.sleep(0.05)
+
+    def _on_streaming_segment_ready(self, audio_16k: np.ndarray, duration_sec: float) -> None:
+        if audio_16k.size < 3200:
+            return
+        with self._interim_lock:
+            self._latest_interim_audio = None
+        self._streaming_queue.put((audio_16k, duration_sec))
+
+    def _streaming_transcription_loop(self) -> None:
+        """Worker thread loop processing streaming audio segments in strict chronological order."""
+        while True:
+            try:
+                item = self._streaming_queue.get()
+                if item is None:
+                    break
+                audio_16k, duration_sec = item
+                self._process_streaming_worker(audio_16k, duration_sec)
+            except Exception as exc:
+                logger.error("Error in streaming transcription loop: %s", exc)
+            finally:
+                self._streaming_queue.task_done()
+
+    def set_transcribe_profile(self, profile: str) -> None:
+        """Update active transcription profile preset ('fast', 'balanced', 'max_accuracy')."""
+        profile = (profile or "balanced").lower().strip()
+        if profile in TranscribeProfile.ALL_PROFILES:
+            self.config.transcribe_profile = profile
+            self.config.save()
+            self.transcriber.profile = profile
+            self.transcribe_profile_changed.emit(profile)
+            logger.info("Transcribe profile switched to: %s", profile)
+
+    def _format_and_commit_dictation(
+        self,
+        raw_text: str,
+        duration_sec: float,
+        vocab: List[Dict[str, Any]],
+        out_script: str,
+        target: Any,
+        trailing_space_always: bool = False,
+    ) -> Optional[Tuple[str, bool, str, str, str]]:
+        """Shared dictation formatting, snippet expansion, style formatting, focus-invariant insertion, and DB commit."""
+        win_title = target.title if target else ""
+        proc_name = target.process_name if target else ""
+        target_hwnd = target.hwnd if target else 0
+        now = time.monotonic()
+
+        if (
+            self._last_dictation_time == 0.0
+            or (now - self._last_dictation_time) > 20.0
+            or (target_hwnd != 0 and self._last_target_hwnd != 0 and target_hwnd != self._last_target_hwnd)
+        ):
+            capitalize_first = True
+        else:
+            capitalize_first = self._last_dictation_ended_sentence
+
+        snippets = []
+        try:
+            snippets = self.db.list_snippets()
+        except Exception:
+            snippets = []
+
+        detailed = DictationProcessor.process_detailed(
+            raw_text=raw_text,
+            vocabulary=vocab,
+            snippets=snippets,
+            cleanup_enabled=self.config.dictation_cleanup,
+            spoken_punctuation=self.config.spoken_punctuation,
+            smart_leading_space=self.config.smart_leading_space,
+            capitalize_first=capitalize_first,
+            output_script=out_script,
+            mode=self.active_writing_mode,
+            window_title=win_title,
+            process_name=proc_name,
+            style_preferences=self._build_style_preferences(),
+        )
+        final_text = detailed["final_text"]
+        app_category = detailed["app_category"]
+        for sid in detailed.get("matched_snippet_ids", []):
+            try:
+                self.db.increment_snippet_usage(sid)
+            except Exception:
+                pass
+        if (
+            final_text
+            and app_category == "email"
+            and getattr(self.config, "email_auto_signature", False)
+            and getattr(self.config, "email_signature_text", "").strip()
+        ):
+            sig = str(self.config.email_signature_text).strip()
+            if sig not in final_text:
+                final_text = f"{final_text.rstrip()}\n\n{sig}"
+
+        if not final_text.strip():
+            return None
+
+        self._last_dictation_ended_sentence = DictationProcessor.is_sentence_complete(final_text)
+        self._last_dictation_time = now
+        self._last_target_hwnd = target_hwnd
+        self._recent_utterance_history.append(final_text)
+        self._last_dictation_raw = raw_text
+        self._last_dictation_final = final_text
+
+        add_space = (
+            not final_text.endswith(("\n", " "))
+            if trailing_space_always
+            else (self.config.smart_leading_space and not final_text.endswith("\n"))
+        )
+        text_to_insert = final_text + (" " if add_space else "")
+        self._last_inserted_len = len(text_to_insert)
+
+        if self._is_in_app_target(target):
+            ok, method_used = True, "in_app_qt"
+        else:
+            ok, method_used = self.text_inserter.insert_text(
+                text_to_insert,
+                method=self.config.insertion_method,
+                restore_clipboard=self.config.restore_clipboard,
+                target=target,
+            )
+
+        if ok:
+            self._session_committed_any = True
+
+        self._last_dictation_id = self.db.add_dictation_entry(
+            raw_text=raw_text,
+            final_text=final_text,
+            duration_sec=duration_sec,
+            target_window=win_title,
+            target_process=proc_name,
+            insertion_method=method_used,
+            status="completed" if ok else "failed",
+            app_category=app_category,
+        )
+        return final_text, ok, method_used, win_title, proc_name
+
+    def _process_streaming_worker(self, audio_16k: np.ndarray, duration_sec: float) -> None:
+        try:
+            self.dictation_interim_updated.emit("", "")
+            vocab = self.db.list_vocabulary(active_only=True)
+            engine_lang = "en+hi" if self.config.language == "hi_latn" else self.config.language
+            out_script = "roman" if self.config.language == "hi_latn" else "auto"
+
+            target = self._get_current_dictation_target()
+            win_title = target.title if target else ""
+            proc_name = target.process_name if target else ""
+            window_keywords = DictationProcessor.extract_window_keywords(win_title, proc_name)
+
+            recent_entries = list(self._recent_utterance_history)
+            if not recent_entries:
+                try:
+                    recent_entries = [
+                        e.get("final_text", "") for e in self.db.list_dictation_history(limit=2)
+                    ]
+                except Exception as db_exc:
+                    logger.debug("Could not fetch recent dictation history: %s", db_exc)
+                    recent_entries = []
+            context_prompt = DictationProcessor.build_contextual_prompt(
+                win_title, proc_name, recent_entries, language=self.config.language
+            )
+
+            custom_terms = [str(v.get("replacement", "")).strip() for v in vocab if v.get("is_active", 1)]
+            all_hotwords_list = list(window_keywords)
+            if custom_terms:
+                all_hotwords_list.extend([w for w in custom_terms if w])
+            effective_hotwords = ", ".join(all_hotwords_list) if all_hotwords_list else None
+
+            raw_text = self.transcriber.transcribe_dictation(
+                audio_16k,
+                initial_prompt=context_prompt,
+                language=engine_lang,
+                vad_filter=self.config.vad_filter,
+                hotwords=effective_hotwords,
+                profile=getattr(self.config, "transcribe_profile", "balanced"),
+            )
+
+            if not raw_text.strip():
+                if self._hands_free_active:
+                    if getattr(self.streaming_typer, "is_in_speech", False):
+                        self.dictation_state_changed.emit("speaking", "Speaking...")
+                    elif not self._streaming_queue.empty():
+                        self.dictation_state_changed.emit("processing", "Transcribing locally...")
+                    else:
+                        self.dictation_state_changed.emit("listening", "Listening...")
+                else:
+                    self._clear_dictation_target()
+                    self._dictation_state = "idle"
+                    idle_msg = (
+                        "Voice typing stopped"
+                        if self._session_committed_any
+                        else "No speech detected — speak closer to the mic and try again"
+                    )
+                    self.dictation_state_changed.emit("idle", idle_msg)
+                return
+
+            logger.info("Voice typing transcribed (%.2fs): '%s'", duration_sec, raw_text)
+
+            clean_lower = raw_text.strip().lower()
+            if clean_lower in DictationProcessor.HALLUCINATION_PHRASES:
+                if self._hands_free_active:
+                    if getattr(self.streaming_typer, "is_in_speech", False):
+                        self.dictation_state_changed.emit("speaking", "Speaking...")
+                    elif not self._streaming_queue.empty():
+                        self.dictation_state_changed.emit("processing", "Transcribing locally...")
+                    else:
+                        self.dictation_state_changed.emit("listening", "Listening...")
+                else:
+                    self._clear_dictation_target()
+                    self._dictation_state = "idle"
+                    idle_msg = (
+                        "Voice typing stopped"
+                        if self._session_committed_any
+                        else "No speech detected — speak closer to the mic and try again"
+                    )
+                    self.dictation_state_changed.emit("idle", idle_msg)
+                return
+
+            # Check voice commands
+            if self.config.voice_commands:
+                cmd = DictationProcessor.detect_voice_command(raw_text)
+                if cmd == "stop_listening":
+                    self.stop_hands_free_typing()
+                    return
+                elif cmd == "delete_that":
+                    target = self._get_current_dictation_target()
+                    if not self._is_in_app_target(target):
+                        self.text_inserter.send_backspaces(
+                            count=max(1, self._last_inserted_len), target=target
+                        )
+                    self._last_inserted_len = 0
+                    if getattr(self.streaming_typer, "is_in_speech", False):
+                        self.dictation_state_changed.emit("speaking", "Speaking...")
+                    else:
+                        self.dictation_state_changed.emit("listening", "Deleted previous phrase")
+                    return
+                elif cmd == "press_enter":
+                    target = self._get_current_dictation_target()
+                    if self._is_in_app_target(target):
+                        self.dictation_completed.emit("\n", f"{target.process_name} ({target.title})", "in_app_qt")
+                    else:
+                        self.text_inserter.send_enter(target=target)
+                    self._last_inserted_len = 0
+                    self._last_dictation_ended_sentence = True
+                    if getattr(self.streaming_typer, "is_in_speech", False):
+                        self.dictation_state_changed.emit("speaking", "Speaking...")
+                    else:
+                        self.dictation_state_changed.emit("listening", "Sent Enter")
+                    return
+                elif cmd == "new_line":
+                    target = self._get_current_dictation_target()
+                    if self._is_in_app_target(target):
+                        self.dictation_completed.emit("\n", f"{target.process_name} ({target.title})", "in_app_qt")
+                    else:
+                        self.text_inserter.insert_text("\n", target=target)
+                    self._last_inserted_len = 1
+                    self._last_dictation_ended_sentence = True
+                    if getattr(self.streaming_typer, "is_in_speech", False):
+                        self.dictation_state_changed.emit("speaking", "Speaking...")
+                    else:
+                        self.dictation_state_changed.emit("listening", "New line")
+                    return
+
+            target = self._get_current_dictation_target()
+            committed = self._format_and_commit_dictation(
+                raw_text=raw_text,
+                duration_sec=duration_sec,
+                vocab=vocab,
+                out_script=out_script,
+                target=target,
+                trailing_space_always=True,
+            )
+            if not committed:
+                if self._hands_free_active:
+                    if getattr(self.streaming_typer, "is_in_speech", False):
+                        self.dictation_state_changed.emit("speaking", "Speaking...")
+                    elif not self._streaming_queue.empty():
+                        self.dictation_state_changed.emit("processing", "Transcribing locally...")
+                    else:
+                        self.dictation_state_changed.emit("listening", "Listening...")
+                else:
+                    self._clear_dictation_target()
+                    self._dictation_state = "idle"
+                    self.dictation_state_changed.emit("idle", "No speech detected — speak closer to the mic and try again")
+                return
+
+            final_text, ok, method_used, win_title, proc_name = committed
+            logger.info(
+                "Voice typing inserted via %s (next_cap=%s): '%s'",
+                method_used,
+                self._last_dictation_ended_sentence,
+                final_text,
+            )
+
+            preview = final_text[:40] + ("..." if len(final_text) > 40 else "")
+            self.dictation_completed.emit(final_text, f"{proc_name} ({win_title})", method_used)
+            if self._hands_free_active:
+                if getattr(self.streaming_typer, "is_in_speech", False):
+                    self.dictation_state_changed.emit("speaking", "Speaking...")
+                elif not self._streaming_queue.empty():
+                    self.dictation_state_changed.emit("processing", "Transcribing locally...")
+                else:
+                    self.dictation_state_changed.emit("listening", f"Typed: \"{preview}\"")
+            else:
+                self._clear_dictation_target()
+                self._dictation_state = "idle"
+                self.dictation_state_changed.emit("idle", "Voice typing stopped")
+            self.history_updated.emit()
+        except Exception as exc:
+            logger.error("Streaming dictation worker error: %s", exc)
+            if self._hands_free_active:
+                self.dictation_state_changed.emit("listening", f"Error: {exc}")
+            else:
+                self._clear_dictation_target()
+                self._dictation_state = "idle"
+                self.dictation_state_changed.emit("idle", "Ready (Offline)")
+
+    def finalize_active_dictation(self) -> None:
+        """Stop active hands-free or single-shot dictation and insert transcribed text."""
+        if self._hands_free_active:
+            self.stop_hands_free_typing()
+        elif self._dictation_state in ("starting", "listening", "speaking") or getattr(self.dictation_recorder, "is_recording", False):
+            self.stop_dictation_and_insert()
+        elif self._dictation_state in ("idle", "completed", "failed"):
+            self.toggle_dictation()
+
+    def start_dictation(self) -> bool:
+        """Push-to-Talk or single-shot dictation start."""
+        with self._state_lock:
+            if self._capture_state in ("recording", "paused"):
+                self.notification_requested.emit(
+                    "Voice Typing Unavailable",
+                    "Voice typing cannot be used while a corporate meeting is actively recording.",
+                )
+                return False
+            if self._screen_rec_state in ("recording", "paused"):
+                self.notification_requested.emit(
+                    "Voice Typing Unavailable",
+                    "Voice typing cannot be used while a PC screen recording is active.",
+                )
+                return False
+            if self._dictation_state in ("starting", "initializing", "listening", "speaking", "processing", "stopping"):
+                return False
+
+            self._dictation_session_id += 1
+            session_id = self._dictation_session_id
+            self._dictation_cancelled = False
+            self._ptt_stop_pending = False
+            self._session_committed_any = False
+            self._set_dictation_state(DictationState.INITIALIZING, "Starting voice capture...")
+
+        target = self._resolve_dictation_target()
+        if self._is_in_app_target(target):
+            target_desc = "VOX In-App Editor"
+        else:
+            target_desc = f"{target.process_name}" if target and target.process_name else "Active App"
+        if target:
+            self.target_window_changed.emit(target.title or "Untitled Window", target.process_name or "")
+
+        ok, msg = self.dictation_recorder.start(
+            preferred_device_index=self.config.mic_device_index,
+            preferred_device_name=self.config.mic_device_name,
+            include_system_audio=self.config.dictation_include_system_audio,
+            preferred_loopback_index=self.config.loopback_device_index,
+            preferred_loopback_name=self.config.loopback_device_name,
+            mic_gain=self.config.mic_gain,
+        )
+        if not ok:
+            self._clear_dictation_target()
+            self._set_dictation_state(DictationState.ERROR, msg)
+            return False
+
+        if self._ptt_stop_pending:
+            logger.info("PTT key released during startup; stopping immediately")
+            self._set_dictation_state(DictationState.LISTENING, "Listening...")
+            self.stop_dictation_and_insert()
+            return True
+
+        self._set_dictation_state(DictationState.LISTENING, f"Listening -> {target_desc}...")
+        return True
+
+    def stop_dictation_and_insert(self) -> None:
+        """Push-to-Talk or single-shot dictation stop & insert."""
+        with self._state_lock:
+            if self._dictation_state in ("starting", "initializing"):
+                logger.info("PTT stop requested while starting; marking pending stop")
+                self._ptt_stop_pending = True
+                return
+
+            if self._dictation_state not in ("listening", "speaking", DictationState.LISTENING.value):
+                return
+
+            self._set_dictation_state(DictationState.STOPPING, "Finalizing speech...")
+
+            audio_16k, duration_sec = self.dictation_recorder.stop()
+            target = self._get_current_dictation_target()
+            session_id = self._dictation_session_id
+
+            self._set_dictation_state(DictationState.PROCESSING, "Transcribing locally...")
+
+            threading.Thread(
+                target=self._process_dictation_worker,
+                args=(audio_16k, duration_sec, target, session_id),
+                name="DictationTranscribeWorker",
+                daemon=True,
+            ).start()
+
+    def cancel_dictation(self) -> None:
+        """Cancel active dictation (hands-free or single-shot) and discard buffered audio without inserting."""
+        with self._state_lock:
+            self._dictation_cancelled = True
+            self._cancel_startup_requested = True
+            self._hands_free_active = False
+
+        self.dictation_interim_updated.emit("", "")
+        with self._interim_lock:
+            self._latest_interim_audio = None
+        while not self._streaming_queue.empty():
+            try:
+                it = self._streaming_queue.get_nowait()
+                if it is None:
+                    self._streaming_queue.put(None)
+                    break
+                self._streaming_queue.task_done()
+            except Exception:
+                break
+        if hasattr(self.streaming_typer, "cancel"):
+            self.streaming_typer.cancel()
+        else:
+            self.streaming_typer.stop()
+        if getattr(self.dictation_recorder, "is_recording", False) or self._dictation_state in (
+            "starting",
+            "initializing",
+            "listening",
+            "speaking",
+            "stopping",
+        ):
+            self.dictation_recorder.stop()
+        self._clear_dictation_target()
+        self._set_dictation_state(DictationState.DISMISSED, "Dictation cancelled")
+        self._set_dictation_state(DictationState.IDLE, "Dictation cancelled")
+
+    cancel_active_dictation = cancel_dictation
+
+    def _process_dictation_worker(self, audio_16k, duration_sec: float, target, session_id: Optional[int] = None) -> None:
+        try:
+            with self._state_lock:
+                if self._dictation_cancelled or (session_id is not None and session_id != self._dictation_session_id):
+                    logger.info("Dictation cancelled before processing")
+                    return
+
+            if audio_16k.size < 3200:
+                self._set_dictation_state(DictationState.IDLE, "No speech detected (too short)")
+                return
+
+            vocab = self.db.list_vocabulary(active_only=True)
+            engine_lang = "en+hi" if self.config.language == "hi_latn" else self.config.language
+            out_script = "roman" if self.config.language == "hi_latn" else "auto"
+            win_title = target.title if target else ""
+            proc_name = target.process_name if target else ""
+            window_keywords = DictationProcessor.extract_window_keywords(win_title, proc_name)
+            recent_entries = list(self._recent_utterance_history)
+            if not recent_entries:
+                try:
+                    recent_entries = [
+                        e.get("final_text", "") for e in self.db.list_dictation_history(limit=2)
+                    ]
+                except Exception as db_exc:
+                    logger.debug("Could not fetch recent dictation history: %s", db_exc)
+                    recent_entries = []
+            context_prompt = DictationProcessor.build_contextual_prompt(
+                win_title, proc_name, recent_entries, language=self.config.language
+            )
+
+            custom_terms = [str(v.get("replacement", "")).strip() for v in vocab if v.get("is_active", 1)]
+            all_hotwords_list = list(window_keywords)
+            if custom_terms:
+                all_hotwords_list.extend([w for w in custom_terms if w])
+            effective_hotwords = ", ".join(all_hotwords_list) if all_hotwords_list else None
+
+            with self._state_lock:
+                if self._dictation_cancelled or (session_id is not None and session_id != self._dictation_session_id):
+                    logger.info("Dictation cancelled before transcription")
+                    return
+
+            raw_text = self.transcriber.transcribe_dictation(
+                audio_16k,
+                initial_prompt=context_prompt,
+                language=engine_lang,
+                vad_filter=self.config.vad_filter,
+                hotwords=effective_hotwords,
+                profile=getattr(self.config, "transcribe_profile", "balanced"),
+            )
+
+            with self._state_lock:
+                if self._dictation_cancelled or (session_id is not None and session_id != self._dictation_session_id):
+                    logger.info("Dictation cancelled after transcription; aborting text insertion")
+                    return
+
+            if not raw_text.strip():
+                self._set_dictation_state(DictationState.IDLE, "No speech detected — speak closer to the mic and try again")
+                return
+
+            committed = self._format_and_commit_dictation(
+                raw_text=raw_text,
+                duration_sec=duration_sec,
+                vocab=vocab,
+                out_script=out_script,
+                target=target,
+                trailing_space_always=False,
+            )
+
+            with self._state_lock:
+                if self._dictation_cancelled or (session_id is not None and session_id != self._dictation_session_id):
+                    logger.info("Dictation cancelled during formatting; aborting commit")
+                    return
+
+            if not committed:
+                self._set_dictation_state(DictationState.IDLE, "No speech detected — speak closer to the mic and try again")
+                return
+
+            final_text, ok, method_used, win_title, proc_name = committed
+
+            if ok:
+                preview = final_text[:45] + ("..." if len(final_text) > 45 else "")
+                self._set_dictation_state("completed", f"Inserted: \"{preview}\"")
+                self.dictation_completed.emit(final_text, f"{proc_name} ({win_title})", method_used)
+                self.history_updated.emit()
+            else:
+                if method_used == "target_closed_saved_to_clipboard":
+                    msg = "Target window closed — transcription saved to clipboard"
+                    self.notification_requested.emit("Voice Typing", msg)
+                else:
+                    msg = "Text insertion failed (copied to clipboard)"
+                self._set_dictation_state(DictationState.ERROR, msg)
+        except Exception as exc:
+            logger.error("Dictation worker error: %s", exc)
+            self._set_dictation_state(DictationState.ERROR, f"Dictation error: {exc}")
+        finally:
+            self._clear_dictation_target()
+
+
+    # ==================================================================
+    # CORE FEATURE A: MEETING RECORDING & TRANSCRIPTION (100% Independent)
+    # ==================================================================
+    def toggle_meeting_recording(self) -> None:
+        if self._capture_state in ("recording", "paused"):
+            self.stop_meeting_recording()
+        elif self._capture_state == "idle":
+            self.start_meeting_recording()
+
+    def start_meeting_recording(
+        self,
+        title: Optional[str] = "",
+        capture_mode: Optional[str] = None,
+        record_screen: Optional[bool] = None,
+        screen_fps: Optional[int] = None,
+        target_hwnd: Optional[int] = None,
+        resolution: str = "1080p",
+        recording_mode: Optional[str] = None,
+        strict_video: bool = False,
+        require_active_meeting: bool = False,
+        allow_deferred_video: bool = False,
+    ) -> Tuple[bool, str]:
+        with self._state_lock:
+            if self._capture_state in ("recording", "paused"):
+                return False, "A meeting recording is already active. Click 'Stop & Save' to finalize it."
+            if self._screen_rec_state in ("recording", "paused"):
+                return False, "A PC screen recording is currently active. Please stop screen recording before starting Meeting Studio."
+            if getattr(self, "_hands_free_active", False):
+                self.stop_hands_free_typing()
+            # Auto-heal orphaned audio recorder if state is idle
+            if getattr(self, "meeting_recorder", None) and getattr(self.meeting_recorder, "is_recording", False):
+                logger.warning("Auto-healing orphaned audio recorder from prior session before starting new meeting")
+                try:
+                    self.meeting_recorder.stop()
+                except Exception as exc:
+                    logger.debug("Error stopping orphan audio recorder: %s", exc)
+
+            ok_disk, free_mb, disk_msg = check_disk_space_mb(self.config.recordings_dir, min_free_mb=150.0)
+            if not ok_disk:
+                logger.error("Cannot start meeting recording: %s", disk_msg)
+                self.set_meeting_lifecycle_state(MeetingLifecycleState.FAILED, disk_msg)
+                self.notification_requested.emit("Low Disk Space", disk_msg)
+                return False, disk_msg
+
+            self._active_meeting_corr_id = generate_correlation_id("mtg")
+            self._active_meeting_diarizer = PersistentSpeakerDiarizer(
+                speaker_prefix="Speaker",
+                new_speaker_threshold=0.085,
+                profile_store=getattr(self.transcriber, "speaker_profile_store", None),
+            )
+
+        with operation_context(self._active_meeting_corr_id, "start_meeting"):
+            # Resolve explicit recording mode ("audio_only" vs "audio_video")
+            if recording_mode in ("audio_only", "audio_video"):
+                should_rec_screen = (recording_mode == "audio_video")
+            elif record_screen is not None:
+                should_rec_screen = bool(record_screen)
+            else:
+                should_rec_screen = bool(self.config.record_meeting_screen)
+            effective_rec_mode = "audio_video" if should_rec_screen else "audio_only"
+
+            # Discover active meeting source for lifecycle binding and/or Mode B video capture
+            effective_target_hwnd = (
+                int(target_hwnd)
+                if (target_hwnd is not None and int(target_hwnd) > 0)
+                else None
+            )
+            source_desc = None
+            try:
+                from voxlocal.video.meeting_capture import resolve_meeting_source
+                source_desc = resolve_meeting_source(target_hwnd=effective_target_hwnd)
+            except Exception as exc:
+                logger.debug("resolve_meeting_source check: %s", exc)
+                source_desc = None
+
+            active_sess = getattr(self.call_detector, "active_session", None)
+            if require_active_meeting and source_desc is None and active_sess is None and effective_target_hwnd is None:
+                msg_no_mtg = "No active meeting detected."
+                self.set_meeting_lifecycle_state(MeetingLifecycleState.NO_MEETING_DETECTED, msg_no_mtg)
+                return False, msg_no_mtg
+
+            if should_rec_screen and strict_video and not allow_deferred_video and source_desc is None:
+                fail_msg = (
+                    "Audio + Video mode requires an active meeting window (Teams, Zoom, Google Meet, Webex, or Slack). "
+                    "Switch to Audio Only mode or open your meeting window."
+                )
+                self.set_meeting_lifecycle_state(MeetingLifecycleState.FAILED, fail_msg)
+                self.meeting_state_changed.emit("idle", fail_msg)
+                return False, fail_msg
+
+            self.set_meeting_lifecycle_state(
+                MeetingLifecycleState.PREPARING_CAPTURE,
+                f"Preparing {'Audio + Video' if should_rec_screen else 'Audio Only'} meeting capture...",
+            )
+
+            mode = capture_mode or self.config.meeting_capture_mode
+            timestamp_slug = datetime.now().strftime("%Y%m%d_%H%M%S")
+            clean_title = (title or "").strip()
+            meeting_title = clean_title or f"Meeting {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            meeting_folder = self.config.recordings_dir / f"meeting_{timestamp_slug}"
+
+            mic_idx = self.config.meeting_mic_device_index if self.config.meeting_mic_device_index is not None else self.config.mic_device_index
+            mic_name = self.config.meeting_mic_device_name or self.config.mic_device_name
+            gain = getattr(self.config, "meeting_mic_gain", 1.0)
+
+            ok, msg = self.meeting_recorder.start(
+                output_dir=meeting_folder,
+                capture_mode=mode,
+                mic_device_index=mic_idx,
+                mic_device_name=mic_name,
+                loopback_device_index=self.config.loopback_device_index,
+                loopback_device_name=self.config.loopback_device_name,
+                mic_gain=gain,
+            )
+            if not ok:
+                self.set_meeting_lifecycle_state(MeetingLifecycleState.FAILED, msg)
+                self.meeting_state_changed.emit("idle", msg)
+                return False, msg
+
+            # Bind target HWND / PID / platform for lifecycle auto-stop in both Audio Only and Audio + Video modes
+            self._active_meeting_target_hwnd = (
+                source_desc.hwnd if source_desc else (active_sess.window_hwnd if active_sess else effective_target_hwnd)
+            )
+            self._active_meeting_pid = (
+                source_desc.pid if source_desc else (active_sess.pid if active_sess else None)
+            )
+            self._active_meeting_platform = (
+                source_desc.platform_name if source_desc else (active_sess.platform if active_sess else "")
+            )
+            self._active_meeting_session_id = active_sess.session_id if active_sess else ""
+            self._manual_target_lost_since = None
+
+            self._meeting_video_recorder = None
+            if should_rec_screen:
+                try:
+                    from voxlocal.video.meeting_capture import MeetingVideoRecorder
+
+                    if source_desc is not None:
+                        video_file = meeting_folder / "meeting_screen.mp4"
+                        target_fps = int(screen_fps or getattr(self.config, "screen_fps", 15))
+                        max_h = 1080
+                        if isinstance(resolution, str):
+                            if "720" in resolution:
+                                max_h = 720
+                            elif "480" in resolution:
+                                max_h = 480
+                            elif "1440" in resolution or "2k" in resolution.lower():
+                                max_h = 1440
+                            elif "2160" in resolution or "4k" in resolution.lower():
+                                max_h = 2160
+
+                        self._meeting_video_recorder = MeetingVideoRecorder(
+                            output_path=str(video_file),
+                            source_descriptor=source_desc,
+                            fps=target_fps,
+                            max_height=max_h,
+                            on_meeting_ended=self._on_meeting_capture_ended,
+                            on_source_state_change=self._on_video_source_state_changed,
+                        )
+                        ok_vid = self._meeting_video_recorder.start(str(video_file))
+                        if ok_vid:
+                            logger.info(
+                                "Call-Only Meeting video recording active (%d FPS, provider=%s, hwnd=%s, title='%s'): %s",
+                                target_fps,
+                                source_desc.provider_id,
+                                source_desc.hwnd,
+                                source_desc.window_title,
+                                video_file,
+                            )
+                        else:
+                            self._meeting_video_recorder = None
+                            if strict_video:
+                                self.meeting_recorder.stop()
+                                shutil.rmtree(meeting_folder, ignore_errors=True)
+                                vid_err = (
+                                    "Could not initialize video capture for the meeting window. "
+                                    "Please verify the meeting window is open or select Audio Only mode."
+                                )
+                                self.set_meeting_lifecycle_state(MeetingLifecycleState.FAILED, vid_err)
+                                self.meeting_state_changed.emit("idle", vid_err)
+                                return False, vid_err
+                            effective_rec_mode = "audio_only"
+                    else:
+                        # Call window has not appeared yet (pre-call startup).
+                        # Begin audio capture AND start MeetingVideoRecorder immediately with pending descriptor
+                        # so meeting_screen.mp4 is created from second 0 and binds dynamically to the call window!
+                        from voxlocal.video.meeting_capture import MeetingSourceDescriptor
+                        self._pending_video_bind = True
+                        self._pending_video_folder = meeting_folder
+                        self._pending_video_fps = int(screen_fps or getattr(self.config, "screen_fps", 15))
+                        self._pending_video_res = resolution
+                        effective_rec_mode = "audio_video"
+                        video_file = meeting_folder / "meeting_screen.mp4"
+                        target_fps = int(screen_fps or getattr(self.config, "screen_fps", 15))
+                        plat = (active_sess.platform if active_sess else "") or self._active_meeting_platform or "Microsoft Teams"
+                        synth_desc = MeetingSourceDescriptor(
+                            provider_id="teams_desktop" if "teams" in plat.lower() else ("zoom_desktop" if "zoom" in plat.lower() else "generic_call"),
+                            platform_name=plat,
+                            hwnd=int(effective_target_hwnd or (active_sess.window_hwnd if active_sess else 0) or 0),
+                            pid=int(getattr(active_sess, "pid", 0) or 0),
+                            process_name="ms-teams.exe" if "teams" in plat.lower() else "",
+                            class_name="",
+                            window_title=meeting_title,
+                            meeting_id_slug=meeting_title.lower(),
+                            bounds=(0, 0, 1920, 1080),
+                            score=100,
+                            is_call_stage=True,
+                        )
+                        self._meeting_video_recorder = MeetingVideoRecorder(
+                            output_path=str(video_file),
+                            source_descriptor=synth_desc,
+                            fps=target_fps,
+                            max_height=1080,
+                            on_meeting_ended=self._on_meeting_capture_ended,
+                            on_source_state_change=self._on_video_source_state_changed,
+                        )
+                        self._meeting_video_recorder.start(str(video_file))
+                        logger.info(
+                            "Call-Only Meeting Recording: Video recorder initialized; video capture will bind automatically when call window connects."
+                        )
+                except Exception as exc:
+                    logger.error("Failed initializing MeetingVideoRecorder: %s", exc)
+                    self._meeting_video_recorder = None
+                    if strict_video:
+                        self.meeting_recorder.stop()
+                        shutil.rmtree(meeting_folder, ignore_errors=True)
+                        vid_err = f"Video capture initialization failed ({exc}). Please select Audio Only mode."
+                        self.set_meeting_lifecycle_state(MeetingLifecycleState.FAILED, vid_err)
+                        self.meeting_state_changed.emit("idle", vid_err)
+                        return False, vid_err
+                    effective_rec_mode = "audio_only"
+
+            with self._state_lock:
+                self._active_recording_mode = effective_rec_mode
+                self._active_meeting_title = meeting_title
+                planned_mixed = str(meeting_folder / "mixed.wav")
+                planned_mic = str(meeting_folder / "mic.wav")
+                planned_sys = str(meeting_folder / "sys.wav")
+                planned_video = str(meeting_folder / "meeting_screen.mp4") if should_rec_screen else ""
+                self._active_meeting_id = self.db.create_meeting(
+                    title=meeting_title,
+                    capture_mode=mode,
+                    mic_device=self.config.mic_device_name,
+                    loopback_device=self.config.loopback_device_name,
+                    audio_path=planned_mixed,
+                    mic_audio_path=planned_mic,
+                    sys_audio_path=planned_sys,
+                    video_path=planned_video,
+                    model_used=self.config.whisper_model,
+                    source_platform=self._active_meeting_platform or "Meeting",
+                    calendar_event_id=getattr(self, "_active_meeting_calendar_event_id", "") or "",
+                    calendar_join_url=getattr(self, "_active_meeting_calendar_join_url", "") or "",
+                    calendar_attendees=getattr(self, "_active_meeting_calendar_attendees", "") or "",
+                    calendar_organizer=getattr(self, "_active_meeting_calendar_organizer", "") or "",
+                    calendar_provider=getattr(self, "_active_meeting_calendar_provider", "") or "",
+                )
+                self._progressive_cursor_sec = 0.0
+                self._progressive_segment_idx = 0
+                self._progressive_worker_busy = False
+                self._capture_state = "recording"
+                self._recent_emitted_segments = []
+
+            if self._meeting_prompt_popup and self._meeting_prompt_popup.isVisible():
+                try:
+                    self._meeting_prompt_popup.close()
+                    self._meeting_prompt_popup = None
+                except Exception:
+                    pass
+            if hasattr(self.call_detector, "set_recording_active"):
+                self.call_detector.set_recording_active(True)
+
+            mode_badge = "Audio + Video" if effective_rec_mode == "audio_video" else "Audio Only"
+            logger.info(
+                "Meeting #%d started ('%s', rec_mode=%s, audio_mode=%s, snapshot=%s)",
+                self._active_meeting_id,
+                meeting_title,
+                effective_rec_mode,
+                mode,
+                get_system_resource_snapshot(),
+            )
+            status_text = (
+                f"Recording ({mode_badge}): {meeting_title} (Waiting for call window...)"
+                if getattr(self, "_pending_video_bind", False)
+                else f"Recording ({mode_badge}): {meeting_title}"
+            )
+            self.set_meeting_lifecycle_state(
+                MeetingLifecycleState.RECORDING,
+                status_text,
+            )
+            self.meeting_state_changed.emit("recording", status_text)
+            self.history_updated.emit()
+            return True, msg
+
+    def pause_meeting_recording(self) -> bool:
+        with self._state_lock:
+            if self._capture_state == "recording" and self.meeting_recorder.pause():
+                if getattr(self, "_meeting_video_recorder", None) and self._meeting_video_recorder.is_recording:
+                    self._meeting_video_recorder.pause()
+                self._capture_state = "paused"
+                self.set_meeting_lifecycle_state(
+                    MeetingLifecycleState.TEMPORARILY_INTERRUPTED,
+                    f"Paused: {self._active_meeting_title}",
+                )
+                self.meeting_state_changed.emit("paused", f"Paused: {self._active_meeting_title}")
+                return True
+        return False
+
+    def resume_meeting_recording(self) -> bool:
+        with self._state_lock:
+            if self._capture_state == "paused" and self.meeting_recorder.resume():
+                if getattr(self, "_meeting_video_recorder", None) and self._meeting_video_recorder.is_paused:
+                    self._meeting_video_recorder.resume()
+                self._capture_state = "recording"
+                self.set_meeting_lifecycle_state(
+                    MeetingLifecycleState.RECORDING,
+                    f"Recording: {self._active_meeting_title}",
+                )
+                self.meeting_state_changed.emit("recording", f"Recording: {self._active_meeting_title}")
+                return True
+        return False
+
+    def stop_meeting_recording(self) -> None:
+        with self._state_lock:
+            if self._capture_state not in ("recording", "paused"):
+                # Safety net: force stop if audio recorder is actively running on disk
+                if getattr(self, "meeting_recorder", None) and getattr(self.meeting_recorder, "is_recording", False):
+                    logger.warning(
+                        "stop_meeting_recording called while capture_state was '%s' but audio recorder was running. Stopping.",
+                        self._capture_state,
+                    )
+                else:
+                    return
+
+            meeting_id = self._active_meeting_id
+            # Synchronously reset capture state to idle in <1ms
+            self._capture_state = "idle"
+            self._active_meeting_id = None
+            self._active_meeting_target_hwnd = None
+            self._active_meeting_pid = None
+            self._active_meeting_platform = ""
+            self._active_meeting_session_id = ""
+            self._manual_target_lost_since = None
+            self._active_meeting_diarizer = None
+            self._active_meeting_calendar_event_id = ""
+            self._active_meeting_calendar_join_url = ""
+            self._active_meeting_calendar_attendees = ""
+            self._active_meeting_calendar_organizer = ""
+            self._active_meeting_calendar_provider = ""
+
+        # Reset call detector state immediately so subsequent meeting discovery starts unblocked
+        if hasattr(self.call_detector, "end_active_session_immediately"):
+            self.call_detector.end_active_session_immediately()
+        elif hasattr(self.call_detector, "set_recording_active"):
+            self.call_detector.set_recording_active(False)
+
+        if self._meeting_prompt_popup and self._meeting_prompt_popup.isVisible():
+            try:
+                self._meeting_prompt_popup.close()
+                self._meeting_prompt_popup = None
+            except Exception:
+                pass
+
+        self.set_meeting_lifecycle_state(
+            MeetingLifecycleState.FINALIZING,
+            "Saving audio & finalizing offline transcript...",
+        )
+        self.meeting_state_changed.emit("transcribing", "Saving audio & finalizing offline transcript...")
+
+        # Finalize Call-Only meeting video recording if active
+        video_path = ""
+        if getattr(self, "_meeting_video_recorder", None) is not None:
+            try:
+                raw_vid = self._meeting_video_recorder.stop()
+                diag = self._meeting_video_recorder.get_capture_diagnostics() if hasattr(self._meeting_video_recorder, "get_capture_diagnostics") else {}
+                # Guard against MagicMock string conversions in test environments (DEF-PRE-03)
+                if (
+                    raw_vid
+                    and isinstance(raw_vid, (str, Path))
+                    and not hasattr(raw_vid, "_mock_return_value")
+                    and not type(raw_vid).__name__.startswith("Mock")
+                    and "MagicMock" not in str(raw_vid)
+                    and "<Mock" not in str(raw_vid)
+                ):
+                    video_path = str(raw_vid)
+                    import json
+                    diag_path = Path(video_path).with_name("capture_diagnostics.json")
+                    diag_path.parent.mkdir(parents=True, exist_ok=True)
+                    diag_path.write_text(json.dumps(diag, indent=2, default=str), encoding="utf-8")
+                else:
+                    video_path = ""
+            except Exception as exc:
+                logger.warning("Error stopping MeetingVideoRecorder: %s", exc)
+            finally:
+                self._meeting_video_recorder = None
+                self._pending_video_bind = False
+                self._pending_video_folder = None
+
+        try:
+            result = self.meeting_recorder.stop(
+                preserve_separate_tracks=self.config.preserve_separate_tracks
+            )
+        except Exception as exc:
+            logger.warning("Error stopping MeetingRecorder: %s", exc)
+            result = None
+        if not result:
+            self.meeting_state_changed.emit("idle", "Meeting stopped")
+            return
+
+        # Recover meeting indexing if ID was missed due to startup exception
+        if meeting_id is None:
+            try:
+                clean_title = getattr(self, "_active_meeting_title", "") or f"Meeting {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                meeting_id = self.db.create_meeting(
+                    title=clean_title,
+                    capture_mode=getattr(self.config, "meeting_capture_mode", "both"),
+                    mic_device=self.config.mic_device_name,
+                    loopback_device=self.config.loopback_device_name,
+                    model_used=self.config.whisper_model,
+                )
+                logger.info("Successfully recovered and indexed unindexed meeting #%d", meeting_id)
+            except Exception as exc:
+                logger.error("Error creating recovery index for stopped meeting: %s", exc)
+
+        if meeting_id is None:
+            self.meeting_state_changed.emit("idle", "Meeting stopped")
+            return
+
+        with self._state_lock:
+            self._finalizing_jobs.add(meeting_id)
+
+        self._cancel_finalization_event.clear()
+        self._finalize_thread = threading.Thread(
+            target=self._finalize_meeting_worker,
+            args=(meeting_id, result, video_path),
+            name=f"MeetingFinalizeWorker-{meeting_id}",
+            daemon=True,
+        )
+        self._finalize_thread.start()
+
+    def cancel_finalization(self) -> None:
+        """Cooperatively request cancellation of active meeting finalization pipeline."""
+        self._cancel_finalization_event.set()
+        logger.info("Meeting finalization cancellation requested.")
+
+    def gather_system_diagnostics(self) -> Dict[str, Any]:
+        """Gather system, audio device, and capture diagnostics, safely guarded against mock objects."""
+        from voxlocal.core.hardware import HardwareProfiler
+        from voxlocal.core.logger import get_system_resource_snapshot
+
+        def _safe_str(val: Any) -> str:
+            if val is None:
+                return ""
+            if hasattr(val, "_mock_return_value") or type(val).__name__.startswith("Mock"):
+                return "<mocked>"
+            s = str(val)
+            if "MagicMock" in s or "<Mock" in s:
+                return "<mocked>"
+            return s
+
+        try:
+            compat = HardwareProfiler.get_system_compatibility_summary()
+        except Exception as exc:
+            compat = {"error": _safe_str(exc)}
+
+        return {
+            "mic_device": _safe_str(getattr(self.config, "mic_device_name", "")),
+            "loopback_device": _safe_str(getattr(self.config, "loopback_device_name", "")),
+            "meeting_state": _safe_str(self.meeting_state),
+            "capture_state": _safe_str(self._capture_state),
+            "finalizing_jobs_count": len(self._finalizing_jobs),
+            "lifecycle_state": _safe_str(getattr(self._meeting_lifecycle_state, "value", self._meeting_lifecycle_state)),
+            "resource_snapshot": get_system_resource_snapshot(),
+            "hardware_compatibility": compat,
+        }
+
+    def _on_meeting_recorder_tick(
+        self,
+        elapsed: float,
+        mic_lvl: float,
+        sys_lvl: float,
+        mic_ok: bool,
+        sys_ok: bool,
+    ) -> None:
+        self.meeting_tick.emit(elapsed, mic_lvl, sys_lvl, mic_ok, sys_ok)
+
+        # Trigger progressive live transcription every `progressive_interval_sec`
+        if (
+            self.config.progressive_transcription
+            and self._capture_state == "recording"
+            and self._active_meeting_id is not None
+            and not self._progressive_worker_busy
+            and (elapsed - self._progressive_cursor_sec) >= float(self.config.progressive_interval_sec)
+        ):
+            start_s = self._progressive_cursor_sec
+            end_s = elapsed
+            self._progressive_cursor_sec = end_s
+            self._progressive_worker_busy = True
+            threading.Thread(
+                target=self._progressive_transcribe_worker,
+                args=(self._active_meeting_id, start_s, end_s),
+                name="ProgressiveMeetingTranscribe",
+                daemon=True,
+            ).start()
+
+    def _progressive_transcribe_worker(
+        self, meeting_id: int, start_sec: float, end_sec: float
+    ) -> None:
+        with operation_context(self._active_meeting_corr_id, f"prog_m{meeting_id}_{int(start_sec)}"):
+            try:
+                mic_slice, sys_slice, actual_start_sec = self.meeting_recorder.get_audio_window(start_sec, end_sec)
+                vocab = self.db.list_vocabulary(active_only=True)
+                prompt = DictationProcessor.build_whisper_prompt(vocab)
+
+                new_segments: List[Dict[str, Any]] = []
+                sys_segs: List[Dict[str, Any]] = []
+                if sys_slice.size > 0 and float(np.max(np.abs(sys_slice))) >= 0.0004:
+                    sys_segs = self.transcriber.transcribe_audio_segments(
+                        sys_slice,
+                        speaker_label="Speaker 1",
+                        source_track="system",
+                        time_offset_sec=actual_start_sec,
+                        initial_prompt=prompt,
+                        language=self.config.language,
+                        diarize_remote_turns=True,
+                        diarizer=self._active_meeting_diarizer,
+                        output_script="roman",
+                    )
+                    new_segments.extend(sys_segs)
+
+                if mic_slice.size > 0 and float(np.max(np.abs(mic_slice))) >= 0.0004:
+                    mic_segs = self.transcriber.transcribe_audio_segments(
+                        mic_slice,
+                        speaker_label="You (Mic)",
+                        source_track="mic",
+                        time_offset_sec=actual_start_sec,
+                        initial_prompt=prompt,
+                        language=self.config.language,
+                        output_script="roman",
+                    )
+                    # Filter acoustic bleed if open speakers caused the exact same system phrase
+                    # to be faintly picked up by the microphone at the exact same timestamp.
+                    # Conversational affirmations (e.g. 'ok', 'yes', 'haan', 'tika', 'sure') are preserved.
+                    for m_seg in mic_segs:
+                        m_txt = m_seg["text"].strip().lower()
+                        is_bleed = False
+                        if len(m_txt) >= 12:
+                            for s_seg in sys_segs:
+                                s_txt = s_seg["text"].strip().lower()
+                                if (
+                                    len(s_txt) >= 12
+                                    and abs(float(m_seg["start_time"]) - float(s_seg["start_time"])) < 1.5
+                                ):
+                                    if m_txt == s_txt or (m_txt in s_txt and len(m_txt) > 0.65 * len(s_txt)):
+                                        is_bleed = True
+                                        break
+                        if not is_bleed:
+                            new_segments.append(m_seg)
+
+                # Sort strictly chronologically by start_time ASC, end_time ASC
+                new_segments.sort(key=lambda s: (float(s["start_time"]), float(s.get("end_time", s["start_time"]))))
+
+                for seg in new_segments:
+                    # Apply custom vocabulary and enforce Romanized Hinglish (Latin script)
+                    processed_text = DictationProcessor.process(
+                        seg["text"],
+                        vocabulary=vocab,
+                        cleanup_enabled=True,
+                        spoken_punctuation=False,
+                        output_script="roman",
+                    ).strip()
+                    if not processed_text:
+                        continue
+
+                    dur = max(0.01, float(seg["end_time"]) - float(seg["start_time"]))
+                    if is_hallucination(processed_text, duration_sec=dur):
+                        continue
+
+                    seg["text"] = processed_text
+
+                    # Segment ID stability & controller-level recent deduplication guard
+                    st = float(seg["start_time"])
+                    et = float(seg["end_time"])
+                    track = seg["source_track"]
+                    norm_lower = processed_text.lower()
+
+                    is_dup = False
+                    for ex in getattr(self, "_recent_emitted_segments", []):
+                        if (
+                            ex.get("source_track") == track
+                            and abs(st - float(ex.get("start_time", 0.0))) <= 1.2
+                        ):
+                            ex_txt = ex.get("text", "").strip().lower()
+                            if ex_txt == norm_lower or norm_lower in ex_txt:
+                                is_dup = True
+                                break
+                            if ex_txt in norm_lower:
+                                # New segment is a more complete completion of earlier partial turn
+                                ex["text"] = processed_text
+                                ex["end_time"] = et
+
+                    if is_dup:
+                        continue
+
+                    self._progressive_segment_idx += 1
+                    seg_id = self.db.add_transcript_segment(
+                        meeting_id=meeting_id,
+                        segment_index=self._progressive_segment_idx,
+                        start_time=st,
+                        end_time=et,
+                        speaker=seg["speaker"],
+                        text=seg["text"],
+                        source_track=track,
+                        confidence=seg.get("confidence", 1.0),
+                    )
+                    seg["id"] = seg_id
+                    seg["stable_id"] = f"{meeting_id}_{track}_{int(st * 10)}_{abs(hash(processed_text)) % 100000}"
+
+                    if not hasattr(self, "_recent_emitted_segments"):
+                        self._recent_emitted_segments = []
+                    self._recent_emitted_segments.append(dict(seg))
+                    if len(self._recent_emitted_segments) > 60:
+                        self._recent_emitted_segments = self._recent_emitted_segments[-60:]
+
+                    self.meeting_progressive_segment.emit(meeting_id, seg)
+            except Exception as exc:
+                logger.debug("Progressive transcription chunk warning: %s", exc)
+            finally:
+                self._progressive_worker_busy = False
+
+    def _finalize_meeting_worker(self, meeting_id: int, result, video_path: str = "") -> None:
+        corr_id = self._active_meeting_corr_id if self._active_meeting_corr_id != "-" else generate_correlation_id("mtg")
+        current_stage = 1
+        with operation_context(corr_id, f"fin_m{meeting_id}"):
+            try:
+                # Cooperative cancellation check before Stage 1
+                if self._cancel_finalization_event.is_set():
+                    self._handle_finalization_cancelled(meeting_id, current_stage=1)
+                    return
+
+                self._safe_emit_finalization_progress("transcribing", "Stage 1/4: Packaging MP4 video & audio tracks...")
+                # 1. Mux synchronized meeting audio into the MP4 video so video playback is loud & clear
+                if video_path and os.path.exists(video_path) and getattr(result, "mixed_wav_path", None) and os.path.exists(str(result.mixed_wav_path)):
+                    try:
+                        # Notify UI to release QMediaPlayer handle on this meeting's video before in-place replace
+                        self._safe_emit(self.meeting_about_to_mux, meeting_id)
+                        time.sleep(0.05)
+                        self.screen_recorder.mux_audio_into_video(Path(video_path), Path(result.mixed_wav_path))
+                        fallback_p = Path(video_path).with_name(Path(video_path).stem + "_with_audio.mp4")
+                        if fallback_p.exists() and not Path(video_path).exists():
+                            video_path = str(fallback_p)
+                    except Exception as mux_err:
+                        logger.warning("Audio-video muxing warning: %s", mux_err)
+
+                ended_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                # Guard duration_sec and devices against MagicMock in test environments
+                dur = getattr(result, "duration_sec", 0.0)
+                try:
+                    dur_val = round(float(dur), 2)
+                except (TypeError, ValueError):
+                    dur_val = 0.0
+
+                def _safe_str_field(val: Any) -> str:
+                    if val is None or hasattr(val, "_mock_return_value") or type(val).__name__.startswith("Mock"):
+                        return ""
+                    s = str(val)
+                    if "MagicMock" in s or "<Mock" in s:
+                        return ""
+                    return s
+
+                mic_dev = _safe_str_field(getattr(result, "mic_device_name", ""))
+                loop_dev = _safe_str_field(getattr(result, "loopback_device_name", ""))
+                audio_p = _safe_str_field(getattr(result, "mixed_wav_path", ""))
+                mic_p = _safe_str_field(getattr(result, "mic_wav_path", ""))
+                sys_p = _safe_str_field(getattr(result, "sys_wav_path", ""))
+                vid_p = _safe_str_field(video_path)
+
+                self.db.update_meeting(
+                    meeting_id,
+                    ended_at=ended_at,
+                    duration_sec=dur_val,
+                    mic_device=mic_dev,
+                    loopback_device=loop_dev,
+                    audio_path=audio_p,
+                    mic_audio_path=mic_p,
+                    sys_audio_path=sys_p,
+                    video_path=vid_p,
+                    status="transcribing",
+                )
+
+                # Cooperative cancellation check between Stage 1 and Stage 2
+                current_stage = 2
+                if self._cancel_finalization_event.is_set():
+                    self._handle_finalization_cancelled(meeting_id, current_stage=2)
+                    return
+
+                meeting_rec = self.db.get_meeting(meeting_id) or {}
+                m_title = (meeting_rec.get("title") or getattr(self, "_current_meeting_title", "") or "").strip()
+                remote_name = "Speaker 1"
+                if m_title and is_likely_person_name(m_title):
+                    remote_name = m_title
+
+                vocab = self.db.list_vocabulary(active_only=True)
+                vocab_prompt = DictationProcessor.build_whisper_prompt(vocab)
+                eff_prompt = f"{remote_name} meeting discussion. {vocab_prompt}".strip() if remote_name != "Speaker 1" else vocab_prompt
+
+                self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing speech with local Whisper...")
+                segments = self.transcriber.transcribe_meeting_dual_track(
+                    mixed_wav_path=getattr(result, "mixed_wav_path", None),
+                    mic_wav_path=getattr(result, "mic_wav_path", None),
+                    sys_wav_path=getattr(result, "sys_wav_path", None),
+                    initial_prompt=eff_prompt,
+                    language=self.config.language,
+                    progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: Transcribing speech ({s})"),
+                    output_script="roman",
+                    remote_speaker_label=remote_name,
+                )
+
+                # Early Stage 2 transcript persistence: Call self.db.replace_meeting_segments
+                # immediately following Stage 2 Whisper transcription completion so intermediate
+                # segments are safely saved to SQLite before Stage 3 diarization begins.
+                if segments:
+                    self.db.replace_meeting_segments(meeting_id, segments)
+                else:
+                    # Fallback: preserve live progressive transcript segments if offline pass yielded no segments
+                    existing_segs = self.db.get_meeting_segments(meeting_id)
+                    if existing_segs:
+                        logger.info("Preserving %d progressive live segments for meeting #%d", len(existing_segs), meeting_id)
+                        cleaned_existing = []
+                        for seg in existing_segs:
+                            txt_p = DictationProcessor.process(
+                                seg.get("text", ""),
+                                vocabulary=vocab,
+                                cleanup_enabled=True,
+                                spoken_punctuation=False,
+                                output_script="roman",
+                            ).strip()
+                            dur_s = max(0.01, float(seg.get("end_time", 0.0)) - float(seg.get("start_time", 0.0)))
+                            if txt_p and not is_hallucination(txt_p, duration_sec=dur_s):
+                                seg["text"] = txt_p
+                                cleaned_existing.append(seg)
+                        self.db.replace_meeting_segments(meeting_id, cleaned_existing)
+                        segments = cleaned_existing
+
+                # Cooperative cancellation check between Stage 2 and Stage 3
+                if self._cancel_finalization_event.is_set():
+                    self._handle_finalization_cancelled(meeting_id, current_stage=3)
+                    return
+
+                current_stage = 3
+                if segments:
+                    self._safe_emit_finalization_progress("transcribing", "Stage 3/4: Separating speakers & aligning conversation turns...")
+                    # Two-pass post-meeting reconciliation using bounded disk slices (no full-WAV RAM spike)
+                    segments = self.transcriber.reconcile_meeting_transcript(
+                        segments=segments,
+                        mic_audio_16k=None,
+                        sys_audio_16k=None,
+                        language=self.config.language,
+                        mic_wav_path=getattr(result, "mic_wav_path", None),
+                        sys_wav_path=getattr(result, "sys_wav_path", None),
+                        output_script="roman",
+                        remote_speaker_label=remote_name,
+                    )
+                    cleaned_segments = []
+                    for seg in segments:
+                        txt_p = DictationProcessor.process(
+                            seg["text"],
+                            vocabulary=vocab,
+                            cleanup_enabled=True,
+                            spoken_punctuation=False,
+                            output_script="roman",
+                        ).strip()
+                        txt_p = clean_repetition_tail(txt_p)
+                        dur_s = max(0.01, float(seg.get("end_time", 0.0)) - float(seg.get("start_time", 0.0)))
+                        if txt_p and not is_hallucination(txt_p, duration_sec=dur_s):
+                            seg["text"] = txt_p
+                            cleaned_segments.append(seg)
+                    self.db.replace_meeting_segments(meeting_id, cleaned_segments)
+                    segments = cleaned_segments
+
+                # Cooperative cancellation check between Stage 3 and Stage 4
+                if self._cancel_finalization_event.is_set():
+                    self._handle_finalization_cancelled(meeting_id, current_stage=4)
+                    return
+
+                current_stage = 4
+                meeting_obj = self.db.get_meeting(meeting_id)
+                full_txt = meeting_obj.get("full_transcript", "") if meeting_obj else ""
+
+                summary, decisions_str, actions_str = ("", "", "")
+                engagement_score = 85
+                topics_str = "General Meeting"
+                smart_folder_id = meeting_obj.get("folder_id") if meeting_obj else None
+
+                if self.config.auto_summarize_meeting:
+                    m_title = meeting_obj.get("title", "") if meeting_obj else "Meeting Notes"
+                    m_plat = "Microsoft Teams"
+                    tl = m_title.lower()
+                    if "zoom" in tl:
+                        m_plat = "Zoom"
+                    elif "meet" in tl:
+                        m_plat = "Google Meet"
+                    elif "slack" in tl:
+                        m_plat = "Slack"
+                    elif "webex" in tl:
+                        m_plat = "Webex"
+
+                    self._safe_emit_finalization_progress("transcribing", "Stage 4/4: Synthesizing executive MoM, action items & decisions with local AI...")
+                    analysis = LocalMeetingSummarizer.analyze_full(
+                        segments,
+                        full_txt,
+                        duration_sec=float(dur_val),
+                        title=m_title,
+                        platform=m_plat,
+                        llm_engine=self.llm_engine,
+                    )
+                    summary = analysis.get("mom_markdown", analysis.get("summary", ""))
+                    engagement_score = int(analysis.get("engagement_score", 85))
+                    topics_list = analysis.get("topics", [])
+                    topics_str = ", ".join(topics_list)
+
+                    # Format human-readable strings
+                    if analysis.get("decisions"):
+                        decisions_str = "\n".join(
+                            f"• [{d.get('timestamp_sec', 0.0):.1f}s] {d['decision']}"
+                            for d in analysis["decisions"]
+                        )
+                    else:
+                        decisions_str = "• No explicit decisions detected."
+
+                    if analysis.get("action_items"):
+                        actions_str = "\n".join(
+                            f"- [ ] [{a.get('owner', 'Unassigned')}] {a['description']}"
+                            for a in analysis["action_items"]
+                        )
+                    else:
+                        actions_str = "- [ ] No explicit action items detected."
+
+                    # Clear prior non-completed auto-generated outcomes before inserting fresh deduplicated items
+                    self.db.clear_meeting_outcomes(meeting_id, preserve_completed=True)
+
+                    # Populate structured action_items table
+                    for act in analysis.get("action_items", []):
+                        self.db.add_action_item(
+                            meeting_id=meeting_id,
+                            description=act.get("description", ""),
+                            owner=act.get("owner", "Unassigned"),
+                            due_date=act.get("due_date", ""),
+                            status="pending",
+                            timestamp_sec=float(act.get("timestamp_sec", 0.0)),
+                        )
+
+                    # Populate structured decisions table
+                    for dec in analysis.get("decisions", []):
+                        self.db.add_decision(
+                            meeting_id=meeting_id,
+                            decision=dec.get("decision", ""),
+                            rationale=dec.get("rationale", ""),
+                            timestamp_sec=float(dec.get("timestamp_sec", 0.0)),
+                        )
+
+                    # Smart Folder auto-classification if not already assigned
+                    if smart_folder_id is None:
+                        title_lower = (meeting_obj.get("title", "") + " " + topics_str).lower()
+                        folders = self.db.list_folders()
+                        for f in folders:
+                            fname = f["name"].lower()
+                            if fname in title_lower or any(word in title_lower for word in fname.split()):
+                                smart_folder_id = f["id"]
+                                break
+
+                # Preserve user-edited report summary if user explicitly edited and saved it
+                if meeting_obj and int(meeting_obj.get("user_edited") or 0) == 1 and (meeting_obj.get("summary") or "").strip():
+                    summary = meeting_obj["summary"]
+
+                # Cooperative cancellation check before final commit
+                if self._cancel_finalization_event.is_set():
+                    self._handle_finalization_cancelled(meeting_id, current_stage=4)
+                    return
+
+                self.db.update_meeting(
+                    meeting_id,
+                    status="completed",
+                    summary=summary,
+                    decisions=decisions_str,
+                    action_items=actions_str,
+                    video_path=video_path,
+                    engagement_score=engagement_score,
+                    topics=topics_str,
+                    folder_id=smart_folder_id,
+                )
+
+                logger.info(
+                    "Finalized meeting #%d (%d segments, engagement=%d%%, video=%s, snapshot=%s)",
+                    meeting_id,
+                    len(segments),
+                    engagement_score,
+                    bool(video_path),
+                    get_system_resource_snapshot(),
+                )
+                with self._state_lock:
+                    if self._capture_state == "idle":
+                        self.set_meeting_lifecycle_state(
+                            MeetingLifecycleState.COMPLETED,
+                            f"Meeting #{meeting_id} completed & saved",
+                        )
+                self._safe_emit_finalization_progress("idle", "Meeting saved & transcribed")
+                self._safe_emit(self.meeting_saved_and_transcribed, meeting_id)
+                self._safe_emit(self.history_updated)
+            except Exception as exc:
+                logger.error("Failed finalizing meeting #%d in Stage %d: %s", meeting_id, current_stage, exc, exc_info=True)
+                self.db.update_meeting(meeting_id, status="error")
+                with self._state_lock:
+                    if self._capture_state == "idle":
+                        self.set_meeting_lifecycle_state(
+                            MeetingLifecycleState.FAILED,
+                            f"Failed finalizing meeting #{meeting_id}: {exc}",
+                        )
+                self._safe_emit_finalization_progress("error", f"Processing failed in Stage {current_stage}: {exc}")
+                self._safe_emit(self.meeting_saved_and_transcribed, meeting_id)
+                self._safe_emit(self.history_updated)
+            finally:
+                with self._state_lock:
+                    self._finalizing_jobs.discard(meeting_id)
+
+    def _handle_finalization_cancelled(self, meeting_id: int, current_stage: int) -> None:
+        """Handle cooperative cancellation cleanly preserving intermediate artifacts."""
+        logger.info("Meeting #%d finalization cancelled by user at Stage %d", meeting_id, current_stage)
+        self.db.update_meeting(meeting_id, status="interrupted")
+        self.set_meeting_lifecycle_state(
+            MeetingLifecycleState.FAILED,
+            f"Meeting #{meeting_id} finalization was cancelled in Stage {current_stage}",
+        )
+        with self._state_lock:
+            self._finalizing_jobs.discard(meeting_id)
+        self._safe_emit_finalization_progress("error", f"Processing cancelled in Stage {current_stage}")
+        self._safe_emit(self.meeting_saved_and_transcribed, meeting_id)
+        self._safe_emit(self.history_updated)
+
+    def re_transcribe_meeting(self, meeting_id: int) -> None:
+        """Re-run offline transcription on an existing saved meeting recording."""
+        with self._state_lock:
+            if meeting_id in self._finalizing_jobs:
+                self.notification_requested.emit(
+                    "Operation in Progress",
+                    f"Meeting #{meeting_id} is already being transcribed in the background.",
+                )
+                return
+
+        meeting = self.db.get_meeting(meeting_id)
+        if not meeting:
+            return
+        audio_path = meeting.get("audio_path", "")
+        if not audio_path or not Path(audio_path).exists():
+            vid_path = meeting.get("video_path", "")
+            if vid_path and (Path(vid_path).parent / "mixed.wav").exists():
+                audio_path = str(Path(vid_path).parent / "mixed.wav")
+                self.db.update_meeting(meeting_id, audio_path=audio_path)
+            else:
+                created_slug = str(meeting.get("created_at", "")).replace("-", "").replace(":", "").replace(" ", "_")
+                for folder in self.config.recordings_dir.glob("meeting_*"):
+                    if folder.is_dir() and (folder / "mixed.wav").exists():
+                        if created_slug and created_slug[:13] in folder.name:
+                            audio_path = str(folder / "mixed.wav")
+                            self.db.update_meeting(meeting_id, audio_path=audio_path)
+                            break
+
+        if not audio_path or not Path(audio_path).exists():
+            self.notification_requested.emit(
+                "Audio File Missing",
+                f"Cannot re-transcribe meeting #{meeting_id}: audio file not found at {audio_path}",
+            )
+            return
+
+        class _SavedResult:
+            duration_sec = float(meeting.get("duration_sec", 0.0))
+            mixed_wav_path = str(meeting.get("audio_path", ""))
+            mic_wav_path = str(meeting.get("mic_audio_path", ""))
+            sys_wav_path = str(meeting.get("sys_audio_path", ""))
+            mic_device_name = str(meeting.get("mic_device", ""))
+            loopback_device_name = str(meeting.get("loopback_device", ""))
+
+        with self._state_lock:
+            self._active_meeting_corr_id = generate_correlation_id("retrans")
+            self._finalizing_jobs.add(meeting_id)
+
+        self._cancel_finalization_event.clear()
+        self._safe_emit_finalization_progress("transcribing", f"Re-transcribing '{meeting.get('title')}'...")
+        self._finalize_thread = threading.Thread(
+            target=self._finalize_meeting_worker,
+            args=(meeting_id, _SavedResult(), meeting.get("video_path", "")),
+            name=f"ReTranscribeMeetingWorker-{meeting_id}",
+            daemon=True,
+        )
+        self._finalize_thread.start()
+
+    # ==================================================================
+    # CORE FEATURE 2: PC SCREEN RECORDING (Full Desktop & System Audio)
+    # ==================================================================
+    @property
+    def is_screen_recording_active(self) -> bool:
+        return self._screen_rec_state in ("recording", "paused")
+
+    @property
+    def screen_recording_state(self) -> str:
+        return self._screen_rec_state
+
+    def start_screen_recording(
+        self,
+        title: str = "",
+        fps: int = 30,
+        resolution: str = "1080p",
+        audio_mode: str = "both",
+        preset: str = "balanced",
+        with_annotation: bool = True,
+    ) -> Tuple[bool, str]:
+        """
+        Record the user's PC screen (full display), including system audio and/or microphone.
+        Supports presets ('compact', 'balanced', 'high') and live screen annotations.
+        """
+        with self._state_lock:
+            if self._capture_state in ("recording", "paused"):
+                return False, "A corporate meeting recording is currently active. Please stop Meeting Studio before starting PC screen recording."
+            if self._screen_rec_state != "idle":
+                return False, f"Screen recording is already {self._screen_rec_state}."
+            if getattr(self, "_hands_free_active", False):
+                self.stop_hands_free_typing()
+
+            # Auto-heal orphaned audio or video recorder from prior screen session if state is idle
+            if getattr(self, "pc_screen_audio", None) and getattr(self.pc_screen_audio, "is_recording", False):
+                logger.warning("Auto-healing orphaned screen audio recorder from prior session before starting new screen recording")
+                try:
+                    self.pc_screen_audio.stop()
+                except Exception as exc:
+                    logger.debug("Error stopping orphan screen audio recorder: %s", exc)
+
+            if getattr(self, "pc_screen_recorder", None) and getattr(self.pc_screen_recorder, "is_recording", False):
+                logger.warning("Auto-healing orphaned screen video recorder from prior session before starting new screen recording")
+                try:
+                    self.pc_screen_recorder.stop()
+                except Exception as exc:
+                    logger.debug("Error stopping orphan screen video recorder: %s", exc)
+
+            ok_disk, free_mb, disk_msg = check_disk_space_mb(self.config.recordings_dir, min_free_mb=150.0)
+            if not ok_disk:
+                logger.error("Cannot start screen recording: %s", disk_msg)
+                self.notification_requested.emit("Low Disk Space", disk_msg)
+                return False, disk_msg
+
+            self._active_screen_rec_corr_id = generate_correlation_id("scr")
+
+        with operation_context(self._active_screen_rec_corr_id, "start_screen_rec"):
+            timestamp_slug = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+            clean_title = title.strip() or f"Screen Recording {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            rec_dir = self.config.recordings_dir / "screen"
+            os.makedirs(rec_dir, exist_ok=True)
+            video_file = rec_dir / f"screen_{timestamp_slug}.mp4"
+            audio_dir = rec_dir / f"audio_{timestamp_slug}"
+
+            # 1. Start audio capture (loopback system audio + mic)
+            audio_started = False
+            if audio_mode != "none":
+                gain = getattr(self.config, "meeting_mic_gain", 1.0)
+                ok_a, msg_a = self.pc_screen_audio.start(
+                    output_dir=audio_dir,
+                    capture_mode=audio_mode,
+                    mic_device_index=self.config.mic_device_index,
+                    mic_device_name=self.config.mic_device_name,
+                    loopback_device_index=self.config.loopback_device_index,
+                    loopback_device_name=self.config.loopback_device_name,
+                    mic_gain=gain,
+                )
+                audio_started = ok_a
+                if not ok_a:
+                    logger.warning("Could not start screen audio: %s", msg_a)
+
+            # 2. Start screen video capture (full desktop, target_hwnd=None)
+            ok_v, msg_v = self.pc_screen_recorder.start(
+                video_file,
+                target_hwnd=None,
+                fps=fps,
+                resolution=resolution,
+                preset=preset,
+            )
+            if not ok_v:
+                if audio_started:
+                    self.pc_screen_audio.stop()
+                if audio_dir.exists():
+                    shutil.rmtree(audio_dir, ignore_errors=True)
+                with self._state_lock:
+                    self._screen_rec_state = "idle"
+                self.screen_recording_state_changed.emit("idle", f"Failed to start screen capture: {msg_v}")
+                return False, msg_v
+
+            with self._state_lock:
+                self._active_screen_rec_video_path = video_file
+                self._active_screen_rec_audio_dir = audio_dir
+                self._active_screen_rec_title = clean_title
+                # Save record in database
+                self._active_screen_rec_id = self.db.create_screen_recording(
+                    title=clean_title,
+                    file_path=str(video_file),
+                    fps=self.pc_screen_recorder.fps,
+                    resolution=resolution,
+                    audio_mode=audio_mode,
+                )
+                self._screen_rec_state = "recording"
+
+            self._screen_rec_timer.start()
+            self.screen_recording_state_changed.emit("recording", f"Recording PC screen: {clean_title}")
+            self.screen_recordings_updated.emit()
+
+            if with_annotation:
+                try:
+                    self.start_annotation_mode()
+                except Exception as ann_err:
+                    logger.debug("Could not auto-start annotation toolbar: %s", ann_err)
+
+            logger.info(
+                "PC Screen recording started: %s (%s @ %d FPS [preset=%s], audio=%s, snapshot=%s)",
+                video_file.name,
+                resolution,
+                self.pc_screen_recorder.fps,
+                preset,
+                audio_mode,
+                get_system_resource_snapshot(),
+            )
+            return True, "PC Screen recording active"
+
+    def pause_screen_recording(self) -> bool:
+        with self._state_lock:
+            if self._screen_rec_state == "recording":
+                self.pc_screen_recorder.pause()
+                if self.pc_screen_audio.state == "recording":
+                    self.pc_screen_audio.pause()
+                self._screen_rec_state = "paused"
+                self.screen_recording_state_changed.emit("paused", "Screen recording paused")
+                return True
+        return False
+
+    def resume_screen_recording(self) -> bool:
+        with self._state_lock:
+            if self._screen_rec_state == "paused":
+                self.pc_screen_recorder.resume()
+                if self.pc_screen_audio.state == "paused":
+                    self.pc_screen_audio.resume()
+                self._screen_rec_state = "recording"
+                self.screen_recording_state_changed.emit("recording", "Screen recording resumed")
+                return True
+        return False
+
+    def stop_screen_recording(self, async_finalize: bool = False) -> Optional[str]:
+        with self._state_lock:
+            if self._screen_rec_state not in ("recording", "paused"):
+                return None
+            self._screen_rec_timer.stop()
+            self._screen_rec_state = "saving"
+            rec_id = self._active_screen_rec_id
+            audio_dir = self._active_screen_rec_audio_dir
+            corr_id = self._active_screen_rec_corr_id
+            self._active_screen_rec_id = None
+            self._active_screen_rec_video_path = None
+            self._active_screen_rec_audio_dir = None
+
+        if self.is_annotation_mode_active():
+            try:
+                self.stop_annotation_mode()
+            except Exception as ann_err:
+                logger.debug("Error stopping annotation mode: %s", ann_err)
+
+        self.screen_recording_state_changed.emit("saving", "Muxing audio & saving PC screen recording...")
+
+        if async_finalize:
+            threading.Thread(
+                target=self._finalize_screen_rec_worker,
+                args=(rec_id, audio_dir, corr_id),
+                name="ScreenRecFinalizeWorker",
+                daemon=True,
+            ).start()
+            return None
+        return self._finalize_screen_rec_worker(rec_id, audio_dir, corr_id)
+
+    def _finalize_screen_rec_worker(
+        self,
+        rec_id: Optional[int],
+        audio_dir: Optional[Path],
+        corr_id: str = "-",
+    ) -> Optional[str]:
+        with operation_context(corr_id if corr_id != "-" else generate_correlation_id("scr"), "stop_screen_rec"):
+            final_path: Optional[str] = None
+            saved_title = getattr(self, "_active_screen_rec_title", "") or "Screen Recording"
+            try:
+                vid_path_str = self.pc_screen_recorder.stop() or ""
+                audio_result = None
+                if self.pc_screen_audio.state in ("recording", "paused"):
+                    audio_result = self.pc_screen_audio.stop()
+
+                final_path = vid_path_str
+                if vid_path_str and audio_result and audio_result.mixed_wav_path and os.path.exists(audio_result.mixed_wav_path):
+                    try:
+                        self.pc_screen_recorder.mux_audio_into_video(
+                            Path(vid_path_str),
+                            Path(audio_result.mixed_wav_path),
+                        )
+                    except Exception as exc:
+                        logger.warning("Error muxing screen audio: %s", exc)
+
+                # Update DB record with duration & file size
+                if rec_id and vid_path_str and Path(vid_path_str).exists():
+                    try:
+                        dur = audio_result.duration_sec if audio_result else 0.0
+                        sz = os.path.getsize(vid_path_str)
+                        self.db.finish_screen_recording(rec_id, dur, sz)
+                    except Exception as db_exc:
+                        logger.debug("Error updating screen recording DB entry: %s", db_exc)
+
+                # Cleanup temporary audio files
+                if audio_dir and audio_dir.exists():
+                    try:
+                        shutil.rmtree(audio_dir, ignore_errors=True)
+                    except Exception as rm_exc:
+                        logger.debug("Error cleaning screen rec temp audio dir: %s", rm_exc)
+
+                logger.info("PC Screen recording finalized: %s", final_path)
+                if final_path and Path(final_path).exists():
+                    self.screen_recording_saved.emit(final_path, saved_title)
+            except Exception as exc:
+                logger.error("Unexpected error finalizing screen recording: %s", exc, exc_info=True)
+            finally:
+                with self._state_lock:
+                    self._screen_rec_state = "idle"
+                self.screen_recording_state_changed.emit("idle", "Screen recording saved successfully")
+                self.screen_recordings_updated.emit()
+            return final_path
+
+    # ------------------------------------------------------------------
+    # Live Annotation & Screenshot Markup Controls (Core Feature 2)
+    # ------------------------------------------------------------------
+    def is_annotation_mode_active(self) -> bool:
+        """Returns True if the live screen annotation overlay/toolbar is currently open."""
+        return bool(self._annotation_overlay and self._annotation_overlay.isVisible())
+
+    def start_annotation_mode(self) -> None:
+        """Initializes and displays the transparent screen overlay and floating toolbar."""
+        app = QApplication.instance()
+        if not app:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            from PyQt6.QtCore import QMetaObject, Qt
+            QMetaObject.invokeMethod(self, "_do_start_annotation_mode", Qt.ConnectionType.QueuedConnection)
+            return
+        self._do_start_annotation_mode()
+
+    def _do_start_annotation_mode(self) -> None:
+        try:
+            from voxlocal.annotation.overlay import AnnotationOverlayWindow
+            from voxlocal.annotation.toolbar import AnnotationToolbar
+
+            if self._annotation_overlay is None:
+                self._annotation_overlay = AnnotationOverlayWindow(self.annotation_engine)
+                self._annotation_toolbar = AnnotationToolbar()
+
+                # Wire toolbar signals to overlay and engine
+                tb = self._annotation_toolbar
+                ov = self._annotation_overlay
+
+                tb.tool_changed.connect(ov.set_active_tool)
+                tb.color_changed.connect(ov.set_active_color)
+                tb.stroke_width_changed.connect(ov.set_stroke_width)
+                tb.interact_mode_toggled.connect(ov.set_interact_mode)
+                tb.undo_requested.connect(lambda: (self.annotation_engine.undo(), ov.update() if ov else None))
+                tb.redo_requested.connect(lambda: (self.annotation_engine.redo(), ov.update() if ov else None))
+                tb.clear_requested.connect(lambda: (self.annotation_engine.clear(), ov.update() if ov else None))
+                tb.visibility_toggled.connect(ov.set_annotations_visible)
+                tb.screenshot_requested.connect(self.capture_screenshot)
+                tb.closed.connect(self.stop_annotation_mode)
+                ov.undo_state_changed.connect(tb.update_history_state)
+
+            # Reposition toolbar near top-right/center if first opening
+            if not self._annotation_toolbar.isVisible():
+                screen = QApplication.primaryScreen()
+                if screen:
+                    geom = screen.availableGeometry()
+                    tx = geom.x() + (geom.width() - self._annotation_toolbar.width()) // 2
+                    ty = geom.y() + 40
+                    self._annotation_toolbar.move(tx, ty)
+
+            self._annotation_overlay.show()
+            self._annotation_overlay.raise_()
+            self._annotation_toolbar.show()
+            self._annotation_toolbar.raise_()
+            self._annotation_toolbar.activateWindow()
+            self.annotation_mode_changed.emit(True)
+            logger.info("Live Screen Annotation mode started.")
+        except Exception as exc:
+            logger.error("Failed to start annotation mode: %s", exc)
+
+    def stop_annotation_mode(self) -> None:
+        """Hides annotation overlay and toolbar."""
+        app = QApplication.instance()
+        if not app:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            from PyQt6.QtCore import QMetaObject, Qt
+            QMetaObject.invokeMethod(self, "_do_stop_annotation_mode", Qt.ConnectionType.QueuedConnection)
+            return
+        self._do_stop_annotation_mode()
+
+    def _do_stop_annotation_mode(self) -> None:
+        try:
+            if self._annotation_overlay and self._annotation_overlay.isVisible():
+                self._annotation_overlay.hide()
+            if self._annotation_toolbar and self._annotation_toolbar.isVisible():
+                self._annotation_toolbar.hide()
+            self.annotation_engine.clear_laser()
+            self.annotation_engine.clear_spotlight()
+            self.annotation_mode_changed.emit(False)
+            logger.info("Live Screen Annotation mode stopped.")
+        except Exception as exc:
+            logger.error("Failed to stop annotation mode: %s", exc)
+
+    def toggle_annotation_mode(self) -> bool:
+        if self.is_annotation_mode_active():
+            self.stop_annotation_mode()
+            return False
+        else:
+            self.start_annotation_mode()
+            return True
+
+    def capture_screenshot(self, mode: str = "region") -> None:
+        """
+        Launches the Snipping tool for Region or Window selection,
+        or immediately grabs Fullscreen, then opens Image Markup Studio.
+        """
+        if mode == "fullscreen":
+            from voxlocal.annotation.snipping import capture_fullscreen
+            pix = capture_fullscreen()
+            self.open_image_markup_studio(pix.toImage(), title="Fullscreen Capture")
+        else:
+            from voxlocal.annotation.snipping import SnippingOverlay
+            snip = SnippingOverlay(mode=mode)
+            snip.snipped.connect(lambda pix: self.open_image_markup_studio(pix.toImage(), title=f"{mode.capitalize()} Snip"))
+            self._active_snipping_overlays.append(snip)
+            snip.show()
+            snip.raise_()
+            snip.activateWindow()
+
+    def open_image_markup_studio(self, image: Any, title: str = "Screenshot") -> Any:
+        """Opens the Image Markup Studio with the given image."""
+        from PyQt6.QtGui import QImage, QPixmap
+        from voxlocal.annotation.markup_studio import ImageMarkupStudio
+
+        qimg: Optional[QImage] = None
+        if isinstance(image, QPixmap):
+            qimg = image.toImage()
+        elif isinstance(image, QImage):
+            qimg = image
+        elif isinstance(image, (str, Path)):
+            qimg = QImage(str(image))
+
+        studio = ImageMarkupStudio(initial_image=qimg, title=title)
+        self._active_markup_studios.append(studio)
+        studio.show()
+        studio.raise_()
+        studio.activateWindow()
+        return studio
+
+    def _on_screen_rec_tick(self) -> None:
+        if self._screen_rec_state == "recording":
+            elapsed = self.pc_screen_audio.elapsed_seconds if self.pc_screen_audio.state == "recording" else 0.0
+            frames = getattr(self.pc_screen_recorder, "_total_frames", 0)
+            self.screen_recording_tick.emit(elapsed, frames)
+
+    def show_meeting_prompt_popup(self, session_info: Any) -> None:
+        """Consolidate meeting detection alert into unified bottom-center FlowBar."""
+        fp = getattr(self, "floating_pill", None)
+        if fp is not None and hasattr(fp, "set_pill_state"):
+            title = getattr(session_info, "clean_title", None) or getattr(session_info, "title", "Call")
+            plat = getattr(session_info, "platform", "Call")
+            fp.set_pill_state("CARD_NOTIFICATION", metadata={"title": title, "platform": plat, "session": session_info})
+            return
+        # Deprecated fallback if FlowBar is not active
+        try:
+            from voxlocal.ui.meeting_prompt_popup import MeetingPromptPopup
+            if self._meeting_prompt_popup and self._meeting_prompt_popup.isVisible():
+                self._meeting_prompt_popup.update_session(session_info)
+                return
+            self._meeting_prompt_popup = MeetingPromptPopup(session_info, self)
+            self._meeting_prompt_popup.show()
+        except Exception as exc:
+            logger.debug("Could not display MeetingPromptPopup: %s", exc)
+
+    def _poll_call_detector(self) -> None:
+        """Layered detection of active Teams, Zoom, Google Meet, Slack, or Webex meetings."""
+        if self._screen_rec_state in ("recording", "paused"):
+            return
+        is_rec_now = self._capture_state in ("recording", "paused")
+        if not is_rec_now and not getattr(self.config, "auto_record_calls", True) and not getattr(self.config, "prompt_on_call", True):
+            return
+
+        # Dynamic binding for pre-call recording (Audio + Video deferred attach or Audio-only target HWND binding)
+        if self._capture_state == "recording":
+            if getattr(self, "_pending_video_bind", False):
+                try:
+                    from voxlocal.video.meeting_capture import resolve_meeting_source, MeetingVideoRecorder
+                    src = resolve_meeting_source(target_hwnd=getattr(self, "_active_meeting_target_hwnd", None))
+                    if src is None and getattr(self, "_active_meeting_platform", None):
+                        src = resolve_meeting_source(platform_hint=self._active_meeting_platform)
+                    if src is not None:
+                        if getattr(self, "_meeting_video_recorder", None) is not None:
+                            self._meeting_video_recorder.source_descriptor = src
+                            self._meeting_video_recorder.target_hwnd = src.hwnd
+                            if hasattr(self._meeting_video_recorder, "validator"):
+                                self._meeting_video_recorder.validator.descriptor = src
+                            self._pending_video_bind = False
+                            self._active_meeting_target_hwnd = src.hwnd
+                            self._active_meeting_pid = src.pid
+                            self._active_meeting_platform = src.platform_name
+                            logger.info(
+                                "Dynamic video binding attached to %s (HWND=%s, title='%s')",
+                                src.platform_name,
+                                src.hwnd,
+                                src.window_title,
+                            )
+                            status_text = f"Recording (Audio + Video): {self._active_meeting_title}"
+                            self.set_meeting_lifecycle_state(
+                                MeetingLifecycleState.RECORDING,
+                                status_text,
+                            )
+                            self.meeting_state_changed.emit("recording", status_text)
+                            self.notification_requested.emit(
+                                "Meeting Video Connected",
+                                f"Connected video recording to {src.platform_name} call window.",
+                            )
+                        elif getattr(self, "_pending_video_folder", None):
+                            video_file = self._pending_video_folder / "meeting_screen.mp4"
+                            target_fps = int(getattr(self, "_pending_video_fps", 15) or 15)
+                            res = getattr(self, "_pending_video_res", "1080p")
+                            max_h = 1080
+                            if isinstance(res, str):
+                                if "720" in res:
+                                    max_h = 720
+                                elif "480" in res:
+                                    max_h = 480
+                                elif "1440" in res or "2k" in res.lower():
+                                    max_h = 1440
+                                elif "2160" in res or "4k" in res.lower():
+                                    max_h = 2160
+
+                            v_rec = MeetingVideoRecorder(
+                                output_path=str(video_file),
+                                source_descriptor=src,
+                                fps=target_fps,
+                                max_height=max_h,
+                                on_meeting_ended=self._on_meeting_capture_ended,
+                                on_source_state_change=self._on_video_source_state_changed,
+                            )
+                            if v_rec.start(str(video_file)):
+                                self._meeting_video_recorder = v_rec
+                                self._pending_video_bind = False
+                                self._active_meeting_target_hwnd = src.hwnd
+                                self._active_meeting_pid = src.pid
+                                self._active_meeting_platform = src.platform_name
+                                logger.info(
+                                    "Dynamic video binding attached to %s (HWND=%s, title='%s'): %s",
+                                    src.platform_name,
+                                    src.hwnd,
+                                    src.window_title,
+                                    video_file,
+                                )
+                                status_text = f"Recording (Audio + Video): {self._active_meeting_title}"
+                                self.set_meeting_lifecycle_state(
+                                    MeetingLifecycleState.RECORDING,
+                                    status_text,
+                                )
+                                self.meeting_state_changed.emit("recording", status_text)
+                                self.notification_requested.emit(
+                                    "Meeting Video Connected",
+                                    f"Connected video recording to {src.platform_name} call window.",
+                                )
+                except Exception as exc:
+                    logger.debug("Deferred video binding attempt: %s", exc)
+
+            if getattr(self, "_active_meeting_target_hwnd", None) is None:
+                try:
+                    from voxlocal.video.meeting_capture import resolve_meeting_source
+                    src = resolve_meeting_source()
+                    if src is not None:
+                        self._active_meeting_target_hwnd = src.hwnd
+                        self._active_meeting_pid = src.pid
+                        self._active_meeting_platform = src.platform_name
+                        logger.info("Bound active meeting target HWND=%s (%s) for pre-started session", src.hwnd, src.platform_name)
+                except Exception as exc:
+                    logger.debug("Deferred target hwnd binding attempt: %s", exc)
+        try:
+            event = self.call_detector.poll()
+            if event == "started":
+                sess = getattr(self.call_detector, "active_session", None)
+                app_name = sess.platform if sess else (self.call_detector.active.app_name if self.call_detector.active else "Call")
+                sess_id = sess.session_id if sess else (getattr(self.call_detector.active, "session_id", "") if self.call_detector.active else "")
+                call_key = self.call_detector.active.key if self.call_detector.active else ""
+                title = sess.clean_title if sess else f"{app_name} ({datetime.now().strftime('%b %d, %H:%M')})"
+                logger.info("CallDetector detected active call in '%s' (session_id=%s)", app_name, sess_id)
+
+                if not getattr(self, "_active_meeting_calendar_event_id", "") and hasattr(self, "calendar_engine") and self.calendar_engine:
+                    try:
+                        now_utc = datetime.now(timezone.utc)
+                        for mtg in self.calendar_engine.get_upcoming_meetings():
+                            st = mtg.start_time
+                            et = mtg.end_time
+                            if (st - timedelta(minutes=15)) <= now_utc <= et:
+                                plat = str(getattr(mtg, "platform", "")).lower()
+                                app_lower = str(app_name).lower()
+                                if plat in app_lower or app_lower in plat or not app_lower:
+                                    self._active_meeting_calendar_event_id = mtg.id
+                                    self._active_meeting_calendar_join_url = mtg.join_url
+                                    self._active_meeting_calendar_attendees = mtg.attendees_str
+                                    self._active_meeting_calendar_organizer = mtg.organizer
+                                    self._active_meeting_calendar_provider = str(mtg.provider_type)
+                                    if not title or title.startswith(app_name):
+                                        title = mtg.title
+                                    break
+                    except Exception as e_cal:
+                        logger.debug("Auto calendar association note: %s", e_cal)
+
+                if self._capture_state == "idle":
+                    self.set_meeting_lifecycle_state(
+                        MeetingLifecycleState.MEETING_DETECTED,
+                        f"Detected {app_name}: {title}",
+                    )
+                    if (sess_id and sess_id in self._dismissed_call_keys) or (call_key and call_key in self._dismissed_call_keys):
+                        return
+                    if getattr(self.config, "prompt_on_call", True):
+                        self.set_meeting_lifecycle_state(
+                            MeetingLifecycleState.AWAITING_CONFIRMATION,
+                            f"Awaiting confirmation for {app_name}: {title}",
+                        )
+                        # Explicit non-activating bottom-right user consent popup
+                        if sess:
+                            self.show_meeting_prompt_popup(sess)
+                        self.call_detected.emit(app_name, title)
+                    else:
+                        target_hwnd = sess.window_hwnd if sess else None
+                        ok, msg = self.start_meeting_recording(title=title, target_hwnd=target_hwnd)
+                        if ok:
+                            self.notification_requested.emit(
+                                "Meeting Recording",
+                                f"Detected {app_name} call. Recording & transcribing meeting notes.",
+                            )
+                        self.call_detected.emit(app_name, title)
+            elif event == "ended":
+                if self._meeting_prompt_popup and self._meeting_prompt_popup.isVisible():
+                    self._meeting_prompt_popup.close()
+                    self._meeting_prompt_popup = None
+                from voxlocal.audio.call_detector import MeetingSessionInfo
+                ended_sess = getattr(self.call_detector, "last_ended_session", None)
+                if not isinstance(ended_sess, MeetingSessionInfo):
+                    ended_sess = None
+                ended_act = getattr(self.call_detector, "active", None) or getattr(self.call_detector, "last_ended_active", None)
+
+                app_name = ""
+                if ended_sess and isinstance(getattr(ended_sess, "platform", None), str):
+                    app_name = ended_sess.platform
+                elif ended_act and hasattr(ended_act, "app_name") and isinstance(ended_act.app_name, str):
+                    app_name = ended_act.app_name
+                elif isinstance(getattr(self, "_active_meeting_platform", ""), str) and getattr(self, "_active_meeting_platform", ""):
+                    app_name = getattr(self, "_active_meeting_platform", "")
+                if not app_name:
+                    app_name = "Call"
+
+                sess_id = ""
+                if ended_sess and isinstance(getattr(ended_sess, "session_id", None), str):
+                    sess_id = ended_sess.session_id
+                elif ended_act and hasattr(ended_act, "session_id") and isinstance(ended_act.session_id, str):
+                    sess_id = ended_act.session_id
+                elif isinstance(getattr(self, "_active_meeting_session_id", ""), str):
+                    sess_id = getattr(self, "_active_meeting_session_id", "")
+
+                call_key = ""
+                if ended_act and hasattr(ended_act, "key") and isinstance(ended_act.key, str):
+                    call_key = ended_act.key
+                if sess_id:
+                    self._dismissed_call_keys.discard(sess_id)
+                if call_key:
+                    self._dismissed_call_keys.discard(call_key)
+                self.call_ended.emit(app_name)
+                if self._capture_state in ("recording", "paused"):
+                    # CRITICAL: Verify meeting target liveness against genuine Call Stage windows or presentation sessions
+                    meeting_target_alive = False
+                    from voxlocal.audio.call_detector import is_leaving_title, is_non_call_hub
+                    from voxlocal.video.meeting_capture import get_window_title, discover_meeting_sources, find_teams_sharing_session, find_zoom_sharing_session
+
+                    if self._active_meeting_target_hwnd and user32.IsWindow(self._active_meeting_target_hwnd):
+                        t = get_window_title(self._active_meeting_target_hwnd)
+                        if not is_leaving_title(t) and not is_non_call_hub(app_name, t):
+                            meeting_target_alive = True
+
+                    if not meeting_target_alive:
+                        # Check if active meeting call stage window exists for this platform
+                        sources = discover_meeting_sources(include_non_call_hubs=False)
+                        for src in sources:
+                            is_target = (self._active_meeting_target_hwnd is None or src.hwnd == self._active_meeting_target_hwnd)
+                            if is_target and (not app_name or app_name == "Call" or src.platform_name.lower() == app_name.lower()) and src.is_call_stage:
+                                if not is_leaving_title(src.window_title):
+                                    meeting_target_alive = True
+                                    self._active_meeting_target_hwnd = src.hwnd
+                                    break
+
+                    if not meeting_target_alive:
+                        # Check if a presentation session is active
+                        if "teams" in app_name.lower() and find_teams_sharing_session(self._active_meeting_pid) is not None:
+                            meeting_target_alive = True
+                        elif "zoom" in app_name.lower() and find_zoom_sharing_session(self._active_meeting_pid) is not None:
+                            meeting_target_alive = True
+
+                    if meeting_target_alive:
+                        logger.info(
+                            "CallDetector signaled potential call end, but active call stage/presentation (HWND=%s) is still confirmed. Recording preserved.",
+                            self._active_meeting_target_hwnd,
+                        )
+                        return
+
+                    logger.info("CallDetector verified meeting call stage closed -> Auto-stopping meeting recording")
+                    self.set_meeting_lifecycle_state(
+                        MeetingLifecycleState.MEETING_ENDING,
+                        f"{app_name} call ended — finalizing recording...",
+                    )
+                    self.stop_meeting_recording()
+                    self.notification_requested.emit(
+                        "Meeting Ended",
+                        f"{app_name} call ended. Finalizing meeting notes and transcription...",
+                    )
+                else:
+                    self.set_meeting_lifecycle_state(MeetingLifecycleState.NO_MEETING_DETECTED, "No active meeting detected.")
+            elif self._capture_state in ("recording", "paused") and self._active_meeting_target_hwnd:
+                # Monitor bound meeting window even if recording was started manually or in Audio-Only mode
+                from voxlocal.audio.call_detector import is_leaving_title, is_non_call_hub
+                from voxlocal.video.meeting_capture import get_window_title, discover_meeting_sources, find_teams_sharing_session, find_zoom_sharing_session
+
+                plat = getattr(self, "_active_meeting_platform", "") or "Call"
+                target_alive = False
+                if user32.IsWindow(self._active_meeting_target_hwnd):
+                    t = get_window_title(self._active_meeting_target_hwnd)
+                    if not is_leaving_title(t) and not is_non_call_hub(plat, t):
+                        target_alive = True
+
+                if not target_alive:
+                    sources = discover_meeting_sources(include_non_call_hubs=False)
+                    for src in sources:
+                        if (plat == "Call" or src.platform_name.lower() == plat.lower()) and src.is_call_stage:
+                            if not is_leaving_title(src.window_title):
+                                target_alive = True
+                                self._active_meeting_target_hwnd = src.hwnd
+                                break
+
+                if not target_alive:
+                    if "teams" in plat.lower() and find_teams_sharing_session(self._active_meeting_pid) is not None:
+                        target_alive = True
+                    elif "zoom" in plat.lower() and find_zoom_sharing_session(self._active_meeting_pid) is not None:
+                        target_alive = True
+
+                if target_alive:
+                    self._manual_target_lost_since = None
+                else:
+                    now_m = time.monotonic()
+                    if self._manual_target_lost_since is None:
+                        self._manual_target_lost_since = now_m
+                    elif (now_m - self._manual_target_lost_since) >= 2.0:
+                        self._manual_target_lost_since = None
+                        logger.info("Bound meeting window (HWND=%s) closed/ended -> Auto-stopping meeting recording", self._active_meeting_target_hwnd)
+                        self.set_meeting_lifecycle_state(
+                            MeetingLifecycleState.MEETING_ENDING,
+                            f"{plat} call ended — finalizing recording...",
+                        )
+                        self.stop_meeting_recording()
+                        self.notification_requested.emit(
+                            "Meeting Ended",
+                            f"{plat} call ended. Finalizing meeting notes and transcription...",
+                        )
+        except Exception as exc:
+            logger.debug("Error in _poll_call_detector: %s", exc)
+
+    def dismiss_call_prompt(self, call_key: Optional[str] = None) -> None:
+        """User dismissed the call prompt: remember not to prompt again for this active call session."""
+        key = call_key or (self.call_detector.active.session_id if (self.call_detector.active and hasattr(self.call_detector.active, "session_id")) else (self.call_detector.active.key if self.call_detector.active else ""))
+        if key:
+            self._dismissed_call_keys.add(key)
+
+    def query_meeting_memory(
+        self, question: str, meeting_id: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Ask Vox: Comprehensive 100% offline local AI & algorithmic cognitive reasoning
+        across recorded meetings (or scoped to meeting_id) with grounded citations.
+        """
+        try:
+            return self.intelligence.query(question, meeting_id=meeting_id)
+        except Exception as exc:
+            logger.error("Error in query_meeting_memory: %s", exc, exc_info=True)
+            return {
+                "question": question,
+                "answer": f"### ⚠️ Analysis Notice\n\nCould not complete search across meetings: {exc}",
+                "citations": [],
+                "intent": "error",
+                "suggestions": ["Summarize recent meetings", "List all action items"],
+            }
+
+    def query_meeting_memory_stream(
+        self, question: str, meeting_id: Optional[int] = None
+    ) -> None:
+        """
+        Ask Vox (Streaming): Process query in background thread, emitting:
+        - ask_vox_citations_ready(citations) immediately when search completes
+        - ask_vox_token_streamed(token_str) as each token is generated
+        - ask_vox_stream_finished(result_dict) upon completion
+        """
+        self._cancel_ask_vox = True
+        if hasattr(self, "_ask_vox_thread") and self._ask_vox_thread and self._ask_vox_thread.is_alive():
+            try:
+                self._ask_vox_thread.join(timeout=0.25)
+            except Exception:
+                pass
+
+        self._ask_vox_query_id += 1
+        current_qid = self._ask_vox_query_id
+        self._cancel_ask_vox = False
+
+        def _worker() -> None:
+            try:
+                res = self.intelligence.query_stream(
+                    question=question,
+                    meeting_id=meeting_id,
+                    on_token=lambda tok: (self.ask_vox_token_streamed.emit(current_qid, tok) if self._ask_vox_query_id == current_qid and not self._cancel_ask_vox else None),
+                    on_citations=lambda cits: (self.ask_vox_citations_ready.emit(current_qid, cits) if self._ask_vox_query_id == current_qid and not self._cancel_ask_vox else None),
+                    cancel_check=lambda: self._cancel_ask_vox or (self._ask_vox_query_id != current_qid),
+                )
+                if self._ask_vox_query_id == current_qid and not self._cancel_ask_vox:
+                    self.ask_vox_stream_finished.emit(current_qid, res)
+            except Exception as exc:
+                logger.error("Error in query_meeting_memory_stream: %s", exc, exc_info=True)
+                err_dict = {
+                    "question": question,
+                    "answer": f"### ⚠️ Analysis Notice\n\nCould not complete search across meetings: {exc}",
+                    "citations": [],
+                    "intent": "error",
+                    "suggestions": ["Summarize recent meetings", "List all action items"],
+                }
+                if self._ask_vox_query_id == current_qid and not self._cancel_ask_vox:
+                    self.ask_vox_stream_finished.emit(current_qid, err_dict)
+
+        self._ask_vox_thread = threading.Thread(target=_worker, name="AskVoxStreamThread", daemon=True)
+        self._ask_vox_thread.start()
+        return current_qid
+
+    def stop_ask_vox_stream(self) -> None:
+        """Cancel ongoing Ask Vox token streaming."""
+        self._cancel_ask_vox = True
+
+    def compare_meetings(self, meeting_id_a: int, meeting_id_b: int) -> Dict[str, Any]:
+        """Compare two meetings side-by-side using MeetingIntelligenceEngine."""
+        return self.intelligence.compare_meetings(meeting_id_a, meeting_id_b)
+
+    def generate_pre_meeting_briefing(self, query_or_topic: str) -> Dict[str, Any]:
+        """Generate an executive pre-meeting briefing using MeetingIntelligenceEngine."""
+        return self.intelligence.generate_pre_meeting_briefing(query_or_topic)
+
+    def get_cross_meeting_decisions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Retrieve cross-meeting decisions."""
+        return self.intelligence.get_cross_meeting_decisions(limit=limit)
+
+    def get_recurring_topics(self, limit: int = 15) -> List[Dict[str, Any]]:
+        """Retrieve recurring topics across meetings."""
+        return self.intelligence.get_recurring_topics(limit=limit)
+
+    def shutdown(self) -> None:
+        """Cleanly stop all timers, hooks, and audio streams on application exit."""
+        logger.info("Shutting down AppController...")
+        self._cancel_ask_vox = True
+        if hasattr(self, "_ask_vox_thread") and self._ask_vox_thread and self._ask_vox_thread.is_alive():
+            try:
+                self._ask_vox_thread.join(timeout=0.5)
+            except Exception:
+                pass
+        self._cancel_finalization_event.set()
+        if hasattr(self, "_finalize_thread") and self._finalize_thread and self._finalize_thread.is_alive():
+            try:
+                self._finalize_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self._interim_worker_running = False
+        try:
+            if hasattr(self, "_focus_timer") and self._focus_timer:
+                self._focus_timer.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_call_timer") and self._call_timer:
+                self._call_timer.stop()
+        except Exception:
+            pass
+        if hasattr(self.call_detector, "stop_winevent_listener"):
+            try:
+                self.call_detector.stop_winevent_listener()
+            except Exception:
+                pass
+        self.hotkey_manager.stop()
+        if self._hands_free_active or self.streaming_typer.is_running:
+            self.streaming_typer.stop()
+        if self.dictation_recorder.is_recording:
+            self.dictation_recorder.stop()
+        if self._screen_rec_state in ("recording", "paused"):
+            self.stop_screen_recording()
+        if hasattr(self, "screen_recorder") and self.screen_recorder.is_recording:
+            self.screen_recorder.stop()
+        if self.meeting_recorder.state != "idle":
+            self.meeting_recorder.stop(preserve_separate_tracks=self.config.preserve_separate_tracks)
+        self.config.save()
