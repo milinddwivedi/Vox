@@ -150,23 +150,87 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
     Device Code Flow (RFC 8628), DPAPI encryption, and offline error recovery.
     """
 
-    # Azure CLI Public Client ID widely used for device code and local loopback desktop access
-    DEFAULT_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+    OFFICE_CLIENT_ID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"  # Microsoft Office preauthorized client for corporate tenants
+    GRAPH_CLI_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # Multi-audience client supporting Personal + Work accounts on /common
+    LEGACY_AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+    DEFAULT_CLIENT_ID = GRAPH_CLI_CLIENT_ID
+    OFFICE_SCOPES = ["https://graph.microsoft.com/.default", "offline_access"]
     SCOPES = ["Calendars.Read", "User.Read", "offline_access"]
     GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+    PERSONAL_EMAIL_DOMAINS = {
+        "outlook.com", "hotmail.com", "live.com", "msn.com", "passport.com",
+        "outlook.in", "outlook.co.uk", "hotmail.co.uk", "live.in",
+        "gmail.com", "googlemail.com", "yahoo.com", "icloud.com", "me.com",
+        "aol.com", "proton.me", "protonmail.com",
+    }
+
+    @classmethod
+    def _effective_scopes_for_client(cls, client_id: str) -> List[str]:
+        if client_id == cls.OFFICE_CLIENT_ID:
+            return list(cls.OFFICE_SCOPES)
+        return list(cls.SCOPES)
+
+    @classmethod
+    def detect_account_type(cls, hint: Optional[str]) -> str:
+        """
+        Automatically classify an optional email/tenant hint into 'personal', 'work', or 'common'.
+        Allows one unified UI passage while diversifying backend auth parameters automatically.
+        """
+        val = (hint or "").strip().lower()
+        if not val or val == "common":
+            return "common"
+        if val == "consumers":
+            return "personal"
+        if val == "organizations":
+            return "work"
+        if "@" in val:
+            domain = val.rsplit("@", 1)[-1].strip()
+            if domain in cls.PERSONAL_EMAIL_DOMAINS:
+                return "personal"
+            return "work"
+        return "work"
+
+    def _set_authority(self, tenant_id: str) -> None:
+        self.tenant_id = (tenant_id or "common").strip() or "common"
+        self.authority = f"https://login.microsoftonline.com/{urllib.parse.quote(self.tenant_id)}"
+        self.auth_endpoint = f"{self.authority}/oauth2/v2.0/authorize"
+        self.token_endpoint = f"{self.authority}/oauth2/v2.0/token"
+        self.device_code_endpoint = f"{self.authority}/oauth2/v2.0/devicecode"
 
     def __init__(
         self,
         client_id: Optional[str] = None,
         auth_file_path: Optional[Path] = None,
         tenant_id: Optional[str] = None,
+        account_hint: Optional[str] = None,
     ) -> None:
-        self.client_id = (client_id or os.environ.get("MS_GRAPH_CLIENT_ID", self.DEFAULT_CLIENT_ID)).strip() or self.DEFAULT_CLIENT_ID
-        self.tenant_id = (tenant_id or os.environ.get("MS_GRAPH_TENANT_ID", "common")).strip() or "common"
-        self.authority = f"https://login.microsoftonline.com/{urllib.parse.quote(self.tenant_id)}"
-        self.auth_endpoint = f"{self.authority}/oauth2/v2.0/authorize"
-        self.token_endpoint = f"{self.authority}/oauth2/v2.0/token"
-        self.device_code_endpoint = f"{self.authority}/oauth2/v2.0/devicecode"
+        raw_client_id = (client_id or os.environ.get("MS_GRAPH_CLIENT_ID", "")).strip()
+        if raw_client_id == self.LEGACY_AZURE_CLI_CLIENT_ID:
+            raw_client_id = ""
+        self._custom_client_id = raw_client_id
+        self.account_hint = (account_hint or "").strip()
+        raw_tenant = (tenant_id or os.environ.get("MS_GRAPH_TENANT_ID", "")).strip()
+        self._explicit_tenant = bool(raw_tenant and raw_tenant.lower() != "common")
+
+        # Automatic backend diversification between Personal, Work, and Unified (/common)
+        acct_type = self.detect_account_type(self.account_hint or raw_tenant)
+        self._account_type = acct_type
+        if self._custom_client_id:
+            self.client_id = self._custom_client_id
+            eff_tenant = raw_tenant if (raw_tenant and "@" not in raw_tenant) else "common"
+        elif acct_type == "work":
+            self.client_id = self.OFFICE_CLIENT_ID
+            eff_tenant = raw_tenant if (raw_tenant and "@" not in raw_tenant) else "organizations"
+        elif acct_type == "personal":
+            self.client_id = self.GRAPH_CLI_CLIENT_ID
+            eff_tenant = "common"
+        else:
+            # Unified default ('common') works for both Personal Microsoft accounts and Work accounts
+            self.client_id = self.GRAPH_CLI_CLIENT_ID
+            eff_tenant = "common"
+
+        self._active_scopes = self._effective_scopes_for_client(self.client_id)
+        self._set_authority(eff_tenant)
         self.auth_file_path = auth_file_path or (Path("data") / "calendar_auth.dat")
         self._access_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
@@ -196,6 +260,24 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
             self._refresh_token = token_data.get("refresh_token")
             self._expires_at = token_data.get("expires_at")
             self._account_upn = token_data.get("account_upn")
+            cached_client_id = str(token_data.get("client_id") or "").strip()
+            has_tokens = bool(self._access_token or self._refresh_token)
+            if (
+                has_tokens
+                and cached_client_id
+                and cached_client_id != self.LEGACY_AZURE_CLI_CLIENT_ID
+                and not self._custom_client_id
+                and not self.account_hint
+            ):
+                self.client_id = cached_client_id
+            cached_tenant = str(token_data.get("tenant_id") or "").strip()
+            if has_tokens and cached_tenant and not self.account_hint and not self._explicit_tenant:
+                self._set_authority(cached_tenant)
+            cached_scopes = token_data.get("scopes")
+            if has_tokens and isinstance(cached_scopes, list) and cached_scopes and not self.account_hint:
+                self._active_scopes = [str(s) for s in cached_scopes]
+            else:
+                self._active_scopes = self._effective_scopes_for_client(self.client_id)
             self._status["account_upn"] = self._account_upn
             return True
         except Exception as exc:
@@ -210,6 +292,9 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
                 "refresh_token": self._refresh_token,
                 "expires_at": self._expires_at,
                 "account_upn": self._account_upn,
+                "client_id": self.client_id,
+                "tenant_id": self.tenant_id,
+                "scopes": list(self._active_scopes),
             }
             plaintext = json.dumps(token_data).encode("utf-8")
             ciphertext = dpapi_encrypt(plaintext)
@@ -243,7 +328,7 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
             "client_id": self.client_id,
             "grant_type": "refresh_token",
             "refresh_token": self._refresh_token,
-            "scope": " ".join(self.SCOPES),
+            "scope": " ".join(self._active_scopes),
         }).encode("utf-8")
         req = urllib.request.Request(self.token_endpoint, data=data, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -265,21 +350,37 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
             return False
 
     # -------------------------------------------------------------------------
-    # RFC 8628 DEVICE CODE FLOW (Recommended for Corporate / WFX Work Accounts)
+    # RFC 8628 DEVICE CODE FLOW (Unified Personal & Work Account Sign-In)
     # -------------------------------------------------------------------------
     def request_device_code(self) -> Dict[str, Any]:
         """
-        Request user code and device verification URL from Microsoft Entra ID.
+        Request user code and device verification URL from Microsoft Identity Platform.
         Returns dict with keys: user_code, device_code, verification_uri, interval, expires_in.
         """
+        self._active_scopes = self._effective_scopes_for_client(self.client_id)
         data = urllib.parse.urlencode({
             "client_id": self.client_id,
-            "scope": " ".join(self.SCOPES),
+            "scope": " ".join(self._active_scopes),
         }).encode("utf-8")
         req = urllib.request.Request(self.device_code_endpoint, data=data, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError:
+            if not self._custom_client_id:
+                alt_client = self.GRAPH_CLI_CLIENT_ID if self.client_id == self.OFFICE_CLIENT_ID else self.OFFICE_CLIENT_ID
+                self.client_id = alt_client
+                self._active_scopes = self._effective_scopes_for_client(self.client_id)
+                fallback_data = urllib.parse.urlencode({
+                    "client_id": self.client_id,
+                    "scope": " ".join(self._active_scopes),
+                }).encode("utf-8")
+                fallback_req = urllib.request.Request(self.device_code_endpoint, data=fallback_data, method="POST")
+                fallback_req.add_header("Content-Type", "application/x-www-form-urlencoded")
+                with urllib.request.urlopen(fallback_req, timeout=15) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            raise
 
     def poll_device_code_tokens(
         self,
@@ -288,13 +389,16 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
         timeout_sec: int = 900,
         expires_in: Optional[int] = None,
         cancel_event: Optional[threading.Event] = None,
+        on_code_received: Optional[Callable[[str, str], None]] = None,
     ) -> Tuple[bool, str]:
         """
         Poll token endpoint until user signs in with their device code.
+        Automatically diversifies to preauthorized Office client if an enterprise tenant blocks dynamic scopes (AADSTS65002).
         """
         effective_timeout = expires_in if expires_in is not None else timeout_sec
         deadline = time.monotonic() + float(effective_timeout)
         eff_interval = max(0, int(interval))
+        tried_office_fallback = False
 
         while time.monotonic() < deadline:
             if cancel_event is not None and cancel_event.is_set():
@@ -322,18 +426,38 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
                     self._save_credentials()
                     self._status["is_healthy"] = True
                     self._status["error_state"] = None
-                    return True, f"Connected as {self._account_upn or 'Microsoft 365 User'}"
+                    return True, f"Connected as {self._account_upn or 'Microsoft Account'}"
             except urllib.error.HTTPError as http_err:
                 try:
                     body = http_err.read().decode("utf-8", errors="replace")
                     err_json = json.loads(body)
                     err_code = err_json.get("error", "")
+                    err_desc = str(err_json.get("error_description") or "")
                     if err_code == "authorization_pending":
                         pass  # User has not finished yet, continue polling
                     elif err_code == "slow_down":
                         eff_interval += 5
                     elif err_code == "code_expired":
                         return False, "The device code expired. Please start sign-in again."
+                    elif (
+                        not tried_office_fallback
+                        and not self._custom_client_id
+                        and self.client_id != self.OFFICE_CLIENT_ID
+                        and ("AADSTS65002" in err_desc or "AADSTS65001" in err_desc)
+                    ):
+                        # Automatically diversify to preauthorized Office client for corporate tenant
+                        tried_office_fallback = True
+                        self.client_id = self.OFFICE_CLIENT_ID
+                        self._active_scopes = list(self.OFFICE_SCOPES)
+                        self._set_authority("organizations")
+                        new_resp = self.request_device_code()
+                        device_code = str(new_resp.get("device_code", ""))
+                        new_user_code = str(new_resp.get("user_code", ""))
+                        new_uri = str(new_resp.get("verification_uri", "https://microsoft.com/devicelogin"))
+                        copy_to_clipboard_win32(new_user_code)
+                        if callable(on_code_received):
+                            on_code_received(new_user_code, new_uri)
+                        continue
                     else:
                         desc = self._parse_aad_error(body, f"HTTP Error {http_err.code}: {http_err.reason}")
                         return False, desc
@@ -388,6 +512,7 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
                 interval=interval,
                 timeout_sec=min(timeout_sec, expires_in),
                 cancel_event=cancel_event,
+                on_code_received=on_code_received,
             )
         except Exception as exc:
             err_msg = f"Failed requesting device code from Microsoft: {exc}"
@@ -417,12 +542,14 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
             "response_type": "code",
             "redirect_uri": redirect_uri,
             "response_mode": "query",
-            "scope": " ".join(self.SCOPES),
+            "scope": " ".join(self._active_scopes),
             "state": state,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
             "prompt": "select_account",
         }
+        if self.account_hint and "@" in self.account_hint:
+            params["login_hint"] = self.account_hint
         return f"{self.auth_endpoint}?{urllib.parse.urlencode(params)}"
 
     @staticmethod
@@ -430,15 +557,21 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
         try:
             err_json = json.loads(raw_body)
             desc = str(err_json.get("error_description") or "").strip()
+            if "AADSTS65002" in desc:
+                return (
+                    "Microsoft blocked dynamic calendar consent for this client ID (AADSTS65002). "
+                    "Click 'Sign in with Microsoft Code' (which uses preauthorized Microsoft Office permissions), "
+                    "use the 'Outlook ICS / MAPI' tab (zero admin approval required), or enter your own Azure App Client ID."
+                )
             if "AADSTS50011" in desc:
                 return (
-                    "Redirect URI mismatch (AADSTS50011). Use the 'Sign In with Code' tab (recommended for WFX accounts) "
-                    "or register http://localhost:8080/callback in your Azure App Registration."
+                    "Redirect URI mismatch (AADSTS50011). Use 'Sign in with Microsoft Code' (recommended for WFX accounts) "
+                    "or register http://localhost in your Azure App Registration under Mobile & Desktop applications."
                 )
             if "AADSTS65001" in desc or "AADSTS700016" in desc:
                 return (
                     "Your organization requires admin consent for this app. "
-                    "Use the 'Sign In with Code' tab or use your company's registered Azure Client ID."
+                    "Use 'Sign in with Microsoft Code', switch to the 'Outlook ICS / MAPI' tab, or use your company's Azure Client ID."
                 )
             if desc:
                 return desc.splitlines()[0][:240]
@@ -468,15 +601,19 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
 
     def authenticate_interactive_pkce(
         self,
-        callback_port: int = 8080,
+        callback_port: int = 8400,
         timeout_sec: int = 180,
         auth_url_opener: Optional[Callable[[str], bool]] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> Tuple[bool, str]:
         """
         Execute interactive PKCE OAuth authorization with local HTTP listener.
-        Standardizes on http://localhost:8080/callback.
+        Uses Microsoft Graph CLI client (or custom client ID) with http://localhost:{port}.
         """
+        if not self._custom_client_id and self.client_id == self.OFFICE_CLIENT_ID:
+            self.client_id = self.GRAPH_CLI_CLIENT_ID
+        self._active_scopes = self._effective_scopes_for_client(self.client_id)
+
         code_verifier, code_challenge = self.generate_pkce_pair()
         expected_state = secrets.token_urlsafe(24)
         result_box: Dict[str, Any] = {"code": None, "state": None, "error": None, "done": threading.Event()}
@@ -491,9 +628,13 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
                 err_desc = params.get("error_description", ["Unknown error"])[0]
 
                 if err_list:
-                    result_box["error"] = err_desc
+                    friendly_err = MsGraphCalendarProvider._parse_aad_error(
+                        json.dumps({"error_description": err_desc}),
+                        err_desc,
+                    )
+                    result_box["error"] = friendly_err
                     title_h = "VOX Sign-In Unsuccessful"
-                    body_h = f"Microsoft returned: {err_desc}"
+                    body_h = friendly_err
                 elif not code_list or not state_list:
                     result_box["error"] = "Missing authorization code or state"
                     title_h = "VOX Sign-In Error"
@@ -530,7 +671,7 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
 
         server: Optional[HTTPServer] = None
         try:
-            # Bind to 8080 or fallback to dynamic port if 8080 is busy
+            # Bind to preferred port (8400) or fallback to dynamic port
             try:
                 server = HTTPServer(("127.0.0.1", int(callback_port)), _OAuthCallbackHandler)
             except OSError:
@@ -538,7 +679,7 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
 
             server.timeout = 0.5
             actual_port = int(server.server_address[1])
-            redirect_uri = f"http://localhost:{actual_port}/callback"
+            redirect_uri = f"http://localhost:{actual_port}"
             auth_url = self.build_authorization_url(redirect_uri, expected_state, code_challenge)
 
             def _serve_loop() -> None:
@@ -589,7 +730,7 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
             "code": code,
             "redirect_uri": redirect_uri,
             "code_verifier": code_verifier,
-            "scope": " ".join(self.SCOPES),
+            "scope": " ".join(self._active_scopes),
         }).encode("utf-8")
 
         req = urllib.request.Request(self.token_endpoint, data=token_data, method="POST")

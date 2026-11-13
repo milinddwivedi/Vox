@@ -20,13 +20,7 @@ if av_libs_dir.exists():
     for dll in av_libs_dir.glob('*.dll'):
         binaries.append((str(dll), 'av.libs'))
 
-# Add NVIDIA CUDA runtime DLLs in their respective package folders (prevents 850MB root duplication)
-nvidia_dir = ROOT_DIR / '.venv/Lib/site-packages/nvidia'
-if nvidia_dir.exists():
-    site_packages = ROOT_DIR / '.venv/Lib/site-packages'
-    for dll in nvidia_dir.glob('**/*.dll'):
-        rel_dir = str(dll.relative_to(site_packages).parent)
-        binaries.append((str(dll), rel_dir))
+# NVIDIA CUDA runtime DLLs are loaded at runtime from .venv/Lib/site-packages/nvidia to avoid 2GB duplication
 
 binaries += collect_dynamic_libs('ctranslate2')
 binaries += collect_dynamic_libs('onnxruntime')

@@ -37,7 +37,6 @@ def _setup_cuda_dll_directories() -> None:
                     os.environ["PATH"] = str(cand) + os.pathsep + os.environ.get("PATH", "")
                 except Exception:
                     pass
-        return
 
     # Check local virtual environment site-packages
     root = get_app_root()

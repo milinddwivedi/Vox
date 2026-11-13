@@ -882,7 +882,7 @@ class LocalWhisperTranscriber:
     def __init__(
         self,
         models_dir: Optional[str | Path] = None,
-        model_name: str = "base",
+        model_name: str = "large-v3-turbo",
         compute_device: str = "auto",
         compute_type: str = "int8",
         cpu_threads: int = 8,
@@ -937,6 +937,12 @@ class LocalWhisperTranscriber:
         setup_nvidia_dll_paths()
         with self._lock:
             target_model = model_name or self.model_name
+            if not self.is_model_cached(target_model) and self.is_model_cached("large-v3-turbo"):
+                logger.info(
+                    "Model '%s' not cached locally; automatically using cached 'large-v3-turbo' model.",
+                    target_model,
+                )
+                target_model = "large-v3-turbo"
             if self._model is not None and self._loaded_model_name == target_model:
                 return True, f"Model '{target_model}' ready on {self._active_device.upper()}."
 

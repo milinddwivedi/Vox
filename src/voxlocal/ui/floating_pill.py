@@ -1054,12 +1054,19 @@ class VoxFlowBar(QWidget):
         if norm_state != PillState.CARD_NOTIFICATION:
             self._expanded_from_mini = False
 
-        if norm_state in (PillState.RESTING, PillState.IDLE):
+        if norm_state == PillState.RESTING:
             self._meeting_active = False
             self._auto_start_timer.stop()
             self._countdown_timer.stop()
             self.auto_start_progress = 0.0
             self.target_size = QSize(30, 6)
+            self.pill_stack.setCurrentIndex(0)
+        elif norm_state == PillState.IDLE:
+            self._meeting_active = False
+            self._auto_start_timer.stop()
+            self._countdown_timer.stop()
+            self.auto_start_progress = 0.0
+            self.target_size = QSize(54, 30)
             self.pill_stack.setCurrentIndex(0)
         elif norm_state == PillState.MINI_MEETING:
             self._auto_start_timer.stop()
@@ -1524,8 +1531,8 @@ class VoxFlowBar(QWidget):
     def _sync_pill_visuals(self) -> None:
         effective = self.pill_state
 
-        if effective in (PillState.IDLE, PillState.RESTING):
-            # 30x6 / 40x8 subtle translucent resting pill
+        if effective == PillState.RESTING:
+            # Subtle collapsed resting bar at screen edge
             self.upper_pill.setStyleSheet(
                 "QFrame#flowBarPill { background-color: rgba(0, 0, 0, 0.52); "
                 "border: 1px solid rgba(255, 255, 255, 0.50); border-radius: 3px; }"
@@ -1539,9 +1546,9 @@ class VoxFlowBar(QWidget):
             self.lbl_state_text.hide()
             self.btn_scratchpad.hide()
             self.waveform_capsule.hide()
-        elif effective == PillState.READY:
+        elif effective in (PillState.IDLE, PillState.READY):
             self.upper_pill.setStyleSheet(
-                "QFrame#flowBarPill { background-color: #000000; border: 1px solid #30302F; border-radius: 15px; }"
+                "QFrame#flowBarPill { background-color: rgba(18, 18, 20, 0.94); border: 1px solid rgba(255, 255, 255, 0.20); border-radius: 15px; }"
             )
             self.pill_stack.setCurrentIndex(0)
             self.btn_cancel.hide()
@@ -1556,6 +1563,10 @@ class VoxFlowBar(QWidget):
             show_sp = True
             if self.controller and getattr(self.controller, "config", None):
                 show_sp = bool(getattr(self.controller.config, "scratchpad_in_flow_bar", True))
+            if show_sp and effective == PillState.READY:
+                self.btn_scratchpad.show()
+            else:
+                self.btn_scratchpad.hide()
             if show_sp:
                 self.btn_scratchpad.show()
         elif effective == PillState.LISTENING:
@@ -1659,10 +1670,10 @@ class VoxFlowBar(QWidget):
     def _sync_geometry(self) -> None:
         effective = self.pill_state
         side_edge = self._dock_edge in ("left", "right")
-        if effective in (PillState.IDLE, PillState.RESTING):
+        if effective == PillState.RESTING:
             pw, ph = (6, 30) if side_edge else (30, 6)
-        elif effective == PillState.READY:
-            pw, ph = (50, 30)
+        elif effective in (PillState.IDLE, PillState.READY):
+            pw, ph = (54, 30)
         elif effective == PillState.LISTENING:
             pw, ph = (74, 30) if self._is_ptt_session else (104, 30)
         elif effective == PillState.PROCESSING:

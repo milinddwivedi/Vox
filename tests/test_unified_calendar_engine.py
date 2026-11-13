@@ -251,6 +251,63 @@ def test_microsoft_graph_device_code_flow(tmp_path):
         assert provider.get_provider_status()["account_upn"] == "milind@wfx.com"
 
 
+def test_microsoft_graph_office_preauthorized_scopes_and_aadsts65002_handling(tmp_path):
+    import urllib.parse
+
+    # 1. Default / Personal account uses unified /common endpoint and GRAPH_CLI_CLIENT_ID
+    personal_provider = MsGraphCalendarProvider(
+        client_id="04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+        account_hint="user@outlook.com",
+        auth_file_path=tmp_path / "ms_auth_personal.dat",
+    )
+    assert personal_provider.client_id == MsGraphCalendarProvider.GRAPH_CLI_CLIENT_ID
+    assert personal_provider.tenant_id == "common"
+
+    # 2. Work account hint or organizational tenant automatically diversifies to OFFICE_CLIENT_ID
+    auth_file = tmp_path / "ms_auth_office.dat"
+    provider = MsGraphCalendarProvider(
+        account_hint="milind@wfx.com",
+        auth_file_path=auth_file,
+    )
+    assert provider.client_id == MsGraphCalendarProvider.OFFICE_CLIENT_ID
+    assert provider.tenant_id == "organizations"
+
+    captured_payloads = []
+
+    def mock_urlopen(req, timeout=15):
+        if req.data:
+            captured_payloads.append(urllib.parse.parse_qs(req.data.decode("utf-8")))
+        body = {
+            "device_code": "dev_123",
+            "user_code": "CODE-9999",
+            "verification_uri": "https://microsoft.com/devicelogin",
+            "expires_in": 900,
+            "interval": 5,
+        }
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(body).encode("utf-8")
+        resp.__enter__.return_value = resp
+        return resp
+
+    with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        personal_provider.request_device_code()
+        provider.request_device_code()
+        assert len(captured_payloads) == 2
+        assert captured_payloads[0]["client_id"] == [MsGraphCalendarProvider.GRAPH_CLI_CLIENT_ID]
+        assert captured_payloads[0]["scope"] == ["Calendars.Read User.Read offline_access"]
+        assert captured_payloads[1]["client_id"] == [MsGraphCalendarProvider.OFFICE_CLIENT_ID]
+        assert captured_payloads[1]["scope"] == ["https://graph.microsoft.com/.default offline_access"]
+
+    # Verify _parse_aad_error translates AADSTS65002 into a clear actionable guide
+    err_body = json.dumps({
+        "error": "invalid_request",
+        "error_description": "AADSTS65002: Consent between first party application '04b07795-8ddb-461a-bbee-02f9e1bf7b46' and first party resource '00000003-0000-0000-c000-000000000000' must be configured via preauthorization",
+    })
+    parsed_msg = MsGraphCalendarProvider._parse_aad_error(err_body, "Fallback")
+    assert "Sign in with Microsoft Code" in parsed_msg
+    assert "Outlook ICS / MAPI" in parsed_msg
+
+
 # ----------------------------------------------------------------------
 # Test 5: Google Calendar API Link Extraction & Single Events
 # ----------------------------------------------------------------------

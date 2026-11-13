@@ -941,13 +941,19 @@ class AppController(QObject):
         tenant_id: Optional[str] = None,
         use_device_code: bool = True,
         cancel_event: Optional[threading.Event] = None,
+        account_hint: Optional[str] = None,
     ) -> None:
         """
-        Connect Microsoft Outlook / Microsoft 365 calendar.
-        Default to RFC 8628 Device Code Flow (supported by all Entra ID tenants including WFX corporate accounts without redirect URI restrictions).
+        Connect Microsoft Outlook calendar (supports both Personal and Work accounts through one unified passage).
         """
+        hint_str = str(account_hint or "").strip()
+        if hint_str.lower().startswith(("http://", "https://", "webcal://")) or hint_str.lower().endswith(".ics"):
+            self.connect_ics_calendar(hint_str, on_complete=on_complete)
+            return
+
         eff_client_id = (client_id if client_id is not None else getattr(self.config, "calendar_client_id", "")) or None
-        eff_tenant_id = (tenant_id if tenant_id is not None else getattr(self.config, "calendar_tenant_id", "common")) or "common"
+        raw_tenant = tenant_id if tenant_id is not None else getattr(self.config, "calendar_tenant_id", "common")
+        eff_tenant_id = str(raw_tenant or "common").strip() or "common"
         if eff_client_id != (getattr(self.config, "calendar_client_id", "") or None) or eff_tenant_id != getattr(self.config, "calendar_tenant_id", "common"):
             self.config.calendar_client_id = eff_client_id or ""
             self.config.calendar_tenant_id = eff_tenant_id
@@ -955,7 +961,8 @@ class AppController(QObject):
 
         def _worker() -> None:
             ok = False
-            msg = "Could not connect Microsoft 365 Calendar."
+            msg = "Could not connect Microsoft Outlook Calendar."
+            auth_msg = ""
             try:
                 from voxlocal.calendar.graph_provider import MsGraphCalendarProvider
                 from voxlocal.calendar.base import CalendarProviderType
@@ -964,6 +971,7 @@ class AppController(QObject):
                     client_id=eff_client_id,
                     tenant_id=eff_tenant_id,
                     auth_file_path=auth_path,
+                    account_hint=hint_str or None,
                 )
                 if use_device_code:
                     code_info = ms_prov.request_device_code()
@@ -979,18 +987,27 @@ class AppController(QObject):
                     if callable(on_device_code):
                         on_device_code(user_code, verification_uri)
                     
-                    ok = bool(ms_prov.poll_device_code_tokens(
+                    res = ms_prov.poll_device_code_tokens(
                         device_code=code_info["device_code"],
                         interval=code_info.get("interval", 5),
                         expires_in=code_info.get("expires_in", 900),
                         cancel_event=cancel_event,
-                    ))
+                        on_code_received=on_device_code,
+                    )
+                    if isinstance(res, tuple):
+                        ok, auth_msg = bool(res[0]), str(res[1])
+                    else:
+                        ok = bool(res)
                 else:
-                    ok = bool(ms_prov.authenticate(interactive=True, cancel_event=cancel_event))
+                    res = ms_prov.authenticate_interactive_pkce(cancel_event=cancel_event)
+                    if isinstance(res, tuple):
+                        ok, auth_msg = bool(res[0]), str(res[1])
+                    else:
+                        ok = bool(res)
 
                 status = ms_prov.get_provider_status()
                 if ok:
-                    upn = str(status.get("account_upn") or "Microsoft 365")
+                    upn = str(status.get("account_upn") or hint_str or "Microsoft Outlook")
                     self.config.calendar_provider = "graph"
                     self.config.ms_graph_enabled = True
                     self.config.calendar_account_email = upn
@@ -1001,7 +1018,8 @@ class AppController(QObject):
                     msg = f"Connected as {upn}"
                 else:
                     msg = str(
-                        status.get("error_detail")
+                        auth_msg
+                        or status.get("error_detail")
                         or status.get("error_state")
                         or "Authentication cancelled or failed."
                     )
@@ -1019,7 +1037,12 @@ class AppController(QObject):
         on_complete: Optional[Callable[[bool, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> None:
-        """Connect Google Calendar via OAuth 2.0 PKCE / loopback."""
+        """Connect Google Calendar via OAuth 2.0 PKCE or iCal (.ics) feed."""
+        cid_str = str(client_id or "").strip()
+        if cid_str.lower().startswith(("http://", "https://", "webcal://")) or cid_str.lower().endswith(".ics"):
+            self.connect_ics_calendar(cid_str, on_complete=on_complete)
+            return
+
         if client_id is not None:
             self.config.google_calendar_client_id = client_id
         if client_secret is not None:
@@ -2928,9 +2951,51 @@ class AppController(QObject):
                 if m_title and is_likely_person_name(m_title):
                     remote_name = m_title
 
+                # Extract calendar attendees and organizer for Whisper priming & 1-on-1 speaker naming
+                cal_names: List[str] = []
+                raw_org = str(meeting_rec.get("calendar_organizer") or "").strip()
+                if raw_org and raw_org not in cal_names:
+                    cal_names.append(raw_org)
+                raw_atts = meeting_rec.get("calendar_attendees") or ""
+                if isinstance(raw_atts, str) and raw_atts.strip():
+                    try:
+                        parsed_atts = json.loads(raw_atts) if raw_atts.strip().startswith("[") else [a.strip() for a in raw_atts.split(",")]
+                        for att in parsed_atts:
+                            att_s = str(att or "").strip()
+                            if att_s and att_s not in cal_names:
+                                cal_names.append(att_s)
+                    except Exception:
+                        pass
+                elif isinstance(raw_atts, list):
+                    for att in raw_atts:
+                        att_s = str(att or "").strip()
+                        if att_s and att_s not in cal_names:
+                            cal_names.append(att_s)
+
+                self_email = str(getattr(self.config, "calendar_account_email", "") or "").strip().lower()
+                remote_candidates = [
+                    n for n in cal_names
+                    if n and (not self_email or self_email not in n.lower())
+                ]
+                if remote_name == "Speaker 1" and len(remote_candidates) == 1:
+                    cand_name = remote_candidates[0].split("<")[0].strip()
+                    if "@" in cand_name:
+                        cand_name = cand_name.split("@", 1)[0].replace(".", " ").replace("_", " ").title()
+                    if cand_name:
+                        remote_name = cand_name
+
                 vocab = self.db.list_vocabulary(active_only=True)
                 vocab_prompt = DictationProcessor.build_whisper_prompt(vocab)
-                eff_prompt = f"{remote_name} meeting discussion. {vocab_prompt}".strip() if remote_name != "Speaker 1" else vocab_prompt
+                prompt_parts: List[str] = []
+                if remote_name != "Speaker 1":
+                    prompt_parts.append(f"{remote_name} meeting discussion.")
+                if cal_names:
+                    clean_cal_names = [n.split("<")[0].strip() for n in cal_names[:8] if n.strip()]
+                    if clean_cal_names:
+                        prompt_parts.append("Participants: " + ", ".join(clean_cal_names) + ".")
+                if vocab_prompt:
+                    prompt_parts.append(vocab_prompt)
+                eff_prompt = " ".join(prompt_parts).strip()
 
                 self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing speech with local Whisper...")
                 segments = self.transcriber.transcribe_meeting_dual_track(
@@ -3005,6 +3070,20 @@ class AppController(QObject):
                             cleaned_segments.append(seg)
                     self.db.replace_meeting_segments(meeting_id, cleaned_segments)
                     segments = cleaned_segments
+
+                # Cleanup redundant Stage-A *_raw.wav backups now that Stage 3 reconciliation finished
+                for raw_attr in ("mixed_wav_path", "mic_wav_path", "sys_wav_path"):
+                    cand_p = _safe_str_field(getattr(result, raw_attr, ""))
+                    if cand_p:
+                        rec_folder = Path(cand_p).parent
+                        for raw_name in ("mic_track_raw.wav", "system_track_raw.wav"):
+                            raw_file = rec_folder / raw_name
+                            if raw_file.is_file():
+                                try:
+                                    raw_file.unlink()
+                                except Exception:
+                                    pass
+                        break
 
                 # Cooperative cancellation check between Stage 3 and Stage 4
                 if self._cancel_finalization_event.is_set():

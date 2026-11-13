@@ -26,7 +26,7 @@ class AppConfig:
     retention_days: int = 0          # 0 = keep forever
 
     # Speech engine
-    whisper_model: str = "small"  # small (Recommended Fast) | base.en | large-v3-turbo | large-v3 | whisper-hindi | small.en
+    whisper_model: str = "large-v3-turbo"  # large-v3-turbo (Best Accuracy & Speed) | large-v3 | small | base
     compute_device: str = "auto"     # auto | cpu | cuda
     cpu_threads: int = 8
     language: str = "en+hi"          # en+hi (Auto Switch) | hi | hi_latn | en | auto

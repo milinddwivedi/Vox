@@ -91,10 +91,10 @@ class VoxCalendarConnectDialog(QDialog):
         nav_row.setSpacing(8)
         self._tab_buttons: list[QPushButton] = []
         tabs = [
-            ("Microsoft Outlook", "Connect WFX work or Microsoft 365 account"),
-            ("Google Calendar", "Connect Google account and Google Meet"),
+            ("Microsoft Outlook", "Connect Microsoft Outlook calendar"),
+            ("Google Calendar", "Connect Google Calendar and Google Meet"),
             ("Zoom Meetings", "Connect Zoom account for upcoming & scheduled calls"),
-            ("Outlook ICS / MAPI", "Published calendar feed or desktop Outlook"),
+            ("Calendar Feed (.ics)", "Published calendar feed or desktop Outlook"),
         ]
         for idx, (label, tooltip) in enumerate(tabs):
             btn = QPushButton(label)
@@ -111,7 +111,7 @@ class VoxCalendarConnectDialog(QDialog):
         root.addWidget(self.stack, 1)
 
         # -------------------------------------------------------------
-        # Tab 0: Microsoft Outlook / Microsoft 365
+        # Tab 0: Microsoft Outlook
         # -------------------------------------------------------------
         tab_ms = QFrame()
         tab_ms.setObjectName("voxCard")
@@ -119,16 +119,20 @@ class VoxCalendarConnectDialog(QDialog):
         ms_lay.setContentsMargins(18, 16, 18, 16)
         ms_lay.setSpacing(12)
 
-        lbl_ms_hdr = QLabel("Microsoft Outlook / Microsoft 365 (Recommended: Device Code Flow)")
+        lbl_ms_hdr = QLabel("Microsoft Outlook Calendar")
         lbl_ms_hdr.setStyleSheet("font-size: 13px; font-weight: 600;")
         ms_lay.addWidget(lbl_ms_hdr)
 
         lbl_ms_info = QLabel(
-            "Connect your corporate WFX work account or personal Microsoft account. "
-            "Device Code Flow works across all corporate Entra ID tenants without redirect URI restrictions."
+            "Connect your Microsoft Outlook calendar to synchronize upcoming meetings, "
+            "recurring events, and Teams, Zoom, or Google Meet links."
         )
         lbl_ms_info.setWordWrap(True)
         ms_lay.addWidget(lbl_ms_info)
+
+        self.txt_ms_account_hint = QLineEdit(str(getattr(self.controller.config, "calendar_account_email", "") or ""))
+        self.txt_ms_account_hint.setPlaceholderText("Account email or calendar .ics link (optional)")
+        ms_lay.addWidget(self.txt_ms_account_hint)
 
         # Device code card (hidden until requested)
         self.code_card = QFrame()
@@ -163,11 +167,18 @@ class VoxCalendarConnectDialog(QDialog):
 
         # Action row
         ms_act = QHBoxLayout()
-        self.btn_ms_start = QPushButton("Sign in with Microsoft Code")
+        self.btn_ms_start = QPushButton("Connect Microsoft Outlook")
         self.btn_ms_start.setObjectName("fathomBtn")
         self.btn_ms_start.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_ms_start.clicked.connect(self._start_ms_device_code)
         ms_act.addWidget(self.btn_ms_start)
+
+        self.btn_ms_pkce = QPushButton("Sign in via Browser (PKCE)")
+        self.btn_ms_pkce.setObjectName("secondaryBtn")
+        self.btn_ms_pkce.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ms_pkce.setVisible(False)
+        self.btn_ms_pkce.clicked.connect(self._start_ms_browser_pkce)
+        ms_act.addWidget(self.btn_ms_pkce)
 
         self.btn_ms_cancel = QPushButton("Cancel")
         self.btn_ms_cancel.setObjectName("ghostBtn")
@@ -178,15 +189,17 @@ class VoxCalendarConnectDialog(QDialog):
         ms_act.addStretch(1)
         ms_lay.addLayout(ms_act)
 
-        # Advanced Entra ID configuration (optional)
-        lbl_ms_adv = QLabel("Optional: Custom Azure App Registration (for organization-managed client apps)")
+        # Advanced OAuth configuration (optional)
+        lbl_ms_adv = QLabel("Optional: Custom App Registration Credentials")
         lbl_ms_adv.setStyleSheet("font-size: 11px; font-weight: 500; margin-top: 8px;")
         ms_lay.addWidget(lbl_ms_adv)
 
         adv_row = QHBoxLayout()
         adv_row.setSpacing(8)
         self.txt_ms_client_id = QLineEdit(str(getattr(self.controller.config, "calendar_client_id", "") or ""))
-        self.txt_ms_client_id.setPlaceholderText("Azure Client ID (leave blank for default)")
+        self.txt_ms_client_id.setPlaceholderText("Custom Client ID (leave blank for default)")
+        self.txt_ms_client_id.textChanged.connect(lambda t: self.btn_ms_pkce.setVisible(bool(t.strip())))
+        self.btn_ms_pkce.setVisible(bool(self.txt_ms_client_id.text().strip()))
         self.txt_ms_tenant_id = QLineEdit(str(getattr(self.controller.config, "calendar_tenant_id", "common") or "common"))
         self.txt_ms_tenant_id.setFixedWidth(140)
         self.txt_ms_tenant_id.setPlaceholderText("Tenant ID (common)")
@@ -211,19 +224,19 @@ class VoxCalendarConnectDialog(QDialog):
         g_lay.addWidget(lbl_g_hdr)
 
         lbl_g_info = QLabel(
-            "Connect Google Calendar using OAuth 2.0 PKCE. VOX synchronizes upcoming calendar events, "
-            "identifies Google Meet video links, and extracts Teams and Zoom meeting URLs."
+            "Connect Google Calendar using OAuth 2.0 PKCE or an iCal (.ics) address. VOX synchronizes "
+            "upcoming calendar events, identifies Google Meet video links, and extracts Teams and Zoom URLs."
         )
         lbl_g_info.setWordWrap(True)
         g_lay.addWidget(lbl_g_info)
 
-        g_creds_lbl = QLabel("Google OAuth Credentials (Optional if pre-configured):")
+        g_creds_lbl = QLabel("Google OAuth Client ID or iCal (.ics) Address:")
         g_creds_lbl.setStyleSheet("font-size: 11px; font-weight: 500;")
         g_lay.addWidget(g_creds_lbl)
 
         g_row1 = QHBoxLayout()
         self.txt_google_client_id = QLineEdit(str(getattr(self.controller.config, "google_calendar_client_id", "") or ""))
-        self.txt_google_client_id.setPlaceholderText("Google OAuth Client ID")
+        self.txt_google_client_id.setPlaceholderText("Google OAuth Client ID or https://calendar.google.com/.../basic.ics")
         g_row1.addWidget(self.txt_google_client_id)
         g_lay.addLayout(g_row1)
 
@@ -310,7 +323,7 @@ class VoxCalendarConnectDialog(QDialog):
         self.stack.addWidget(tab_zoom)
 
         # -------------------------------------------------------------
-        # Tab 3: Outlook ICS / Desktop MAPI
+        # Tab 3: Calendar Feed (.ics) / Desktop MAPI
         # -------------------------------------------------------------
         tab_ics = QFrame()
         tab_ics.setObjectName("voxCard")
@@ -319,9 +332,8 @@ class VoxCalendarConnectDialog(QDialog):
         i_lay.setSpacing(10)
 
         lbl_i_steps = QLabel(
-            "Zero-admin Outlook ICS feed:\n"
-            "1. Open Outlook (Web or New Outlook) -> Settings -> Calendar -> Shared calendars\n"
-            "2. Publish a calendar -> Can view all details -> Publish -> Copy ICS link"
+            "Connect any published iCalendar (.ics) URL or local .ics file from Outlook, Google Calendar, "
+            "or Apple Calendar, or synchronize directly with local Classic Outlook Desktop (MAPI)."
         )
         lbl_i_steps.setWordWrap(True)
         i_lay.addWidget(lbl_i_steps)
@@ -339,7 +351,7 @@ class VoxCalendarConnectDialog(QDialog):
         i_lay.addLayout(ics_row)
 
         ics_act = QHBoxLayout()
-        self.btn_ics_connect = QPushButton("Connect Outlook ICS Link")
+        self.btn_ics_connect = QPushButton("Connect Calendar Feed (.ics)")
         self.btn_ics_connect.setObjectName("fathomBtn")
         self.btn_ics_connect.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_ics_connect.clicked.connect(self._start_ics)
@@ -394,6 +406,7 @@ class VoxCalendarConnectDialog(QDialog):
         self._busy = busy
         for btn in (
             self.btn_ms_start,
+            self.btn_ms_pkce,
             self.btn_google_start,
             self.btn_zoom_start,
             self.btn_ics_connect,
@@ -432,13 +445,34 @@ class VoxCalendarConnectDialog(QDialog):
         self._set_busy(True, "Requesting Microsoft sign-in code...")
         client_id = self.txt_ms_client_id.text().strip() or None
         tenant_id = self.txt_ms_tenant_id.text().strip() or "common"
+        account_hint = self.txt_ms_account_hint.text().strip() or None
 
         self.controller.connect_microsoft_calendar(
             on_complete=lambda ok, msg: self._async_result.emit(bool(ok), str(msg)),
             on_device_code=lambda code, uri: self._device_code_received.emit(code, uri),
             client_id=client_id,
             tenant_id=tenant_id,
+            account_hint=account_hint,
             use_device_code=True,
+            cancel_event=self._cancel_event,
+        )
+
+    def _start_ms_browser_pkce(self) -> None:
+        if not hasattr(self.controller, "connect_microsoft_calendar"):
+            self._show_status("Calendar controller unavailable.", kind="err")
+            return
+        self._cancel_event = threading.Event()
+        self._set_busy(True, "Opening Microsoft sign-in in browser...")
+        client_id = self.txt_ms_client_id.text().strip() or None
+        tenant_id = self.txt_ms_tenant_id.text().strip() or "common"
+        account_hint = self.txt_ms_account_hint.text().strip() or None
+
+        self.controller.connect_microsoft_calendar(
+            on_complete=lambda ok, msg: self._async_result.emit(bool(ok), str(msg)),
+            client_id=client_id,
+            tenant_id=tenant_id,
+            account_hint=account_hint,
+            use_device_code=False,
             cancel_event=self._cancel_event,
         )
 
