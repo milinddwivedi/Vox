@@ -14,7 +14,7 @@ scripts
 *.mp4
 *.zip
 *.exe
-!docs/downloads/*.exe
+docs/downloads/
 *.wav
 *.bin
 *.pt

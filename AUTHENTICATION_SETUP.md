@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-VOX authentication supports both **personal Google accounts** and **work / workspace accounts** through a single unified authentication passage. Users can authenticate seamlessly on the web landing page or inside the installed Windows desktop client.
+VOX authentication supports both **personal Google accounts** and **work / Google Workspace accounts** through a unified authentication passage. Users authenticate seamlessly on the web landing page or inside the installed Windows desktop client.
 
 Desktop login implements standard **RFC 7636 Proof Key for Code Exchange (PKCE)** with an ephemeral loopback HTTP receiver (`127.0.0.1:8400-8403`), eliminating embedded webviews, keeping credentials secure in the system's default browser, and storing tokens inside Windows DPAPI-protected vaults.
 
@@ -21,62 +21,80 @@ Desktop login implements standard **RFC 7636 Proof Key for Code Exchange (PKCE)*
        │
        │ 4. Opens https://vox-voice-assistant.vercel.app/api/auth/desktop-login
        │ 5. User signs in with Google Account (Personal or Work)
-       │ 6. Google redirects with auth code & state
+       │ 6. Google redirects to Supabase OAuth Callback
        ▼
-[Loopback Receiver: http://127.0.0.1:8400/auth/callback]
+[Supabase GoTrue & Callback Relay: https://vox-voice-assistant.vercel.app/api/auth/desktop-callback]
        │
-       │ 7. Verifies state parameter matches session
-       │ 8. Exchanges code + code_verifier for session tokens
-       │ 9. Returns clean "Authentication Successful" HTML landing page
+       │ 7. Relays authorization code to local loopback server
+       ▼
+[Loopback Receiver: http://127.0.0.1:8400/callback]
+       │
+       │ 8. Verifies state parameter matches session
+       │ 9. Exchanges code + code_verifier for session tokens
+       │ 10. Returns clean "Authentication Successful" HTML landing page
        ▼
 [Desktop Application Session Vault]
        │
-       │ 10. Encrypts tokens with Win32 DPAPI (CryptProtectData)
-       │ 11. Stores encrypted session at data/auth_session.vault
-       │ 12. Emits auth_state_changed signal and updates UI
+       │ 11. Encrypts tokens with Win32 DPAPI (CryptProtectData)
+       │ 12. Stores encrypted session at %APPDATA%/VoxLocal/data/auth_session.vault
+       │ 13. Emits auth_state_changed signal and updates UI
 ```
 
 ---
 
-## 3. Configuration Steps
+## 3. Production Configuration
 
-### 3.1 Supabase Configuration
-1. Open your **Supabase Dashboard** (`https://supabase.com/dashboard/project/<PROJECT_REF>`).
-2. Navigate to **Authentication &gt; Providers &gt; Google**.
-3. Toggle Google to **Enabled**.
-4. Enter your **Google Client ID** and **Google Client Secret** from Google Cloud Console.
-5. In **Authentication &gt; URL Configuration**:
-   - **Site URL:** `https://vox-voice-assistant.vercel.app`
-   - **Redirect URLs:** Add:
-     - `https://vox-voice-assistant.vercel.app/account.html`
-     - `https://vox-voice-assistant.vercel.app/api/auth/desktop-login`
-     - `http://127.0.0.1:8400/auth/callback`
-     - `http://127.0.0.1:8401/auth/callback`
-     - `http://127.0.0.1:8402/auth/callback`
-     - `http://127.0.0.1:8403/auth/callback`
+### 3.1 Google Cloud Platform (Canonical Project: `vox-local-514822`)
+- **Project Name:** Vox Local
+- **Project ID:** `vox-local-514822`
+- **OAuth 2.0 Web Application Client:**
+  - **Client ID:** `541845334167-k9sa1dem22flsddu5721tsr173snbppo.apps.googleusercontent.com`
+  - **Authorized JavaScript Origins:**
+    - `https://vox-voice-assistant.vercel.app`
+    - `https://qiigoipgoedexmdowtvj.supabase.co`
+  - **Authorized Redirect URIs:**
+    - `https://qiigoipgoedexmdowtvj.supabase.co/auth/v1/callback`
+    - `https://vox-voice-assistant.vercel.app/account.html`
+    - `https://vox-voice-assistant.vercel.app/download`
+    - `https://vox-voice-assistant.vercel.app/api/auth/desktop-callback`
+  - **Scopes:** `openid`, `email`, `profile`
 
-### 3.2 Google Cloud Console Configuration
-1. Open **Google Cloud Console** (`https://console.cloud.google.com/apis/credentials`).
-2. Under **OAuth 2.0 Client IDs**, select or create your OAuth Client.
-3. Under **Authorized JavaScript Origins**, add:
-   - `https://vox-voice-assistant.vercel.app`
-4. Under **Authorized Redirect URIs**, add your Supabase callback URL:
-   - `https://<PROJECT_REF>.supabase.co/auth/v1/callback`
+### 3.2 Supabase Production Project (`qiigoipgoedexmdowtvj`)
+- **Project Name:** Vox
+- **Region:** `ap-southeast-1`
+- **URL:** `https://qiigoipgoedexmdowtvj.supabase.co`
+- **Google Provider:** Configured and active with Web Client ID `541845334167-k9sa1dem22flsddu5721tsr173snbppo.apps.googleusercontent.com`
+- **Site URL:** `https://vox-voice-assistant.vercel.app`
+- **Redirect Allowlist:**
+  - `https://vox-voice-assistant.vercel.app/**`
+  - `https://vox-voice-assistant.vercel.app/account.html`
+  - `https://vox-voice-assistant.vercel.app/download`
+  - `https://vox-voice-assistant.vercel.app/api/auth/desktop-callback`
+  - `http://127.0.0.1:8400/callback`
 
-### 3.3 Environment Variables
-Configure the following in your Vercel Project Settings (`vercel env add`):
-```bash
-SUPABASE_URL=https://<PROJECT_REF>.supabase.co
-SUPABASE_ANON_KEY=eyJ...
-SUPABASE_SERVICE_ROLE_KEY=eyJ...
-VOX_ENTITLEMENT_SECRET=vox_production_entitlement_hmac_secret_2026
-```
+### 3.3 Private Storage & Authenticated Download Architecture
+- **Supabase Storage Bucket:** `vox-releases` (`public: false`)
+- **Release Object:** `releases/1.0.0/VoxLocal-Setup.exe` (10,067,409 bytes, SHA-256 `300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7`)
+- **Authorization Endpoint:** `POST /api/download/authorize` (requires Supabase Bearer token, generates 120-second time-limited signed download URL)
+- **Web Download Portal:** `https://vox-voice-assistant.vercel.app/download` (enforces Google login before download button is enabled)
+- **Static Exposure:** Direct static URLs (`/downloads/VoxLocal-Setup.exe`) return HTTP 404.
+
+### 3.4 Razorpay Subscription Infrastructure
+- **Monthly Plan:** `plan_U0JlftJ0ZkwAbY` (₹199 / month)
+  - Hosted Subscription Link: `https://rzp.io/rzp/ugv7JBF2`
+- **Annual Plan:** `plan_U0JmYZAfwuRIyg` (₹1,599 / year)
+  - Hosted Subscription Link: `https://rzp.io/rzp/fycKln1w`
+- **Webhook Endpoint:** `https://vox-voice-assistant.vercel.app/api/webhooks/razorpay` (HMAC-SHA256 signature verified against `RAZORPAY_WEBHOOK_SECRET`)
 
 ---
 
-## 4. Local Session Vault Security
+## 4. Verification Checkpoint
 
-Tokens on Windows are encrypted using `CryptProtectData`:
-- Keys are tied to the active Windows user account login credentials.
-- Other user accounts on the machine cannot decrypt the vault.
-- Logging out clears the vault file (`data/auth_session.vault`) and safely reverts the desktop application to the Free tier without touching local recordings.
+All production endpoints and security controls are validated via `scripts/verify_live_production.py`:
+- [x] Check 1: Ed25519 asymmetric entitlement verification (`/api/entitlements`)
+- [x] Check 2: Account UI clean of test metrics (`/account.html`)
+- [x] Check 3: Ed25519 signed release manifest (`/api/releases/latest`)
+- [x] Check 4: Unauthenticated direct binary download blocked with HTTP 404
+- [x] Check 5: Download authorization endpoint rejects unauthenticated requests with HTTP 401
+- [x] Check 6: Download portal page live at `/download` with authentication gate
+- [x] Check 7: Supabase Google OAuth endpoint redirects to `accounts.google.com` with production client ID

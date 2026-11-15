@@ -282,6 +282,7 @@ async function handler(req, res) {
     const notes = subEntity.notes || paymentEntity.notes || orderEntity.notes || refundEntity.notes || {};
     const isAnnual = notes.plan_type === 'pro_annual' ||
                      notes.interval === 'annual' ||
+                     subEntity.plan_id === 'plan_U0JmYZAfwuRIyg' ||
                      subEntity.plan_id === 'plan_U0JmYZAfwuRlyg';
     const interval = isAnnual ? 'annual' : 'monthly';
 

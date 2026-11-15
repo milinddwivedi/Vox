@@ -55,8 +55,15 @@ All critical engineering, security, commercial metering, desktop UI, web dashboa
   - `tests/test_live_supabase_journey.py` (5)
 - **Node.js Verification Suites:**
   - `tests/test_milestone3_frontend_and_loopback.js`: **5/5 checks passed**
-  - `tests/test_milestone4_api_contracts.js`: **25/25 tests passed**
-- **Live HTTPS Production Audit (`scripts/verify_live_production.py`):** **5/5 checks passed** against `https://vox-voice-assistant.vercel.app` and `https://qiigoipgoedexmdowtvj.supabase.co` after the final deployment.
+  - `tests/test_milestone4_api_contracts.js`: **29/29 tests passed** (including authorized download contracts)
+- **Live HTTPS Production Audit (`scripts/verify_live_production.py`):** **7/7 checks passed (100%)** against `https://vox-voice-assistant.vercel.app` and `https://qiigoipgoedexmdowtvj.supabase.co`:
+  1. `/api/entitlements`: HTTP 200, Ed25519 asymmetric verification valid.
+  2. `/account.html`: HTTP 200, clean of mock metrics and client overrides.
+  3. `/api/releases/latest`: HTTP 200, Ed25519 signed manifest valid.
+  4. `/downloads/VoxLocal-Setup.exe`: HTTP 404 (Public static download bypass permanently blocked).
+  5. `POST & OPTIONS /api/download/authorize`: OPTIONS 200 (CORS valid), Unauthenticated POST 401 Unauthorized with proper gating error.
+  6. `/download`: HTTP 200, Dedicated download portal live with Google OAuth gating.
+  7. Supabase Google OAuth endpoint: HTTP 302 Found redirecting to `accounts.google.com` with client ID `541845334167-k9sa1dem22flsddu5721tsr173snbppo.apps.googleusercontent.com`.
 
 ---
 

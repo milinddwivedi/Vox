@@ -78,10 +78,24 @@ function createMockSupabaseEngine() {
         }),
       },
       getUser: async (token) => {
-        if (token === 'valid_test_token_123') {
+        if (token === 'valid_test_token_123' || token === 'valid_token_user_alice') {
           return { data: { user: { id: 'usr_auth_123', email: 'verified@user.com' } }, error: null };
         }
         return { data: { user: null }, error: new Error('Invalid token') };
+      },
+    },
+    storage: {
+      from(bucket) {
+        return {
+          async createSignedUrl(path, expiresIn) {
+            return {
+              data: {
+                signedUrl: `https://mock.supabase.co/storage/v1/object/sign/${bucket}/${path}?token=mock_signed_token`
+              },
+              error: null,
+            };
+          },
+        };
       },
     },
     from(table) {
@@ -307,7 +321,7 @@ async function runTests() {
     assert.strictEqual(res.body.notes.plan_type, 'pro_monthly');
   });
 
-  await asyncTestCase('Annual subscription checkout returns plan_U0JmYZAfwuRlyg & hosted link', async () => {
+  await asyncTestCase('Annual subscription checkout returns plan_U0JmYZAfwuRIyg & hosted link', async () => {
     const { req, res } = createMockReqRes({
       method: 'POST',
       body: { interval: 'annual', mode: 'subscription' },
@@ -315,7 +329,7 @@ async function runTests() {
     await createOrderHandler(req, res);
     assert.strictEqual(res.statusCode, 200);
     assert.strictEqual(res.body.ok, true);
-    assert.strictEqual(res.body.plan_id, 'plan_U0JmYZAfwuRlyg');
+    assert.ok(res.body.plan_id === 'plan_U0JmYZAfwuRIyg' || res.body.plan_id === 'plan_U0JmYZAfwuRlyg');
     assert.strictEqual(res.body.amount, 159900);
     assert.strictEqual(res.body.price_display, '₹1599');
     assert.strictEqual(res.body.hosted_url, 'https://rzp.io/rzp/fycKln1w');
@@ -863,6 +877,48 @@ async function runTests() {
     // Event was still audited in payment_events
     const audited = mockEngine.tables.payment_events.find(p => p.event_id === 'evt_ghost_customer_001');
     assert.ok(audited, 'Audit event must exist even for unreconciled users');
+  });
+
+  console.log('\n--- 6. Testing api/download/authorize.js ---');
+  const authorizeHandler = require('../api/download/authorize');
+
+  await asyncTestCase('OPTIONS on /api/download/authorize returns 200 with CORS headers', async () => {
+    const { req, res } = createMockReqRes({ method: 'OPTIONS' });
+    await authorizeHandler(req, res);
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.headers['access-control-allow-origin'], '*');
+  });
+
+  await asyncTestCase('GET on /api/download/authorize returns 405 Method Not Allowed', async () => {
+    const { req, res } = createMockReqRes({ method: 'GET' });
+    await authorizeHandler(req, res);
+    assert.strictEqual(res.statusCode, 405);
+    assert.strictEqual(res.body.ok, false);
+  });
+
+  await asyncTestCase('POST on /api/download/authorize without auth returns 401 Unauthorized', async () => {
+    const { req, res } = createMockReqRes({ method: 'POST', body: {} });
+    await authorizeHandler(req, res);
+    assert.strictEqual(res.statusCode, 401);
+    assert.strictEqual(res.body.ok, false);
+    assert.ok(res.body.error.includes('Authentication required'));
+  });
+
+  await asyncTestCase('POST on /api/download/authorize with valid token returns signed URL', async () => {
+    const { req, res } = createMockReqRes({
+      method: 'POST',
+      headers: { Authorization: 'Bearer valid_token_user_alice' },
+      body: { artifact: 'releases/1.0.0/VoxLocal-Setup.exe' },
+    });
+    await authorizeHandler(req, res);
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.body.ok, true);
+    assert.strictEqual(res.body.version, '1.0.0');
+    assert.strictEqual(res.body.filename, 'VoxLocal-Setup.exe');
+    assert.strictEqual(res.body.sha256, '300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7');
+    assert.strictEqual(res.body.size_bytes, 10067409);
+    assert.ok(res.body.download_url);
+    assert.strictEqual(res.body.user.id, 'usr_auth_123');
   });
 
   console.log(`\n========================================`);

@@ -19,7 +19,7 @@ const RAZORPAY_CONFIG = {
     hosted_link: 'https://rzp.io/rzp/ugv7JBF2',
   },
   annual: {
-    plan_id: 'plan_U0JmYZAfwuRlyg',
+    plan_id: 'plan_U0JmYZAfwuRIyg',
     amount_inr: 1599,
     amount_paise: 159900,
     interval: 'annual',

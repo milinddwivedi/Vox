@@ -92,54 +92,85 @@ def main():
         print(f"  [+] Manifest Signature Verification: VALID against DEFAULT_ENTITLEMENT_PUBLIC_KEY")
         print("  -> CHECK 3 PASSED.\n")
 
-    # 4. HEAD & GET /downloads/VoxLocal-Setup.exe
-    print("[CHECK 4] HEAD & GET https://vox-voice-assistant.vercel.app/downloads/VoxLocal-Setup.exe")
+    # 4. Verify public unauthenticated download bypass is blocked (returns 404)
+    print("[CHECK 4] HEAD https://vox-voice-assistant.vercel.app/downloads/VoxLocal-Setup.exe (Must be blocked)")
     req4_head = urllib.request.Request(
         "https://vox-voice-assistant.vercel.app/downloads/VoxLocal-Setup.exe",
         method="HEAD",
         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     )
-    with urllib.request.urlopen(req4_head) as r4_head:
-        assert r4_head.status == 200, f"Expected 200, got {r4_head.status}"
-        content_len = int(r4_head.headers.get("Content-Length"))
-        assert content_len == 10067409, f"Header size mismatch: {content_len}"
-        content_type = r4_head.headers.get("Content-Type")
-        print(f"  [+] HEAD Status: HTTP {r4_head.status}")
-        print(f"  [+] Content-Length: {content_len} bytes")
-        print(f"  [+] Content-Type: {content_type}")
+    try:
+        with urllib.request.urlopen(req4_head) as r4_head:
+            raise AssertionError(f"Expected HTTP 404, but got HTTP {r4_head.status} - Public download bypass is open!")
+    except urllib.error.HTTPError as e4:
+        assert e4.code == 404, f"Expected HTTP 404, got {e4.code}"
+        print(f"  [+] Status: HTTP {e4.code} Not Found (Public static bypass successfully blocked)")
+        print("  -> CHECK 4 PASSED.\n")
 
-    # Stream download and verify hash
-    req4_get = urllib.request.Request(
-        "https://vox-voice-assistant.vercel.app/downloads/VoxLocal-Setup.exe",
+    # 5. /api/download/authorize authorization gating
+    print("[CHECK 5] POST & OPTIONS https://vox-voice-assistant.vercel.app/api/download/authorize")
+    req5_opt = urllib.request.Request(
+        "https://vox-voice-assistant.vercel.app/api/download/authorize",
+        method="OPTIONS",
         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     )
-    hasher = hashlib.sha256()
-    total = 0
-    with urllib.request.urlopen(req4_get) as r4_get:
-        while chunk := r4_get.read(65536):
-            hasher.update(chunk)
-            total += len(chunk)
-    live_sha = hasher.hexdigest()
-    assert total == 10067409, f"Downloaded size mismatch: {total}"
-    assert live_sha == "300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7", f"Live hash mismatch: {live_sha}"
-    print(f"  [+] Downloaded: {total} bytes")
-    print(f"  [+] Live Stream SHA-256: {live_sha}")
-    print("  -> CHECK 4 PASSED.\n")
+    with urllib.request.urlopen(req5_opt) as r5_opt:
+        assert r5_opt.status == 200, f"Expected 200, got {r5_opt.status}"
+        assert r5_opt.headers.get("Access-Control-Allow-Origin") == "*", "Missing CORS header"
+        print(f"  [+] OPTIONS Status: HTTP {r5_opt.status} (CORS Preflight Valid)")
 
-    # 5. Supabase Google OAuth Authorize endpoint
-    print("[CHECK 5] GET https://qiigoipgoedexmdowtvj.supabase.co/auth/v1/authorize?provider=custom:google")
+    req5_post = urllib.request.Request(
+        "https://vox-voice-assistant.vercel.app/api/download/authorize",
+        data=b'{}',
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req5_post) as r5_post:
+            raise AssertionError(f"Expected HTTP 401, but got HTTP {r5_post.status}")
+    except urllib.error.HTTPError as e5:
+        assert e5.code == 401, f"Expected HTTP 401, got {e5.code}"
+        err_data = json.loads(e5.read().decode("utf-8"))
+        assert err_data.get("ok") is False, f"Expected ok=false: {err_data}"
+        assert "Authentication required" in err_data.get("error", ""), f"Unexpected error message: {err_data}"
+        print(f"  [+] Unauthenticated POST Status: HTTP {e5.code} Unauthorized")
+        print(f"  [+] Gating Error: {err_data.get('error')}")
+        print("  -> CHECK 5 PASSED.\n")
+
+    # 6. /download portal
+    print("[CHECK 6] GET https://vox-voice-assistant.vercel.app/download")
+    req6 = urllib.request.Request(
+        "https://vox-voice-assistant.vercel.app/download",
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+    )
+    with urllib.request.urlopen(req6) as r6:
+        assert r6.status == 200, f"Expected 200, got {r6.status}"
+        html6 = r6.read().decode("utf-8")
+        assert "Sign in to Download VOX" in html6, "Download portal missing sign-in gate"
+        assert "VoxLocal-Setup.exe" in html6, "Download portal missing artifact name"
+        assert "300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7" in html6, "Download portal missing SHA-256 digest"
+        print(f"  [+] Status: HTTP {r6.status}")
+        print(f"  [+] Portal HTML size: {len(html6)} bytes")
+        print("  [+] Verified Presence: Sign in to Download VOX gate, SHA-256 digest, Setup Guide")
+        print("  -> CHECK 6 PASSED.\n")
+
+    # 7. Supabase Google OAuth Authorize endpoint
+    print("[CHECK 7] GET https://qiigoipgoedexmdowtvj.supabase.co/auth/v1/authorize?provider=custom:google")
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             return None
 
     opener = urllib.request.build_opener(NoRedirect)
-    req5 = urllib.request.Request(
+    req7 = urllib.request.Request(
         "https://qiigoipgoedexmdowtvj.supabase.co/auth/v1/authorize?provider=custom:google",
         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     )
     try:
-        resp5 = opener.open(req5)
-        print(f"  [!] Received unexpected 200: {resp5.status}")
+        resp7 = opener.open(req7)
+        print(f"  [!] Received unexpected 200: {resp7.status}")
         sys.exit(1)
     except urllib.error.HTTPError as e:
         assert e.code in (302, 303), f"Expected HTTP 302/303 redirect, got {e.code}"
@@ -152,10 +183,10 @@ def main():
         print(f"  [+] Redirect Target: https://accounts.google.com/o/oauth2/v2/auth")
         print(f"  [+] Google Client ID present in query: 541845334167-k9sa1dem22flsddu5721tsr173snbppo.apps.googleusercontent.com")
         print(f"  [+] Callback URI present in query: https://qiigoipgoedexmdowtvj.supabase.co/auth/v1/callback")
-        print("  -> CHECK 5 PASSED.\n")
+        print("  -> CHECK 7 PASSED.\n")
 
     print("=================================================================")
-    print("SUCCESS: ALL 5 LIVE PRODUCTION VERIFICATION AUDITS PASSED 100%!")
+    print("SUCCESS: ALL 7 LIVE PRODUCTION VERIFICATION AUDITS PASSED 100%!")
     print("=================================================================")
 
 

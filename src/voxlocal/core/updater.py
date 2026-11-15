@@ -257,3 +257,86 @@ class UpdateManager:
             return True, manifest, f"New version {latest_version} available"
 
         return False, manifest, f"Up to date (version {self.current_version})"
+
+    def resolve_download_url(
+        self,
+        manifest: Dict[str, Any],
+        auth_token: Optional[str] = None,
+        auth_api_url: str = "https://vox-voice-assistant.vercel.app/api/download/authorize",
+        timeout_sec: int = 15,
+    ) -> Tuple[bool, str, str]:
+        """
+        Resolves an authorized download URL. If an auth_token is provided,
+        requests a short-lived signed URL from the serverless authorization endpoint.
+        Falls back to manifest['installer_url'].
+        Returns: (success, download_url, message)
+        """
+        if auth_token:
+            try:
+                payload = json.dumps({"artifact": "releases/1.0.0/VoxLocal-Setup.exe"}).encode("utf-8")
+                req = urllib.request.Request(
+                    auth_api_url,
+                    data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {auth_token}",
+                        "User-Agent": f"VOX-Desktop/{self.current_version}",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if data.get("ok") and data.get("download_url"):
+                            return True, str(data["download_url"]), "Authorized signed URL retrieved"
+            except Exception as exc:
+                logger.warning("Failed to obtain authorized download URL: %s", exc)
+
+        fallback = manifest.get("installer_url", "")
+        if fallback:
+            return True, fallback, "Using manifest fallback URL"
+        return False, "", "No download URL available"
+
+    def download_and_verify(
+        self,
+        manifest: Dict[str, Any],
+        dest_path: Union[str, Path],
+        auth_token: Optional[str] = None,
+        timeout_sec: int = 120,
+    ) -> Tuple[bool, str]:
+        """
+        Downloads the installer binary from an authorized or manifest URL,
+        writes to dest_path, and validates the complete release trust chain.
+        """
+        ok, dl_url, msg = self.resolve_download_url(manifest, auth_token=auth_token)
+        if not ok or not dl_url:
+            return False, f"Could not obtain download URL: {msg}"
+
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            req = urllib.request.Request(
+                dl_url,
+                headers={"User-Agent": f"VOX-Desktop/{self.current_version}"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                if resp.status != 200:
+                    return False, f"Download failed with HTTP {resp.status}"
+                with dest.open("wb") as out_f:
+                    while chunk := resp.read(64 * 1024):
+                        out_f.write(chunk)
+        except Exception as exc:
+            return False, f"Download error: {exc}"
+
+        # Verify trust chain
+        valid, reason = verify_release_trust_chain(manifest, dest, self.public_key_hex)
+        if not valid:
+            if dest.exists():
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+            return False, f"Trust chain validation failed: {reason}"
+
+        return True, "Download and trust chain verified successfully"

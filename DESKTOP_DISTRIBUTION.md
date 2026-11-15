@@ -2,13 +2,17 @@
 
 ## 1. Overview & Distribution Channels
 
-VOX is distributed to end users through two official Windows artifacts:
-1. **`VoxLocal-Setup.exe` (Recommended Installer):**
-   - Size: ~7.56 MB bootstrap installer.
+VOX is distributed to end users through two official Windows distribution avenues:
+1. **`VoxLocal-Setup.exe` (Official Installer):**
+   - Size: 10,067,409 bytes (~9.6 MB bootstrap installer).
+   - SHA-256 Digest: `300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7`
    - User Experience: Single-click setup, installs to `%LOCALAPPDATA%\Programs\VoxLocal`, creates Windows Start Menu shortcut, Desktop shortcut, and registers Windows uninstaller in `Add/Remove Programs`.
    - Automatic Dependency Resolution: Automatically fetches and configures required model weights into `data\models\` on first launch.
-2. **`VoxLocal-Portable-win64.zip`:**
-   - Standalone portable archive for corporate environments with restricted administrative permissions or USB drive execution.
+2. **Authenticated Private Storage Distribution:**
+   - Private Supabase Storage Bucket: `vox-releases` (`public: false`).
+   - Secure Download Portal: `https://vox-voice-assistant.vercel.app/download`
+   - Authorization API: `POST /api/download/authorize` (requires Supabase user Bearer token, generates 120s signed download URL).
+   - Zero Public Static Bypass: Direct unauthenticated static requests to `/downloads/VoxLocal-Setup.exe` return HTTP 404.
 
 ---
 
@@ -40,7 +44,17 @@ The desktop application checks for software updates periodically via `GET /api/r
 
 ---
 
-## 3. Building the Distribution Installer
+## 3. Desktop UpdateManager & Trust Chain Verification
+
+The desktop client verifies release authenticity before applying any updates:
+1. `UpdateManager.fetch_manifest()` fetches the latest release manifest.
+2. `verify_manifest_signature()` validates the Ed25519 signature against `DEFAULT_ENTITLEMENT_PUBLIC_KEY`.
+3. `UpdateManager.resolve_download_url(manifest, auth_token=...)` obtains an authorized signed download URL from `/api/download/authorize` using the active session token stored in `%APPDATA%/VoxLocal/data/auth_session.vault`.
+4. `UpdateManager.download_and_verify()` streams the binary and validates that the computed SHA-256 matches the manifest digest bit-for-bit.
+
+---
+
+## 4. Building the Distribution Installer
 
 The installer script resides in `packaging/vox_setup_installer.py` and is built using PyInstaller:
 
@@ -54,18 +68,3 @@ $env:PYTHONPATH='src'
     --icon="assets/favicon.ico" `
     packaging/vox_setup_installer.py
 ```
-
-### Build Characteristics
-- Utilizes native Win32 `ctypes.windll.user32.MessageBoxW` and Windows Registry (`winreg`) to ensure zero GUI toolkit bloating.
-- Fast execution with low memory footprint (~7.5 MB final executable).
-- Installs to per-user directory without requiring Windows UAC administrator elevation.
-
----
-
-## 4. GitHub Releases & CI/CD Deployment
-
-The compiled setup installer is uploaded to the repository's GitHub Releases page:
-- Repository: `https://github.com/milinddwivedi/Vox`
-- Releases Link: `https://github.com/milinddwivedi/Vox/releases`
-- Direct Download: `https://github.com/milinddwivedi/Vox/releases/latest/download/VoxLocal-Setup.exe`
-- Webpage download buttons in `docs/index.html`, `docs/pricing.html`, and `docs/account.html` automatically route to this verified release URL.
