@@ -23,8 +23,8 @@ The desktop application checks for software updates periodically via `GET /api/r
   "product_name": "VOX — Local AI Voice Assistant",
   "release_date": "2026-11-15",
   "installer_url": "https://vox-voice-assistant.vercel.app/downloads/VoxLocal-Setup.exe",
-  "installer_size_bytes": 10070068,
-  "sha256": "a361938d9031cb2e6e577cc58637651192b41050cada520214c4dc8204ef6fad",
+  "installer_size_bytes": 10067409,
+  "sha256": "300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7",
   "min_os_version": "Windows 10 Build 19041 (64-bit)",
   "mandatory": false,
   "release_notes": [
@@ -34,7 +34,7 @@ The desktop application checks for software updates periodically via `GET /api/r
     "Local-First Commercial Metering: Weekly usage limits with DPAPI cryptographically sealed local ledger and zero cloud audio upload.",
     "Unified Calendar Hub: 1-click sync for Microsoft 365, Google Calendar, and Zoom."
   ],
-  "signature": "aefe398b5a8de04501e0ec226d12c070f89c7ffbb707baf2eb15a1c0bade38cb87f4515d5747cd619a2aac708d526ec92bba2e718b1854454b956da3b5efc509"
+  "signature": "e97989d120a11f4322d8d7c219bb48c32753cea3408e8720146da9a45d6585d94132151ca0c1b590ea41dc548dca1591adeb4db95a056133cd63cf26edaa2805"
 }
 ```
 

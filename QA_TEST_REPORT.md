@@ -2,10 +2,11 @@
 
 ## 1. Execution Summary
 
-- **Test Suite:** `tests/test_commercial_metering_and_entitlements.py`
-- **Test Framework:** `pytest 9.2.0` on Python 3.13.14 (Win64)
-- **Status:** **19 PASSED, 0 FAILED** (100% Pass Rate)
-- **Execution Time:** 0.87 seconds
+- **Python Test Suites (7 files):** `tests/test_commercial_metering_and_entitlements.py` (23), `tests/test_pro_upgrade_dialog_and_gating.py` (7), `tests/test_milestone2_desktop_ui.py` (11), `tests/test_e2e_commercial_journey.py` (80), `tests/api/test_webhooks_and_sync.py` (26), `tests/test_release_trust_chain.py` (20), `tests/test_live_supabase_journey.py` (5)
+- **Test Framework (Python):** `pytest 9.2.0` on Python 3.13.14 (Win64) — **172 PASSED, 0 FAILED** (`14.98s`)
+- **Node.js API & Frontend Suites:** `tests/test_milestone3_frontend_and_loopback.js` (**5/5 PASSED**) + `tests/test_milestone4_api_contracts.js` (**25/25 PASSED**)
+- **Total Automated Coverage:** **202 PASSED, 0 FAILED** (100% Pass Rate after Ed25519 production key rotation and `VoxLocal-Setup.exe` rebuild)
+- **Live HTTPS Production Audit:** `scripts/verify_live_production.py` (**5/5 live HTTPS checks** against `https://vox-voice-assistant.vercel.app` and `https://qiigoipgoedexmdowtvj.supabase.co`)
 
 ---
 
@@ -27,9 +28,9 @@
 | **Usage Metering Engine** | `test_meeting_overrun_non_terminating_policy` | **PASSED** | Exceeding 90 min cap emits overrun warning without terminating call |
 | **Usage Metering Engine** | `test_record_completed_meeting` | **PASSED** | Accounts for meeting duration & session count |
 | **Usage Metering Engine** | `test_ask_vox_query_metering` | **PASSED** | Permits 10 Free queries and restricts 11th query with Pro upgrade call |
-| **Entitlements & Tokens** | `test_sign_and_verify_valid_token` | **PASSED** | Valid HMAC-SHA256 token verifies and decodes claims |
-| **Entitlements & Tokens** | `test_tampered_token_rejected` | **PASSED** | Tampered token signature fails verification |
-| **Entitlements & Tokens** | `test_wrong_secret_rejected` | **PASSED** | Verification rejects tokens signed with wrong secret |
+| **Entitlements & Tokens** | `test_sign_and_verify_valid_token` | **PASSED** | Valid Ed25519 asymmetric token (`verify_and_decode_entitlement_token`) verifies and decodes claims |
+| **Entitlements & Tokens** | `test_tampered_token_rejected` | **PASSED** | Tampered token signature fails Ed25519 verification |
+| **Entitlements & Tokens** | `test_wrong_public_key_rejected` | **PASSED** | Verification rejects tokens verified against wrong public key |
 | **Entitlements & Offline Grace** | `test_entitlement_manager_offline_grace` | **PASSED** | Offline within 72h maintains Pro; beyond 72h falls back to Free |
 | **Data Preservation Policy** | `test_downgrade_preserves_local_data` | **PASSED** | Downgrading to Free preserves 100% of SQLite records and recordings |
 

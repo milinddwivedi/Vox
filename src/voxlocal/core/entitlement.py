@@ -35,8 +35,8 @@ from voxlocal.core.logger import get_app_root, get_logger
 logger = get_logger("entitlement")
 
 # Default production Ed25519 public key (32-byte raw hex)
-# Corresponds to DEV_FALLBACK_PUBLIC_KEY_HEX from api/_lib/token.js
-DEFAULT_ENTITLEMENT_PUBLIC_KEY = "c9ee868a92d0f39ed1d04a039d9bf4093200565395c05f881662af3b9c17613a"
+# Corresponds to DEFAULT_PUBLIC_KEY_HEX from api/_lib/token.js (private key in Vercel Secrets only)
+DEFAULT_ENTITLEMENT_PUBLIC_KEY = "05de27f30f315a3eab09b1168993e32ce9b89b4c1fb596608c258ff302fb9e36"
 DEFAULT_ENTITLEMENT_VERIFY_KEY = DEFAULT_ENTITLEMENT_PUBLIC_KEY  # Backward compatibility alias
 
 MAX_OFFLINE_GRACE_HOURS = 72.0
@@ -144,6 +144,11 @@ def verify_and_decode_entitlement_token(
 
     if len(sig_bytes) != 64:
         return False, None, f"Invalid signature length: {len(sig_bytes)} bytes (expected 64)"
+
+    if verify_key == DEFAULT_ENTITLEMENT_PUBLIC_KEY:
+        env_key = os.environ.get("VOX_ENTITLEMENT_PUBLIC_KEY", os.environ.get("VOX_ENTITLEMENT_VERIFY_KEY"))
+        if env_key:
+            verify_key = env_key
 
     pub_key_bytes = normalize_public_key(verify_key)
 

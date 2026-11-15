@@ -25,6 +25,7 @@ from voxlocal.core.entitlement import (
 )
 from tests.token_test_helper import (
     DEV_FALLBACK_PRIVATE_KEY_HEX,
+    TEST_DEV_PUBLIC_KEY_HEX,
 )
 from voxlocal.core.updater import (
     UpdateManager,
@@ -283,7 +284,7 @@ class TestCrossLanguageCryptographicParity:
         node_script = (
             "const { signManifest } = require('./api/_lib/token.js');"
             f"const m = {json.dumps(test_payload)};"
-            "m.signature = signManifest(m);"
+            f"m.signature = signManifest(m, {json.dumps(DEV_FALLBACK_PRIVATE_KEY_HEX)});"
             "console.log(JSON.stringify(m));"
         )
         node_res = subprocess.run(
@@ -295,7 +296,7 @@ class TestCrossLanguageCryptographicParity:
         )
         signed_manifest = json.loads(node_res.stdout.strip())
 
-        assert verify_manifest_signature(signed_manifest, DEFAULT_ENTITLEMENT_PUBLIC_KEY) is True
+        assert verify_manifest_signature(signed_manifest, TEST_DEV_PUBLIC_KEY_HEX) is True
 
     def test_node_verifies_python_signature(self) -> None:
         """Node verifyManifest validates token signed by Python ed25519_sign."""
@@ -313,7 +314,7 @@ class TestCrossLanguageCryptographicParity:
         node_script = (
             "const { verifyManifest } = require('./api/_lib/token.js');"
             f"const m = {json.dumps(test_payload)};"
-            "console.log(verifyManifest(m));"
+            f"console.log(verifyManifest(m, {json.dumps(TEST_DEV_PUBLIC_KEY_HEX)}));"
         )
         node_res = subprocess.run(
             ["node", "-e", node_script],

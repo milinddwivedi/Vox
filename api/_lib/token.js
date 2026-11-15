@@ -4,20 +4,20 @@ const crypto = require('crypto');
 const PKCS8_PREFIX_HEX = '302e020100300506032b657004220420'; // 16 bytes
 const SPKI_PREFIX_HEX = '302a300506032b6570032100';         // 12 bytes
 
-// Deterministic fallback development keypair (for local dev & automated test suites ONLY)
-const DEV_FALLBACK_PRIVATE_KEY_PEM = [
-  '-----BEGIN PRIVATE KEY-----',
-  'MC4CAQAwBQYDK2VwBCIEIFxc083+iUyO2MQq/nDMbl/7HgVvQmInW9smbusroxWk',
-  '-----END PRIVATE KEY-----',
-].join('\n');
-
-const DEV_FALLBACK_PUBLIC_KEY_PEM = [
+// Production Ed25519 public key (32-byte raw hex + SPKI PEM).
+// The corresponding private key MUST be supplied via VOX_ENTITLEMENT_PRIVATE_KEY_ED25519
+// or ENTITLEMENT_PRIVATE_KEY_PEM (never committed to source control).
+const DEFAULT_PUBLIC_KEY_PEM = [
   '-----BEGIN PUBLIC KEY-----',
-  'MCowBQYDK2VwAyEAye6GipLQ857R0EoDnZv0CTIAVlOVwF+IFmKvO5wXYTo=',
+  'MCowBQYDK2VwAyEABd4n8w8xWj6rCbEWiZPjLOm4m0wftZZgjCWP8wL7njY=',
   '-----END PUBLIC KEY-----',
 ].join('\n');
 
-const DEV_FALLBACK_PUBLIC_KEY_HEX = 'c9ee868a92d0f39ed1d04a039d9bf4093200565395c05f881662af3b9c17613a';
+const DEFAULT_PUBLIC_KEY_HEX = '05de27f30f315a3eab09b1168993e32ce9b89b4c1fb596608c258ff302fb9e36';
+
+// Backward-compatible public key export aliases (zero private keys in repository)
+const DEV_FALLBACK_PUBLIC_KEY_PEM = DEFAULT_PUBLIC_KEY_PEM;
+const DEV_FALLBACK_PUBLIC_KEY_HEX = DEFAULT_PUBLIC_KEY_HEX;
 
 function base64UrlEncode(buffer) {
   return buffer.toString('base64')
@@ -42,10 +42,7 @@ function parsePrivateKey(input) {
     input = process.env.VOX_ENTITLEMENT_PRIVATE_KEY_ED25519 || process.env.ENTITLEMENT_PRIVATE_KEY_PEM;
   }
   if (!input) {
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error('VOX_ENTITLEMENT_PRIVATE_KEY_ED25519 or ENTITLEMENT_PRIVATE_KEY_PEM is missing in production environment');
-    }
-    input = DEV_FALLBACK_PRIVATE_KEY_PEM;
+    throw new Error('Ed25519 private key is required (set VOX_ENTITLEMENT_PRIVATE_KEY_ED25519)');
   }
 
   if (typeof input !== 'string') return input;
@@ -89,7 +86,7 @@ function parsePrivateKey(input) {
  */
 function parsePublicKey(input) {
   if (!input) {
-    input = DEV_FALLBACK_PUBLIC_KEY_PEM;
+    input = process.env.VOX_ENTITLEMENT_PUBLIC_KEY_ED25519 || DEFAULT_PUBLIC_KEY_PEM;
   }
   if (typeof input !== 'string') return input;
   const trimmed = input.trim();
@@ -224,7 +221,8 @@ module.exports = {
   canonicalizeManifest,
   parsePrivateKey,
   parsePublicKey,
+  DEFAULT_PUBLIC_KEY_HEX,
+  DEFAULT_PUBLIC_KEY_PEM,
   DEV_FALLBACK_PUBLIC_KEY_HEX,
   DEV_FALLBACK_PUBLIC_KEY_PEM,
-  DEV_FALLBACK_PRIVATE_KEY_PEM,
 };

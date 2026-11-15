@@ -631,7 +631,7 @@ class TestTier1FeatureCoverage:
             "product_name": "VOX — Local AI Voice Assistant",
             "release_date": "2026-11-15",
             "installer_url": "https://vox-voice-assistant.vercel.app/downloads/VoxLocal-Setup.exe",
-            "sha256": "a361938d9031cb2e6e577cc58637651192b41050cada520214c4dc8204ef6fad",
+            "sha256": "300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7",
         }
         for key in ["version", "product_name", "installer_url", "sha256"]:
             assert key in manifest
@@ -671,7 +671,7 @@ class TestTier1FeatureCoverage:
         downloaded_file = tmp_path / "downloaded_setup.exe"
         downloaded_file.write_bytes(b"CorruptedBinaryData")
 
-        manifest_hash = "a361938d9031cb2e6e577cc58637651192b41050cada520214c4dc8204ef6fad"
+        manifest_hash = "300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7"
         computed_hash = hashlib.sha256(downloaded_file.read_bytes()).hexdigest()
         assert computed_hash != manifest_hash
 

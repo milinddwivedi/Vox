@@ -78,8 +78,8 @@ def main():
     with urllib.request.urlopen(req3) as r3:
         assert r3.status == 200, f"Expected 200, got {r3.status}"
         manifest3 = json.loads(r3.read().decode("utf-8"))
-        expected_sha = "a361938d9031cb2e6e577cc58637651192b41050cada520214c4dc8204ef6fad"
-        expected_size = 10070068
+        expected_sha = "300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7"
+        expected_size = 10067409
         assert manifest3["sha256"] == expected_sha, f"SHA mismatch: {manifest3['sha256']}"
         assert manifest3["installer_size_bytes"] == expected_size, f"Size mismatch: {manifest3['installer_size_bytes']}"
         assert verify_manifest_signature(manifest3, DEFAULT_ENTITLEMENT_PUBLIC_KEY), "Manifest signature invalid!"
@@ -102,7 +102,7 @@ def main():
     with urllib.request.urlopen(req4_head) as r4_head:
         assert r4_head.status == 200, f"Expected 200, got {r4_head.status}"
         content_len = int(r4_head.headers.get("Content-Length"))
-        assert content_len == 10070068, f"Header size mismatch: {content_len}"
+        assert content_len == 10067409, f"Header size mismatch: {content_len}"
         content_type = r4_head.headers.get("Content-Type")
         print(f"  [+] HEAD Status: HTTP {r4_head.status}")
         print(f"  [+] Content-Length: {content_len} bytes")
@@ -120,8 +120,8 @@ def main():
             hasher.update(chunk)
             total += len(chunk)
     live_sha = hasher.hexdigest()
-    assert total == 10070068, f"Downloaded size mismatch: {total}"
-    assert live_sha == "a361938d9031cb2e6e577cc58637651192b41050cada520214c4dc8204ef6fad", f"Live hash mismatch: {live_sha}"
+    assert total == 10067409, f"Downloaded size mismatch: {total}"
+    assert live_sha == "300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7", f"Live hash mismatch: {live_sha}"
     print(f"  [+] Downloaded: {total} bytes")
     print(f"  [+] Live Stream SHA-256: {live_sha}")
     print("  -> CHECK 4 PASSED.\n")

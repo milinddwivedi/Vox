@@ -36,6 +36,7 @@ from voxlocal.core.entitlement import (
 )
 from tests.token_test_helper import (
     DEV_FALLBACK_PRIVATE_KEY_HEX,
+    TEST_DEV_PUBLIC_KEY_HEX,
     sign_entitlement_payload,
 )
 from voxlocal.core.metering import UsageMeteringEngine
@@ -53,21 +54,29 @@ def qapp():
 
 @pytest.fixture
 def temp_environment():
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        cfg = AppConfig(storage_dir=str(tmp_path))
-        cfg.disable_model_preload = True
-        cfg.disable_hotkeys = True
-        db_path = Path(cfg.db_path)
-        vault_path = tmp_path / "entitlement.vault"
-        auth_vault = tmp_path / "auth_session.vault"
-        yield {
-            "tmp_path": tmp_path,
-            "db_path": db_path,
-            "vault_path": vault_path,
-            "auth_vault": auth_vault,
-            "cfg": cfg,
-        }
+    prev_pub_key = os.environ.get("VOX_ENTITLEMENT_PUBLIC_KEY")
+    os.environ["VOX_ENTITLEMENT_PUBLIC_KEY"] = TEST_DEV_PUBLIC_KEY_HEX
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            cfg = AppConfig(storage_dir=str(tmp_path))
+            cfg.disable_model_preload = True
+            cfg.disable_hotkeys = True
+            db_path = Path(cfg.db_path)
+            vault_path = tmp_path / "entitlement.vault"
+            auth_vault = tmp_path / "auth_session.vault"
+            yield {
+                "tmp_path": tmp_path,
+                "db_path": db_path,
+                "vault_path": vault_path,
+                "auth_vault": auth_vault,
+                "cfg": cfg,
+            }
+    finally:
+        if prev_pub_key is None:
+            os.environ.pop("VOX_ENTITLEMENT_PUBLIC_KEY", None)
+        else:
+            os.environ["VOX_ENTITLEMENT_PUBLIC_KEY"] = prev_pub_key
 
 
 def _create_signed_token(user_id: str, plan_code: str = "pro_monthly", hours_valid: float = 720.0) -> str:
