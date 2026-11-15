@@ -112,12 +112,22 @@ class BITMAPINFO(ctypes.Structure):
     ]
 
 
+user32.GetDC.argtypes = [ctypes.wintypes.HWND]
+user32.GetDC.restype = ctypes.wintypes.HDC
 user32.PrintWindow.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.HDC, ctypes.wintypes.UINT]
 user32.PrintWindow.restype = ctypes.wintypes.BOOL
 user32.GetWindowDC.argtypes = [ctypes.wintypes.HWND]
 user32.GetWindowDC.restype = ctypes.wintypes.HDC
 user32.ReleaseDC.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.HDC]
 user32.ReleaseDC.restype = ctypes.c_int
+user32.IsWindow.argtypes = [ctypes.wintypes.HWND]
+user32.IsWindow.restype = ctypes.wintypes.BOOL
+user32.IsWindowVisible.argtypes = [ctypes.wintypes.HWND]
+user32.IsWindowVisible.restype = ctypes.wintypes.BOOL
+user32.IsIconic.argtypes = [ctypes.wintypes.HWND]
+user32.IsIconic.restype = ctypes.wintypes.BOOL
+user32.GetWindowRect.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.RECT)]
+user32.GetWindowRect.restype = ctypes.wintypes.BOOL
 gdi32.CreateCompatibleDC.argtypes = [ctypes.wintypes.HDC]
 gdi32.CreateCompatibleDC.restype = ctypes.wintypes.HDC
 gdi32.CreateCompatibleBitmap.argtypes = [ctypes.wintypes.HDC, ctypes.c_int, ctypes.c_int]
@@ -128,6 +138,18 @@ gdi32.DeleteObject.argtypes = [ctypes.wintypes.HGDIOBJ]
 gdi32.DeleteObject.restype = ctypes.wintypes.BOOL
 gdi32.DeleteDC.argtypes = [ctypes.wintypes.HDC]
 gdi32.DeleteDC.restype = ctypes.wintypes.BOOL
+gdi32.BitBlt.argtypes = [
+    ctypes.wintypes.HDC,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.wintypes.HDC,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.wintypes.DWORD,
+]
+gdi32.BitBlt.restype = ctypes.wintypes.BOOL
 gdi32.GetDIBits.argtypes = [
     ctypes.wintypes.HDC,
     ctypes.wintypes.HBITMAP,
@@ -2326,6 +2348,7 @@ class MeetingVideoRecorder:
         self._consecutive_blank_frames: int = 0
         self._capture_mode_preference: str = "auto"
         self._has_switched_to_fallback: bool = False
+        self._has_ever_captured_live_window: bool = bool(source_descriptor and source_descriptor.hwnd and user32.IsWindow(source_descriptor.hwnd))
         self.health_monitor = VideoHealthMonitor(fps=self.fps)
 
     @property
@@ -2788,6 +2811,9 @@ class MeetingVideoRecorder:
                     next_tick = now + frame_interval
 
                 validation = self.validator.validate_frame_source()
+                if validation.is_valid:
+                    self._has_ever_captured_live_window = True
+
                 # Resilient grace period for drop/rejoin, screen-share swapping, or window recreation
                 if validation.reason in ("window_closed", "meeting_ended"):
                     if window_closed_since == 0.0:
@@ -2802,22 +2828,27 @@ class MeetingVideoRecorder:
                                     "MeetingVideoRecorder: Re-bound to new call window HWND=%s ('%s') during grace period",
                                     re_desc.hwnd,
                                     re_desc.window_title,
-                                )
+                                    )
                                 self.source_descriptor = re_desc
                                 self.target_hwnd = re_desc.hwnd
                                 self.validator.descriptor = re_desc
+                                self._has_ever_captured_live_window = True
                                 window_closed_since = 0.0
                                 validation = SourceValidationResult(is_valid=True, active_hwnd=re_desc.hwnd, reason="rebound_after_reconnect")
                         except Exception as re_err:
                             logger.debug("Re-discovery in grace period: %s", re_err)
                     else:
-                        logger.info("MeetingVideoRecorder: call stage closed or ended (%s) beyond grace period. Finalizing video capture.", validation.reason)
-                        if self.on_meeting_ended:
-                            try:
-                                self.on_meeting_ended()
-                            except Exception:
-                                pass
-                        break
+                        if self._has_ever_captured_live_window:
+                            logger.info("MeetingVideoRecorder: call stage closed or ended (%s) beyond grace period. Finalizing video capture.", validation.reason)
+                            if self.on_meeting_ended:
+                                try:
+                                    self.on_meeting_ended()
+                                except Exception:
+                                    pass
+                            break
+                        else:
+                            # Standalone/in-person or pre-call recording: continue waiting for call stage without terminating meeting
+                            window_closed_since = 0.0
                 else:
                     window_closed_since = 0.0
 

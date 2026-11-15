@@ -411,24 +411,6 @@ def is_leaving_title(title: str) -> bool:
     tl = title.strip().lower()
     return any(tl == lt or tl.startswith("leaving") or "left the meeting" in tl for lt in LEAVING_TITLES)
 
-LEAVING_TITLES = (
-    "leaving...",
-    "leaving",
-    "left the meeting",
-    "call ended",
-    "meeting ended",
-    "you left the meeting",
-    "reconnecting...",
-    "ended call",
-)
-
-def is_leaving_title(title: str) -> bool:
-    """True if window title indicates the user has hung up or the meeting is terminating."""
-    if not title:
-        return False
-    tl = title.strip().lower()
-    return any(tl == lt or tl.startswith("leaving") or "left the meeting" in tl for lt in LEAVING_TITLES)
-
 def _rank_candidate(c: Tuple[int, str, str, Tuple[int, int, int, int]]) -> Tuple[int, int]:
     _h, plat, t_title, bounds = c
     tl = t_title.lower()

@@ -189,9 +189,13 @@ class CalendarManager(QObject):
             logger.error("Error during calendar polling: %s", exc)
             return []
 
-    def get_upcoming_meetings(self) -> List[CalendarMeeting]:
-        """Return the most recently polled upcoming meetings."""
-        return list(self._cached_upcoming)
+    def get_upcoming_meetings(self, limit: Optional[int] = None, *args: Any, **kwargs: Any) -> List[CalendarMeeting]:
+        """Return the most recently polled upcoming meetings, optionally sliced by limit."""
+        with self._lock:
+            meetings = list(self._cached_upcoming)
+            if limit is not None and limit > 0:
+                return meetings[:limit]
+            return meetings
 
     def trigger_capture(self, meeting: CalendarMeeting) -> None:
         """User clicked 1-click capture on meeting alert prompt."""

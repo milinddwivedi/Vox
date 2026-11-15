@@ -449,6 +449,14 @@ def create_default_vox_commands(main_window: Any, controller: Optional[Any] = No
         handler=lambda: main_window.navigate_to_workspace("insights") if hasattr(main_window, "navigate_to_workspace") else None,
     ))
     cmds.append(PaletteCommand(
+        id="calendar",
+        title="Calendar",
+        description="Upcoming meetings, Outlook/Google/Zoom accounts, and Notetaker prep",
+        category="Workspace",
+        shortcut="Ctrl+8",
+        handler=lambda: main_window.navigate_to_workspace("calendar") if hasattr(main_window, "navigate_to_workspace") else None,
+    ))
+    cmds.append(PaletteCommand(
         id="settings",
         title="Settings",
         description="Audio devices, hotkeys, startup, and AI model preferences",

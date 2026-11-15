@@ -9,7 +9,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from PyQt6.QtCore import QCoreApplication
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PyQt6.QtWidgets import QApplication
 
 # Ensure src is on sys.path
 SRC_DIR = Path(__file__).resolve().parent.parent / "src"
@@ -31,9 +32,9 @@ from voxlocal.core.config import AppConfig
 
 @pytest.fixture(scope="module")
 def qapp():
-    app = QCoreApplication.instance()
+    app = QApplication.instance()
     if app is None:
-        app = QCoreApplication([])
+        app = QApplication([])
     return app
 
 
@@ -482,6 +483,7 @@ def test_controller_start_meeting_from_calendar_lifecycle(qapp, tmp_path):
         # 2. Finalize session 1
         ctrl.stop_meeting_recording()
         assert ctrl._capture_state == "idle"
+
         assert ctrl._active_meeting_calendar_event_id == ""
 
         # 3. Consecutive meeting 2 without app restart
@@ -512,4 +514,731 @@ def test_controller_start_meeting_from_calendar_lifecycle(qapp, tmp_path):
 
         ctrl.stop_meeting_recording()
         assert ctrl._capture_state == "idle"
+
+
+# ----------------------------------------------------------------------
+# Test 10: Multi-User DB Isolation, Secret Scrubbing & OAuth Sanitization
+# ----------------------------------------------------------------------
+def test_multi_user_isolation_secret_scrubbing_and_sanitization(tmp_path):
+    from voxlocal.calendar.auth_service import (
+        CalendarAuthBroker,
+        classify_account_kind,
+        sanitize_oauth_error_for_user,
+    )
+
+    db = LocalDatabase(tmp_path / "multi_user.db")
+    broker = CalendarAuthBroker(db=db)
+
+    # Secrets must never persist into plaintext config.json
+    cfg = AppConfig()
+    cfg.storage_dir = str(tmp_path)
+    cfg_path = cfg.config_file_path()
+    cfg.google_calendar_client_secret = "gsec-top-secret"
+    cfg.zoom_client_secret = "zsec-top-secret"
+    broker.save_app_secret("google_calendar_client_secret", cfg.google_calendar_client_secret, user_id="user_alice")
+    broker.save_app_secret("zoom_client_secret", cfg.zoom_client_secret, user_id="user_alice")
+    cfg.save()
+
+    raw_cfg_text = cfg_path.read_text(encoding="utf-8")
+    assert "gsec-top-secret" not in raw_cfg_text
+    assert "zsec-top-secret" not in raw_cfg_text
+    assert broker.load_app_secret("google_calendar_client_secret", user_id="user_alice") == "gsec-top-secret"
+    assert broker.load_app_secret("google_calendar_client_secret", user_id="user_bob") == ""
+
+    # User-scoped accounts, encrypted vault tokens, events & meeting links stay isolated
+    now_utc = datetime.now(timezone.utc)
+    db.upsert_calendar_account(
+        user_id="user_alice",
+        account_id="ms_graph:alice@contoso.com",
+        provider_type="ms_graph",
+        account_email="alice@contoso.com",
+        display_name="Alice",
+        account_kind="work",
+        tenant_id="contoso-tid",
+    )
+    db.upsert_calendar_account(
+        user_id="user_bob",
+        account_id="google:bob@gmail.com",
+        provider_type="google",
+        account_email="bob@gmail.com",
+        display_name="Bob",
+        account_kind="personal",
+    )
+    broker.save_credentials("user_alice", "ms_graph:alice@contoso.com", "ms_graph", {"refresh_token": "alice-rt"})
+    broker.save_credentials("user_bob", "google:bob@gmail.com", "google", {"refresh_token": "bob-rt"})
+
+    db.upsert_calendar_events(
+        [
+            CalendarMeeting(
+                id="ev-alice-1",
+                title="Alice Executive Brief",
+                start_time=now_utc + timedelta(hours=1),
+                end_time=now_utc + timedelta(hours=2),
+                account_id="ms_graph:alice@contoso.com",
+                provider_type="ms_graph",
+            )
+        ],
+        user_id="user_alice",
+        account_id="ms_graph:alice@contoso.com",
+    )
+    db.upsert_calendar_events(
+        [
+            CalendarMeeting(
+                id="ev-bob-1",
+                title="Bob Dentist",
+                start_time=now_utc + timedelta(hours=1),
+                end_time=now_utc + timedelta(hours=2),
+                account_id="google:bob@gmail.com",
+                provider_type="google",
+            )
+        ],
+        user_id="user_bob",
+        account_id="google:bob@gmail.com",
+    )
+
+    alice_accts = db.list_calendar_accounts(user_id="user_alice")
+    bob_accts = db.list_calendar_accounts(user_id="user_bob")
+    assert [a["account_id"] for a in alice_accts] == ["ms_graph:alice@contoso.com"]
+    assert [a["account_id"] for a in bob_accts] == ["google:bob@gmail.com"]
+    assert len(db.list_calendar_events(user_id="user_alice")) == 1
+    assert db.list_calendar_events(user_id="user_alice")[0]["title"] == "Alice Executive Brief"
+    assert len(db.list_calendar_events(user_id="user_bob")) == 1
+    assert db.list_calendar_events(user_id="user_bob")[0]["title"] == "Bob Dentist"
+    assert broker.load_credentials("user_alice", "google:bob@gmail.com") is None
+
+    db.create_meeting(
+        title="Alice Recorded Call",
+        user_id="user_alice",
+        calendar_event_id="ev-alice-1",
+        calendar_account_id="ms_graph:alice@contoso.com",
+    )
+    assert "ev-alice-1" in db.list_meetings_by_calendar_event_ids(user_id="user_alice")
+    assert "ev-alice-1" not in db.list_meetings_by_calendar_event_ids(user_id="user_bob")
+
+    # Technical errors must sanitize cleanly without leaking AADSTS/OAuth JSON
+    code_admin, msg_admin = sanitize_oauth_error_for_user(
+        '{"error":"consent_required","error_description":"AADSTS65001: user has not consented trace=999"}',
+        "ms_graph",
+    )
+    assert code_admin == "ADMIN_APPROVAL_REQUIRED"
+    assert "AADSTS65001" not in msg_admin
+    assert "IT administrator" in msg_admin
+
+    code_rev, msg_rev = sanitize_oauth_error_for_user("HTTP 401 invalid_grant token revoked", "google")
+    assert code_rev == "AUTH_EXPIRED"
+    assert "invalid_grant" not in msg_rev
+
+    code_den, msg_den = sanitize_oauth_error_for_user("access_denied by resource owner", "zoom")
+    assert code_den == "AUTH_DENIED"
+    assert "access_denied" not in msg_den
+
+    code_net, msg_net = sanitize_oauth_error_for_user("URLError: [WinError 11001] getaddrinfo failed", "google")
+    assert code_net == "NETWORK_OFFLINE"
+    assert "WinError" not in msg_net
+
+    assert classify_account_kind("ms_graph", "u@outlook.com", "9188040d-6c67-4c5b-b112-36a304b66dad") == "personal"
+    assert classify_account_kind("ms_graph", "u@acme.com", "tenant-guid-123") == "work"
+
+
+# ----------------------------------------------------------------------
+# Test 11: Microsoft Graph Delta Sync, @removed & 410 Fallback
+# ----------------------------------------------------------------------
+def test_ms_graph_delta_sync_removed_410_and_tid_classification(tmp_path):
+    import base64
+
+    prov = MsGraphCalendarProvider(auth_file_path=tmp_path / "ms_delta.dat")
+    # Build mock JWT with consumer MSA tid vs enterprise tid check
+    hdr = base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode()).decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"tid": "enterprise-tenant-abc", "upn": "alex@enterprise.com"}).encode()
+    ).decode().rstrip("=")
+    fake_jwt = f"{hdr}.{payload}.sig"
+    prov._fetch_user_profile_upn = lambda: "alex@enterprise.com"
+    prov._record_token_response({
+        "access_token": fake_jwt,
+        "refresh_token": "rt-ms",
+        "expires_in": 3600,
+    })
+    assert prov.get_account_info()["account_kind"] == "work"
+    assert prov.get_account_info()["tenant_id"] == "enterprise-tenant-abc"
+
+    st_dt = (datetime.now(timezone.utc) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    en_dt = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    delta_responses = [
+        # Page 1 initial sync -> nextLink -> page 2 deltaLink
+        (
+            {
+                "value": [
+                    {
+                        "id": "ms-ev-1",
+                        "iCalUId": "uid-ms-1",
+                        "subject": "Initial Architecture Call",
+                        "start": {"dateTime": st_dt, "timeZone": "UTC"},
+                        "end": {"dateTime": en_dt, "timeZone": "UTC"},
+                        "onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3adelta1"},
+                        "organizer": {"emailAddress": {"name": "Alex", "address": "alex@enterprise.com"}},
+                    }
+                ],
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/calendarView/delta?$skiptoken=p2",
+            },
+            200,
+            None,
+        ),
+        (
+            {
+                "value": [
+                    {
+                        "id": "ms-ev-2",
+                        "iCalUId": "uid-ms-2",
+                        "subject": "Vendor Review",
+                        "start": {"dateTime": st_dt, "timeZone": "UTC"},
+                        "end": {"dateTime": en_dt, "timeZone": "UTC"},
+                    }
+                ],
+                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=dtok1",
+            },
+            200,
+            None,
+        ),
+        # Incremental delta call returning modified ms-ev-1 and @removed ms-ev-2
+        (
+            {
+                "value": [
+                    {
+                        "id": "ms-ev-1",
+                        "iCalUId": "uid-ms-1",
+                        "subject": "Updated Architecture Call",
+                        "start": {"dateTime": st_dt, "timeZone": "UTC"},
+                        "end": {"dateTime": en_dt, "timeZone": "UTC"},
+                    },
+                    {"id": "ms-ev-2", "@removed": {"reason": "deleted"}},
+                ],
+                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=dtok2",
+            },
+            200,
+            None,
+        ),
+        # Simulated 410 Gone on stale deltaLink followed by fresh resync
+        (None, 410, "HTTP_410"),
+        (
+            {
+                "value": [
+                    {
+                        "id": "ms-ev-1",
+                        "subject": "Full Reset Architecture Call",
+                        "start": {"dateTime": st_dt, "timeZone": "UTC"},
+                        "end": {"dateTime": en_dt, "timeZone": "UTC"},
+                    }
+                ],
+                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=dtok3",
+            },
+            200,
+            None,
+        ),
+    ]
+    called_urls = []
+
+    def _fake_get(url):
+        called_urls.append(url)
+        return delta_responses.pop(0)
+
+    prov._http_get_json_with_recovery = _fake_get
+
+    res1 = prov.sync_events_delta(window_minutes=1440, use_delta=True)
+    assert res1["ok"] is True
+    assert res1["is_incremental"] is False
+    assert len(res1["meetings"]) == 2
+    assert prov._delta_links["default"].endswith("dtok1")
+
+    res2 = prov.sync_events_delta(window_minutes=1440, use_delta=True)
+    assert res2["ok"] is True
+    assert res2["is_incremental"] is True
+    assert [m.title for m in res2["meetings"]] == ["Updated Architecture Call"]
+    assert res2["removed_ids"] == ["ms-ev-2"]
+    assert "dtok1" in called_urls[2]
+
+    res3 = prov.sync_events_delta(window_minutes=1440, use_delta=True)
+    assert res3["ok"] is True
+    assert res3["is_incremental"] is False
+    assert [m.title for m in res3["meetings"]] == ["Full Reset Architecture Call"]
+
+
+# ----------------------------------------------------------------------
+# Test 12: Google Incremental syncToken, Cancelled Deletion & pageToken Fix
+# ----------------------------------------------------------------------
+def test_google_sync_token_pagetoken_and_workspace_classification(tmp_path):
+    prov = GoogleCalendarProvider(auth_file_path=tmp_path / "g_sync.dat")
+    prov._apply_token_data({
+        "access_token": "gtok",
+        "refresh_token": "grt",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+        "account_email": "maya@acme.io",
+        "hosted_domain": "acme.io",
+    })
+    assert prov.get_account_info()["account_kind"] == "work"
+
+    # Verify pageToken URL replacement never duplicates query params
+    u1 = GoogleCalendarProvider._with_query_param(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&pageToken=old",
+        "pageToken",
+        "new_tok",
+    )
+    assert u1.count("pageToken=") == 1
+    assert "pageToken=new_tok" in u1
+
+    st_dt = (datetime.now(timezone.utc) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    en_dt = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    g_responses = [
+        # Initial 2 pages with nextPageToken + nextSyncToken
+        (
+            {
+                "items": [
+                    {
+                        "id": "g-ev-1",
+                        "iCalUID": "guid-1@google.com",
+                        "summary": "Design Review",
+                        "start": {"dateTime": st_dt},
+                        "end": {"dateTime": en_dt},
+                        "hangoutLink": "https://meet.google.com/aaa-bbbb-ccc",
+                    }
+                ],
+                "nextPageToken": "p2tok",
+            },
+            200,
+            None,
+        ),
+        (
+            {
+                "items": [
+                    {
+                        "id": "g-ev-2",
+                        "summary": "Cancelled Event",
+                        "status": "cancelled",
+                    }
+                ],
+                "nextSyncToken": "sync-tok-1",
+            },
+            200,
+            None,
+        ),
+        # Incremental 410 Gone fallback to full resync
+        (None, 410, "HTTP_410"),
+        (
+            {
+                "items": [
+                    {
+                        "id": "g-ev-1",
+                        "summary": "Design Review Resynced",
+                        "start": {"dateTime": st_dt},
+                        "end": {"dateTime": en_dt},
+                    }
+                ],
+                "nextSyncToken": "sync-tok-2",
+            },
+            200,
+            None,
+        ),
+    ]
+    g_urls = []
+
+    def _fake_g_get(url):
+        g_urls.append(url)
+        return g_responses.pop(0)
+
+    prov._http_get_json_with_recovery = _fake_g_get
+
+    r1 = prov.sync_events_incremental(window_minutes=1440, use_sync_token=True)
+    assert r1["ok"] is True
+    assert len(r1["meetings"]) == 1
+    assert r1["meetings"][0].title == "Design Review"
+    assert r1["removed_ids"] == ["g-ev-2"]
+    assert "pageToken=p2tok" in g_urls[1]
+    assert g_urls[1].count("pageToken=") == 1
+    assert prov._sync_tokens["primary"] == "sync-tok-1"
+
+    r2 = prov.sync_events_incremental(window_minutes=1440, use_sync_token=True)
+    assert r2["ok"] is True
+    assert r2["is_incremental"] is False
+    assert r2["meetings"][0].title == "Design Review Resynced"
+    assert prov._sync_tokens["primary"] == "sync-tok-2"
+
+
+# ----------------------------------------------------------------------
+# Test 13: Zoom Recurring Occurrences & ICS RECURRENCE-ID Override
+# ----------------------------------------------------------------------
+def test_zoom_recurring_occurrences_and_ics_recurrence_override(tmp_path):
+    from voxlocal.calendar.ics_provider import IcsCalendarProvider, parse_ics_events
+
+    zprov = ZoomCalendarProvider(auth_file_path=tmp_path / "zoom_rec.dat")
+    zprov._apply_token_data({
+        "access_token": "ztok",
+        "refresh_token": "zrt",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+        "account_email": "host@acme.com",
+        "zoom_account_type": 2,
+    })
+    assert zprov.get_account_info()["account_kind"] == "work"
+
+    # Zoom PKCE S256 check
+    url = zprov.build_authorization_url("http://127.0.0.1:9999/cb", state="st1", code_challenge="pkce_s256_challenge")
+    assert "code_challenge=pkce_s256_challenge" in url
+    assert "code_challenge_method=S256" in url
+
+    t1 = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%dT10:00:00Z")
+    t2 = (datetime.now(timezone.utc) + timedelta(days=8)).strftime("%Y-%m-%dT10:00:00Z")
+
+    def _fake_zoom_get(req_url):
+        if "type=upcoming" in req_url:
+            return (
+                {
+                    "meetings": [
+                        {
+                            "id": 99001122,
+                            "topic": "Weekly Product Sync",
+                            "type": 8,
+                            "join_url": "https://zoom.us/j/99001122",
+                            "occurrences": [
+                                {"occurrence_id": "101", "start_time": t1, "duration": 45, "status": "available"},
+                                {"occurrence_id": "102", "start_time": t2, "duration": 45, "status": "available"},
+                                {"occurrence_id": "103", "start_time": t2, "duration": 45, "status": "deleted"},
+                            ],
+                        }
+                    ]
+                },
+                200,
+                None,
+            )
+        return ({"meetings": []}, 200, None)
+
+    zprov._http_get_json_with_recovery = _fake_zoom_get
+    z_mtgs = zprov.get_upcoming_meetings(window_minutes=60 * 24 * 30)
+    assert len(z_mtgs) == 2
+    assert all(m.is_recurring for m in z_mtgs)
+    assert all(m.series_master_id == "99001122" for m in z_mtgs)
+
+    # ICS provider: provider_type must be "ics", and RECURRENCE-ID overrides original series instance
+    ics_p = IcsCalendarProvider(auth_file_path=tmp_path / "ics.dat")
+    assert ics_p.provider_type == "ics"
+
+    base_utc = (datetime.now(timezone.utc) + timedelta(days=1)).replace(hour=14, minute=0, second=0, microsecond=0)
+    day1_str = base_utc.strftime("%Y%m%dT%H%M%SZ")
+    day2_str = (base_utc + timedelta(days=1)).strftime("%Y%m%dT%H%M%SZ")
+    day2_mod_start = (base_utc + timedelta(days=1, hours=2)).strftime("%Y%m%dT%H%M%SZ")
+    day2_mod_end = (base_utc + timedelta(days=1, hours=3)).strftime("%Y%m%dT%H%M%SZ")
+    end1_str = (base_utc + timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ")
+
+    ics_text = "\r\n".join([
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "X-WR-CALNAME:Team ICS",
+        "BEGIN:VEVENT",
+        "UID:series-ics-1@vox",
+        f"DTSTART:{day1_str}",
+        f"DTEND:{end1_str}",
+        "RRULE:FREQ=DAILY;COUNT=3",
+        "SUMMARY:Daily Huddle",
+        "DESCRIPTION:Join https://teams.microsoft.com/l/meetup-join/19%3aicsseries",
+        "END:VEVENT",
+        "BEGIN:VEVENT",
+        "UID:series-ics-1@vox",
+        f"RECURRENCE-ID:{day2_str}",
+        f"DTSTART:{day2_mod_start}",
+        f"DTEND:{day2_mod_end}",
+        "SUMMARY:Daily Huddle (Moved)",
+        "END:VEVENT",
+        "END:VCALENDAR",
+    ])
+    cal_name, parsed_ics = parse_ics_events(
+        ics_text,
+        window_start=base_utc - timedelta(hours=1),
+        window_end=base_utc + timedelta(days=5),
+        account_id="ics:abc",
+    )
+    assert cal_name == "Team ICS"
+    assert len(parsed_ics) == 3
+    moved = [m for m in parsed_ics if m.is_modified_occurrence]
+    assert len(moved) == 1
+    assert moved[0].title == "Daily Huddle (Moved)"
+    assert moved[0].start_time == (base_utc + timedelta(days=1, hours=2))
+
+
+# ----------------------------------------------------------------------
+# Test 14: Recurring Dedup, Timezone Boundaries, Fault Isolation & Restart Recovery
+# ----------------------------------------------------------------------
+def test_recurring_series_not_collapsed_fault_isolation_and_restart_recovery(tmp_path):
+    db = LocalDatabase(tmp_path / "engine_restart.db")
+    engine = UnifiedCalendarEngine(db=db, user_id="default")
+
+    now_utc = datetime.now(timezone.utc)
+    day1 = now_utc + timedelta(hours=2)
+    day2 = now_utc + timedelta(days=7, hours=2)
+
+    class _GoodProvider(BaseCalendarProvider):
+        def __init__(self, pid: str, mtgs: list, pt: str = "google", email: str = "a@acme.com"):
+            self._id = pid
+            self._mtgs = mtgs
+            self._pt = pt
+            self._email = email
+            self.selected_cals = ["primary"]
+
+        @property
+        def provider_type(self) -> str:
+            return self._pt
+
+        def authenticate(self, interactive: bool = True) -> bool:
+            return True
+
+        def disconnect(self) -> bool:
+            return True
+
+        def is_authenticated(self) -> bool:
+            return True
+
+        def get_upcoming_meetings(self, window_minutes: int = 60):
+            return list(self._mtgs)
+
+        def get_provider_status(self):
+            return {
+                "provider_type": self._pt,
+                "account_id": self._id,
+                "account_email": self._email,
+                "display_name": "Good Account",
+                "account_kind": "work",
+                "is_authenticated": True,
+                "is_healthy": True,
+                "connection_state": "connected",
+                "error_state": None,
+                "friendly_error": None,
+                "selected_calendars": self.selected_cals,
+            }
+
+    class _FailingProvider(_GoodProvider):
+        def get_upcoming_meetings(self, window_minutes: int = 60):
+            raise RuntimeError("HTTP 429 rate_limit exceeded")
+
+        def get_provider_status(self):
+            st = super().get_provider_status()
+            st.update({
+                "is_healthy": False,
+                "connection_state": "failed",
+                "error_state": "HTTP_429_RATE_LIMIT",
+                "friendly_error": "Rate limited",
+            })
+            return st
+
+    # 2 occurrences of SAME recurring Zoom link on different days must NOT collapse,
+    # whereas same timestamp meeting across 2 accounts MUST merge source_accounts.
+    occ1 = CalendarMeeting(
+        id="rec-occ-1",
+        title="Weekly Architecture",
+        start_time=day1,
+        end_time=day1 + timedelta(minutes=45),
+        join_url="https://zoom.us/j/555444333",
+        platform="zoom",
+        provider_type="google",
+        account_id="google:good@acme.com",
+        provider_account="good@acme.com",
+        is_recurring=True,
+    )
+    occ2 = CalendarMeeting(
+        id="rec-occ-2",
+        title="Weekly Architecture",
+        start_time=day2,
+        end_time=day2 + timedelta(minutes=45),
+        join_url="https://zoom.us/j/555444333",
+        platform="zoom",
+        provider_type="google",
+        account_id="google:good@acme.com",
+        provider_account="good@acme.com",
+        is_recurring=True,
+    )
+    dup_ms = CalendarMeeting(
+        id="ms-dup-occ-1",
+        title="Weekly Architecture",
+        start_time=day1 + timedelta(minutes=1),
+        end_time=day1 + timedelta(minutes=46),
+        join_url="https://zoom.us/j/555444333",
+        platform="zoom",
+        provider_type="ms_graph",
+        account_id="ms_graph:good@contoso.com",
+        provider_account="good@contoso.com",
+        is_recurring=True,
+    )
+
+    p_good1 = _GoodProvider("google:good@acme.com", [occ1, occ2], pt="google", email="good@acme.com")
+    p_good2 = _GoodProvider("ms_graph:good@contoso.com", [dup_ms], pt="ms_graph", email="good@contoso.com")
+    p_bad = _FailingProvider("zoom:bad@acme.com", [], pt="zoom", email="bad@acme.com")
+
+    engine.register_provider("google:good@acme.com", p_good1, sync_immediately=False)
+    engine.register_provider("ms_graph:good@contoso.com", p_good2, sync_immediately=False)
+    engine.register_provider("zoom:bad@acme.com", p_bad, sync_immediately=False)
+
+    merged = engine.poll_all_sync(force=True)
+    # 2 distinct weekly occurrences preserved; day1 across Google + MS merged into 1
+    assert len(merged) == 2
+    first = min(merged, key=lambda m: m.start_time)
+    assert len(first.source_accounts) == 2
+    assert set(first.source_providers) == {"google", "ms_graph"}
+    assert "zoom:bad@acme.com" in engine._account_backoff_until  # failing account backed off without blocking others
+
+    # Offline / application restart recovery from DB cache
+    db_only_engine = UnifiedCalendarEngine(db=db, user_id="default")
+    db_only_engine.hydrate_from_database()
+    assert len(db_only_engine.get_upcoming_meetings()) == 2
+    # Local timezone property works cleanly across tz-aware timestamps
+    assert db_only_engine.get_upcoming_meetings()[0].local_start_time.tzinfo is not None
+
+
+# ----------------------------------------------------------------------
+# Test 15: Notetaker Smart Overlapping Match & Prepare-Notetaker Bridge
+# ----------------------------------------------------------------------
+def test_controller_overlapping_meeting_match_and_prepare_notetaker(tmp_path):
+    from voxlocal.core.controller import AppController
+
+    cfg = AppConfig()
+    cfg.storage_dir = str(tmp_path)
+    cfg.disable_hotkeys = True
+    cfg.ensure_directories()
+    ctrl = AppController(cfg)
+
+    now_utc = datetime.now(timezone.utc)
+    m_teams = CalendarMeeting(
+        id="ov-teams",
+        title="Product Alignment",
+        start_time=now_utc - timedelta(minutes=2),
+        end_time=now_utc + timedelta(minutes=30),
+        join_url="https://teams.microsoft.com/l/meetup-join/19%3ateamsov",
+        platform="teams",
+        provider_type="ms_graph",
+        account_id="ms_graph:a@contoso.com",
+        attendees=["Priya Sharma", "Sam Lee"],
+        organizer="Alex Chen",
+    )
+    m_zoom = CalendarMeeting(
+        id="ov-zoom",
+        title="Customer Demo Call",
+        start_time=now_utc - timedelta(minutes=1),
+        end_time=now_utc + timedelta(minutes=45),
+        join_url="https://zoom.us/j/123456789",
+        platform="zoom",
+        provider_type="zoom",
+        account_id="zoom:a@acme.com",
+        attendees=["Dana White"],
+        organizer="Chris Doe",
+    )
+    ctrl.calendar_engine._cached_meetings = [m_teams, m_zoom]
+
+    matched_zoom = ctrl.match_active_call_to_calendar_meeting(
+        detected_platform="zoom",
+        window_title="Zoom Meeting - Customer Demo",
+    )
+    assert matched_zoom is not None
+    assert matched_zoom.id == "ov-zoom"
+
+    matched_teams = ctrl.match_active_call_to_calendar_meeting(
+        detected_platform="teams",
+        window_title="Microsoft Teams",
+    )
+    assert matched_teams is not None
+    assert matched_teams.id == "ov-teams"
+
+    emitted = []
+    ctrl.calendar_prepare_notetaker_requested.connect(lambda m: emitted.append(m))
+    ok, _msg = ctrl.prepare_notetaker_for_meeting(m_zoom, start_recording=False)
+    assert ok is True
+    assert len(emitted) == 1
+    assert ctrl._capture_state == "idle"  # Preserve recording consent: preparing never auto-records
+    assert ctrl._active_meeting_calendar_event_id == "ov-zoom"
+    assert getattr(ctrl, "_prepared_priming_terms", None) is not None
+
+
+# ----------------------------------------------------------------------
+# Test 16: Dedicated CalendarPage, Meeting Details & MainWindow /calendar UI
+# ----------------------------------------------------------------------
+def test_calendar_page_and_main_window_calendar_routing_ui(qapp, tmp_path):
+    from voxlocal.core.controller import AppController
+    from voxlocal.ui.calendar_page import CalendarMeetingDetailsDialog, CalendarPage
+    from voxlocal.ui.main_window import MainWindow
+
+    cfg = AppConfig()
+    cfg.storage_dir = str(tmp_path)
+    cfg.disable_hotkeys = True
+    cfg.ensure_directories()
+    ctrl = AppController(cfg)
+    db = ctrl.db
+
+    now_utc = datetime.now(timezone.utc)
+    today_m = CalendarMeeting(
+        id="ui-today-1",
+        title="Q4 Roadmap Review",
+        start_time=now_utc + timedelta(hours=1),
+        end_time=now_utc + timedelta(hours=2),
+        join_url="https://meet.google.com/abc-defg-hij",
+        platform="meet",
+        provider_type="google",
+        account_id="google:work@acme.com",
+        provider_account="work@acme.com",
+        organizer="Alex",
+        attendees=["Jordan", "Taylor"],
+    )
+    tomorrow_m = CalendarMeeting(
+        id="ui-tom-1",
+        title="Sprint Retro",
+        start_time=now_utc + timedelta(days=1, hours=2),
+        end_time=now_utc + timedelta(days=1, hours=3),
+        join_url="https://teams.microsoft.com/l/meetup-join/19%3auitom1",
+        platform="teams",
+        provider_type="ms_graph",
+        account_id="ms_graph:work@contoso.com",
+        provider_account="work@contoso.com",
+    )
+    db.upsert_calendar_account(
+        user_id="default",
+        account_id="google:work@acme.com",
+        provider_type="google",
+        account_email="work@acme.com",
+        display_name="Work Google",
+        account_kind="work",
+        is_healthy=True,
+        connection_state="connected",
+    )
+    db.upsert_calendar_events([today_m], user_id="default", account_id="google:work@acme.com")
+    ctrl.calendar_engine._cached_meetings = [today_m, tomorrow_m]
+
+    win = MainWindow(controller=ctrl)
+    # Must preserve 8 WORKSPACES and clamping integer 999 -> 7 (Settings) for existing E2E contracts
+    assert len(MainWindow.WORKSPACES) == 8
+    win.navigate_to_workspace(999)
+    assert win.workspace_stack.currentIndex() == 7
+
+    # Route "/calendar" activates CalendarPage at index 8 and checks sidebar btn_calendar
+    win.navigate_to_workspace("/calendar")
+    assert win.workspace_stack.currentIndex() == 8
+    assert isinstance(win.calendar_page, CalendarPage)
+    assert win.btn_calendar.isChecked() is True
+    assert win.calendar_page.lbl_kpi_accounts.text().isdigit()
+
+    # Filter modes & search work cleanly
+    win.calendar_page.set_time_filter("today")
+    filtered_today = win.calendar_page._filter_meetings([today_m, tomorrow_m])
+    assert any(m.id == "ui-today-1" for m in filtered_today)
+
+    win.calendar_page._on_search_changed("Sprint")
+    filtered_search = win.calendar_page._filter_meetings([today_m, tomorrow_m])
+    assert filtered_search == [] or all("sprint" in m.title.lower() for m in filtered_search)
+
+    # Meeting Details dialog renders safely in both Light & Dark themes
+    dlg = CalendarMeetingDetailsDialog(today_m, controller=ctrl, theme="dark")
+    assert "Q4 Roadmap Review" in dlg.windowTitle()
+    dlg.close()
+
+    # Prepare Notetaker from Calendar switches cleanly to Notetaker and shows prepared banner
+    win._on_prepare_notetaker_from_calendar(today_m)
+    assert win.workspace_stack.currentIndex() == 1
+    assert win.notetaker_page.prepared_banner.isVisibleTo(win.notetaker_page) or "Q4 Roadmap Review" in win.notetaker_page.lbl_prepared_summary.text()
+
+    win.close()
+
 

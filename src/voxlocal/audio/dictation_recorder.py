@@ -18,6 +18,7 @@ import pyaudiowpatch as pyaudio
 from voxlocal.audio.devices import (
     AudioDeviceInfo,
     AudioDeviceManager,
+    StreamResampler,
     compute_rms_level,
     normalize_speech_audio,
     resample_audio_to_16k_mono,
@@ -59,6 +60,11 @@ class DictationRecorder:
 
         self.on_level_change: Optional[Callable[[float], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
+        self.on_interim_audio: Optional[Callable[[np.ndarray, float], None]] = None
+
+        self._resampler: Optional[StreamResampler] = None
+        self._accumulated_16k: List[np.ndarray] = []
+        self._last_interim_time: float = 0.0
 
     @property
     def is_recording(self) -> bool:
@@ -90,7 +96,10 @@ class DictationRecorder:
         preferred_loopback_index: Optional[int] = None,
         preferred_loopback_name: str = "",
         mic_gain: Optional[float] = None,
+        resolved_mic_device: Optional[AudioDeviceInfo] = None,
+        resolved_loop_devices: Optional[List[AudioDeviceInfo]] = None,
     ) -> Tuple[bool, str]:
+        fail_exc = None
         with self._lock:
             if self._is_recording:
                 return True, "Already listening."
@@ -98,15 +107,19 @@ class DictationRecorder:
             if mic_gain is not None:
                 self.mic_gain = max(0.5, float(mic_gain))
 
-            mic_dev = AudioDeviceManager.resolve_microphone(
-                preferred_device_index, preferred_device_name
+            mic_dev = resolved_mic_device or AudioDeviceManager.resolve_microphone(
+                preferred_device_index, preferred_device_name, use_cache=True
             )
             loop_devs = (
-                AudioDeviceManager.resolve_loopbacks_list(
-                    preferred_loopback_index, preferred_loopback_name
+                resolved_loop_devices
+                if resolved_loop_devices is not None
+                else (
+                    AudioDeviceManager.resolve_loopbacks_list(
+                        preferred_loopback_index, preferred_loopback_name, use_cache=True
+                    )
+                    if include_system_audio
+                    else []
                 )
-                if include_system_audio
-                else []
             )
 
             if not mic_dev and not loop_devs:
@@ -125,6 +138,23 @@ class DictationRecorder:
             self._loop_devices = loop_devs
             self.last_mic_16k = np.zeros(0, dtype=np.float32)
             self.last_sys_16k = np.zeros(0, dtype=np.float32)
+            self._accumulated_16k.clear()
+            self._last_interim_time = time.monotonic()
+            if mic_dev is not None:
+                self._resampler = StreamResampler(mic_dev.sample_rate, mic_dev.channels)
+                if pre_speech_frames:
+                    try:
+                        raw_pre = b"".join(pre_speech_frames)
+                        pre_pcm16 = np.frombuffer(raw_pre, dtype=np.int16)
+                        pre_16k = self._resampler.process(pre_pcm16)
+                        if pre_16k.size > 0:
+                            if self.mic_gain != 1.0:
+                                pre_16k = np.clip(pre_16k * float(self.mic_gain), -1.0, 1.0)
+                            self._accumulated_16k.append(pre_16k)
+                    except Exception as pre_exc:
+                        logger.debug("Failed pre-buffering audio in resampler: %s", pre_exc)
+            else:
+                self._resampler = None
 
             try:
                 self._pa = pyaudio.PyAudio()
@@ -147,6 +177,13 @@ class DictationRecorder:
                                 return (None, pyaudio.paContinue)
                             self._mic_frames.append(in_data)
                             self._pre_buffer.append(in_data)
+                            if self._resampler is not None:
+                                pcm16 = np.frombuffer(in_data, dtype=np.int16)
+                                ch_16k = self._resampler.process(pcm16)
+                                if ch_16k.size > 0:
+                                    if self.mic_gain != 1.0:
+                                        ch_16k = np.clip(ch_16k * float(self.mic_gain), -1.0, 1.0)
+                                    self._accumulated_16k.append(ch_16k)
 
                         if self.on_level_change and in_data:
                             try:
@@ -156,6 +193,22 @@ class DictationRecorder:
                                 self.on_level_change(lvl)
                             except Exception:
                                 pass
+
+                        now = time.monotonic()
+                        if self.on_interim_audio and (now - self._last_interim_time) >= 0.22:
+                            self._last_interim_time = now
+                            with self._lock:
+                                snapshot = (
+                                    np.concatenate(self._accumulated_16k)
+                                    if self._accumulated_16k
+                                    else np.zeros(0, dtype=np.float32)
+                                )
+                            if snapshot.size >= int(0.35 * 16000):
+                                dur = float(snapshot.size / 16000.0)
+                                try:
+                                    self.on_interim_audio(snapshot, dur)
+                                except Exception as exc:
+                                    logger.debug("DictationRecorder interim callback error: %s", exc)
                         return (None, pyaudio.paContinue)
 
                     try:
@@ -231,12 +284,15 @@ class DictationRecorder:
                 )
                 return True, status_desc
             except Exception as exc:
-                self._cleanup_resources()
-                msg = f"Failed to start audio capture: {exc}"
-                logger.error(msg)
-                if self.on_error:
-                    self.on_error(msg)
-                return False, msg
+                fail_exc = exc
+
+        if fail_exc is not None:
+            self._cleanup_resources()
+            msg = f"Failed to start audio capture: {fail_exc}"
+            logger.error(msg)
+            if self.on_error:
+                self.on_error(msg)
+            return False, msg
 
     def stop(self) -> Tuple[np.ndarray, float]:
         """
@@ -262,7 +318,16 @@ class DictationRecorder:
 
             self._mic_frames.clear()
             self._loop_frames.clear()
-            self._cleanup_resources()
+            cached_mic_16k = (
+                np.concatenate(self._accumulated_16k)
+                if self._accumulated_16k
+                else np.zeros(0, dtype=np.float32)
+            )
+            self._accumulated_16k.clear()
+            self._resampler = None
+
+        # Clean up PortAudio streams outside self._lock to prevent ABBA deadlock with native callback threads
+        self._cleanup_resources()
 
         if self.on_level_change:
             try:
@@ -271,8 +336,8 @@ class DictationRecorder:
                 pass
 
         # 1. Resample Microphone Track & Apply Digital Gain
-        mic_16k = np.zeros(0, dtype=np.float32)
-        if raw_mic_bytes and mic_dev:
+        mic_16k = cached_mic_16k
+        if mic_16k.size == 0 and raw_mic_bytes and mic_dev:
             pcm_i16 = np.frombuffer(raw_mic_bytes, dtype=np.int16)
             mic_16k = resample_audio_to_16k_mono(pcm_i16, mic_dev.sample_rate, mic_dev.channels)
             if self.mic_gain != 1.0 and mic_16k.size > 0:
@@ -335,19 +400,26 @@ class DictationRecorder:
         return final_16k, duration
 
     def _cleanup_resources(self) -> None:
-        if self._mic_stream is not None:
-            try:
-                if self._mic_stream.is_active():
-                    self._mic_stream.stop_stream()
-            except Exception:
-                pass
-            try:
-                self._mic_stream.close()
-            except Exception:
-                pass
+        with self._lock:
+            mic_stream = self._mic_stream
             self._mic_stream = None
+            loop_streams = list(self._loop_streams)
+            self._loop_streams.clear()
+            pa = self._pa
+            self._pa = None
 
-        for _, st in self._loop_streams:
+        if mic_stream is not None:
+            try:
+                if mic_stream.is_active():
+                    mic_stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                mic_stream.close()
+            except Exception:
+                pass
+
+        for _, st in loop_streams:
             try:
                 if st.is_active():
                     st.stop_stream()
@@ -357,11 +429,9 @@ class DictationRecorder:
                 st.close()
             except Exception:
                 pass
-        self._loop_streams.clear()
 
-        if self._pa is not None:
+        if pa is not None:
             try:
-                self._pa.terminate()
+                pa.terminate()
             except Exception:
                 pass
-            self._pa = None

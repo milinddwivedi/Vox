@@ -10,10 +10,21 @@ Provides unified calendar connectivity via:
 - UnifiedCalendarEngine multi-provider aggregator with cross-calendar deduplication
 """
 
+from voxlocal.calendar.auth_service import (
+    CalendarAuthBroker,
+    classify_account_kind,
+    dpapi_decrypt,
+    dpapi_encrypt,
+    make_account_id,
+    sanitize_oauth_error_for_user,
+)
 from voxlocal.calendar.base import (
+    AccountConnectionState,
     BaseCalendarProvider,
+    CalendarAccountInfo,
     CalendarMeeting,
     CalendarProviderType,
+    MeetingPlatform,
 )
 from voxlocal.calendar.calendar_manager import (
     CalendarAlertEvaluator,
@@ -28,9 +39,13 @@ from voxlocal.calendar.unified_engine import UnifiedCalendarEngine
 from voxlocal.calendar.zoom_provider import ZoomCalendarProvider
 
 __all__ = [
+    "AccountConnectionState",
     "BaseCalendarProvider",
+    "CalendarAccountInfo",
+    "CalendarAuthBroker",
     "CalendarMeeting",
     "CalendarProviderType",
+    "MeetingPlatform",
     "MockCalendarProvider",
     "MsGraphCalendarProvider",
     "GoogleCalendarProvider",
@@ -40,4 +55,9 @@ __all__ = [
     "CalendarAlertEvaluator",
     "CalendarManager",
     "UnifiedCalendarEngine",
+    "classify_account_kind",
+    "dpapi_decrypt",
+    "dpapi_encrypt",
+    "make_account_id",
+    "sanitize_oauth_error_for_user",
 ]

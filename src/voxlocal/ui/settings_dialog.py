@@ -92,11 +92,12 @@ class ShortcutCaptureDialog(QDialog):
         layout.addWidget(header_lbl)
 
         instructions = QLabel(
-            "Press a key combination (e.g. Ctrl + Win, Ctrl + Shift + Space, Alt + V, F8) "
-            "or choose a quick preset."
+            "Press any key on your keyboard (e.g. F8, F9, CapsLock, Right Alt, Ctrl + Win) or choose a preset below.\n"
+            "💡 Note: On PC laptops, the standalone 'Fn' key is handled by BIOS hardware and does not emit a Windows key. "
+            "Use F8, F9, CapsLock, or Right Alt for reliable one-touch voice typing."
         )
         instructions.setWordWrap(True)
-        instructions.setStyleSheet(f"font-size: 12px; color: {t['text_muted']};")
+        instructions.setStyleSheet(f"font-size: 11px; color: {t['text_muted']}; line-height: 1.4;")
         layout.addWidget(instructions)
 
         self.display_chip = QLabel(
@@ -114,7 +115,14 @@ class ShortcutCaptureDialog(QDialog):
 
         preset_row = QHBoxLayout()
         preset_row.setSpacing(6)
-        for label, combo in (("Ctrl + Win", "ctrl+win"), ("Fn", "fn"), ("Right Alt", "ralt")):
+        for label, combo in (
+            ("F8 (Recommended)", "f8"),
+            ("F9", "f9"),
+            ("Caps Lock", "capslock"),
+            ("Right Alt", "ralt"),
+            ("Right Ctrl", "rctrl"),
+            ("Ctrl + Win", "ctrl+win"),
+        ):
             pb = QPushButton(label)
             pb.setFixedHeight(24)
             pb.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -264,6 +272,7 @@ class SettingsWorkspaceWidget(QWidget):
     replay_tour_requested = pyqtSignal()
     status_toast = pyqtSignal(str, str)
     mic_level_updated = pyqtSignal(float)
+    open_calendar_requested = pyqtSignal()
 
     SECTIONS = [
         ("General", "Hotkeys, microphone & local AI engine", "group1"),
@@ -476,7 +485,21 @@ class SettingsWorkspaceWidget(QWidget):
 
         # Hotkeys card
         card_hk, hk_lay = self._make_card()
-        self._add_hotkey_row(hk_lay, "ptt_hotkey", "Push-to-Talk Dictation", "Hold to speak, release to insert clean text.")
+        self.combo_dict_mode = QComboBox()
+        self.combo_dict_mode.setMinimumWidth(260)
+        self.combo_dict_mode.setMaximumWidth(320)
+        self.combo_dict_mode.setAccessibleName("Dictation trigger style")
+        self.combo_dict_mode.addItem("Hold to Speak (Hold key down, release to insert)", "push_to_talk")
+        self.combo_dict_mode.addItem("Click to Toggle (Click once to speak, click again to stop)", "toggle")
+        self.combo_dict_mode.addItem("Hybrid (Hold to speak or tap to toggle)", "hybrid")
+        self.combo_dict_mode.currentIndexChanged.connect(self._on_dict_mode_changed)
+        self._add_control_row(
+            hk_lay,
+            "Dictation Trigger Style",
+            "Choose whether your dictation key holds to speak or switches on/off with a click.",
+            self.combo_dict_mode,
+        )
+        self._add_hotkey_row(hk_lay, "ptt_hotkey", "Push-to-Talk / Dictation Key", "Primary key to hold or toggle speech dictation.")
         self.sw_hands_free_dt = self._add_toggle_row(
             hk_lay,
             "Double-tap for Hands-Free",
@@ -902,6 +925,13 @@ class SettingsWorkspaceWidget(QWidget):
         self.btn_disconnect_cal.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_disconnect_cal.clicked.connect(self._on_disconnect_calendar_clicked)
         cal_btns.addWidget(self.btn_disconnect_cal)
+
+        self.btn_open_calendar_hub = QPushButton("Manage Accounts & Calendars →")
+        self.btn_open_calendar_hub.setObjectName("dawnBtn")
+        self.btn_open_calendar_hub.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_calendar_hub.clicked.connect(self.open_calendar_requested.emit)
+        cal_btns.addWidget(self.btn_open_calendar_hub)
+
         cal_btns.addStretch(1)
         a_lay.addLayout(cal_btns)
 
@@ -1032,6 +1062,7 @@ class SettingsWorkspaceWidget(QWidget):
         self.lbl_mic_gain.setText(f"{self.slider_mic_gain.value() / 100.0:.2f}x")
         self.slider_mic_gain.blockSignals(False)
 
+        self._set_combo_by_data(self.combo_dict_mode, getattr(cfg, "dictation_mode", "push_to_talk"))
         self._set_combo_by_data(self.combo_lang, getattr(cfg, "language", "en+hi"))
         self._set_combo_by_data(self.combo_model, getattr(cfg, "whisper_model", "large-v3-turbo"))
         self._set_combo_by_data(self.combo_compute, getattr(cfg, "compute_type", "default") or "default")
@@ -1096,6 +1127,10 @@ class SettingsWorkspaceWidget(QWidget):
         self.controller.config.save()
         if hasattr(self, "_mic_probe") and self._mic_probe is not None and getattr(self, "btn_test_mic", None) and self.btn_test_mic.isChecked():
             self._start_mic_probe(self.controller.config.mic_device_index, self.controller.config.mic_device_name)
+
+    def _on_dict_mode_changed(self) -> None:
+        val = str(self.combo_dict_mode.currentData() or "push_to_talk")
+        self._save_cfg("dictation_mode", val, apply_hotkeys=True)
 
     def _on_mic_gain_changed(self, value: int) -> None:
         gain = round(value / 100.0, 2)
@@ -1232,10 +1267,20 @@ class SettingsWorkspaceWidget(QWidget):
     def _refresh_calendar_status(self) -> None:
         cfg = getattr(self.controller, "config", None)
         storage_dir = Path(getattr(cfg, "storage_dir", "data"))
+        db_accounts = []
+        if hasattr(self.controller, "list_connected_calendar_accounts"):
+            try:
+                db_accounts = list(self.controller.list_connected_calendar_accounts() or [])
+            except Exception:
+                db_accounts = []
+
+        ms_accounts = [a for a in db_accounts if a.get("provider_type") == "ms_graph" and a.get("is_authenticated")]
+        g_accounts = [a for a in db_accounts if a.get("provider_type") == "google" and a.get("is_authenticated")]
+        z_accounts = [a for a in db_accounts if a.get("provider_type") == "zoom" and a.get("is_authenticated")]
 
         # 1. MS Graph status
-        ms_connected = bool(getattr(cfg, "ms_graph_enabled", False) or (storage_dir / "calendar_auth.dat").exists())
-        ms_acct = getattr(cfg, "calendar_account_email", "") or "Authenticated"
+        ms_connected = bool(ms_accounts or getattr(cfg, "ms_graph_enabled", False) or (storage_dir / "calendar_auth.dat").exists())
+        ms_acct = ", ".join(a.get("account_email") or a.get("display_name") or "Outlook" for a in ms_accounts) or getattr(cfg, "calendar_account_email", "") or "Authenticated"
         if ms_connected:
             self.lbl_ms_status.setText(f"Microsoft 365: Connected ({ms_acct})")
             self.btn_connect_ms.setText("Reconnect Outlook")
@@ -1246,8 +1291,8 @@ class SettingsWorkspaceWidget(QWidget):
             self.btn_disconnect_ms.setVisible(False)
 
         # 2. Google Calendar status
-        google_connected = bool(getattr(cfg, "google_calendar_enabled", False) or (storage_dir / "calendar_google.dat").exists())
-        g_acct = getattr(cfg, "google_calendar_account_email", "") or "Authenticated"
+        google_connected = bool(g_accounts or getattr(cfg, "google_calendar_enabled", False) or (storage_dir / "calendar_google.dat").exists())
+        g_acct = ", ".join(a.get("account_email") or a.get("display_name") or "Google" for a in g_accounts) or getattr(cfg, "google_calendar_account_email", "") or "Authenticated"
         if google_connected:
             self.lbl_google_status.setText(f"Google Calendar: Connected ({g_acct})")
             self.btn_connect_google.setText("Reconnect Google")
@@ -1258,8 +1303,8 @@ class SettingsWorkspaceWidget(QWidget):
             self.btn_disconnect_google.setVisible(False)
 
         # 3. Zoom status
-        zoom_connected = bool(getattr(cfg, "zoom_enabled", False) or (storage_dir / "calendar_zoom.dat").exists())
-        z_acct = getattr(cfg, "zoom_account_email", "") or "Authenticated"
+        zoom_connected = bool(z_accounts or getattr(cfg, "zoom_enabled", False) or (storage_dir / "calendar_zoom.dat").exists())
+        z_acct = ", ".join(a.get("account_email") or a.get("display_name") or "Zoom" for a in z_accounts) or getattr(cfg, "zoom_account_email", "") or "Authenticated"
         if zoom_connected:
             self.lbl_zoom_status.setText(f"Zoom Meetings: Connected ({z_acct})")
             self.btn_connect_zoom.setText("Reconnect Zoom")
@@ -1269,7 +1314,7 @@ class SettingsWorkspaceWidget(QWidget):
             self.btn_connect_zoom.setText("Connect Zoom")
             self.btn_disconnect_zoom.setVisible(False)
 
-        any_connected = ms_connected or google_connected or zoom_connected
+        any_connected = ms_connected or google_connected or zoom_connected or bool(db_accounts)
         self.btn_sync_cal.setVisible(any_connected)
         self.btn_disconnect_cal.setVisible(any_connected)
 

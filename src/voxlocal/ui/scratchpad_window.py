@@ -63,6 +63,8 @@ class VoxScratchpadWindow(QWidget):
         if self.controller:
             self.controller.theme_changed.connect(self.apply_theme)
             self.controller.dictation_completed.connect(self._on_dictation_ready)
+            if hasattr(self.controller, "dictation_interim_updated"):
+                self.controller.dictation_interim_updated.connect(self._on_dictation_interim_updated)
             if hasattr(self.controller, "dictation_state_changed"):
                 self.controller.dictation_state_changed.connect(self._on_dictation_state)
 
@@ -151,6 +153,13 @@ class VoxScratchpadWindow(QWidget):
         self.editor.setFont(get_ui_font(14, 400))
         self.editor.textChanged.connect(self._mark_dirty)
         root.addWidget(self.editor, 1)
+
+        self.lbl_live_interim = QLabel("")
+        self.lbl_live_interim.setObjectName("lblScratchpadInterim")
+        self.lbl_live_interim.setWordWrap(True)
+        self.lbl_live_interim.setStyleSheet("color: #8E8D8A; font-style: italic; font-size: 13px; padding: 4px 10px; background: rgba(0,0,0,0.03); border-radius: 6px;")
+        self.lbl_live_interim.setVisible(False)
+        root.addWidget(self.lbl_live_interim)
 
         # AI Transform / Rewrite Bar
         ai_card = QFrame()
@@ -331,6 +340,24 @@ class VoxScratchpadWindow(QWidget):
         else:
             self.controller.toggle_dictation()
 
+    def _on_dictation_interim_updated(self, provisional: str, stable: str) -> None:
+        app = QApplication.instance()
+        active_win = app.activeWindow() if app else None
+        is_target = (active_win is self) or self.isActiveWindow() or self.editor.hasFocus()
+        if not is_target:
+            if hasattr(self, "lbl_live_interim"):
+                self.lbl_live_interim.setText("")
+                self.lbl_live_interim.setVisible(False)
+            return
+
+        combined = " ".join(x for x in (stable.strip(), provisional.strip()) if x).strip()
+        if combined and hasattr(self, "lbl_live_interim"):
+            self.lbl_live_interim.setText(f"🎙️ Live: {combined}")
+            self.lbl_live_interim.setVisible(True)
+        elif hasattr(self, "lbl_live_interim"):
+            self.lbl_live_interim.setText("")
+            self.lbl_live_interim.setVisible(False)
+
     def _on_dictation_state(self, state: str, _msg: str = "") -> None:
         if state in ("listening", "speaking") and (
             self.isActiveWindow() or self.editor.hasFocus()
@@ -340,32 +367,47 @@ class VoxScratchpadWindow(QWidget):
             self.btn_dictate.setText("Transcribing...")
         else:
             self.btn_dictate.setText("Dictate Here")
+            if hasattr(self, "lbl_live_interim"):
+                self.lbl_live_interim.setText("")
+                self.lbl_live_interim.setVisible(False)
 
     def _on_dictation_ready(self, final_text: str, _target: str = "", method_used: str = "") -> None:
-        if not final_text:
+        if hasattr(self, "lbl_live_interim"):
+            self.lbl_live_interim.setText("")
+            self.lbl_live_interim.setVisible(False)
+        if not final_text or not final_text.strip():
             return
-        if method_used == "in_app_qt" and (self.isVisible() or self.editor.hasFocus()):
+
+        app = QApplication.instance()
+        active_win = app.activeWindow() if app else None
+        is_target = (
+            (active_win is self)
+            or self.isActiveWindow()
+            or self.editor.hasFocus()
+            or (method_used == "in_app_qt" and self.isVisible())
+            or ("scratchpad" in _target.lower() if _target else False)
+        )
+        if not is_target:
+            return
+
+        # Check if already inserted directly into editor
+        current_text = self.editor.toPlainText()
+        tail = current_text[-max(40, len(final_text) + 10) :] if current_text else ""
+        if final_text.strip() not in tail:
             cursor = self.editor.textCursor()
             existing = self.editor.toPlainText()
             pos = cursor.position()
             if final_text == "\n":
                 to_insert = "\n"
-            elif existing and pos > 0 and not existing[pos - 1].isspace():
+            elif existing and pos > 0 and not existing[pos - 1].isspace() and not final_text.startswith(" "):
                 to_insert = " " + final_text.lstrip()
             else:
-                to_insert = (
-                    final_text.lstrip()
-                    if existing and pos > 0 and existing[pos - 1].isspace()
-                    else final_text
-                )
+                to_insert = final_text
             cursor.insertText(to_insert)
             self.editor.setTextCursor(cursor)
             self.editor.ensureCursorVisible()
-            self.editor.setFocus()
-            self._autosave_timer.start()
-        elif self.isActiveWindow() and self.editor.hasFocus():
-            # Already inserted via TextInserter when focused; save immediately
-            self._autosave_timer.start()
+
+        self._autosave_timer.start()
 
     def hideEvent(self, event) -> None:
         if self.controller and hasattr(self.controller, "clear_in_app_dictation_target"):

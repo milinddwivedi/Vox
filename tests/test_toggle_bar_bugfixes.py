@@ -204,3 +204,140 @@ def test_dictation_completed_toast_feedback(app, mock_controller):
     assert not bar.btn_check.isHidden()
     assert not bar.btn_undo_toast.isHidden()
     bar.hide()
+
+
+def test_wispr_active_recording_chevron_contextual_panel_and_finishing(app, mock_controller):
+    bar = VoxFlowBar(parent=None, controller=mock_controller)
+    bar.set_dock_edge("right")
+    bar.show()
+    bar.set_pill_state(PillState.ACTIVE_RECORDING, metadata={"title": "Sync", "platform": "zoom"}, animated=False)
+
+    assert not bar.isHidden()
+    assert bar.satellite_chevron.isHidden()
+    assert (bar.width(), bar.height()) == (30, 72)
+
+    # Hovering reveals the satellite chevron and expands height to 30x106 without shifting pill
+    bar.enterEvent(None)
+    assert not bar.satellite_chevron.isHidden()
+    assert bar.satellite_chevron._opacity >= 0.35
+    assert (bar.width(), bar.height()) == (30, 106)
+
+    # Clicking chevron toggles the Contextual Meeting Panel cleanly
+    bar._toggle_contextual_panel()
+    assert bar._contextual_panel_open is True
+    assert not bar.contextual_panel.isHidden()
+    bar._toggle_contextual_panel()
+    assert bar._contextual_panel_open is False
+
+    # Finishing hides the chevron and switches capsule to finishing spinner mode
+    bar._on_controller_meeting_lifecycle("finalizing", "")
+    assert bar._meeting_finishing is True
+    assert bar.satellite_chevron.isHidden()
+    assert bar.active_recording_capsule._finishing is True
+
+    bar.hide_widget()
+
+
+def test_wispr_upcoming_popover_cancelled_toast_and_mistake_card(app, mock_controller):
+    bar = VoxFlowBar(parent=None, controller=mock_controller)
+    bar.set_dock_edge("bottom")
+    bar.show()
+
+    # Upcoming popover toggles open cleanly on chevron click
+    assert bar.upcoming_popover.isHidden()
+    bar._on_notetaker_chevron_clicked()
+    assert bar.upcoming_popover.isVisible()
+    bar.upcoming_popover.hide()
+
+    # Cancelling dictation triggers the cancelled toast
+    bar.set_state(PillState.LISTENING)
+    bar._on_cancel_clicked()
+    assert bar.cancelled_toast.isVisible()
+    bar.cancelled_toast.hide()
+
+    # Short recording save triggers Started by mistake? card
+    bar.set_pill_state(PillState.ACTIVE_RECORDING, animated=False)
+    bar._last_meeting_elapsed_sec = 2.0
+    bar._pending_safeguard_check = True
+    bar._meeting_active = False
+    bar._on_meeting_saved_and_transcribed(77)
+    assert bar.mistake_card.isVisible()
+    bar.mistake_card.hide()
+    bar.hide_widget()
+
+
+def test_ready_bar_fixed_dimensions_and_no_hover_shift(app, mock_controller):
+    """Verify ready bar has fixed size and does not resize or shift on hover."""
+    bar = VoxFlowBar(parent=None, controller=mock_controller)
+    bar.set_dock_edge("bottom")
+    bar.set_pill_state(PillState.READY, animated=False)
+    bar.show()
+
+    initial_dims = bar._ready_dims()
+    assert initial_dims == (82, 30)
+
+    # Hovering over notetaker button does NOT expand width from 30 to 52
+    bar.btn_notetaker.enterEvent(MagicMock())
+    assert bar.btn_notetaker.width() == 30
+    assert bar.btn_notetaker.height() == 30
+    assert bar._ready_dims() == (82, 30)
+
+    # Leaving notetaker button preserves fixed dimensions
+    bar.btn_notetaker.leaveEvent(MagicMock())
+    assert bar.btn_notetaker.width() == 30
+    assert bar._ready_dims() == (82, 30)
+    bar.hide_widget()
+
+
+def test_chevron_click_opens_popover_without_starting_dictation(app, mock_controller):
+    """Verify clicking the arrow chevron opens upcoming popover and does NOT start dictation."""
+    mock_controller.toggle_dictation.reset_mock()
+    bar = VoxFlowBar(parent=None, controller=mock_controller)
+    bar.set_dock_edge("bottom")
+    bar.set_pill_state(PillState.READY, animated=False)
+    bar.show()
+
+    dictation_signals = []
+    bar.start_dictation_requested.connect(lambda: dictation_signals.append(True))
+
+    assert bar.upcoming_popover.isHidden()
+
+    # Simulate click on btn_notetaker with no upcoming meetings
+    mock_controller.calendar_engine.get_upcoming_meetings.return_value = []
+    bar.btn_notetaker._is_down = True
+    ev = MagicMock()
+    ev.button.return_value = Qt.MouseButton.LeftButton
+    ev.globalPosition().toPoint.return_value = bar.btn_notetaker.mapToGlobal(QPoint(15, 15))
+    bar.btn_notetaker.mouseReleaseEvent(ev)
+
+    # Popover is now visible
+    assert bar.upcoming_popover.isVisible()
+
+    # Dictation must NOT have started
+    assert len(dictation_signals) == 0
+    mock_controller.toggle_dictation.assert_not_called()
+
+    # Empty state popover text
+    assert bar.upcoming_popover.lbl_title.text() == "No meetings for today"
+
+    bar.upcoming_popover.hide()
+    bar.hide_widget()
+
+
+def test_arrow_direction_per_dock_edge(app, mock_controller):
+    """Verify arrow orientation correctly reflects dock edges."""
+    bar = VoxFlowBar(parent=None, controller=mock_controller)
+
+    bar.set_dock_edge("bottom")
+    assert bar.btn_notetaker._dock_edge == "bottom"
+
+    bar.set_dock_edge("right")
+    assert bar.btn_notetaker._dock_edge == "right"
+    # When docked on right, ready dims are vertical
+    assert bar._ready_dims() == (30, 78)
+
+    bar.set_dock_edge("left")
+    assert bar.btn_notetaker._dock_edge == "left"
+    assert bar._ready_dims() == (30, 78)
+
+    bar.hide_widget()

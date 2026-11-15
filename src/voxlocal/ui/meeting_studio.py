@@ -232,6 +232,21 @@ class VoxMyThoughtsTab(QWidget):
         self.editor.cursorPositionChanged.connect(self._check_cursor_timestamp)
         layout.addWidget(self.editor, 1)
 
+        self.lbl_live_interim = QLabel("")
+        self.lbl_live_interim.setObjectName("lblLiveInterim")
+        self.lbl_live_interim.setWordWrap(True)
+        self.lbl_live_interim.setStyleSheet("color: #8E8D8A; font-style: italic; font-size: 13px; padding: 4px 8px;")
+        self.lbl_live_interim.setVisible(False)
+        layout.addWidget(self.lbl_live_interim)
+
+    def set_interim_text(self, text: str) -> None:
+        if text and text.strip():
+            self.lbl_live_interim.setText(f"🎙️ Live: {text.strip()}")
+            self.lbl_live_interim.setVisible(True)
+        else:
+            self.lbl_live_interim.setText("")
+            self.lbl_live_interim.setVisible(False)
+
     def apply_theme(self, theme_name: str) -> None:
         self.theme = (theme_name or "dark").lower()
         t = get_theme_tokens(self.theme)

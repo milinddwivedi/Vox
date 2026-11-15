@@ -7,6 +7,7 @@ voice typing dictation history, and custom vocabulary.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import shutil
@@ -268,19 +269,39 @@ class LocalDatabase:
                 ("calendar_attendees", "ALTER TABLE meetings ADD COLUMN calendar_attendees TEXT DEFAULT '';"),
                 ("calendar_organizer", "ALTER TABLE meetings ADD COLUMN calendar_organizer TEXT DEFAULT '';"),
                 ("calendar_provider", "ALTER TABLE meetings ADD COLUMN calendar_provider TEXT DEFAULT '';"),
+                ("calendar_account_id", "ALTER TABLE meetings ADD COLUMN calendar_account_id TEXT DEFAULT '';"),
+                ("user_id", "ALTER TABLE meetings ADD COLUMN user_id TEXT DEFAULT 'default';"),
             ]:
                 try:
                     conn.execute(ddl)
                 except sqlite3.OperationalError:
                     pass
 
-            # Calendar events cache table
+            # Calendar events cache, multi-account registry, and encrypted credential vault
+            existing_cal_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(calendar_events)").fetchall()
+            }
+            if existing_cal_cols and "user_id" not in existing_cal_cols:
+                conn.executescript(
+                    """
+                    ALTER TABLE calendar_events RENAME TO calendar_events_legacy;
+                    """
+                )
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS calendar_events (
-                    id TEXT PRIMARY KEY,
+                    id TEXT NOT NULL,
+                    user_id TEXT NOT NULL DEFAULT 'default',
+                    account_id TEXT NOT NULL DEFAULT '',
                     provider_type TEXT NOT NULL,
                     provider_account TEXT NOT NULL,
+                    calendar_id TEXT DEFAULT '',
+                    calendar_name TEXT DEFAULT '',
+                    ical_uid TEXT DEFAULT '',
+                    series_master_id TEXT DEFAULT '',
+                    is_modified_occurrence INTEGER DEFAULT 0,
+                    timezone_name TEXT DEFAULT '',
+                    conference_id TEXT DEFAULT '',
                     title TEXT NOT NULL,
                     start_time TEXT NOT NULL,
                     end_time TEXT NOT NULL,
@@ -293,11 +314,69 @@ class LocalDatabase:
                     is_cancelled INTEGER DEFAULT 0,
                     is_recurring INTEGER DEFAULT 0,
                     description TEXT DEFAULT '',
-                    last_synced_at TEXT NOT NULL
+                    source_accounts_json TEXT DEFAULT '[]',
+                    source_providers_json TEXT DEFAULT '[]',
+                    source_event_ids_json TEXT DEFAULT '[]',
+                    last_synced_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, account_id, id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_cal_start ON calendar_events(start_time);
+                CREATE INDEX IF NOT EXISTS idx_cal_user_account ON calendar_events(user_id, account_id, start_time);
+
+                CREATE TABLE IF NOT EXISTS calendar_accounts (
+                    account_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL DEFAULT 'default',
+                    provider_type TEXT NOT NULL,
+                    account_email TEXT DEFAULT '',
+                    display_name TEXT DEFAULT '',
+                    account_kind TEXT DEFAULT 'personal',
+                    tenant_id TEXT DEFAULT '',
+                    organization_name TEXT DEFAULT '',
+                    enabled INTEGER DEFAULT 1,
+                    connection_state TEXT DEFAULT 'disconnected',
+                    last_sync_at TEXT DEFAULT '',
+                    last_error TEXT DEFAULT '',
+                    error_code TEXT DEFAULT '',
+                    selected_calendars_json TEXT DEFAULT '[]',
+                    available_calendars_json TEXT DEFAULT '[]',
+                    delta_links_json TEXT DEFAULT '{}',
+                    sync_tokens_json TEXT DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, account_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_cal_accounts_user ON calendar_accounts(user_id, enabled);
+
+                CREATE TABLE IF NOT EXISTS calendar_credentials_vault (
+                    user_id TEXT NOT NULL DEFAULT 'default',
+                    account_id TEXT NOT NULL,
+                    provider_type TEXT NOT NULL,
+                    encrypted_blob BLOB NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, account_id)
+                );
                 """
             )
+            if existing_cal_cols and "user_id" not in existing_cal_cols:
+                try:
+                    conn.executescript(
+                        """
+                        INSERT OR IGNORE INTO calendar_events (
+                            id, user_id, account_id, provider_type, provider_account,
+                            title, start_time, end_time, location, join_url, attendees,
+                            organizer, platform, is_online, is_cancelled, is_recurring,
+                            description, last_synced_at
+                        )
+                        SELECT id, 'default', provider_type || ':' || COALESCE(provider_account, ''),
+                               provider_type, provider_account, title, start_time, end_time,
+                               location, join_url, attendees, organizer, platform, is_online,
+                               is_cancelled, is_recurring, description, last_synced_at
+                        FROM calendar_events_legacy;
+                        DROP TABLE IF EXISTS calendar_events_legacy;
+                        """
+                    )
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
 
         self._migrate_v6()
@@ -607,6 +686,8 @@ class LocalDatabase:
         calendar_attendees: str = "",
         calendar_organizer: str = "",
         calendar_provider: str = "",
+        calendar_account_id: str = "",
+        user_id: str = "default",
     ) -> int:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._lock, self._connect() as conn:
@@ -617,8 +698,9 @@ class LocalDatabase:
                     audio_path, mic_audio_path, sys_audio_path, video_path, status, model_used,
                     folder_id, meeting_type, source_platform, engagement_score, sentiment_score, topics,
                     timezone, utc_offset_min,
-                    calendar_event_id, calendar_join_url, calendar_attendees, calendar_organizer, calendar_provider
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'recording', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    calendar_event_id, calendar_join_url, calendar_attendees, calendar_organizer, calendar_provider,
+                    calendar_account_id, user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'recording', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     title,
@@ -644,6 +726,8 @@ class LocalDatabase:
                     calendar_attendees,
                     calendar_organizer,
                     calendar_provider,
+                    calendar_account_id,
+                    user_id or "default",
                 ),
             )
             conn.commit()
@@ -693,6 +777,8 @@ class LocalDatabase:
             "calendar_attendees",
             "calendar_organizer",
             "calendar_provider",
+            "calendar_account_id",
+            "user_id",
         }
         fields = {k: v for k, v in kwargs.items() if k in allowed}
         if not fields:
@@ -1036,6 +1122,14 @@ class LocalDatabase:
                 if path_str and os.path.exists(path_str):
                     try:
                         os.remove(path_str)
+                    except PermissionError:
+                        import gc
+                        gc.collect()
+                        time.sleep(0.05)
+                        try:
+                            os.remove(path_str)
+                        except Exception as exc:
+                            logger.warning("Could not delete file %s: %s", path_str, exc)
                     except Exception as exc:
                         logger.warning("Could not delete file %s: %s", path_str, exc)
                 if path_str:
@@ -2513,6 +2607,10 @@ class LocalDatabase:
                 conn.execute("DELETE FROM transcript_segments")
             if "screen_recordings" in categories:
                 removed["screen_recordings"] = conn.execute("DELETE FROM screen_recordings").rowcount
+            if "calendar" in categories or "calendar_events" in categories:
+                removed["calendar_events"] = conn.execute("DELETE FROM calendar_events").rowcount
+                removed["calendar_accounts"] = conn.execute("DELETE FROM calendar_accounts").rowcount
+                conn.execute("DELETE FROM calendar_credentials_vault")
             conn.commit()
         if "meetings" in categories and recordings_dir and recordings_dir.exists():
             for child in recordings_dir.iterdir():
@@ -2614,12 +2712,15 @@ class LocalDatabase:
         return deleted_count
 
     def wipe_all_user_data(self, recordings_dir: Optional[Path] = None) -> None:
-        """Completely delete all meetings, transcripts, audio files, and dictation history."""
+        """Completely delete all meetings, transcripts, audio files, calendar caches, and dictation history."""
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM transcript_segments")
             conn.execute("DELETE FROM meetings")
             conn.execute("DELETE FROM dictation_history")
             conn.execute("DELETE FROM screen_recordings")
+            conn.execute("DELETE FROM calendar_events")
+            conn.execute("DELETE FROM calendar_accounts")
+            conn.execute("DELETE FROM calendar_credentials_vault")
             conn.commit()
         if recordings_dir and recordings_dir.exists():
             for child in recordings_dir.iterdir():
@@ -2634,4 +2735,440 @@ class LocalDatabase:
 
     def wipe_all_data(self, recordings_dir: Optional[Path] = None) -> None:
         self.wipe_all_user_data(recordings_dir=recordings_dir)
+
+    # ------------------------------------------------------------------
+    # Multi-User Calendar Accounts, Credential Vault, and Event Sync Cache
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _decode_cal_account_row(row: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(row)
+        for jcol, out_col, default_val in [
+            ("selected_calendars_json", "selected_calendars", []),
+            ("available_calendars_json", "available_calendars", []),
+            ("delta_links_json", "delta_links", {}),
+            ("sync_tokens_json", "sync_tokens", {}),
+        ]:
+            try:
+                d[out_col] = json.loads(d.get(jcol) or json.dumps(default_val))
+            except Exception:
+                d[out_col] = default_val
+        d["enabled"] = bool(d.get("enabled", 1))
+        return d
+
+    def upsert_calendar_account(
+        self,
+        account_id: str,
+        provider_type: str,
+        user_id: str = "default",
+        **kwargs: Any,
+    ) -> None:
+        uid = user_id or "default"
+        now = datetime.now().isoformat()
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM calendar_accounts WHERE user_id = ? AND account_id = ?",
+                (uid, account_id),
+            ).fetchone()
+            base = self._decode_cal_account_row(existing) if existing else {
+                "account_id": account_id,
+                "user_id": uid,
+                "provider_type": provider_type,
+                "account_email": "",
+                "display_name": "",
+                "account_kind": "personal",
+                "tenant_id": "",
+                "organization_name": "",
+                "enabled": True,
+                "connection_state": "disconnected",
+                "last_sync_at": "",
+                "last_error": "",
+                "error_code": "",
+                "selected_calendars": [],
+                "available_calendars": [],
+                "delta_links": {},
+                "sync_tokens": {},
+                "created_at": now,
+            }
+            base["provider_type"] = provider_type or base.get("provider_type", "ms_graph")
+            for k in (
+                "account_email",
+                "display_name",
+                "account_kind",
+                "tenant_id",
+                "organization_name",
+                "enabled",
+                "connection_state",
+                "last_sync_at",
+                "last_error",
+                "error_code",
+                "selected_calendars",
+                "available_calendars",
+                "delta_links",
+                "sync_tokens",
+            ):
+                if k in kwargs and kwargs[k] is not None:
+                    base[k] = kwargs[k]
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO calendar_accounts (
+                    account_id, user_id, provider_type, account_email, display_name,
+                    account_kind, tenant_id, organization_name, enabled, connection_state,
+                    last_sync_at, last_error, error_code,
+                    selected_calendars_json, available_calendars_json,
+                    delta_links_json, sync_tokens_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_id,
+                    uid,
+                    str(base["provider_type"]),
+                    str(base["account_email"] or ""),
+                    str(base["display_name"] or ""),
+                    str(base["account_kind"] or "personal"),
+                    str(base["tenant_id"] or ""),
+                    str(base["organization_name"] or ""),
+                    1 if base.get("enabled", True) else 0,
+                    str(base.get("connection_state") or "disconnected"),
+                    str(base.get("last_sync_at") or ""),
+                    str(base.get("last_error") or ""),
+                    str(base.get("error_code") or ""),
+                    json.dumps(base.get("selected_calendars") or []),
+                    json.dumps(base.get("available_calendars") or []),
+                    json.dumps(base.get("delta_links") or {}),
+                    json.dumps(base.get("sync_tokens") or {}),
+                    str(base.get("created_at") or now),
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def get_calendar_account(self, account_id: str, user_id: str = "default") -> Optional[Dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM calendar_accounts WHERE user_id = ? AND account_id = ?",
+                (user_id or "default", account_id),
+            ).fetchone()
+            return self._decode_cal_account_row(row) if row else None
+
+    def list_calendar_accounts(
+        self,
+        user_id: str = "default",
+        enabled_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            sql = "SELECT * FROM calendar_accounts WHERE user_id = ?"
+            params: List[Any] = [user_id or "default"]
+            if enabled_only:
+                sql += " AND enabled = 1"
+            sql += " ORDER BY created_at ASC, account_id ASC"
+            rows = conn.execute(sql, params).fetchall()
+            return [self._decode_cal_account_row(r) for r in rows]
+
+    def update_calendar_account_state(
+        self,
+        account_id: str,
+        user_id: str = "default",
+        **kwargs: Any,
+    ) -> None:
+        uid = user_id or "default"
+        existing = self.get_calendar_account(account_id, user_id=uid)
+        if not existing:
+            return
+        self.upsert_calendar_account(
+            account_id=account_id,
+            provider_type=existing["provider_type"],
+            user_id=uid,
+            **kwargs,
+        )
+
+    def set_calendar_account_enabled(
+        self,
+        account_id: str,
+        enabled: bool,
+        user_id: str = "default",
+    ) -> None:
+        self.update_calendar_account_state(
+            account_id=account_id,
+            user_id=user_id,
+            enabled=bool(enabled),
+        )
+
+    def delete_calendar_account(self, account_id: str, user_id: str = "default") -> None:
+        uid = user_id or "default"
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM calendar_accounts WHERE user_id = ? AND account_id = ?",
+                (uid, account_id),
+            )
+            conn.execute(
+                "DELETE FROM calendar_credentials_vault WHERE user_id = ? AND account_id = ?",
+                (uid, account_id),
+            )
+            conn.execute(
+                "DELETE FROM calendar_events WHERE user_id = ? AND account_id = ?",
+                (uid, account_id),
+            )
+            conn.commit()
+
+    def save_calendar_credentials(
+        self,
+        user_id: str,
+        account_id: str,
+        provider_type: str,
+        encrypted_blob: bytes,
+    ) -> bool:
+        uid = user_id or "default"
+        now = datetime.now().isoformat()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO calendar_credentials_vault (
+                    user_id, account_id, provider_type, encrypted_blob, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (uid, account_id, provider_type, sqlite3.Binary(encrypted_blob), now),
+            )
+            conn.commit()
+            return True
+
+    def load_calendar_credentials(self, user_id: str, account_id: str) -> Optional[bytes]:
+        uid = user_id or "default"
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT encrypted_blob FROM calendar_credentials_vault WHERE user_id = ? AND account_id = ?",
+                (uid, account_id),
+            ).fetchone()
+            if not row or row["encrypted_blob"] is None:
+                return None
+            return bytes(row["encrypted_blob"])
+
+    def delete_calendar_credentials(self, user_id: str, account_id: str) -> bool:
+        uid = user_id or "default"
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM calendar_credentials_vault WHERE user_id = ? AND account_id = ?",
+                (uid, account_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def upsert_calendar_events(
+        self,
+        events: List[Any],
+        user_id: str = "default",
+        account_id: str = "",
+    ) -> int:
+        uid = user_id or "default"
+        now = datetime.now().isoformat()
+        count = 0
+        with self._lock, self._connect() as conn:
+            for ev in events:
+                if isinstance(ev, dict):
+                    ev_id = str(ev.get("id") or "")
+                    ev_acc = str(account_id or ev.get("account_id") or "")
+                    ptype = str(ev.get("provider_type") or "ms_graph")
+                    pacc = str(ev.get("provider_account") or "")
+                    cal_id = str(ev.get("calendar_id") or "")
+                    cal_name = str(ev.get("calendar_name") or "")
+                    ical_uid = str(ev.get("ical_uid") or "")
+                    series_id = str(ev.get("series_master_id") or "")
+                    mod_occ = 1 if ev.get("is_modified_occurrence") else 0
+                    tz_name = str(ev.get("timezone_name") or "")
+                    conf_id = str(ev.get("conference_id") or "")
+                    title = str(ev.get("title") or "Untitled Meeting")
+                    st = str(ev.get("start_time") or "")
+                    et = str(ev.get("end_time") or "")
+                    loc = str(ev.get("location") or "")
+                    jurl = str(ev.get("join_url") or "")
+                    att = ", ".join(ev.get("attendees") or []) if isinstance(ev.get("attendees"), list) else str(ev.get("attendees") or "")
+                    org = str(ev.get("organizer") or "")
+                    plat = str(ev.get("platform") or "generic")
+                    is_on = 1 if ev.get("is_online") else 0
+                    is_canc = 1 if ev.get("is_cancelled") else 0
+                    is_rec = 1 if ev.get("is_recurring") else 0
+                    desc = str(ev.get("description") or "")
+                    src_accs = json.dumps(ev.get("source_accounts") or [])
+                    src_provs = json.dumps(ev.get("source_providers") or [])
+                    src_ids = json.dumps(ev.get("source_event_ids") or [ev_id])
+                else:
+                    ev_id = str(getattr(ev, "id", "") or "")
+                    ev_acc = str(account_id or getattr(ev, "account_id", "") or "")
+                    ptype = str(getattr(ev, "provider_type", "ms_graph") or "ms_graph")
+                    pacc = str(getattr(ev, "provider_account", "") or "")
+                    cal_id = str(getattr(ev, "calendar_id", "") or "")
+                    cal_name = str(getattr(ev, "calendar_name", "") or "")
+                    ical_uid = str(getattr(ev, "ical_uid", "") or "")
+                    series_id = str(getattr(ev, "series_master_id", "") or "")
+                    mod_occ = 1 if getattr(ev, "is_modified_occurrence", False) else 0
+                    tz_name = str(getattr(ev, "timezone_name", "") or "")
+                    conf_id = str(getattr(ev, "conference_id", "") or "")
+                    title = str(getattr(ev, "title", "Untitled Meeting") or "Untitled Meeting")
+                    st_dt = getattr(ev, "start_time", None)
+                    et_dt = getattr(ev, "end_time", None)
+                    st = st_dt.isoformat() if hasattr(st_dt, "isoformat") else str(st_dt or "")
+                    et = et_dt.isoformat() if hasattr(et_dt, "isoformat") else str(et_dt or "")
+                    loc = str(getattr(ev, "location", "") or "")
+                    jurl = str(getattr(ev, "join_url", "") or "")
+                    att = ", ".join(getattr(ev, "attendees", []) or [])
+                    org = str(getattr(ev, "organizer", "") or "")
+                    plat = str(getattr(ev, "platform", "generic") or "generic")
+                    is_on = 1 if getattr(ev, "is_online", False) else 0
+                    is_canc = 1 if getattr(ev, "is_cancelled", False) else 0
+                    is_rec = 1 if getattr(ev, "is_recurring", False) else 0
+                    desc = str(getattr(ev, "description", "") or "")
+                    src_accs = json.dumps(getattr(ev, "source_accounts", []) or [])
+                    src_provs = json.dumps(getattr(ev, "source_providers", []) or [])
+                    src_ids = json.dumps(getattr(ev, "source_event_ids", []) or [ev_id])
+                if not ev_id:
+                    continue
+                if not ev_acc:
+                    ev_acc = f"{ptype}:{pacc}"
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO calendar_events (
+                        id, user_id, account_id, provider_type, provider_account,
+                        calendar_id, calendar_name, ical_uid, series_master_id,
+                        is_modified_occurrence, timezone_name, conference_id,
+                        title, start_time, end_time, location, join_url,
+                        attendees, organizer, platform, is_online, is_cancelled,
+                        is_recurring, description, source_accounts_json,
+                        source_providers_json, source_event_ids_json, last_synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ev_id, uid, ev_acc, ptype, pacc,
+                        cal_id, cal_name, ical_uid, series_id,
+                        mod_occ, tz_name, conf_id,
+                        title, st, et, loc, jurl,
+                        att, org, plat, is_on, is_canc,
+                        is_rec, desc, src_accs, src_provs, src_ids, now,
+                    ),
+                )
+                count += 1
+            conn.commit()
+        return count
+
+    def delete_calendar_events_by_ids(
+        self,
+        event_ids: List[str],
+        user_id: str = "default",
+        account_id: str = "",
+    ) -> int:
+        ids = [str(eid) for eid in (event_ids or []) if eid]
+        if not ids:
+            return 0
+        uid = user_id or "default"
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock, self._connect() as conn:
+            if account_id:
+                cur = conn.execute(
+                    f"DELETE FROM calendar_events WHERE user_id = ? AND account_id = ? AND id IN ({placeholders})",
+                    [uid, account_id] + ids,
+                )
+            else:
+                cur = conn.execute(
+                    f"DELETE FROM calendar_events WHERE user_id = ? AND id IN ({placeholders})",
+                    [uid] + ids,
+                )
+            conn.commit()
+            return cur.rowcount
+
+    def clear_calendar_events_for_account(self, account_id: str, user_id: str = "default") -> int:
+        uid = user_id or "default"
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM calendar_events WHERE user_id = ? AND account_id = ?",
+                (uid, account_id),
+            )
+            conn.commit()
+            return cur.rowcount
+
+    def list_calendar_events(
+        self,
+        user_id: str = "default",
+        account_id: Optional[str] = None,
+        start_iso: Optional[str] = None,
+        end_iso: Optional[str] = None,
+        include_cancelled: bool = False,
+    ) -> List[Dict[str, Any]]:
+        uid = user_id or "default"
+        clauses = ["user_id = ?"]
+        params: List[Any] = [uid]
+        if account_id:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        if not include_cancelled:
+            clauses.append("is_cancelled = 0")
+        if start_iso:
+            clauses.append("end_time >= ?")
+            params.append(start_iso)
+        if end_iso:
+            clauses.append("start_time <= ?")
+            params.append(end_iso)
+        sql = f"SELECT * FROM calendar_events WHERE {' AND '.join(clauses)} ORDER BY start_time ASC"
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                d["is_online"] = bool(d.get("is_online"))
+                d["is_cancelled"] = bool(d.get("is_cancelled"))
+                d["is_recurring"] = bool(d.get("is_recurring"))
+                d["is_modified_occurrence"] = bool(d.get("is_modified_occurrence"))
+                att_raw = d.get("attendees") or ""
+                d["attendees"] = [a.strip() for a in att_raw.split(",") if a.strip()]
+                for jcol, key in [
+                    ("source_accounts_json", "source_accounts"),
+                    ("source_providers_json", "source_providers"),
+                    ("source_event_ids_json", "source_event_ids"),
+                ]:
+                    try:
+                        d[key] = json.loads(d.get(jcol) or "[]")
+                    except Exception:
+                        d[key] = []
+                out.append(d)
+            return out
+
+    def find_meeting_by_calendar_event(
+        self,
+        calendar_event_id: str,
+        user_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not calendar_event_id:
+            return None
+        with self._lock, self._connect() as conn:
+            if user_id:
+                row = conn.execute(
+                    "SELECT * FROM meetings WHERE calendar_event_id = ? AND (user_id = ? OR user_id = '') ORDER BY id DESC LIMIT 1",
+                    (calendar_event_id, user_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM meetings WHERE calendar_event_id = ? ORDER BY id DESC LIMIT 1",
+                    (calendar_event_id,),
+                ).fetchone()
+            return dict(row) if row else None
+
+    def list_meetings_by_calendar_event_ids(
+        self,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """Map non-empty calendar_event_id -> most recent recorded meeting_id."""
+        with self._lock, self._connect() as conn:
+            if user_id:
+                rows = conn.execute(
+                    "SELECT id, calendar_event_id FROM meetings WHERE calendar_event_id != '' AND (user_id = ? OR user_id = '') ORDER BY id ASC",
+                    (user_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, calendar_event_id FROM meetings WHERE calendar_event_id != '' ORDER BY id ASC"
+                ).fetchall()
+            mapping: Dict[str, int] = {}
+            for r in rows:
+                ev_id = str(r["calendar_event_id"] or "").strip()
+                if ev_id:
+                    mapping[ev_id] = int(r["id"])
+            return mapping
+
 

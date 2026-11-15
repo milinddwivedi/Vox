@@ -1,25 +1,39 @@
 """
 VoxLocal ICS Calendar Feed Provider.
 Zero-admin-approval Outlook / Microsoft 365 / Google Calendar support via:
-- Published Outlook Web / New Outlook .ics subscription URLs (webcal://, https://)
+- Published Outlook Web / New Outlook / Google Calendar .ics subscription URLs (webcal://, https://)
 - Local .ics calendar files
-- Windows timezone name mapping + Teams / Zoom / Google Meet join URL extraction
-- Encrypted feed URI persistence using Windows DPAPI
+- Windows timezone name mapping + Teams / Zoom / Google Meet / Webex link extraction
+- RFC 5545 recurrence expansion (`DAILY`, `WEEKLY`, `MONTHLY`) + `EXDATE` + `RECURRENCE-ID` modified occurrences
+- DPAPI / SQLite vault encrypted persistence (multi-account safe)
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+import calendar
 import json
-from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional
 import urllib.error
 import urllib.request
+from datetime import datetime, time as dt_time, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
-from voxlocal.calendar.base import BaseCalendarProvider, CalendarMeeting, CalendarProviderType
-from voxlocal.calendar.graph_provider import dpapi_decrypt, dpapi_encrypt
+from voxlocal.calendar.auth_service import (
+    classify_account_kind,
+    dpapi_decrypt,
+    dpapi_encrypt,
+    make_account_id,
+    sanitize_oauth_error_for_user,
+)
+from voxlocal.calendar.base import (
+    AccountConnectionState,
+    BaseCalendarProvider,
+    CalendarMeeting,
+    CalendarProviderType,
+)
+from voxlocal.calendar.graph_provider import extract_meeting_links
 from voxlocal.core.logger import get_logger
 
 logger = get_logger("calendar.ics")
@@ -43,11 +57,6 @@ WINDOWS_TZ_TO_IANA: Dict[str, str] = {
     "AUS Eastern Standard Time": "Australia/Sydney",
     "Arabian Standard Time": "Asia/Dubai",
 }
-
-_MEETING_URL_RE = re.compile(
-    r"https?://(?:teams\.microsoft\.com|teams\.live\.com|[\w.-]*zoom\.us|meet\.google\.com)/[^\s<>\"'\\]+",
-    re.IGNORECASE,
-)
 
 _WEEKDAY_MAP = {
     "MO": 0,
@@ -121,19 +130,23 @@ def parse_ics_events(
     ics_content: str,
     window_start: datetime,
     window_end: datetime,
-) -> tuple[str, List[CalendarMeeting]]:
+    account_id: str = "",
+    provider_account: str = "",
+) -> Tuple[str, List[CalendarMeeting]]:
     """
     Parse RFC 5545 VCALENDAR text into CalendarMeeting instances falling within
-    [window_start - 15m, window_end], returning (calendar_name, meetings).
+    [window_start - 15m, window_end], supporting `RECURRENCE-ID` modified occurrences
+    and `EXDATE` exclusions. Returns (calendar_name, meetings).
     """
     unfolded = re.sub(r"\r?\n[ \t]", "", ics_content)
     lines = unfolded.splitlines()
 
-    cal_name = "Outlook ICS Calendar"
+    cal_name = "ICS Calendar"
     in_event = False
     cur: Dict[str, Any] = {}
     attendees: List[str] = []
-    meetings: List[CalendarMeeting] = []
+    raw_events: List[Dict[str, Any]] = []
+    override_timestamps_by_uid: Dict[str, Set[int]] = {}
     search_start = window_start - timedelta(minutes=15)
 
     for line in lines:
@@ -148,55 +161,13 @@ def parse_ics_events(
             continue
         if upper == "END:VEVENT":
             in_event = False
-            dtstart: Optional[datetime] = cur.get("dtstart")
-            if dtstart is not None:
-                dtend: Optional[datetime] = cur.get("dtend")
-                if dtend is None:
-                    dur = cur.get("duration") or timedelta(minutes=30)
-                    dtend = dtstart + dur
-                ev_dur = max(timedelta(minutes=5), dtend - dtstart)
-
-                occ_starts = _expand_rrule_occurrences(
-                    dtstart=dtstart,
-                    rrule=cur.get("rrule", ""),
-                    search_start=search_start,
-                    search_end=window_end,
-                    exdates=cur.get("exdates", set()),
-                )
-
-                join_url = cur.get("join_url")
-                if not join_url:
-                    haystack = f"{cur.get('location', '')}\n{cur.get('description', '')}"
-                    m_url = _MEETING_URL_RE.search(haystack)
-                    if m_url:
-                        join_url = m_url.group(0).rstrip(".,;)")
-
-                loc = cur.get("location", "") or ("Online Meeting" if join_url else "")
-                is_cancelled = cur.get("status", "").upper() == "CANCELLED"
-                is_online = bool(join_url) or any(
-                    kw in loc.lower() for kw in ("teams", "zoom", "meet.google", "webex")
-                )
-                uid = cur.get("uid") or f"ics-{abs(hash((cur.get('summary', ''), dtstart.isoformat())))}"
-                for idx, occ_s in enumerate(occ_starts):
-                    occ_e = occ_s + ev_dur
-                    if occ_e < search_start or occ_s > window_end:
-                        continue
-                    occ_id = uid if idx == 0 else f"{uid}_{int(occ_s.timestamp())}"
-                    meetings.append(
-                        CalendarMeeting(
-                            id=occ_id,
-                            title=cur.get("summary") or "Untitled Meeting",
-                            start_time=occ_s,
-                            end_time=occ_e,
-                            location=loc,
-                            join_url=join_url,
-                            attendees=list(attendees),
-                            organizer=cur.get("organizer", ""),
-                            is_online=is_online,
-                            is_cancelled=is_cancelled,
-                            sensitivity=cur.get("class", "normal").lower(),
-                        )
-                    )
+            if cur.get("dtstart") is not None:
+                cur["attendees"] = list(attendees)
+                uid = str(cur.get("uid") or "")
+                rec_id_dt: Optional[datetime] = cur.get("recurrence_id")
+                if uid and rec_id_dt is not None:
+                    override_timestamps_by_uid.setdefault(uid, set()).add(int(rec_id_dt.timestamp()))
+                raw_events.append(cur)
             cur = {}
             attendees = []
             continue
@@ -229,12 +200,16 @@ def parse_ics_events(
             cur["status"] = raw_val.strip()
         elif prop_name == "CLASS":
             cur["class"] = raw_val.strip()
-        elif prop_name == "X-MICROSOFT-SKYPETEAMSMEETINGURL":
-            cur["join_url"] = raw_val.strip()
+        elif prop_name in ("X-MICROSOFT-SKYPETEAMSMEETINGURL", "X-GOOGLE-CONFERENCE", "URL"):
+            if not cur.get("join_url"):
+                cur["join_url"] = raw_val.strip()
         elif prop_name == "DTSTART":
             cur["dtstart"] = _parse_ics_datetime(raw_val, params.get("TZID"))
+            cur["tzid"] = params.get("TZID") or "UTC"
         elif prop_name == "DTEND":
             cur["dtend"] = _parse_ics_datetime(raw_val, params.get("TZID"))
+        elif prop_name == "RECURRENCE-ID":
+            cur["recurrence_id"] = _parse_ics_datetime(raw_val, params.get("TZID"))
         elif prop_name == "DURATION":
             cur["duration"] = _parse_duration_iso(raw_val)
         elif prop_name == "RRULE":
@@ -253,6 +228,85 @@ def parse_ics_events(
             att_clean = _unescape_ics_text(att)
             if att_clean and att_clean not in attendees:
                 attendees.append(att_clean)
+
+    meetings: List[CalendarMeeting] = []
+    for ev in raw_events:
+        dtstart: datetime = ev["dtstart"]
+        dtend: Optional[datetime] = ev.get("dtend")
+        if dtend is None:
+            dur = ev.get("duration") or timedelta(minutes=30)
+            dtend = dtstart + dur
+        ev_dur = max(timedelta(minutes=5), dtend - dtstart)
+        uid = str(ev.get("uid") or f"ics-{abs(hash((ev.get('summary', ''), dtstart.isoformat())))}")
+        is_cancelled = str(ev.get("status") or "").upper() == "CANCELLED"
+        rec_id: Optional[datetime] = ev.get("recurrence_id")
+        is_override = rec_id is not None
+
+        if is_override:
+            if is_cancelled:
+                continue
+            occ_starts = [dtstart]
+        else:
+            exdates = set(ev.get("exdates") or set())
+            exdates.update(override_timestamps_by_uid.get(uid, set()))
+            occ_starts = _expand_rrule_occurrences(
+                dtstart=dtstart,
+                rrule=ev.get("rrule", ""),
+                search_start=search_start,
+                search_end=window_end,
+                exdates=exdates,
+            )
+
+        join_url = ev.get("join_url")
+        platform = "generic"
+        if join_url:
+            _, platform = extract_meeting_links(str(join_url))
+        else:
+            found_url, found_plat = extract_meeting_links(f"{ev.get('location', '')}\n{ev.get('description', '')}")
+            if found_url:
+                join_url = found_url
+                platform = found_plat
+
+        loc = ev.get("location", "") or ("Online Meeting" if join_url else "")
+        is_online = bool(join_url) or any(
+            kw in loc.lower() for kw in ("teams", "zoom", "meet.google", "webex")
+        )
+        rrule_str = str(ev.get("rrule") or "")
+
+        for idx, occ_s in enumerate(occ_starts):
+            occ_e = occ_s + ev_dur
+            if occ_e < search_start or occ_s > window_end:
+                continue
+            if is_override and rec_id is not None:
+                occ_id = f"{uid}_mod_{int(rec_id.timestamp())}"
+            else:
+                occ_id = uid if (idx == 0 and not rrule_str) else f"{uid}_{int(occ_s.timestamp())}"
+            meetings.append(
+                CalendarMeeting(
+                    id=occ_id,
+                    title=ev.get("summary") or "Untitled Meeting",
+                    start_time=occ_s,
+                    end_time=occ_e,
+                    location=loc,
+                    join_url=join_url,
+                    attendees=list(ev.get("attendees") or []),
+                    organizer=ev.get("organizer", ""),
+                    is_online=is_online,
+                    is_cancelled=is_cancelled,
+                    sensitivity=str(ev.get("class") or "normal").lower(),
+                    platform=platform,
+                    is_recurring=bool(rrule_str or is_override),
+                    provider_type=CalendarProviderType.ICS.value,
+                    provider_account=provider_account or cal_name,
+                    description=str(ev.get("description") or "")[:500].strip(),
+                    account_id=account_id,
+                    calendar_name=cal_name,
+                    ical_uid=uid,
+                    series_master_id=uid if (rrule_str or is_override) else "",
+                    is_modified_occurrence=is_override,
+                    timezone_name=str(ev.get("tzid") or "UTC"),
+                )
+            )
 
     meetings.sort(key=lambda m: m.start_time)
     return cal_name, meetings
@@ -308,7 +362,6 @@ def _expand_rrule_occurrences(
         if not target_days:
             target_days = [dtstart.weekday()]
 
-        # Jump close to search_start minus 1 week to keep expansion instant
         if dtstart < search_start - timedelta(days=14) and max_count is None:
             weeks_diff = max(0, ((search_start - dtstart).days // 7) // interval - 1)
             cur_week = dtstart + timedelta(weeks=weeks_diff * interval)
@@ -336,29 +389,65 @@ def _expand_rrule_occurrences(
                 break
         return results
 
+    if freq == "MONTHLY":
+        year = dtstart.year
+        month = dtstart.month
+        idx = 0
+        for _ in range(240):
+            last_day = calendar.monthrange(year, month)[1]
+            day = min(dtstart.day, last_day)
+            cand = dtstart.replace(year=year, month=month, day=day)
+            if cand > hard_end:
+                break
+            if max_count is not None and idx >= max_count:
+                break
+            idx += 1
+            if cand >= dtstart and cand >= search_start and int(cand.timestamp()) not in exdates:
+                results.append(cand)
+            total_months = year * 12 + (month - 1) + interval
+            year, month = divmod(total_months, 12)
+            month += 1
+        return results
+
     return [] if int(dtstart.timestamp()) in exdates else [dtstart]
 
 
 class IcsCalendarProvider(BaseCalendarProvider):
-    """Outlook / Microsoft 365 / iCalendar (.ics URL or file) calendar provider."""
+    """Outlook / Microsoft 365 / Google / Standard iCalendar (.ics URL or file) provider."""
 
     def __init__(
         self,
         feed_url: str = "",
         auth_file_path: Optional[Path] = None,
+        account_id: str = "",
+        user_id: str = "default",
+        auth_broker: Any = None,
     ) -> None:
+        self.user_id = (user_id or "default").strip() or "default"
+        self._auth_broker = auth_broker
+        self._explicit_auth_file_path = auth_file_path is not None
         self.auth_file_path = auth_file_path or (Path("data") / "calendar_ics.dat")
         self._feed_url: str = self._normalize_url(feed_url)
         self._calendar_name: str = ""
         self._last_ics_text: str = ""
         self._authenticated: bool = False
+        self._account_id: str = (account_id or "").strip() or (
+            make_account_id(CalendarProviderType.ICS.value, fallback_label=self._feed_url) if self._feed_url else ""
+        )
+        self._account_kind: str = classify_account_kind("ics", "")
         self._status: Dict[str, Any] = {
-            "provider_type": CalendarProviderType.LOCAL_MAPI.value,
+            "provider_type": CalendarProviderType.ICS.value,
+            "account_id": self._account_id,
             "is_healthy": True,
             "last_poll_time": None,
+            "last_sync_at": None,
             "error_state": None,
             "error_detail": None,
+            "friendly_error": None,
+            "connection_state": AccountConnectionState.DISCONNECTED.value,
             "account_upn": None,
+            "display_name": "",
+            "account_kind": self._account_kind,
             "source_mode": "ics",
         }
         if not self._feed_url:
@@ -372,6 +461,15 @@ class IcsCalendarProvider(BaseCalendarProvider):
         return val
 
     def _load_cached_config(self) -> None:
+        if self._auth_broker is not None and self._account_id:
+            vault_data = self._auth_broker.load_credentials(self.user_id, self._account_id)
+            if isinstance(vault_data, dict) and vault_data.get("feed_url"):
+                self._feed_url = self._normalize_url(vault_data.get("feed_url", ""))
+                self._calendar_name = str(vault_data.get("calendar_name", "") or "")
+                self._authenticated = True
+                self._status["connection_state"] = AccountConnectionState.CONNECTED.value
+                self._status["account_upn"] = self._display_source_label()
+                return
         if not self.auth_file_path.exists():
             return
         try:
@@ -380,27 +478,47 @@ class IcsCalendarProvider(BaseCalendarProvider):
             self._feed_url = self._normalize_url(data.get("feed_url", ""))
             self._calendar_name = str(data.get("calendar_name", "") or "")
             if self._feed_url:
+                self._account_id = self._account_id or make_account_id(CalendarProviderType.ICS.value, fallback_label=self._feed_url)
                 self._authenticated = True
-                self._status["account_upn"] = self._calendar_name or self._display_source_label()
+                self._status["account_id"] = self._account_id
+                self._status["connection_state"] = AccountConnectionState.CONNECTED.value
+                self._status["account_upn"] = self._display_source_label()
         except Exception as exc:
             logger.debug("Could not load cached ICS calendar config: %s", exc)
 
     def _save_config(self) -> None:
-        try:
-            self.auth_file_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps({
-                "feed_url": self._feed_url,
-                "calendar_name": self._calendar_name,
-            }).encode("utf-8")
-            self.auth_file_path.write_bytes(dpapi_encrypt(payload, "VoxLocal ICS Calendar"))
-        except Exception as exc:
-            logger.error("Failed saving encrypted ICS calendar config: %s", exc)
+        if not self._account_id and self._feed_url:
+            self._account_id = make_account_id(CalendarProviderType.ICS.value, fallback_label=self._feed_url)
+        self._status["account_id"] = self._account_id
+        payload_dict = {
+            "feed_url": self._feed_url,
+            "calendar_name": self._calendar_name,
+        }
+        if self._auth_broker is not None and self._account_id:
+            try:
+                self._auth_broker.save_credentials(
+                    self.user_id,
+                    self._account_id,
+                    CalendarProviderType.ICS.value,
+                    payload_dict,
+                )
+            except Exception as exc:
+                logger.warning("Failed storing ICS config in DB vault: %s", exc)
+        if self._explicit_auth_file_path or self._auth_broker is None:
+            try:
+                self.auth_file_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = json.dumps(payload_dict).encode("utf-8")
+                self.auth_file_path.write_bytes(dpapi_encrypt(payload, "VoxLocal ICS Calendar"))
+            except Exception as exc:
+                logger.error("Failed saving encrypted ICS calendar config: %s", exc)
 
     def _display_source_label(self) -> str:
         if self._calendar_name:
             return self._calendar_name
         if "outlook" in self._feed_url.lower() or "office365" in self._feed_url.lower():
             return "Outlook ICS Calendar"
+        if "calendar.google.com" in self._feed_url.lower():
+            return "Google ICS Calendar"
         return Path(self._feed_url).name if self._feed_url and not self._feed_url.startswith("http") else "ICS Calendar Feed"
 
     def _fetch_ics_text(self) -> str:
@@ -421,7 +539,8 @@ class IcsCalendarProvider(BaseCalendarProvider):
         if not self._feed_url:
             self._authenticated = False
             self._status["error_state"] = "AUTH_REQUIRED"
-            self._status["error_detail"] = "Enter your Outlook/M365 .ics URL or choose a local .ics file."
+            self._status["error_detail"] = "Enter your Outlook/Google .ics URL or choose a local .ics file."
+            self._status["connection_state"] = AccountConnectionState.DISCONNECTED.value
             return False
         try:
             raw_ics = self._fetch_ics_text()
@@ -432,10 +551,15 @@ class IcsCalendarProvider(BaseCalendarProvider):
             cal_name, _ = parse_ics_events(raw_ics, now_dt, now_dt + timedelta(hours=24))
             self._calendar_name = cal_name
             self._authenticated = True
+            if not self._account_id:
+                self._account_id = make_account_id(CalendarProviderType.ICS.value, fallback_label=self._feed_url)
             self._status["is_healthy"] = True
             self._status["error_state"] = None
             self._status["error_detail"] = None
+            self._status["friendly_error"] = None
+            self._status["connection_state"] = AccountConnectionState.CONNECTED.value
             self._status["account_upn"] = self._display_source_label()
+            self._status["display_name"] = self._display_source_label()
             self._save_config()
             return True
         except Exception as exc:
@@ -443,6 +567,8 @@ class IcsCalendarProvider(BaseCalendarProvider):
             self._status["is_healthy"] = False
             self._status["error_state"] = "ICS_FETCH_FAILED"
             self._status["error_detail"] = str(exc)
+            self._status["friendly_error"] = sanitize_oauth_error_for_user(str(exc), "ics")[1]
+            self._status["connection_state"] = AccountConnectionState.FAILED.value
             logger.warning("ICS calendar validation failed: %s", exc)
             return False
 
@@ -450,6 +576,8 @@ class IcsCalendarProvider(BaseCalendarProvider):
         return bool(self._authenticated and self._feed_url)
 
     def disconnect(self) -> bool:
+        if self._auth_broker is not None and self._account_id:
+            self._auth_broker.delete_credentials(self.user_id, self._account_id)
         self._authenticated = False
         self._feed_url = ""
         self._last_ics_text = ""
@@ -462,11 +590,14 @@ class IcsCalendarProvider(BaseCalendarProvider):
         self._status["is_healthy"] = True
         self._status["error_state"] = "DISCONNECTED"
         self._status["error_detail"] = None
+        self._status["friendly_error"] = None
+        self._status["connection_state"] = AccountConnectionState.DISCONNECTED.value
         self._status["account_upn"] = None
         return True
 
     def get_upcoming_meetings(self, window_minutes: int = 60) -> List[CalendarMeeting]:
-        self._status["last_poll_time"] = datetime.now(timezone.utc).isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._status["last_poll_time"] = now_iso
         if not self.is_authenticated():
             return []
         try:
@@ -474,21 +605,35 @@ class IcsCalendarProvider(BaseCalendarProvider):
             self._last_ics_text = raw_ics
             self._status["is_healthy"] = True
             self._status["error_state"] = None
+            self._status["error_detail"] = None
+            self._status["friendly_error"] = None
+            self._status["connection_state"] = AccountConnectionState.CONNECTED.value
+            self._status["last_sync_at"] = now_iso
         except Exception as exc:
             logger.warning("ICS refresh failed (%s); using cached events if available.", exc)
             self._status["is_healthy"] = False
             self._status["error_state"] = "NETWORK_OFFLINE"
             self._status["error_detail"] = str(exc)
+            self._status["friendly_error"] = sanitize_oauth_error_for_user(str(exc), "ics")[1]
+            self._status["connection_state"] = AccountConnectionState.FAILED.value
             raw_ics = self._last_ics_text
             if not raw_ics:
                 return []
 
         now_dt = datetime.now(timezone.utc)
         end_dt = now_dt + timedelta(minutes=window_minutes)
-        cal_name, meetings = parse_ics_events(raw_ics, now_dt, end_dt)
+        label = self._display_source_label()
+        cal_name, meetings = parse_ics_events(
+            raw_ics,
+            now_dt,
+            end_dt,
+            account_id=self._account_id,
+            provider_account=label,
+        )
         if cal_name:
             self._calendar_name = cal_name
             self._status["account_upn"] = self._display_source_label()
+            self._status["display_name"] = self._display_source_label()
         return meetings
 
     def get_provider_status(self) -> Dict[str, Any]:

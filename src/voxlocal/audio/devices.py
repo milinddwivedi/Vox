@@ -529,8 +529,27 @@ def compute_rms_level(audio: np.ndarray) -> float:
 class AudioDeviceManager:
     """Enumerates microphones and WASAPI loopback (system audio) endpoints."""
 
-    @staticmethod
-    def list_devices() -> Tuple[List[AudioDeviceInfo], List[AudioDeviceInfo]]:
+    _cached_devices: Optional[Tuple[List[AudioDeviceInfo], List[AudioDeviceInfo]]] = None
+    _cached_devices_ts: float = 0.0
+    _CACHE_TTL_SEC: float = 10.0
+    _cache_lock = threading.Lock()
+
+    @classmethod
+    def invalidate_cache(cls) -> None:
+        with cls._cache_lock:
+            cls._cached_devices = None
+            cls._cached_devices_ts = 0.0
+
+    @classmethod
+    def list_devices(
+        cls, use_cache: bool = False, max_age_sec: float = 10.0
+    ) -> Tuple[List[AudioDeviceInfo], List[AudioDeviceInfo]]:
+        if use_cache:
+            with cls._cache_lock:
+                now = time.monotonic()
+                if cls._cached_devices is not None and (now - cls._cached_devices_ts) < max_age_sec:
+                    return cls._cached_devices
+
         mics: List[AudioDeviceInfo] = []
         loopbacks: List[AudioDeviceInfo] = []
         p = pyaudio.PyAudio()
@@ -576,18 +595,25 @@ class AudioDeviceManager:
         # Default first; Bluetooth "Headset (" hands-free mics last (they degrade headphone audio)
         mics.sort(key=lambda d: (not d.is_default, "headset (" in d.name.lower(), d.index))
         loopbacks.sort(key=lambda d: (not d.is_default, d.index))
+        with cls._cache_lock:
+            cls._cached_devices = (mics, loopbacks)
+            cls._cached_devices_ts = time.monotonic()
         return mics, loopbacks
 
     @classmethod
-    def list_input_devices(cls) -> List[AudioDeviceInfo]:
+    def list_input_devices(cls, use_cache: bool = False) -> List[AudioDeviceInfo]:
         """Return available microphone input devices (system default first)."""
-        mics, _ = cls.list_devices()
+        mics, _ = cls.list_devices(use_cache=use_cache)
         return mics
 
     @classmethod
-    def resolve_microphone(cls, preferred_index: Optional[int] = None,
-                           preferred_name: str = "") -> Optional[AudioDeviceInfo]:
-        mics, _ = cls.list_devices()
+    def resolve_microphone(
+        cls,
+        preferred_index: Optional[int] = None,
+        preferred_name: str = "",
+        use_cache: bool = True,
+    ) -> Optional[AudioDeviceInfo]:
+        mics, _ = cls.list_devices(use_cache=use_cache)
         if not mics:
             return None
         # Device indexes change when devices are plugged/unplugged -> match by name first
@@ -603,10 +629,13 @@ class AudioDeviceManager:
 
     @classmethod
     def resolve_loopbacks_list(
-        cls, preferred_index: Optional[int] = None, preferred_name: str = ""
+        cls,
+        preferred_index: Optional[int] = None,
+        preferred_name: str = "",
+        use_cache: bool = True,
     ) -> List[AudioDeviceInfo]:
         """A specific endpoint, or ALL output endpoints (headphones + speakers + monitor)."""
-        _, loopbacks = cls.list_devices()
+        _, loopbacks = cls.list_devices(use_cache=use_cache)
         if not loopbacks:
             return []
         if preferred_name:
@@ -621,9 +650,14 @@ class AudioDeviceManager:
 
     @classmethod
     def resolve_loopback(
-        cls, preferred_index: Optional[int] = None, preferred_name: str = ""
+        cls,
+        preferred_index: Optional[int] = None,
+        preferred_name: str = "",
+        use_cache: bool = True,
     ) -> Optional[AudioDeviceInfo]:
-        lst = cls.resolve_loopbacks_list(preferred_index, preferred_name)
+        lst = cls.resolve_loopbacks_list(
+            preferred_index, preferred_name, use_cache=use_cache
+        )
         return lst[0] if lst else None
 
     @classmethod

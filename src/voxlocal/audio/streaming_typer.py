@@ -204,8 +204,9 @@ class StreamingVoiceTyper:
                 rms = float(np.sqrt(np.mean(np.square(combined))))
                 if (
                     dur >= self.min_speech_duration_sec
-                    and peak >= self._min_utterance_peak
-                    and (self._voiced_frames_in_utterance >= 2 or rms >= 0.0020)
+                    and peak >= max(self._min_utterance_peak, 0.025)
+                    and (self._in_speech or self._voiced_frames_in_utterance >= 4)
+                    and rms >= 0.0050
                 ):
                     cleaned = clean_speech_microphone_audio(combined, self.TARGET_RATE)
                     norm_audio = normalize_speech_audio(cleaned)
@@ -343,7 +344,7 @@ class StreamingVoiceTyper:
                     if (
                         self.on_interim_audio
                         and silence_duration < 0.22
-                        and (now - self._last_interim_time) >= 0.70
+                        and (now - self._last_interim_time) >= 0.22
                     ):
                         if utterance_dur >= 0.55 and self._current_utterance:
                             self._last_interim_time = now

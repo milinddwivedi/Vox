@@ -164,9 +164,10 @@ class TestTier1Feature06Polymorphic8StateEngine:
         pill: DualTierFloatingPill = offscreen_widgets["pill"]()
         _safe_transition_state(pill, "RESTING")
         w, h = _get_flowbar_size(pill)
-        # Authoritative: resting capsule width in [30, 40], height in [6, 8]
-        assert 28 <= w <= 50, f"Resting width {w} out of bounds"
-        assert 6 <= h <= 12, f"Resting height {h} out of bounds"
+        # Orientation-aware bounds: (40x8 on bottom, 8x40 on left/right edge)
+        long_dim, short_dim = max(w, h), min(w, h)
+        assert 28 <= long_dim <= 50, f"Resting long dimension {long_dim} ({w}x{h}) out of bounds"
+        assert 6 <= short_dim <= 12, f"Resting short dimension {short_dim} ({w}x{h}) out of bounds"
         assert pill.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
     def test_02_flowbar_mini_meeting_state_dimensions(self, offscreen_widgets: Dict[str, Any]) -> None:
@@ -191,13 +192,14 @@ class TestTier1Feature06Polymorphic8StateEngine:
         assert pill.width() > 0 and pill.height() > 0
 
     def test_04_flowbar_active_recording_state_dimensions(self, offscreen_widgets: Dict[str, Any]) -> None:
-        """Verify Active Recording state dimensions conform to compact capsule (120x36 or 104x30)."""
+        """Verify Active Recording state dimensions conform to compact capsule (72x30 bottom or 30x72 side)."""
         pill: DualTierFloatingPill = offscreen_widgets["pill"]()
         _safe_transition_state(pill, "ACTIVE_RECORDING")
         w, h = _get_flowbar_size(pill)
-        # Active recording capsule width between 74 and 150, height between 30 and 40
-        assert 70 <= w <= 160, f"Active recording width {w} out of bounds"
-        assert 28 <= h <= 45, f"Active recording height {h} out of bounds"
+        # Orientation-aware active recording capsule bounds (72x30 bottom, 30x72 side)
+        long_dim, short_dim = max(w, h), min(w, h)
+        assert 70 <= long_dim <= 160, f"Active recording long dimension {long_dim} ({w}x{h}) out of bounds"
+        assert 28 <= short_dim <= 45, f"Active recording short dimension {short_dim} ({w}x{h}) out of bounds"
         assert not pill.waveform_capsule.isHidden()
 
     def test_05_flowbar_l4_preview_state_dimensions(self, offscreen_widgets: Dict[str, Any]) -> None:
@@ -322,7 +324,7 @@ class TestTier1Feature08NotificationPopupConsolidation:
             _safe_transition_state(pill, "RESTING")
         QApplication.processEvents()
         w, h = _get_flowbar_size(pill)
-        assert w <= 50 and h <= 12
+        assert min(w, h) <= 12 and max(w, h) <= 50
 
     def test_05_snooze_action_sets_reminder_timer(self, offscreen_widgets: Dict[str, Any]) -> None:
         """Verify snooze action collapses notification and registers a reminder timer."""
@@ -713,8 +715,8 @@ class TestTier3PairwiseToggleBar:
         # Click join
         _safe_transition_state(pill, "ACTIVE_RECORDING")
         w, h = _get_flowbar_size(pill)
-        assert 70 <= w <= 160
-        assert 28 <= h <= 45
+        assert 70 <= max(w, h) <= 160
+        assert 28 <= min(w, h) <= 45
 
     def test_04_dock_edge_change_updates_spring_morph_anchor(self, offscreen_widgets: Dict[str, Any]) -> None:
         """Pairwise: Changing dock edge from bottom to left recalculates morph anchor geometry."""
@@ -760,7 +762,7 @@ class TestTier4ToggleBarScenarios:
         # 3. Auto-start countdown reaches 1.0 (auto-start triggers)
         _safe_transition_state(pill, "ACTIVE_RECORDING")
         w, h = _get_flowbar_size(pill)
-        assert 70 <= w <= 160
+        assert 70 <= max(w, h) <= 160
         assert not pill.waveform_capsule.isHidden()
 
     def test_scenario_2_mini_toggle_hover_expansion_and_split_join(
@@ -810,7 +812,7 @@ class TestTier4ToggleBarScenarios:
         pill.set_state(PillState.IDLE)
         assert pill.pill_state == PillState.IDLE
         w, h = _get_flowbar_size(pill)
-        assert w <= 50 and h <= 12
+        assert min(w, h) <= 12 and max(w, h) <= 50
 
     def test_scenario_5_app_switching_focus_invariance_throughout_morph(
         self, offscreen_widgets: Dict[str, Any]

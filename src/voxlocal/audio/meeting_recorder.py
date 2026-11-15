@@ -196,13 +196,18 @@ class MeetingRecorder:
                 self._mic_sos = None
                 self._mic_zi = None
             self._mic_noise_floor = 0.001
+            open_err = None
             try:
                 self._pa = pyaudio.PyAudio()
                 self._open_streams()
             except Exception as exc:
-                self._close_streams()
-                return False, f"Could not open audio devices: {exc}"
+                open_err = exc
 
+        if open_err is not None:
+            self._close_streams()
+            return False, f"Could not open audio devices: {open_err}"
+
+        with self._lock:
             self._mic = _Track(self._out_dir / "mic_track.wav") if self._mic_stream else None
             self._sys = _Track(self._out_dir / "system_track.wav") if self._loop_streams else None
             self._resume_ts = time.perf_counter()
@@ -316,22 +321,29 @@ class MeetingRecorder:
             self._drain_locked(final=True)
             self._pad_locked(self._elapsed)
             loop_names = [d.name for d, _ in self._loop_streams]
-            self._close_streams()
             mic_path = self._mic.path if self._mic else None
             sys_path = self._sys.path if self._sys else None
             for t in (self._mic, self._sys):
                 if t:
                     t.close()
             self._mic = self._sys = None
+            duration = self._elapsed
+
+        # Close streams outside self._lock to prevent deadlocks with PortAudio callback threads
+        self._close_streams()
 
         assert self._out_dir is not None
         mixed_path = self._out_dir / "meeting_mixed.wav"
-        duration = _write_mixed(mic_path, sys_path, mixed_path)
-        if not preserve_separate_tracks:
-            for p in (mic_path, sys_path):
-                if p and p.exists():
-                    p.unlink()
-            mic_path = sys_path = None
+
+        # Initialize empty valid 16kHz mono WAV header (<0.2ms) so path exists cleanly for immediate inspection
+        if not mixed_path.exists():
+            try:
+                with wave.open(str(mixed_path), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(TARGET_SAMPLE_RATE)
+            except Exception as stub_exc:
+                logger.debug("Failed initializing stub mixed WAV: %s", stub_exc)
 
         res = MeetingRecordingResult(
             duration_sec=duration,
@@ -453,28 +465,38 @@ class MeetingRecorder:
                 except Exception:
                     pass
 
-    def _close_streams(self) -> None:
-        streams = [self._mic_stream, self._keepalive] + [s for _, s in self._loop_streams]
-        for st in streams:
-            if st is None:
-                continue
-            try:
-                st.stop_stream()
-            except Exception:
-                pass
-            try:
-                st.close()
-            except Exception:
-                pass
-        self._mic_stream = None
-        self._keepalive = None
-        self._loop_streams = []
-        if self._pa:
-            try:
-                self._pa.terminate()
-            except Exception:
-                pass
+    def _close_streams(self, synchronous: bool = False) -> None:
+        with self._lock:
+            streams = [self._mic_stream, self._keepalive] + [s for _, s in self._loop_streams]
+            self._mic_stream = None
+            self._keepalive = None
+            self._loop_streams = []
+            pa = self._pa
             self._pa = None
+
+        def _do_close():
+            for st in streams:
+                if st is None:
+                    continue
+                try:
+                    if st.is_active():
+                        st.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    st.close()
+                except Exception:
+                    pass
+            if pa:
+                try:
+                    pa.terminate()
+                except Exception:
+                    pass
+
+        if synchronous:
+            _do_close()
+        else:
+            threading.Thread(target=_do_close, name="MeetingStreamTeardown", daemon=True).start()
 
     def _write_mixed(
         self,

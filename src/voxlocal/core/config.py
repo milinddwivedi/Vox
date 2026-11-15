@@ -71,7 +71,8 @@ class AppConfig:
     first_run_done: bool = False
     onboarding_completed: bool = False
     theme: str = "light"             # "light" | "dark" | "system"
-    flow_bar_edge: str = "bottom"    # "bottom" | "left" | "right"
+    flow_bar_edge: str = "right"     # "bottom" | "left" | "right" (default right edge vertically centered)
+    flow_bar_y_ratio: float = 0.5    # vertical position ratio (0.1 to 0.9)
     flow_bar_hidden_until: float = 0.0
     reminder_muted_until: float = 0.0
 
@@ -129,6 +130,8 @@ class AppConfig:
     calendar_sync_horizon_days: int = 30
     calendar_auto_join: bool = False
     hide_in_screen_share: bool = False
+    current_user_id: str = "default"
+    auth_backend_url: str = ""
 
     # Context & Vibe Coding
     context_awareness: bool = True
@@ -247,7 +250,7 @@ class AppConfig:
         custom_env = os.environ.get("VOXLOCAL_CONFIG_PATH")
         if custom_env:
             return Path(custom_env)
-        if self.storage_dir and ("temp" in self.storage_dir.lower() or "tmp" in self.storage_dir.lower()):
+        if self.storage_dir and ("temp" in str(self.storage_dir).lower() or "tmp" in str(self.storage_dir).lower()):
             return Path(self.storage_dir) / "config.json"
         return get_app_root() / "data" / "config.json"
 
@@ -255,8 +258,12 @@ class AppConfig:
         try:
             path = self.config_file_path()
             os.makedirs(path.parent, exist_ok=True)
+            data = asdict(self)
+            # Never serialize client secrets to plaintext config.json
+            data["google_calendar_client_secret"] = ""
+            data["zoom_client_secret"] = ""
             tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
             os.replace(tmp, path)  # atomic: never leaves a half-written config
         except Exception as exc:
             logger.error("Failed to save config: %s", exc)

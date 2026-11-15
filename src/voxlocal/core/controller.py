@@ -16,7 +16,7 @@ import queue
 import shutil
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import ctypes
@@ -83,6 +83,57 @@ class DictationState(str, enum.Enum):
     TESTING = "testing"
 
 
+class FinalizingJobsSet(set):
+    """Set of meeting_ids undergoing finalization, also maintaining per-session cancellation events."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._events: Dict[int, threading.Event] = {}
+
+    def add(self, meeting_id: int, event: Optional[threading.Event] = None) -> None:
+        super().add(meeting_id)
+        if event is not None:
+            self._events[meeting_id] = event
+        elif meeting_id not in self._events:
+            self._events[meeting_id] = threading.Event()
+
+    def discard(self, meeting_id: int) -> None:
+        super().discard(meeting_id)
+        self._events.pop(meeting_id, None)
+
+    def remove(self, meeting_id: int) -> None:
+        super().remove(meeting_id)
+        self._events.pop(meeting_id, None)
+
+    def pop(self) -> int:
+        mid = super().pop()
+        self._events.pop(mid, None)
+        return mid
+
+    def clear(self) -> None:
+        super().clear()
+        self._events.clear()
+
+    def update(self, *s):
+        for iterable in s:
+            for item in iterable:
+                self.add(item)
+
+    def get(self, meeting_id: int, default: Any = None) -> Any:
+        return self._events.get(meeting_id, default)
+
+    def __getitem__(self, meeting_id: int) -> threading.Event:
+        if meeting_id not in self._events:
+            self._events[meeting_id] = threading.Event()
+        return self._events[meeting_id]
+
+    def __setitem__(self, meeting_id: int, event: threading.Event) -> None:
+        self.add(meeting_id, event)
+
+    def values(self):
+        return self._events.values()
+
+
 class AppController(QObject):
     """Central orchestrator exposing Qt signals for all UI components."""
 
@@ -130,6 +181,8 @@ class AppController(QObject):
     snippets_updated = pyqtSignal()
     vocabulary_updated = pyqtSignal()
     calendar_upcoming_changed = pyqtSignal(list)
+    calendar_accounts_changed = pyqtSignal(list)
+    calendar_prepare_notetaker_requested = pyqtSignal(object)
     hotkey_copy_last_requested = pyqtSignal()
     hotkey_paste_last_requested = pyqtSignal()
     hotkey_transform_last_requested = pyqtSignal()
@@ -228,9 +281,12 @@ class AppController(QObject):
         self._ptt_stop_pending: bool = False
         # Milestone 5: Decoupled Dual-Track Meeting State Machine
         self._capture_state: str = "idle"  # "idle" | "recording" | "paused"
-        self._finalizing_jobs: Set[int] = set()  # set of meeting_ids undergoing background finalization
+        self._finalizing_jobs: FinalizingJobsSet = FinalizingJobsSet()
         self._meeting_lifecycle_state: MeetingLifecycleState = MeetingLifecycleState.NO_MEETING_DETECTED
         self._meeting_lifecycle_message: str = ""
+        self._last_emitted_target_info: Optional[Tuple[int, str, str]] = None
+        self._cached_mic_device: Optional[AudioDeviceInfo] = None
+        self._cached_loop_devices: Optional[List[AudioDeviceInfo]] = None
         self._active_recording_mode: str = getattr(self.config, "meeting_recording_mode", "audio_video")
         self._active_meeting_session_id: str = ""
         self._active_meeting_platform: str = ""
@@ -258,6 +314,8 @@ class AppController(QObject):
         self._active_meeting_calendar_attendees: str = ""
         self._active_meeting_calendar_organizer: str = ""
         self._active_meeting_calendar_provider: str = ""
+        self._active_meeting_calendar_account_id: str = ""
+        self._prepared_calendar_meeting: Any = None
         self._pending_video_bind: bool = False
         self._pending_video_folder: Optional[Path] = None
         self._pending_video_fps: int = 15
@@ -291,6 +349,7 @@ class AppController(QObject):
         # Wire callbacks
         self.dictation_recorder.on_level_change = self._on_dictation_level_change
         self.dictation_recorder.on_error = self._on_dictation_error
+        self.dictation_recorder.on_interim_audio = self._on_streaming_interim_audio
 
         self.streaming_typer.on_segment_ready = self._on_streaming_segment_ready
         self.streaming_typer.on_interim_audio = self._on_streaming_interim_audio
@@ -657,7 +716,10 @@ class AppController(QObject):
     def _poll_foreground_window(self) -> None:
         info = self.focus_tracker.poll_foreground()
         if info:
-            self.target_window_changed.emit(info.title or "Untitled Window", info.process_name)
+            key = (info.hwnd, info.title or "Untitled Window", info.process_name or "")
+            if key != self._last_emitted_target_info:
+                self._last_emitted_target_info = key
+                self.target_window_changed.emit(info.title or "Untitled Window", info.process_name)
 
     def _safe_emit_model_status(self, msg: str) -> None:
         try:
@@ -753,12 +815,14 @@ class AppController(QObject):
         self.set_theme(next_theme)
         return next_theme
 
-    def set_flow_bar_edge(self, edge: str) -> None:
-        """Set Flow Bar docking edge ('bottom', 'left', or 'right')."""
-        val = (edge or "bottom").lower().strip()
+    def set_flow_bar_edge(self, edge: str, y_ratio: Optional[float] = None) -> None:
+        """Set Flow Bar docking edge ('bottom', 'left', or 'right') and optional y_ratio."""
+        val = (edge or "right").lower().strip()
         if val not in ("bottom", "left", "right"):
-            val = "bottom"
+            val = "right"
         self.config.flow_bar_edge = val
+        if y_ratio is not None:
+            self.config.flow_bar_y_ratio = max(0.1, min(0.9, float(y_ratio)))
         self.config.save()
         self.flow_bar_edge_changed.emit(val)
         fp = getattr(self, "floating_pill", None)
@@ -815,8 +879,9 @@ class AppController(QObject):
         return 1 if self._capture_state in ("recording", "paused") else 0
 
     def _init_calendar_subsystem(self) -> None:
-        """Initialize UnifiedCalendarEngine aggregating Microsoft 365, Google Calendar, Zoom, and ICS."""
+        """Initialize UnifiedCalendarEngine and CalendarAuthBroker for multi-account calendar sync."""
         try:
+            from voxlocal.calendar.auth_service import CalendarAuthBroker, make_account_id
             from voxlocal.calendar.unified_engine import UnifiedCalendarEngine
             from voxlocal.calendar.base import CalendarProviderType
             from voxlocal.calendar.graph_provider import MsGraphCalendarProvider
@@ -826,79 +891,198 @@ class AppController(QObject):
 
             storage_dir = Path(self.config.storage_dir or "data")
             storage_dir.mkdir(parents=True, exist_ok=True)
+            user_id = getattr(self.config, "current_user_id", "default") or "default"
 
-            self.calendar_engine = UnifiedCalendarEngine(parent=self)
-            self.calendar_manager = self.calendar_engine  # 100% backward-compatibility alias
+            self.auth_broker = CalendarAuthBroker(
+                db=self.db,
+                backend_url=getattr(self.config, "auth_backend_url", ""),
+            )
 
-            # 1. Restore Microsoft Graph if token exists or enabled
+            # Migrate any legacy plaintext OAuth secrets out of config into DPAPI vault
+            migrated_secret = False
+            if getattr(self.config, "google_calendar_client_secret", ""):
+                self.auth_broker.save_app_secret(
+                    "google_calendar_client_secret",
+                    self.config.google_calendar_client_secret,
+                    user_id=user_id,
+                )
+                self.config.google_calendar_client_secret = ""
+                migrated_secret = True
+            if getattr(self.config, "zoom_client_secret", ""):
+                self.auth_broker.save_app_secret(
+                    "zoom_client_secret",
+                    self.config.zoom_client_secret,
+                    user_id=user_id,
+                )
+                self.config.zoom_client_secret = ""
+                migrated_secret = True
+            if migrated_secret:
+                self.config.save()
+
+            self.calendar_engine = UnifiedCalendarEngine(
+                parent=self,
+                db=self.db,
+                user_id=user_id,
+                auth_broker=self.auth_broker,
+            )
+            self.calendar_manager = self.calendar_engine  # Backward-compatibility alias
+
+            # Restore multi-account records saved in SQLite DB
+            db_accounts = self.db.list_calendar_accounts(user_id=user_id)
+            restored_ids: set[str] = set()
+            for acc in db_accounts:
+                acc_id = str(acc.get("account_id") or "")
+                ptype = str(acc.get("provider_type") or "")
+                email = str(acc.get("account_email") or "")
+                if not acc_id or not ptype:
+                    continue
+                try:
+                    prov = None
+                    if ptype == CalendarProviderType.MS_GRAPH.value:
+                        prov = MsGraphCalendarProvider(
+                            client_id=(getattr(self.config, "calendar_client_id", "") or None),
+                            tenant_id=(str(acc.get("tenant_id") or "") or getattr(self.config, "calendar_tenant_id", "common") or "common"),
+                            account_hint=email or None,
+                            account_id=acc_id,
+                            user_id=user_id,
+                            auth_broker=self.auth_broker,
+                        )
+                    elif ptype == CalendarProviderType.GOOGLE.value:
+                        prov = GoogleCalendarProvider(
+                            client_id=(getattr(self.config, "google_calendar_client_id", "") or None),
+                            client_secret=self.auth_broker.load_app_secret("google_calendar_client_secret", user_id=user_id) or None,
+                            account_id=acc_id,
+                            user_id=user_id,
+                            auth_broker=self.auth_broker,
+                        )
+                    elif ptype == CalendarProviderType.ZOOM.value:
+                        prov = ZoomCalendarProvider(
+                            client_id=(getattr(self.config, "zoom_client_id", "") or None),
+                            client_secret=self.auth_broker.load_app_secret("zoom_client_secret", user_id=user_id) or None,
+                            account_id=acc_id,
+                            user_id=user_id,
+                            auth_broker=self.auth_broker,
+                        )
+                    elif ptype == CalendarProviderType.ICS.value:
+                        prov = IcsCalendarProvider(
+                            account_id=acc_id,
+                            user_id=user_id,
+                            auth_broker=self.auth_broker,
+                        )
+                    elif ptype == CalendarProviderType.LOCAL_MAPI.value:
+                        from voxlocal.calendar.mapi_provider import LocalMapiCalendarProvider
+                        prov = LocalMapiCalendarProvider(account_id=acc_id, user_id=user_id)
+                        prov.authenticate(interactive=False)
+
+                    if prov is not None:
+                        if acc.get("selected_calendars"):
+                            prov.set_selected_calendars(list(acc["selected_calendars"]))
+                        if acc.get("delta_links") and hasattr(prov, "_delta_links"):
+                            prov._delta_links.update(acc["delta_links"])
+                        if acc.get("sync_tokens") and hasattr(prov, "_sync_tokens"):
+                            prov._sync_tokens.update(acc["sync_tokens"])
+                        self.calendar_engine.register_provider(
+                            acc_id,
+                            prov,
+                            sync_immediately=False,
+                            account_meta=acc,
+                        )
+                        if not acc.get("enabled", True):
+                            self.calendar_engine.set_account_enabled(acc_id, False)
+                        restored_ids.add(acc_id)
+                except Exception as exc:
+                    logger.debug("Failed restoring DB calendar account %s: %s", acc_id, exc)
+
+            # Backward-compatible restore from legacy standalone .dat files if not yet migrated
             ms_auth = storage_dir / "calendar_auth.dat"
-            if ms_auth.exists() or getattr(self.config, "ms_graph_enabled", False):
+            if (ms_auth.exists() or getattr(self.config, "ms_graph_enabled", False)) and not any(
+                rid.startswith("ms_graph") for rid in restored_ids
+            ):
                 try:
                     ms_prov = MsGraphCalendarProvider(
                         client_id=(getattr(self.config, "calendar_client_id", "") or None),
                         tenant_id=(getattr(self.config, "calendar_tenant_id", "common") or "common"),
                         auth_file_path=ms_auth,
+                        user_id=user_id,
+                        auth_broker=self.auth_broker,
                     )
                     if ms_prov.is_authenticated():
-                        self.calendar_engine.register_provider(CalendarProviderType.MS_GRAPH.value, ms_prov)
+                        acc_id = ms_prov.get_provider_status().get("account_id") or CalendarProviderType.MS_GRAPH.value
+                        self.calendar_engine.register_provider(acc_id, ms_prov, sync_immediately=False)
                 except Exception as exc:
-                    logger.debug("Failed restoring MS Graph provider: %s", exc)
+                    logger.debug("Failed restoring legacy MS Graph provider: %s", exc)
 
-            # 2. Restore Google Calendar if token exists or enabled
             google_auth = storage_dir / "calendar_google.dat"
-            if google_auth.exists() or getattr(self.config, "google_calendar_enabled", False):
+            if (google_auth.exists() or getattr(self.config, "google_calendar_enabled", False)) and not any(
+                rid.startswith("google") for rid in restored_ids
+            ):
                 try:
                     g_prov = GoogleCalendarProvider(
                         client_id=(getattr(self.config, "google_calendar_client_id", "") or None),
-                        client_secret=(getattr(self.config, "google_calendar_client_secret", "") or None),
+                        client_secret=self.auth_broker.load_app_secret("google_calendar_client_secret", user_id=user_id) or None,
                         auth_file_path=google_auth,
+                        user_id=user_id,
+                        auth_broker=self.auth_broker,
                     )
                     if g_prov.is_authenticated():
-                        self.calendar_engine.register_provider(CalendarProviderType.GOOGLE.value, g_prov)
+                        acc_id = g_prov.get_provider_status().get("account_id") or CalendarProviderType.GOOGLE.value
+                        self.calendar_engine.register_provider(acc_id, g_prov, sync_immediately=False)
                 except Exception as exc:
-                    logger.debug("Failed restoring Google Calendar provider: %s", exc)
+                    logger.debug("Failed restoring legacy Google Calendar provider: %s", exc)
 
-            # 3. Restore Zoom Meetings if token exists or enabled
             zoom_auth = storage_dir / "calendar_zoom.dat"
-            if zoom_auth.exists() or getattr(self.config, "zoom_enabled", False):
+            if (zoom_auth.exists() or getattr(self.config, "zoom_enabled", False)) and not any(
+                rid.startswith("zoom") for rid in restored_ids
+            ):
                 try:
                     z_prov = ZoomCalendarProvider(
                         client_id=(getattr(self.config, "zoom_client_id", "") or None),
-                        client_secret=(getattr(self.config, "zoom_client_secret", "") or None),
+                        client_secret=self.auth_broker.load_app_secret("zoom_client_secret", user_id=user_id) or None,
                         auth_file_path=zoom_auth,
+                        user_id=user_id,
+                        auth_broker=self.auth_broker,
                     )
                     if z_prov.is_authenticated():
-                        self.calendar_engine.register_provider(CalendarProviderType.ZOOM.value, z_prov)
+                        acc_id = z_prov.get_provider_status().get("account_id") or CalendarProviderType.ZOOM.value
+                        self.calendar_engine.register_provider(acc_id, z_prov, sync_immediately=False)
                 except Exception as exc:
-                    logger.debug("Failed restoring Zoom provider: %s", exc)
+                    logger.debug("Failed restoring legacy Zoom provider: %s", exc)
 
-            # 4. Restore ICS feed if configured
             ics_path = storage_dir / "calendar_ics.dat"
             ics_url = str(getattr(self.config, "calendar_ics_url", "") or "")
-            if ics_url or (getattr(self.config, "calendar_provider", "") == "ics" and ics_path.exists()):
+            if (ics_url or (getattr(self.config, "calendar_provider", "") == "ics" and ics_path.exists())) and not any(
+                rid.startswith("ics") for rid in restored_ids
+            ):
                 try:
-                    ics_prov = IcsCalendarProvider(feed_url=ics_url, auth_file_path=ics_path)
+                    ics_prov = IcsCalendarProvider(
+                        feed_url=ics_url,
+                        auth_file_path=ics_path,
+                        user_id=user_id,
+                        auth_broker=self.auth_broker,
+                    )
                     if ics_prov.is_authenticated():
-                        self.calendar_engine.register_provider(CalendarProviderType.ICS.value, ics_prov)
+                        acc_id = ics_prov.get_provider_status().get("account_id") or CalendarProviderType.ICS.value
+                        self.calendar_engine.register_provider(acc_id, ics_prov, sync_immediately=False)
                 except Exception as exc:
-                    logger.debug("Failed restoring ICS provider: %s", exc)
+                    logger.debug("Failed restoring legacy ICS provider: %s", exc)
 
-            # 5. Restore Classic MAPI if configured
-            if getattr(self.config, "calendar_provider", "") == "mapi":
+            if getattr(self.config, "calendar_provider", "") == "mapi" and not any(
+                rid.startswith("local_mapi") for rid in restored_ids
+            ):
                 try:
                     from voxlocal.calendar.mapi_provider import LocalMapiCalendarProvider
-                    mapi_prov = LocalMapiCalendarProvider()
+                    mapi_prov = LocalMapiCalendarProvider(user_id=user_id)
                     if mapi_prov.authenticate(interactive=False):
-                        self.calendar_engine.register_provider(CalendarProviderType.LOCAL_MAPI.value, mapi_prov)
+                        self.calendar_engine.register_provider("local_mapi:default", mapi_prov, sync_immediately=False)
                 except Exception as exc:
                     logger.debug("Failed restoring MAPI provider: %s", exc)
 
             # Wire engine signals
             self.calendar_engine.upcoming_meetings_updated.connect(self.calendar_upcoming_changed.emit)
+            self.calendar_engine.accounts_updated.connect(self.calendar_accounts_changed.emit)
             self.calendar_engine.meeting_alert.connect(self._on_calendar_meeting_alert)
             self.calendar_engine.start_capture_requested.connect(self.start_meeting_from_calendar)
 
-            # Start polling timer
             poll_interval = int(getattr(self.config, "calendar_sync_interval_sec", 60) or 60)
             self.calendar_engine.start_polling(interval_sec=poll_interval)
         except Exception as exc:
@@ -964,29 +1148,37 @@ class AppController(QObject):
             msg = "Could not connect Microsoft Outlook Calendar."
             auth_msg = ""
             try:
+                from voxlocal.calendar.auth_service import make_account_id, sanitize_oauth_error_for_user
                 from voxlocal.calendar.graph_provider import MsGraphCalendarProvider
                 from voxlocal.calendar.base import CalendarProviderType
-                auth_path = Path(self.config.storage_dir or "data") / "calendar_auth.dat"
+                user_id = getattr(self.config, "current_user_id", "default") or "default"
+                auth_broker = getattr(self, "auth_broker", None)
+                temp_account_id = make_account_id(CalendarProviderType.MS_GRAPH.value, hint_str)
+                auth_path = Path(self.config.storage_dir or "data") / f"calendar_ms_{abs(hash(temp_account_id)) % 100000}.dat"
                 ms_prov = MsGraphCalendarProvider(
                     client_id=eff_client_id,
                     tenant_id=eff_tenant_id,
                     auth_file_path=auth_path,
                     account_hint=hint_str or None,
+                    account_id=temp_account_id,
+                    user_id=user_id,
+                    auth_broker=auth_broker,
                 )
                 if use_device_code:
                     code_info = ms_prov.request_device_code()
                     if not code_info:
-                        err_detail = ms_prov.get_provider_status().get("error_detail", "Failed initiating device code flow.")
+                        raw_err = str(ms_prov.get_provider_status().get("error_detail") or "Failed initiating device code flow.")
+                        _ec, msg = sanitize_oauth_error_for_user(raw_err, "ms_graph")
                         if callable(on_complete):
-                            on_complete(False, err_detail)
+                            on_complete(False, msg)
                         return
 
                     user_code = code_info["user_code"]
                     verification_uri = code_info.get("verification_uri", "https://microsoft.com/devicelogin")
-                    
+
                     if callable(on_device_code):
                         on_device_code(user_code, verification_uri)
-                    
+
                     res = ms_prov.poll_device_code_tokens(
                         device_code=code_info["device_code"],
                         interval=code_info.get("interval", 5),
@@ -1008,23 +1200,31 @@ class AppController(QObject):
                 status = ms_prov.get_provider_status()
                 if ok:
                     upn = str(status.get("account_upn") or hint_str or "Microsoft Outlook")
+                    canon_id = str(status.get("account_id") or make_account_id(CalendarProviderType.MS_GRAPH.value, upn))
+                    ms_prov._account_id = canon_id
+                    try:
+                        ms_prov.list_calendars()
+                    except Exception:
+                        pass
+                    ms_prov._save_credentials()
                     self.config.calendar_provider = "graph"
                     self.config.ms_graph_enabled = True
                     self.config.calendar_account_email = upn
                     self.config.save()
                     if self.calendar_engine is not None:
-                        self.calendar_engine.register_provider(CalendarProviderType.MS_GRAPH.value, ms_prov)
-                        self.calendar_engine.poll_all_now()
+                        self.calendar_engine.register_account_provider(canon_id, ms_prov)
                     msg = f"Connected as {upn}"
                 else:
-                    msg = str(
+                    raw_msg = str(
                         auth_msg
                         or status.get("error_detail")
                         or status.get("error_state")
                         or "Authentication cancelled or failed."
                     )
+                    _ec, msg = sanitize_oauth_error_for_user(raw_msg, "ms_graph")
             except Exception as exc:
-                msg = str(exc)
+                from voxlocal.calendar.auth_service import sanitize_oauth_error_for_user
+                _ec, msg = sanitize_oauth_error_for_user(str(exc), "ms_graph")
             if callable(on_complete):
                 on_complete(ok, msg)
 
@@ -1037,45 +1237,62 @@ class AppController(QObject):
         on_complete: Optional[Callable[[bool, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> None:
-        """Connect Google Calendar via OAuth 2.0 PKCE or iCal (.ics) feed."""
+        """Connect Google Calendar (Gmail or Google Workspace) via OAuth 2.0 PKCE or iCal (.ics) feed."""
         cid_str = str(client_id or "").strip()
         if cid_str.lower().startswith(("http://", "https://", "webcal://")) or cid_str.lower().endswith(".ics"):
             self.connect_ics_calendar(cid_str, on_complete=on_complete)
             return
 
+        user_id = getattr(self.config, "current_user_id", "default") or "default"
+        auth_broker = getattr(self, "auth_broker", None)
         if client_id is not None:
             self.config.google_calendar_client_id = client_id
-        if client_secret is not None:
-            self.config.google_calendar_client_secret = client_secret
+        if client_secret:
+            if auth_broker is not None:
+                auth_broker.save_app_secret("google_calendar_client_secret", client_secret, user_id=user_id)
+            self.config.google_calendar_client_secret = ""
         self.config.save()
 
         def _worker() -> None:
             ok = False
             msg = "Could not connect Google Calendar."
             try:
+                from voxlocal.calendar.auth_service import make_account_id, sanitize_oauth_error_for_user
                 from voxlocal.calendar.google_provider import GoogleCalendarProvider
                 from voxlocal.calendar.base import CalendarProviderType
-                auth_path = Path(self.config.storage_dir or "data") / "calendar_google.dat"
+                resolved_secret = client_secret or (
+                    auth_broker.load_app_secret("google_calendar_client_secret", user_id=user_id) if auth_broker else ""
+                )
+                auth_path = Path(self.config.storage_dir or "data") / f"calendar_google_{int(time.time()) % 100000}.dat"
                 g_prov = GoogleCalendarProvider(
                     client_id=client_id or getattr(self.config, "google_calendar_client_id", "") or None,
-                    client_secret=client_secret or getattr(self.config, "google_calendar_client_secret", "") or None,
+                    client_secret=resolved_secret or None,
                     auth_file_path=auth_path,
+                    user_id=user_id,
+                    auth_broker=auth_broker,
                 )
                 ok = bool(g_prov.authenticate(interactive=True, cancel_event=cancel_event))
                 status = g_prov.get_provider_status()
                 if ok:
                     acct = str(status.get("account_email") or "Google Calendar")
+                    canon_id = str(status.get("account_id") or make_account_id(CalendarProviderType.GOOGLE.value, acct))
+                    g_prov._account_id = canon_id
+                    try:
+                        g_prov.list_calendars()
+                    except Exception:
+                        pass
+                    g_prov._save_credentials()
                     self.config.google_calendar_enabled = True
                     self.config.google_calendar_account_email = acct
                     self.config.save()
                     if self.calendar_engine is not None:
-                        self.calendar_engine.register_provider(CalendarProviderType.GOOGLE.value, g_prov)
-                        self.calendar_engine.poll_all_now()
+                        self.calendar_engine.register_account_provider(canon_id, g_prov)
                     msg = f"Connected as {acct}"
                 else:
-                    msg = str(status.get("error_detail") or status.get("error_state") or "Google authentication cancelled or failed.")
+                    msg = str(status.get("friendly_error") or sanitize_oauth_error_for_user(str(status.get("error_detail") or status.get("error_state") or ""), "google")[1])
             except Exception as exc:
-                msg = str(exc)
+                from voxlocal.calendar.auth_service import sanitize_oauth_error_for_user
+                _ec, msg = sanitize_oauth_error_for_user(str(exc), "google")
             if callable(on_complete):
                 on_complete(ok, msg)
 
@@ -1088,40 +1305,53 @@ class AppController(QObject):
         on_complete: Optional[Callable[[bool, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> None:
-        """Connect Zoom account via OAuth 2.0 to retrieve scheduled & upcoming meetings."""
+        """Connect Zoom account via OAuth 2.0 + PKCE to retrieve scheduled & upcoming meetings."""
+        user_id = getattr(self.config, "current_user_id", "default") or "default"
+        auth_broker = getattr(self, "auth_broker", None)
         if client_id is not None:
             self.config.zoom_client_id = client_id
-        if client_secret is not None:
-            self.config.zoom_client_secret = client_secret
+        if client_secret:
+            if auth_broker is not None:
+                auth_broker.save_app_secret("zoom_client_secret", client_secret, user_id=user_id)
+            self.config.zoom_client_secret = ""
         self.config.save()
 
         def _worker() -> None:
             ok = False
             msg = "Could not connect Zoom."
             try:
+                from voxlocal.calendar.auth_service import make_account_id, sanitize_oauth_error_for_user
                 from voxlocal.calendar.zoom_provider import ZoomCalendarProvider
                 from voxlocal.calendar.base import CalendarProviderType
-                auth_path = Path(self.config.storage_dir or "data") / "calendar_zoom.dat"
+                resolved_secret = client_secret or (
+                    auth_broker.load_app_secret("zoom_client_secret", user_id=user_id) if auth_broker else ""
+                )
+                auth_path = Path(self.config.storage_dir or "data") / f"calendar_zoom_{int(time.time()) % 100000}.dat"
                 z_prov = ZoomCalendarProvider(
                     client_id=client_id or getattr(self.config, "zoom_client_id", "") or None,
-                    client_secret=client_secret or getattr(self.config, "zoom_client_secret", "") or None,
+                    client_secret=resolved_secret or None,
                     auth_file_path=auth_path,
+                    user_id=user_id,
+                    auth_broker=auth_broker,
                 )
                 ok = bool(z_prov.authenticate(interactive=True, cancel_event=cancel_event))
                 status = z_prov.get_provider_status()
                 if ok:
                     acct = str(status.get("account_email") or "Zoom Account")
+                    canon_id = str(status.get("account_id") or make_account_id(CalendarProviderType.ZOOM.value, acct))
+                    z_prov._account_id = canon_id
+                    z_prov._save_credentials()
                     self.config.zoom_enabled = True
                     self.config.zoom_account_email = acct
                     self.config.save()
                     if self.calendar_engine is not None:
-                        self.calendar_engine.register_provider(CalendarProviderType.ZOOM.value, z_prov)
-                        self.calendar_engine.poll_all_now()
+                        self.calendar_engine.register_account_provider(canon_id, z_prov)
                     msg = f"Connected as {acct}"
                 else:
-                    msg = str(status.get("error_detail") or status.get("error_state") or "Zoom authentication cancelled or failed.")
+                    msg = str(status.get("friendly_error") or sanitize_oauth_error_for_user(str(status.get("error_detail") or status.get("error_state") or ""), "zoom")[1])
             except Exception as exc:
-                msg = str(exc)
+                from voxlocal.calendar.auth_service import sanitize_oauth_error_for_user
+                _ec, msg = sanitize_oauth_error_for_user(str(exc), "zoom")
             if callable(on_complete):
                 on_complete(ok, msg)
 
@@ -1137,24 +1367,33 @@ class AppController(QObject):
             ok = False
             msg = "Could not connect ICS calendar."
             try:
+                from voxlocal.calendar.auth_service import make_account_id, sanitize_oauth_error_for_user
                 from voxlocal.calendar.ics_provider import IcsCalendarProvider
                 from voxlocal.calendar.base import CalendarProviderType
-                ics_path = Path(self.config.storage_dir or "data") / "calendar_ics.dat"
-                prov = IcsCalendarProvider(feed_url=feed_url, auth_file_path=ics_path)
+                user_id = getattr(self.config, "current_user_id", "default") or "default"
+                auth_broker = getattr(self, "auth_broker", None)
+                canon_id = make_account_id(CalendarProviderType.ICS.value, fallback_label=feed_url)
+                ics_path = Path(self.config.storage_dir or "data") / f"calendar_{canon_id.replace(':', '_')}.dat"
+                prov = IcsCalendarProvider(
+                    feed_url=feed_url,
+                    auth_file_path=ics_path,
+                    account_id=canon_id,
+                    user_id=user_id,
+                    auth_broker=auth_broker,
+                )
                 ok = bool(prov.authenticate(interactive=True))
                 status = prov.get_provider_status()
                 if ok:
-                    label = str(status.get("account_upn") or "Outlook ICS Calendar")
+                    label = str(status.get("account_upn") or "ICS Calendar Feed")
                     self.config.calendar_provider = "ics"
                     self.config.calendar_account_email = label
                     self.config.calendar_ics_url = prov._feed_url
                     self.config.save()
                     if self.calendar_engine is not None:
-                        self.calendar_engine.register_provider(CalendarProviderType.ICS.value, prov)
-                        self.calendar_engine.poll_all_now()
+                        self.calendar_engine.register_account_provider(canon_id, prov)
                     msg = f"Connected to {label}"
                 else:
-                    msg = str(status.get("error_detail") or status.get("error_state") or "Invalid ICS feed.")
+                    msg = str(status.get("friendly_error") or sanitize_oauth_error_for_user(str(status.get("error_detail") or status.get("error_state") or ""), "ics")[1])
             except Exception as exc:
                 msg = str(exc)
             if callable(on_complete):
@@ -1172,8 +1411,8 @@ class AppController(QObject):
             msg = "Classic Outlook desktop profile not found."
             try:
                 from voxlocal.calendar.mapi_provider import LocalMapiCalendarProvider
-                from voxlocal.calendar.base import CalendarProviderType
-                prov = LocalMapiCalendarProvider()
+                user_id = getattr(self.config, "current_user_id", "default") or "default"
+                prov = LocalMapiCalendarProvider(account_id="local_mapi:default", user_id=user_id)
                 ok = bool(prov.authenticate(interactive=True))
                 status = prov.get_provider_status()
                 if ok:
@@ -1182,15 +1421,14 @@ class AppController(QObject):
                     self.config.calendar_account_email = acct
                     self.config.save()
                     if self.calendar_engine is not None:
-                        self.calendar_engine.register_provider(CalendarProviderType.LOCAL_MAPI.value, prov)
-                        self.calendar_engine.poll_all_now()
+                        self.calendar_engine.register_account_provider("local_mapi:default", prov)
                     msg = f"Connected to {acct}"
                 else:
                     err = str(status.get("error_state") or "MAPI_UNAVAILABLE")
                     msg = (
                         "Classic Outlook desktop MAPI is unavailable (New Outlook & web Outlook do not expose COM MAPI). "
-                        "Use the Outlook Device Code or ICS Link tab."
-                        if err in ("OUTLOOK_NOT_INSTALLED", "OUTLOOK_PROFILE_UNAVAILABLE", "MAPI_UNAVAILABLE")
+                        "Use the Microsoft Sign-In or ICS Feed tab."
+                        if err in ("OUTLOOK_NOT_INSTALLED", "OUTLOOK_PROFILE_UNAVAILABLE", "MAPI_UNAVAILABLE", "OUTLOOK_COM_UNAVAILABLE", "PYWIN32_UNAVAILABLE")
                         else err
                     )
             except Exception as exc:
@@ -1200,10 +1438,104 @@ class AppController(QObject):
 
         threading.Thread(target=_worker, daemon=True, name="vox-calendar-mapi").start()
 
+    def list_connected_calendar_accounts(self) -> List[Dict[str, Any]]:
+        if self.calendar_engine is None:
+            return []
+        return self.calendar_engine.list_accounts()
+
+    def get_calendar_sync_health(self) -> Dict[str, Any]:
+        if self.calendar_engine is None:
+            return {"state": "not_connected", "connected_accounts": 0, "healthy_accounts": 0, "degraded_accounts": 0, "last_sync_at": "", "errors": []}
+        return self.calendar_engine.get_sync_health_summary()
+
+    def fetch_account_calendars(self, account_id: str) -> List[Dict[str, Any]]:
+        if self.calendar_engine is None:
+            return []
+        prov = self.calendar_engine.get_provider(account_id)
+        if prov is None:
+            return []
+        try:
+            cals = prov.list_calendars()
+            self.calendar_engine._persist_provider_account_record(account_id, prov)
+            self.calendar_accounts_changed.emit(self.calendar_engine.list_accounts())
+            return cals
+        except Exception as exc:
+            logger.debug("Failed listing calendars for %s: %s", account_id, exc)
+            return []
+
+    def set_account_selected_calendars(self, account_id: str, calendar_ids: List[str]) -> bool:
+        if self.calendar_engine is None:
+            return False
+        return self.calendar_engine.set_account_selected_calendars(account_id, calendar_ids)
+
+    def set_calendar_account_enabled(self, account_id: str, enabled: bool) -> bool:
+        if self.calendar_engine is None:
+            return False
+        return self.calendar_engine.set_account_enabled(account_id, enabled)
+
+    def sync_calendar_account(self, account_id: str) -> None:
+        if self.calendar_engine is None:
+            return
+        threading.Thread(
+            target=self.calendar_engine.sync_account_now,
+            args=(account_id, True),
+            daemon=True,
+            name="vox-calendar-sync-acc",
+        ).start()
+
+    def sync_all_calendars(self, force: bool = True) -> None:
+        if self.calendar_engine is None:
+            return
+        self.calendar_engine.poll_all_now(force=force)
+
+    def disconnect_calendar_account(self, account_id: str) -> bool:
+        if self.calendar_engine is None:
+            return False
+        return self.calendar_engine.unregister_provider(account_id)
+
+    def reconnect_calendar_account(
+        self,
+        account_id: str,
+        on_complete: Optional[Callable[[bool, str], None]] = None,
+        on_device_code: Optional[Callable[[str, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
+        """Initiate re-authentication for a specific expired or failed calendar account."""
+        if self.calendar_engine is None:
+            if callable(on_complete):
+                on_complete(False, "Calendar subsystem not initialized.")
+            return
+        accounts = {a["account_id"]: a for a in self.calendar_engine.list_accounts()}
+        meta = accounts.get(account_id, {})
+        ptype = str(meta.get("provider_type") or (account_id.split(":", 1)[0] if ":" in account_id else account_id))
+        email = str(meta.get("account_email") or "")
+        if ptype == "ms_graph":
+            self.connect_microsoft_calendar(
+                on_complete=on_complete,
+                on_device_code=on_device_code,
+                account_hint=email or None,
+                cancel_event=cancel_event,
+            )
+        elif ptype == "google":
+            self.connect_google_calendar(on_complete=on_complete, cancel_event=cancel_event)
+        elif ptype == "zoom":
+            self.connect_zoom_calendar(on_complete=on_complete, cancel_event=cancel_event)
+        elif ptype == "local_mapi":
+            self.connect_local_outlook_calendar(on_complete=on_complete)
+        else:
+            prov = self.calendar_engine.get_provider(account_id)
+            if prov is not None and getattr(prov, "_feed_url", ""):
+                self.connect_ics_calendar(prov._feed_url, on_complete=on_complete)
+            elif callable(on_complete):
+                on_complete(False, "Open Add Account to enter this calendar feed again.")
+
     def disconnect_calendar_provider(self, provider_type: str) -> bool:
-        """Disconnect a specific calendar provider (e.g. 'ms_graph', 'google', 'zoom', 'ics')."""
+        """Disconnect a specific calendar provider or specific account_id."""
         try:
             pt = str(provider_type).lower()
+            if ":" in pt and self.calendar_engine is not None:
+                return self.calendar_engine.unregister_provider(provider_type)
+
             storage_dir = Path(self.config.storage_dir or "data")
             if pt in ("ms_graph", "graph"):
                 self.config.ms_graph_enabled = False
@@ -1253,10 +1585,86 @@ class AppController(QObject):
             self.config.calendar_ics_url = ""
             self.config.save()
             self.calendar_upcoming_changed.emit([])
+            self.calendar_accounts_changed.emit([])
             return True
         except Exception as exc:
             logger.warning("Calendar disconnect all failed: %s", exc)
             return False
+
+    def match_active_call_to_calendar_meeting(
+        self,
+        detected_platform: str = "",
+        window_title: str = "",
+    ) -> Optional[Any]:
+        """
+        Score active/near-term calendar meetings against a detected call window
+        to disambiguate overlapping meetings safely.
+        """
+        if not hasattr(self, "calendar_engine") or self.calendar_engine is None:
+            return None
+        now_utc = datetime.now(timezone.utc)
+        app_lower = (detected_platform or "").lower().strip()
+        win_tokens = {w for w in (window_title or "").lower().replace("-", " ").split() if len(w) > 2}
+
+        best_mtg: Optional[Any] = None
+        best_score = -1.0
+        for mtg in self.calendar_engine.get_upcoming_meetings():
+            st = mtg.start_time if mtg.start_time.tzinfo else mtg.start_time.replace(tzinfo=timezone.utc)
+            et = mtg.end_time if mtg.end_time.tzinfo else mtg.end_time.replace(tzinfo=timezone.utc)
+            if not ((st - timedelta(minutes=20)) <= now_utc <= (et + timedelta(minutes=15))):
+                continue
+
+            score = 0.0
+            plat = str(getattr(mtg, "platform", "")).lower()
+            if app_lower and (plat in app_lower or app_lower in plat):
+                score += 40.0
+            elif app_lower and plat in ("teams", "zoom", "meet", "webex") and plat not in app_lower:
+                score -= 10.0
+
+            title_tokens = {w for w in str(getattr(mtg, "title", "")).lower().replace("-", " ").split() if len(w) > 2}
+            if win_tokens and title_tokens:
+                overlap = len(win_tokens & title_tokens) / max(1, len(title_tokens))
+                score += overlap * 35.0
+
+            if getattr(mtg, "join_url", None):
+                score += 15.0
+            if st <= now_utc <= et:
+                score += 20.0
+            else:
+                delta_min = abs((now_utc - st).total_seconds()) / 60.0
+                score += max(0.0, 15.0 - delta_min)
+
+            if score > best_score:
+                best_score = score
+                best_mtg = mtg
+
+        return best_mtg
+
+    def prepare_notetaker_for_meeting(self, meeting: Any, start_recording: bool = False) -> Tuple[bool, str]:
+        """
+        Prepare VOX Notetaker with a calendar event's title, platform, organizer, attendees,
+        and join link without automatically starting recording unless requested.
+        """
+        if start_recording:
+            return self.start_meeting_from_calendar(meeting)
+        self._prepared_calendar_meeting = meeting
+        self._active_meeting_calendar_event_id = getattr(meeting, "id", "")
+        self._active_meeting_calendar_join_url = getattr(meeting, "join_url", "") or ""
+        self._active_meeting_calendar_attendees = getattr(meeting, "attendees_str", "")
+        self._active_meeting_calendar_organizer = getattr(meeting, "organizer", "")
+        self._active_meeting_calendar_provider = str(getattr(meeting, "provider_type", ""))
+        self._active_meeting_calendar_account_id = str(getattr(meeting, "account_id", ""))
+        self._active_meeting_platform = str(getattr(meeting, "meeting_platform_label", None) or getattr(meeting, "platform", "Meeting"))
+        try:
+            self._prepared_priming_terms = (
+                self.calendar_manager.extract_acoustic_priming_terms(meeting)
+                if getattr(self, "calendar_manager", None) is not None
+                else []
+            )
+        except Exception:
+            self._prepared_priming_terms = []
+        self.calendar_prepare_notetaker_requested.emit(meeting)
+        return True, f"Prepared Notetaker for '{getattr(meeting, 'title', 'Meeting')}'"
 
     def start_meeting_from_calendar(self, meeting: Any) -> Tuple[bool, str]:
         """One-click Join Meeting & Start Notetaker."""
@@ -1269,13 +1677,13 @@ class AppController(QObject):
 
             # Record calendar metadata for active session
             self._active_meeting_calendar_event_id = getattr(meeting, "id", "")
-            self._active_meeting_calendar_join_url = join_url
+            self._active_meeting_calendar_join_url = join_url or ""
             self._active_meeting_calendar_attendees = getattr(meeting, "attendees_str", "")
             self._active_meeting_calendar_organizer = getattr(meeting, "organizer", "")
             self._active_meeting_calendar_provider = str(getattr(meeting, "provider_type", ""))
+            self._active_meeting_calendar_account_id = str(getattr(meeting, "account_id", ""))
             self._active_meeting_platform = str(getattr(meeting, "platform", "Meeting"))
 
-            # Start Notetaker recording
             ok, msg = self.start_meeting_recording(title=title)
             if ok:
                 self.notification_requested.emit(
@@ -1509,11 +1917,18 @@ class AppController(QObject):
                 app = QApplication.instance()
                 if app is not None:
                     active_win = app.activeWindow()
-                    fw = app.focusWidget()
                     if active_win is not None and active_win.isVisible():
-                        is_editable = isinstance(fw, (QTextEdit, QPlainTextEdit, QLineEdit))
-                        is_onboarding = active_win.objectName() == "voxOnboardingWizard"
-                        if is_editable or is_onboarding:
+                        fw = app.focusWidget()
+                        editor_widget = None
+                        if isinstance(fw, (QTextEdit, QPlainTextEdit, QLineEdit)):
+                            editor_widget = fw
+                        else:
+                            editors = active_win.findChildren((QTextEdit, QPlainTextEdit, QLineEdit))
+                            if editors:
+                                editor_widget = editors[0]
+
+                        if editor_widget is not None or active_win.objectName() == "voxOnboardingWizard":
+                            self._explicit_in_app_widget_ref = editor_widget
                             title = active_win.windowTitle() or self._explicit_in_app_title or "VOX"
                             in_app = TargetWindowInfo(
                                 hwnd=0,
@@ -1673,6 +2088,13 @@ class AppController(QObject):
         with self._interim_lock:
             self._latest_interim_audio = (audio_16k, duration_sec)
 
+    def _is_dictation_active_for_interim(self) -> bool:
+        return bool(
+            self._hands_free_active
+            or getattr(self.dictation_recorder, "is_recording", False)
+            or self._dictation_state in ("listening", "speaking", DictationState.LISTENING.value, DictationState.SPEAKING.value)
+        )
+
     def _interim_transcription_loop(self) -> None:
         """Worker thread loop computing non-blocking speculative partials during ongoing speech."""
         while getattr(self, "_interim_worker_running", True):
@@ -1683,8 +2105,9 @@ class AppController(QObject):
                         audio_item = self._latest_interim_audio
                         self._latest_interim_audio = None
 
-                if audio_item is None or not self._hands_free_active or not self._streaming_queue.empty():
-                    time.sleep(0.06)
+                is_active = self._is_dictation_active_for_interim()
+                if audio_item is None or not is_active or not self._streaming_queue.empty():
+                    time.sleep(0.04)
                     continue
 
                 audio_16k, duration_sec = audio_item
@@ -1695,7 +2118,7 @@ class AppController(QObject):
                     audio_16k,
                     language=engine_lang,
                 )
-                if raw_interim and self._hands_free_active and self._streaming_queue.empty():
+                if raw_interim and self._is_dictation_active_for_interim() and self._streaming_queue.empty():
                     vocab = self.db.list_vocabulary(active_only=True)
                     processed_interim = DictationProcessor.process_interim(
                         raw_interim,
@@ -1707,7 +2130,7 @@ class AppController(QObject):
                         self.dictation_interim_updated.emit(processed_interim, "")
             except Exception as exc:
                 logger.debug("Interim transcription error: %s", exc)
-            time.sleep(0.05)
+            time.sleep(0.04)
 
     def _on_streaming_segment_ready(self, audio_16k: np.ndarray, duration_sec: float) -> None:
         if audio_16k.size < 3200:
@@ -1821,6 +2244,22 @@ class AppController(QObject):
 
         if self._is_in_app_target(target):
             ok, method_used = True, "in_app_qt"
+            w = getattr(self, "_explicit_in_app_widget_ref", None)
+            if w is not None:
+                try:
+                    from PyQt6.QtWidgets import QTextEdit, QPlainTextEdit, QLineEdit
+                    if isinstance(w, (QTextEdit, QPlainTextEdit)):
+                        cursor = w.textCursor()
+                        existing = w.toPlainText()
+                        pos = cursor.position()
+                        prefix = " " if (existing and pos > 0 and not existing[pos - 1].isspace() and not text_to_insert.startswith(" ")) else ""
+                        cursor.insertText(prefix + text_to_insert)
+                        w.setTextCursor(cursor)
+                        w.ensureCursorVisible()
+                    elif isinstance(w, QLineEdit):
+                        w.insert(text_to_insert)
+                except Exception as in_app_err:
+                    logger.debug("Direct in-app widget insertion error: %s", in_app_err)
         else:
             ok, method_used = self.text_inserter.insert_text(
                 text_to_insert,
@@ -2064,7 +2503,21 @@ class AppController(QObject):
         else:
             target_desc = f"{target.process_name}" if target and target.process_name else "Active App"
         if target:
+            self._last_emitted_target_info = (target.hwnd, target.title or "Untitled Window", target.process_name or "")
             self.target_window_changed.emit(target.title or "Untitled Window", target.process_name or "")
+
+        if self._cached_mic_device is None:
+            self._cached_mic_device = AudioDeviceManager.resolve_microphone(
+                self.config.mic_device_index, self.config.mic_device_name, use_cache=True
+            )
+        if self._cached_loop_devices is None:
+            self._cached_loop_devices = (
+                AudioDeviceManager.resolve_loopbacks_list(
+                    self.config.loopback_device_index, self.config.loopback_device_name, use_cache=True
+                )
+                if self.config.dictation_include_system_audio
+                else []
+            )
 
         ok, msg = self.dictation_recorder.start(
             preferred_device_index=self.config.mic_device_index,
@@ -2073,6 +2526,8 @@ class AppController(QObject):
             preferred_loopback_index=self.config.loopback_device_index,
             preferred_loopback_name=self.config.loopback_device_name,
             mic_gain=self.config.mic_gain,
+            resolved_mic_device=self._cached_mic_device,
+            resolved_loop_devices=self._cached_loop_devices,
         )
         if not ok:
             self._clear_dictation_target()
@@ -2100,6 +2555,7 @@ class AppController(QObject):
                 return
 
             self._set_dictation_state(DictationState.STOPPING, "Finalizing speech...")
+            self.dictation_interim_updated.emit("", "")
 
             audio_16k, duration_sec = self.dictation_recorder.stop()
             target = self._get_current_dictation_target()
@@ -2137,6 +2593,9 @@ class AppController(QObject):
             self.streaming_typer.cancel()
         else:
             self.streaming_typer.stop()
+        cancelled_audio = None
+        cancelled_dur = 0.0
+        target = self._get_current_dictation_target()
         if getattr(self.dictation_recorder, "is_recording", False) or self._dictation_state in (
             "starting",
             "initializing",
@@ -2144,12 +2603,43 @@ class AppController(QObject):
             "speaking",
             "stopping",
         ):
-            self.dictation_recorder.stop()
+            try:
+                res = self.dictation_recorder.stop()
+                if isinstance(res, tuple) and len(res) >= 2:
+                    cancelled_audio, cancelled_dur = res[0], float(res[1] or 0.0)
+            except Exception:
+                cancelled_audio, cancelled_dur = None, 0.0
+        if cancelled_audio is not None and getattr(cancelled_audio, "size", 0) >= 3200:
+            self._last_cancelled_dictation = (cancelled_audio, cancelled_dur, target)
+        else:
+            self._last_cancelled_dictation = None
         self._clear_dictation_target()
         self._set_dictation_state(DictationState.DISMISSED, "Dictation cancelled")
         self._set_dictation_state(DictationState.IDLE, "Dictation cancelled")
 
     cancel_active_dictation = cancel_dictation
+
+    def undo_cancelled_dictation(self) -> bool:
+        """Restore and transcribe the last cancelled dictation buffer if available."""
+        cached = getattr(self, "_last_cancelled_dictation", None)
+        if not cached:
+            return False
+        self._last_cancelled_dictation = None
+        audio_16k, duration_sec, target = cached
+        if audio_16k is None or getattr(audio_16k, "size", 0) < 3200:
+            return False
+        with self._state_lock:
+            self._dictation_session_id += 1
+            session_id = self._dictation_session_id
+            self._dictation_cancelled = False
+        self._set_dictation_state(DictationState.PROCESSING, "Restoring cancelled dictation...")
+        threading.Thread(
+            target=self._process_dictation_worker,
+            args=(audio_16k, duration_sec, target, session_id),
+            name="DictationUndoCancelWorker",
+            daemon=True,
+        ).start()
+        return True
 
     def _process_dictation_worker(self, audio_16k, duration_sec: float, target, session_id: Optional[int] = None) -> None:
         try:
@@ -2270,6 +2760,7 @@ class AppController(QObject):
         strict_video: bool = False,
         require_active_meeting: bool = False,
         allow_deferred_video: bool = False,
+        is_auto_detected: bool = False,
     ) -> Tuple[bool, str]:
         with self._state_lock:
             if self._capture_state in ("recording", "paused"):
@@ -2278,6 +2769,7 @@ class AppController(QObject):
                 return False, "A PC screen recording is currently active. Please stop screen recording before starting Meeting Studio."
             if getattr(self, "_hands_free_active", False):
                 self.stop_hands_free_typing()
+            self._is_manual_meeting = not is_auto_detected
             # Auto-heal orphaned audio recorder if state is idle
             if getattr(self, "meeting_recorder", None) and getattr(self.meeting_recorder, "is_recording", False):
                 logger.warning("Auto-healing orphaned audio recorder from prior session before starting new meeting")
@@ -2504,6 +2996,8 @@ class AppController(QObject):
                     calendar_attendees=getattr(self, "_active_meeting_calendar_attendees", "") or "",
                     calendar_organizer=getattr(self, "_active_meeting_calendar_organizer", "") or "",
                     calendar_provider=getattr(self, "_active_meeting_calendar_provider", "") or "",
+                    calendar_account_id=getattr(self, "_active_meeting_calendar_account_id", "") or "",
+                    user_id=getattr(self.config, "current_user_id", "default") or "default",
                 )
                 self._progressive_cursor_sec = 0.0
                 self._progressive_segment_idx = 0
@@ -2597,6 +3091,8 @@ class AppController(QObject):
             self._active_meeting_calendar_attendees = ""
             self._active_meeting_calendar_organizer = ""
             self._active_meeting_calendar_provider = ""
+            self._active_meeting_calendar_account_id = ""
+            self._prepared_calendar_meeting = None
 
         # Reset call detector state immediately so subsequent meeting discovery starts unblocked
         if hasattr(self.call_detector, "end_active_session_immediately"):
@@ -2676,22 +3172,45 @@ class AppController(QObject):
             self.meeting_state_changed.emit("idle", "Meeting stopped")
             return
 
+        session_cancel_event = threading.Event()
         with self._state_lock:
-            self._finalizing_jobs.add(meeting_id)
+            self._finalizing_jobs.add(meeting_id, session_cancel_event)
 
-        self._cancel_finalization_event.clear()
+        def _finalize_worker_runner(mid: int, res, vid_p: str) -> None:
+            try:
+                self._finalize_meeting_worker(mid, res, vid_p)
+            except Exception as exc:
+                logger.error("Finalization worker error for meeting #%d: %s", mid, exc)
+                try:
+                    self.db.update_meeting(mid, status="error")
+                except Exception:
+                    pass
+                with self._state_lock:
+                    self._finalizing_jobs.discard(mid)
+                self._safe_emit(self.meeting_saved_and_transcribed, mid)
+                self._safe_emit(self.history_updated)
+
         self._finalize_thread = threading.Thread(
-            target=self._finalize_meeting_worker,
+            target=_finalize_worker_runner,
             args=(meeting_id, result, video_path),
             name=f"MeetingFinalizeWorker-{meeting_id}",
             daemon=True,
         )
         self._finalize_thread.start()
 
-    def cancel_finalization(self) -> None:
+    def cancel_finalization(self, meeting_id: Optional[int] = None) -> None:
         """Cooperatively request cancellation of active meeting finalization pipeline."""
         self._cancel_finalization_event.set()
-        logger.info("Meeting finalization cancellation requested.")
+        with self._state_lock:
+            if meeting_id is not None:
+                evt = self._finalizing_jobs.get(meeting_id)
+                if evt and isinstance(evt, threading.Event):
+                    evt.set()
+            else:
+                for evt in list(self._finalizing_jobs.values()):
+                    if isinstance(evt, threading.Event):
+                        evt.set()
+        logger.info("Meeting finalization cancellation requested (meeting_id=%s).", meeting_id)
 
     def gather_system_diagnostics(self) -> Dict[str, Any]:
         """Gather system, audio device, and capture diagnostics, safely guarded against mock objects."""
@@ -2878,17 +3397,48 @@ class AppController(QObject):
             finally:
                 self._progressive_worker_busy = False
 
-    def _finalize_meeting_worker(self, meeting_id: int, result, video_path: str = "") -> None:
+    def _finalize_meeting_worker(
+        self, meeting_id: int, result, video_path: str = "", cancel_event: Optional[threading.Event] = None
+    ) -> None:
+        if cancel_event is None:
+            cancel_event = self._finalizing_jobs.get(meeting_id) or self._cancel_finalization_event
+
+        def is_cancelled() -> bool:
+            return bool(cancel_event.is_set())
+
         corr_id = self._active_meeting_corr_id if self._active_meeting_corr_id != "-" else generate_correlation_id("mtg")
         current_stage = 1
         with operation_context(corr_id, f"fin_m{meeting_id}"):
             try:
                 # Cooperative cancellation check before Stage 1
-                if self._cancel_finalization_event.is_set():
+                if is_cancelled():
                     self._handle_finalization_cancelled(meeting_id, current_stage=1)
                     return
 
                 self._safe_emit_finalization_progress("transcribing", "Stage 1/4: Packaging MP4 video & audio tracks...")
+
+                # Background mixing of tracks into meeting_mixed.wav with vocal enhancement DSP
+                mixed_p = getattr(result, "mixed_wav_path", None)
+                mic_p = getattr(result, "mic_wav_path", None)
+                sys_p = getattr(result, "sys_wav_path", None)
+                dur = getattr(result, "duration_sec", 0.0)
+                try:
+                    dur_val = round(float(dur), 2)
+                except (TypeError, ValueError):
+                    dur_val = 0.0
+
+                if mixed_p:
+                    mixed_path = Path(mixed_p)
+                    mic_path = Path(mic_p) if (mic_p and Path(mic_p).exists()) else None
+                    sys_path = Path(sys_p) if (sys_p and Path(sys_p).exists()) else None
+                    try:
+                        from voxlocal.audio.meeting_recorder import _write_mixed
+                        dur_calc = _write_mixed(mic_path, sys_path, mixed_path)
+                        if dur_calc > 0:
+                            dur_val = round(float(dur_calc), 2)
+                    except Exception as mix_err:
+                        logger.warning("Error generating background mixed audio: %s", mix_err)
+
                 # 1. Mux synchronized meeting audio into the MP4 video so video playback is loud & clear
                 if video_path and os.path.exists(video_path) and getattr(result, "mixed_wav_path", None) and os.path.exists(str(result.mixed_wav_path)):
                     try:
@@ -2903,13 +3453,6 @@ class AppController(QObject):
                         logger.warning("Audio-video muxing warning: %s", mux_err)
 
                 ended_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                # Guard duration_sec and devices against MagicMock in test environments
-                dur = getattr(result, "duration_sec", 0.0)
-                try:
-                    dur_val = round(float(dur), 2)
-                except (TypeError, ValueError):
-                    dur_val = 0.0
 
                 def _safe_str_field(val: Any) -> str:
                     if val is None or hasattr(val, "_mock_return_value") or type(val).__name__.startswith("Mock"):
@@ -2941,7 +3484,7 @@ class AppController(QObject):
 
                 # Cooperative cancellation check between Stage 1 and Stage 2
                 current_stage = 2
-                if self._cancel_finalization_event.is_set():
+                if is_cancelled():
                     self._handle_finalization_cancelled(meeting_id, current_stage=2)
                     return
 
@@ -3005,6 +3548,7 @@ class AppController(QObject):
                     initial_prompt=eff_prompt,
                     language=self.config.language,
                     progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: Transcribing speech ({s})"),
+                    cancel_check=is_cancelled,
                     output_script="roman",
                     remote_speaker_label=remote_name,
                 )
@@ -3036,7 +3580,7 @@ class AppController(QObject):
                         segments = cleaned_existing
 
                 # Cooperative cancellation check between Stage 2 and Stage 3
-                if self._cancel_finalization_event.is_set():
+                if is_cancelled():
                     self._handle_finalization_cancelled(meeting_id, current_stage=3)
                     return
 
@@ -3086,7 +3630,7 @@ class AppController(QObject):
                         break
 
                 # Cooperative cancellation check between Stage 3 and Stage 4
-                if self._cancel_finalization_event.is_set():
+                if is_cancelled():
                     self._handle_finalization_cancelled(meeting_id, current_stage=4)
                     return
 
@@ -3181,7 +3725,7 @@ class AppController(QObject):
                     summary = meeting_obj["summary"]
 
                 # Cooperative cancellation check before final commit
-                if self._cancel_finalization_event.is_set():
+                if is_cancelled():
                     self._handle_finalization_cancelled(meeting_id, current_stage=4)
                     return
 
@@ -3811,22 +4355,20 @@ class AppController(QObject):
 
                 if not getattr(self, "_active_meeting_calendar_event_id", "") and hasattr(self, "calendar_engine") and self.calendar_engine:
                     try:
-                        now_utc = datetime.now(timezone.utc)
-                        for mtg in self.calendar_engine.get_upcoming_meetings():
-                            st = mtg.start_time
-                            et = mtg.end_time
-                            if (st - timedelta(minutes=15)) <= now_utc <= et:
-                                plat = str(getattr(mtg, "platform", "")).lower()
-                                app_lower = str(app_name).lower()
-                                if plat in app_lower or app_lower in plat or not app_lower:
-                                    self._active_meeting_calendar_event_id = mtg.id
-                                    self._active_meeting_calendar_join_url = mtg.join_url
-                                    self._active_meeting_calendar_attendees = mtg.attendees_str
-                                    self._active_meeting_calendar_organizer = mtg.organizer
-                                    self._active_meeting_calendar_provider = str(mtg.provider_type)
-                                    if not title or title.startswith(app_name):
-                                        title = mtg.title
-                                    break
+                        raw_win_title = sess.raw_title if sess else ""
+                        matched_mtg = self.match_active_call_to_calendar_meeting(
+                            detected_platform=app_name,
+                            window_title=raw_win_title or title,
+                        )
+                        if matched_mtg is not None:
+                            self._active_meeting_calendar_event_id = matched_mtg.id
+                            self._active_meeting_calendar_join_url = matched_mtg.join_url or ""
+                            self._active_meeting_calendar_attendees = matched_mtg.attendees_str
+                            self._active_meeting_calendar_organizer = matched_mtg.organizer
+                            self._active_meeting_calendar_provider = str(matched_mtg.provider_type)
+                            self._active_meeting_calendar_account_id = str(getattr(matched_mtg, "account_id", ""))
+                            if not title or title.startswith(app_name):
+                                title = matched_mtg.title
                     except Exception as e_cal:
                         logger.debug("Auto calendar association note: %s", e_cal)
 
@@ -3848,7 +4390,7 @@ class AppController(QObject):
                         self.call_detected.emit(app_name, title)
                     else:
                         target_hwnd = sess.window_hwnd if sess else None
-                        ok, msg = self.start_meeting_recording(title=title, target_hwnd=target_hwnd)
+                        ok, msg = self.start_meeting_recording(title=title, target_hwnd=target_hwnd, is_auto_detected=True)
                         if ok:
                             self.notification_requested.emit(
                                 "Meeting Recording",
@@ -3939,8 +4481,13 @@ class AppController(QObject):
                     )
                 else:
                     self.set_meeting_lifecycle_state(MeetingLifecycleState.NO_MEETING_DETECTED, "No active meeting detected.")
-            elif self._capture_state in ("recording", "paused") and self._active_meeting_target_hwnd:
-                # Monitor bound meeting window even if recording was started manually or in Audio-Only mode
+            elif (
+                self._capture_state in ("recording", "paused")
+                and self._active_meeting_target_hwnd
+                and not getattr(self, "_is_manual_meeting", False)
+                and bool(self.config.notetaker_auto_end)
+            ):
+                # Monitor verified auto-detected online meeting window (Teams/Meet/Zoom)
                 from voxlocal.audio.call_detector import is_leaving_title, is_non_call_hub
                 from voxlocal.video.meeting_capture import get_window_title, discover_meeting_sources, find_teams_sharing_session, find_zoom_sharing_session
 

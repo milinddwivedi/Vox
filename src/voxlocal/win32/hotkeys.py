@@ -64,6 +64,7 @@ VK_MAP: Dict[str, int] = {
     "right": 0x27,
     "capslock": 0x14,
     "pause": 0x13,
+    "fn": 0x77,  # Default hardware Function Key alias to VK_F8 (0x77)
     "`": 0xC0,
     "tilde": 0xC0,
     "-": 0xBD,
@@ -135,6 +136,8 @@ user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
 user32.UnhookWindowsHookEx.restype = wintypes.BOOL
 user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.PostThreadMessageW.restype = wintypes.BOOL
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
 
 
 class GlobalHotkeyManager:
@@ -330,7 +333,8 @@ class GlobalHotkeyManager:
                         vk = normalize_vk(int(kb.vkCode))
                         is_down = w_param in (WM_KEYDOWN, WM_SYSKEYDOWN)
                         is_up = w_param in (WM_KEYUP, WM_SYSKEYUP)
-                        self._handle_key_event(vk, is_down, is_up)
+                        if self._handle_key_event(vk, is_down, is_up):
+                            return 1
                 except Exception as exc:
                     logger.error("Error in low-level keyboard hook: %s", exc)
             return int(user32.CallNextHookEx(hook_handle, n_code, w_param, l_param))
@@ -408,26 +412,36 @@ class GlobalHotkeyManager:
                         return
 
                 if self._enable_voice_typing_hotkey:
-                    # Simultaneous Push-to-Talk & Double-Tap Hands-Free on PTT chord
                     ptt_now_down = bool(self._ptt_vks and self._ptt_vks.issubset(self._pressed_vks))
-                    if ptt_now_down and not was_ptt_down:
-                        self._ptt_press_time = time.monotonic()
-                        self._ptt_had_other_key = False
+                    dict_now_down = bool(self._dictation_vks and self._dictation_vks.issubset(self._pressed_vks))
 
                     if self._dictation_mode == "toggle":
-                        if self._dictation_vks and self._dictation_vks.issubset(self._pressed_vks):
-                            if not self._dictation_latch:
-                                self._dictation_latch = True
-                                if self.on_dictation_toggle:
-                                    threading.Thread(target=self.on_dictation_toggle, daemon=True).start()
+                        # Toggle Mode: Pressing either the configured dictation key or PTT key switches dictation on/off
+                        is_trigger_down = (ptt_now_down and not was_ptt_down) or (dict_now_down and not self._dictation_latch)
+                        if is_trigger_down and not self._dictation_latch:
+                            self._dictation_latch = True
+                            if self.on_dictation_toggle:
+                                threading.Thread(target=self.on_dictation_toggle, daemon=True).start()
                     elif self._dictation_mode == "push_to_talk":
-                        ptt_target = self._ptt_vks if ptt_now_down else (
-                            self._dictation_vks if (self._dictation_vks and self._dictation_vks.issubset(self._pressed_vks)) else None
-                        )
-                        if ptt_target and not self._ptt_active:
-                            self._ptt_active = True
-                            if self.on_ptt_start:
-                                threading.Thread(target=self.on_ptt_start, daemon=True).start()
+                        # Pure Push-to-Talk: Holding the key captures speech, releasing finalizes and inserts
+                        is_ptt_pressed = (ptt_now_down and not was_ptt_down) or (dict_now_down and not self._ptt_active)
+                        if is_ptt_pressed:
+                            self._ptt_press_time = time.monotonic()
+                            self._ptt_had_other_key = False
+                            if not self._ptt_active:
+                                self._ptt_active = True
+                                if self.on_ptt_start:
+                                    threading.Thread(target=self.on_ptt_start, daemon=True).start()
+                    else:
+                        # Hybrid Mode: Hold to Speak (>0.35s) OR Quick Tap (<0.35s) to Toggle
+                        is_ptt_pressed = (ptt_now_down and not was_ptt_down) or (dict_now_down and not self._ptt_active)
+                        if is_ptt_pressed:
+                            self._ptt_press_time = time.monotonic()
+                            self._ptt_had_other_key = False
+                            if not self._ptt_active:
+                                self._ptt_active = True
+                                if self.on_ptt_start:
+                                    threading.Thread(target=self.on_ptt_start, daemon=True).start()
 
                 # Meeting Recording Toggle
                 if self._meeting_vks and self._meeting_vks.issubset(self._pressed_vks):
@@ -475,7 +489,7 @@ class GlobalHotkeyManager:
                             if cb:
                                 threading.Thread(target=cb, daemon=True).start()
 
-                if self._dictation_latch and not self._dictation_vks.issubset(self._pressed_vks):
+                if self._dictation_latch and not self._dictation_vks.issubset(self._pressed_vks) and not (self._ptt_vks and self._ptt_vks.issubset(self._pressed_vks)):
                     self._dictation_latch = False
 
                 if self._meeting_latch and not self._meeting_vks.issubset(self._pressed_vks):
@@ -485,8 +499,16 @@ class GlobalHotkeyManager:
 
                 if self._ptt_active:
                     chord1 = self._ptt_vks and self._ptt_vks.issubset(self._pressed_vks)
-                    chord2 = self._dictation_vks and self._dictation_vks.issubset(self._pressed_vks)
+                    chord2 = (self._dictation_mode in ("push_to_talk", "hybrid")) and bool(self._dictation_vks and self._dictation_vks.issubset(self._pressed_vks))
                     if not chord1 and not chord2:
                         self._ptt_active = False
                         if self.on_ptt_stop:
                             threading.Thread(target=self.on_ptt_stop, daemon=True).start()
+
+            is_standalone_ptt = bool(
+                self._enable_voice_typing_hotkey
+                and len(self._ptt_vks) == 1
+                and vk in self._ptt_vks
+                and (0x70 <= vk <= 0x87 or vk in (0x13, 0x14, 0xC0))
+            )
+            return is_standalone_ptt

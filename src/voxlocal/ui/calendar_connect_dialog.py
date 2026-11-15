@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from voxlocal.calendar.auth_service import sanitize_oauth_error_for_user
 from voxlocal.core.logger import get_logger
 from voxlocal.ui.theme import get_dialog_stylesheet, get_theme_tokens, get_ui_font
 
@@ -79,12 +80,25 @@ class VoxCalendarConnectDialog(QDialog):
         root.addWidget(self.lbl_title)
 
         self.lbl_sub = QLabel(
-            "Connect your real accounts to see upcoming meetings, detect Teams, Zoom and Google Meet calls, "
-            "and power 1-click Notetaker capture with zero meeting bots."
+            "Connect your personal or work accounts to see upcoming meetings, identify Teams, Zoom, and Google Meet links, "
+            "and prepare Notetaker automatically. Connecting another account adds it alongside your existing calendars."
         )
         self.lbl_sub.setWordWrap(True)
         self.lbl_sub.setObjectName("onbSub")
         root.addWidget(self.lbl_sub)
+
+        self.perm_banner = QFrame()
+        self.perm_banner.setObjectName("voxWellCard")
+        perm_lay = QHBoxLayout(self.perm_banner)
+        perm_lay.setContentsMargins(12, 8, 12, 8)
+        self.lbl_permissions = QLabel(
+            "Read-only permissions: VOX reads your calendar events to display schedules and detect calls. "
+            "Recordings and transcripts stay private and local."
+        )
+        self.lbl_permissions.setWordWrap(True)
+        self.lbl_permissions.setStyleSheet("font-size: 11px;")
+        perm_lay.addWidget(self.lbl_permissions)
+        root.addWidget(self.perm_banner)
 
         # Tab navigation row
         nav_row = QHBoxLayout()
@@ -119,19 +133,19 @@ class VoxCalendarConnectDialog(QDialog):
         ms_lay.setContentsMargins(18, 16, 18, 16)
         ms_lay.setSpacing(12)
 
-        lbl_ms_hdr = QLabel("Microsoft Outlook Calendar")
+        lbl_ms_hdr = QLabel("Microsoft Outlook & Microsoft 365")
         lbl_ms_hdr.setStyleSheet("font-size: 13px; font-weight: 600;")
         ms_lay.addWidget(lbl_ms_hdr)
 
         lbl_ms_info = QLabel(
-            "Connect your Microsoft Outlook calendar to synchronize upcoming meetings, "
-            "recurring events, and Teams, Zoom, or Google Meet links."
+            "Supports personal Outlook (@outlook.com, @hotmail.com, @live.com) as well as "
+            "corporate Microsoft 365 and school Entra ID accounts."
         )
         lbl_ms_info.setWordWrap(True)
         ms_lay.addWidget(lbl_ms_info)
 
         self.txt_ms_account_hint = QLineEdit(str(getattr(self.controller.config, "calendar_account_email", "") or ""))
-        self.txt_ms_account_hint.setPlaceholderText("Account email or calendar .ics link (optional)")
+        self.txt_ms_account_hint.setPlaceholderText("Email address (optional — leave blank to choose account in browser)")
         ms_lay.addWidget(self.txt_ms_account_hint)
 
         # Device code card (hidden until requested)
@@ -382,6 +396,13 @@ class VoxCalendarConnectDialog(QDialog):
         root.addWidget(self.status_banner)
 
         footer = QHBoxLayout()
+        self.btn_pick_calendars = QPushButton("Choose Calendars...")
+        self.btn_pick_calendars.setObjectName("dawnBtn")
+        self.btn_pick_calendars.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pick_calendars.setVisible(False)
+        self.btn_pick_calendars.clicked.connect(self._open_calendar_picker_for_latest)
+        footer.addWidget(self.btn_pick_calendars)
+
         footer.addStretch(1)
         self.btn_close = QPushButton("Close")
         self.btn_close.setObjectName("secondaryBtn")
@@ -390,6 +411,7 @@ class VoxCalendarConnectDialog(QDialog):
         footer.addWidget(self.btn_close)
         root.addLayout(footer)
 
+        self._picking_calendars: bool = False
         self._current_verification_uri: str = "https://microsoft.com/devicelogin"
         self._current_user_code: str = ""
         self._select_tab(0)
@@ -575,11 +597,41 @@ class VoxCalendarConnectDialog(QDialog):
         self.code_card.setVisible(False)
         if ok:
             self._connected_msg = msg
-            self._show_status(msg, kind="ok")
+            self._show_status(
+                f"{msg} Syncing upcoming events automatically.",
+                kind="ok",
+            )
+            current_tab = self.stack.currentIndex() if hasattr(self, "stack") else 0
+            if current_tab in (0, 1) and hasattr(self.controller, "list_connected_calendar_accounts"):
+                self.btn_pick_calendars.setVisible(True)
             self.connected.emit(msg)
-            QTimer.singleShot(800, self.accept)
+            QTimer.singleShot(1100, self._maybe_auto_accept)
         else:
-            self._show_status(msg, kind="err")
+            _code, friendly = sanitize_oauth_error_for_user(msg)
+            self._show_status(friendly, kind="err")
+
+    def _maybe_auto_accept(self) -> None:
+        if not getattr(self, "_picking_calendars", False):
+            self.accept()
+
+    def _open_calendar_picker_for_latest(self) -> None:
+        self._picking_calendars = True
+        try:
+            accounts = self.controller.list_connected_calendar_accounts() if hasattr(self.controller, "list_connected_calendar_accounts") else []
+            target = None
+            tab = self.stack.currentIndex()
+            want_type = "ms_graph" if tab == 0 else ("google" if tab == 1 else "")
+            for acc in reversed(accounts):
+                if not want_type or acc.get("provider_type") == want_type:
+                    target = acc
+                    break
+            if target is not None:
+                from voxlocal.ui.calendar_page import CalendarSelectionDialog
+                dlg = CalendarSelectionDialog(self.controller, target, theme=self._theme, parent=self)
+                dlg.exec()
+        finally:
+            self._picking_calendars = False
+            self.accept()
 
     def reject(self) -> None:
         if self._cancel_event is not None:
@@ -595,6 +647,10 @@ class VoxCalendarConnectDialog(QDialog):
             QLabel#onbSub {{
                 color: {t['text_secondary']};
                 font-size: 13px;
+            }}
+            QLineEdit {{
+                min-height: 22px;
+                padding: 6px 10px;
             }}
             """
         )

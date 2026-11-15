@@ -57,6 +57,7 @@ class NotetakerPage(QWidget):
     """Notetaker Hub workspace combining Calendar upcoming meetings, library, playback, and Studio."""
 
     status_toast = pyqtSignal(str, str)
+    open_calendar_requested = pyqtSignal()
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -66,6 +67,7 @@ class NotetakerPage(QWidget):
         self._active_folder_id: Optional[int] = None
         self._cal_filter: str = "today"
         self._cached_calendar_meetings: List[Any] = []
+        self._prepared_calendar_meeting: Optional[Any] = None
 
         self.media_player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -81,6 +83,10 @@ class NotetakerPage(QWidget):
         self.controller.meeting_tick.connect(self._on_meeting_tick)
         if hasattr(self.controller, "calendar_upcoming_changed"):
             self.controller.calendar_upcoming_changed.connect(self._refresh_calendar_strip)
+        if hasattr(self.controller, "dictation_interim_updated"):
+            self.controller.dictation_interim_updated.connect(self._on_dictation_interim_updated)
+        if hasattr(self.controller, "dictation_completed"):
+            self.controller.dictation_completed.connect(self._on_dictation_completed)
 
         self.refresh_all()
 
@@ -156,6 +162,31 @@ class NotetakerPage(QWidget):
         b_lay.addWidget(self.btn_stop_rec)
         root.addWidget(self.rec_banner)
 
+        # Prepared Calendar Meeting Banner (shown when user prepares a meeting from Calendar)
+        self.prepared_banner = QFrame()
+        self.prepared_banner.setObjectName("ntBanner")
+        self.prepared_banner.setVisible(False)
+        pb_lay = QHBoxLayout(self.prepared_banner)
+        pb_lay.setContentsMargins(*MARGINS_TOOLBAR)
+        pb_lay.setSpacing(10)
+        self.lbl_prepared_summary = QLabel("")
+        self.lbl_prepared_summary.setWordWrap(True)
+        self.lbl_prepared_summary.setStyleSheet("font-weight: 600;")
+        pb_lay.addWidget(self.lbl_prepared_summary, 1)
+
+        self.btn_start_prepared = QPushButton("Start Recording")
+        self.btn_start_prepared.setObjectName("primaryBtn")
+        self.btn_start_prepared.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_start_prepared.clicked.connect(self._start_prepared_meeting)
+        pb_lay.addWidget(self.btn_start_prepared)
+
+        self.btn_clear_prepared = QPushButton("Dismiss")
+        self.btn_clear_prepared.setObjectName("secondaryBtn")
+        self.btn_clear_prepared.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_prepared.clicked.connect(self._clear_prepared_meeting)
+        pb_lay.addWidget(self.btn_clear_prepared)
+        root.addWidget(self.prepared_banner)
+
         # Unified Multi-Provider Upcoming Meetings Hub
         self.cal_card = QFrame()
         self.cal_card.setObjectName("ntCard")
@@ -221,6 +252,13 @@ class NotetakerPage(QWidget):
         self.btn_cal_connect.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_cal_connect.clicked.connect(self._connect_calendar)
         cal_top.addWidget(self.btn_cal_connect)
+
+        self.btn_open_calendar = QPushButton("Open Calendar →")
+        self.btn_open_calendar.setObjectName("secondaryBtn")
+        self.btn_open_calendar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_calendar.setToolTip("Open the dedicated Calendar workspace for all accounts & upcoming meetings")
+        self.btn_open_calendar.clicked.connect(self.open_calendar_requested.emit)
+        cal_top.addWidget(self.btn_open_calendar)
 
         cal_root_lay.addLayout(cal_top)
 
@@ -300,6 +338,14 @@ class NotetakerPage(QWidget):
         meta_col.addWidget(self.lbl_sel_title)
         meta_col.addWidget(self.lbl_sel_meta)
         top_meta.addLayout(meta_col, 1)
+
+        self.btn_view_in_calendar = QPushButton("Calendar Event")
+        self.btn_view_in_calendar.setObjectName("secondaryBtn")
+        self.btn_view_in_calendar.setVisible(False)
+        self.btn_view_in_calendar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_view_in_calendar.setToolTip("Open Calendar workspace")
+        self.btn_view_in_calendar.clicked.connect(self.open_calendar_requested.emit)
+        top_meta.addWidget(self.btn_view_in_calendar)
 
         self.btn_watch_video = QPushButton("Watch Video")
         self.btn_watch_video.setObjectName("primaryBtn")
@@ -445,26 +491,42 @@ class NotetakerPage(QWidget):
                 providers_dict = {"default": p}
 
         active_providers = [k for k, p in providers_dict.items() if p.is_authenticated()]
-        has_active_provider = len(active_providers) > 0
+        db_accounts = []
+        if hasattr(self.controller, "list_connected_calendar_accounts"):
+            try:
+                db_accounts = list(self.controller.list_connected_calendar_accounts() or [])
+            except Exception:
+                db_accounts = []
+        active_provider_types = {str(getattr(p, "provider_type", k) or k).lower() for k, p in providers_dict.items() if p.is_authenticated()} | {
+            str(a.get("provider_type", "")).lower() for a in db_accounts if a.get("enabled", True) and a.get("is_authenticated")
+        }
+        has_active_provider = len(active_providers) > 0 or len(active_provider_types) > 0
 
         cfg = getattr(self.controller, "config", None)
         storage_dir = Path(getattr(cfg, "storage_dir", "data"))
         ms_connected = bool(
-            "ms_graph" in active_providers
+            "ms_graph" in active_provider_types
+            or "ms_graph" in active_providers
             or getattr(cfg, "ms_graph_enabled", False)
             or (storage_dir / "calendar_auth.dat").exists()
         )
         google_connected = bool(
-            "google" in active_providers
+            "google" in active_provider_types
+            or "google" in active_providers
             or getattr(cfg, "google_calendar_enabled", False)
             or (storage_dir / "calendar_google.dat").exists()
         )
         zoom_connected = bool(
-            "zoom" in active_providers
+            "zoom" in active_provider_types
+            or "zoom" in active_providers
             or getattr(cfg, "zoom_enabled", False)
             or (storage_dir / "calendar_zoom.dat").exists()
         )
-        ics_connected = bool("ics" in active_providers or getattr(cfg, "calendar_ics_url", ""))
+        ics_connected = bool(
+            "ics" in active_provider_types
+            or "ics" in active_providers
+            or getattr(cfg, "calendar_ics_url", "")
+        )
 
         if ms_connected:
             upn = getattr(cfg, "calendar_account_email", "") or "Outlook"
@@ -592,6 +654,28 @@ class NotetakerPage(QWidget):
             self.controller.start_meeting_from_calendar(mtg)
         else:
             self.controller.start_meeting_recording(title=getattr(mtg, "title", "Scheduled Meeting"))
+
+    def prepare_for_calendar_meeting(self, mtg: Any) -> None:
+        self._prepared_calendar_meeting = mtg
+        title = str(getattr(mtg, "title", "Scheduled Meeting") or "Scheduled Meeting")
+        plat = str(getattr(mtg, "meeting_platform_label", "") or getattr(mtg, "platform", "") or "Meeting")
+        self.lbl_prepared_summary.setText(f"Prepared from Calendar: {title} ({plat})")
+        self.prepared_banner.setVisible(True)
+
+    def _start_prepared_meeting(self) -> None:
+        mtg = self._prepared_calendar_meeting
+        if mtg is None:
+            return
+        if hasattr(self.controller, "prepare_notetaker_for_meeting"):
+            self.controller.prepare_notetaker_for_meeting(mtg, start_recording=True)
+        else:
+            self._start_for_calendar_meeting(mtg)
+        self._clear_prepared_meeting()
+
+    def _clear_prepared_meeting(self) -> None:
+        self._prepared_calendar_meeting = None
+        if hasattr(self, "prepared_banner"):
+            self.prepared_banner.setVisible(False)
 
     def _refresh_recording_banner(self, state: str = "", status_msg: str = "") -> None:
         raw_state = str(state or "").strip().lower()
@@ -793,8 +877,14 @@ class NotetakerPage(QWidget):
         dur = format_seconds_hms(float(m.get("duration_sec") or 0.0))
         plat = str(m.get("source_platform") or "Desktop Call")
         date_str = str(m.get("started_at") or "")[:16].replace("T", " ")
+        cal_ev_id = str(m.get("calendar_event_id") or "")
         self.lbl_sel_title.setText(str(m.get("title") or "Untitled Meeting"))
-        self.lbl_sel_meta.setText(f"{date_str} · Duration {dur} · {plat}")
+        meta_text = f"{date_str} · Duration {dur} · {plat}"
+        if cal_ev_id:
+            meta_text += " · Linked Calendar Event"
+        self.lbl_sel_meta.setText(meta_text)
+        if hasattr(self, "btn_view_in_calendar"):
+            self.btn_view_in_calendar.setVisible(bool(cal_ev_id))
 
         has_vid = self._resolve_video_path(m) is not None
         self.btn_watch_video.setEnabled(has_vid)
@@ -977,6 +1067,7 @@ class NotetakerPage(QWidget):
             return
         if QMessageBox.question(self, "Delete Meeting", "Permanently delete this meeting recording and notes?") == QMessageBox.StandardButton.Yes:
             self.media_player.stop()
+            self.media_player.setSource(QUrl())
             self.controller.db.delete_meeting(self._selected_meeting_id)
             self._selected_meeting_id = None
             self.refresh_meetings_list()
@@ -1064,5 +1155,24 @@ class NotetakerPage(QWidget):
         res = self.controller.query_meeting_memory(query, meeting_id=int(m_id))
         ans = str((res or {}).get("answer") or "No relevant excerpts found in this meeting.")
         self.studio.tab_summary.set_ask_answer(ans)
+
+    def _on_dictation_interim_updated(self, provisional: str, stable: str) -> None:
+        combined = " ".join(x for x in (stable.strip(), provisional.strip()) if x).strip()
+        if hasattr(self, "studio") and hasattr(self.studio, "tab_thoughts") and hasattr(self.studio.tab_thoughts, "set_interim_text"):
+            self.studio.tab_thoughts.set_interim_text(combined)
+
+    def _on_dictation_completed(self, text: str, target: str, method: str) -> None:
+        if hasattr(self, "studio") and hasattr(self.studio, "tab_thoughts"):
+            if hasattr(self.studio.tab_thoughts, "set_interim_text"):
+                self.studio.tab_thoughts.set_interim_text("")
+            if hasattr(self.studio.tab_thoughts, "editor") and text.strip():
+                app = QApplication.instance()
+                active_win = app.activeWindow() if app else None
+                is_vox_active = active_win is not None and "vox" in type(active_win).__name__.lower()
+                if "in_app" in method or "VOX" in target or is_vox_active or self.studio.tab_thoughts.editor.hasFocus():
+                    current = self.studio.tab_thoughts.editor.toPlainText()
+                    tail = current[-max(40, len(text) + 10) :] if current else ""
+                    if text.strip() not in tail:
+                        self.studio.tab_thoughts.editor.insertPlainText(text + " ")
 
     set_theme = apply_theme

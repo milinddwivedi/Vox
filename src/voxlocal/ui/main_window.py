@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 from voxlocal.core.logger import get_logger
 from voxlocal.storage.exporter import format_seconds_hms
 from voxlocal.ui.animations import ThemeToggleCapsule, ToastNotification
+from voxlocal.ui.calendar_page import CalendarPage
 from voxlocal.ui.command_palette import VoxCommandPaletteDialog, create_default_vox_commands
 from voxlocal.ui.hub_pages import (
     DictionaryPage,
@@ -195,6 +196,7 @@ class MainWindow(QMainWindow):
         "history": 6,
         "analytics": 6,
         "settings": 7,
+        "calendar": 8,
     }
 
     _LEGACY_INT_TO_INDEX: Dict[int, int] = {
@@ -316,6 +318,17 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda _=False, i=idx: self.navigate_to_workspace(i))
             self.nav_buttons.append(btn)
             sb_lay.addWidget(btn)
+            if idx == 1:
+                self.btn_calendar = QPushButton("Calendar")
+                self.btn_calendar.setCheckable(True)
+                self.btn_calendar.setCursor(Qt.CursorShape.PointingHandCursor)
+                self.btn_calendar.setFixedHeight(36)
+                self.btn_calendar.setAccessibleName("Calendar workspace")
+                self.btn_calendar.setAccessibleDescription(
+                    "Navigate to Calendar ecosystem, connected accounts, and upcoming meetings, keyboard shortcut Control+8"
+                )
+                self.btn_calendar.clicked.connect(lambda: self.navigate_to_workspace("calendar"))
+                sb_lay.addWidget(self.btn_calendar)
 
         sb_lay.addStretch(1)
 
@@ -387,7 +400,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.sidebar)
 
         # ---- Right Workspace Stack ----
-        labels = [ws["name"] for ws in self.WORKSPACES]
+        labels = [ws["name"] for ws in self.WORKSPACES] + ["Calendar"]
         self.workspace_stack = VoxWorkspaceStack(labels=labels, parent=central)
         self.tab_widget = self.workspace_stack  # Legacy compatibility alias
 
@@ -397,6 +410,7 @@ class MainWindow(QMainWindow):
 
         self.notetaker_page = NotetakerPage(self.controller, parent=self)
         self.notetaker_page.status_toast.connect(self.show_toast)
+        self.notetaker_page.open_calendar_requested.connect(lambda: self.navigate_to_workspace("calendar"))
 
         self.dictionary_page = DictionaryPage(self.controller, parent=self)
         self.dictionary_page.status_toast.connect(self.show_toast)
@@ -415,6 +429,15 @@ class MainWindow(QMainWindow):
         self.settings_page = SettingsWorkspaceWidget(self.controller, parent=self)
         self.settings_page.replay_tour_requested.connect(self.replay_tour_requested.emit)
         self.settings_page.status_toast.connect(self.show_toast)
+        self.settings_page.open_calendar_requested.connect(lambda: self.navigate_to_workspace("calendar"))
+
+        self.calendar_page = CalendarPage(self.controller, parent=self)
+        self.calendar_page.status_toast.connect(self.show_toast)
+        self.calendar_page.open_meeting_recording_requested.connect(self._on_open_recording_from_calendar)
+        if hasattr(self.controller, "calendar_prepare_notetaker_requested"):
+            self.controller.calendar_prepare_notetaker_requested.connect(self._on_prepare_notetaker_from_calendar)
+        else:
+            self.calendar_page.prepare_notetaker_requested.connect(self._on_prepare_notetaker_from_calendar)
 
         for page in (
             self.home_page,
@@ -425,6 +448,7 @@ class MainWindow(QMainWindow):
             self.scratchpad_page,
             self.insights_page,
             self.settings_page,
+            self.calendar_page,
         ):
             self.workspace_stack.addWidget(page)
 
@@ -436,6 +460,7 @@ class MainWindow(QMainWindow):
         for idx, ws in enumerate(self.WORKSPACES):
             sc = QShortcut(QKeySequence(ws["shortcut"]), self)
             sc.activated.connect(lambda i=idx: self.navigate_to_workspace(i))
+        QShortcut(QKeySequence("Ctrl+8"), self).activated.connect(lambda: self.navigate_to_workspace("calendar"))
         QShortcut(QKeySequence("Ctrl+K"), self).activated.connect(self._open_global_search)
         QShortcut(QKeySequence("Ctrl+T"), self).activated.connect(self.controller.toggle_theme)
 
@@ -455,13 +480,16 @@ class MainWindow(QMainWindow):
             idx = int(target)
         if legacy_map and idx in self._LEGACY_INT_TO_INDEX:
             return self._LEGACY_INT_TO_INDEX[idx]
-        return max(0, min(idx, self.workspace_stack.count() - 1))
+        max_ws_idx = max(0, len(self.WORKSPACES) - 1)
+        return max(0, min(idx, max_ws_idx))
 
     def navigate_to_workspace(self, target: Union[int, str], legacy_map: bool = False) -> None:
         idx = self._resolve_workspace_index(target, legacy_map=legacy_map)
         self.workspace_stack.setCurrentIndex(idx)
         for i, btn in enumerate(self.nav_buttons):
             btn.setChecked(i == idx)
+        if hasattr(self, "btn_calendar"):
+            self.btn_calendar.setChecked(idx == 8)
         if idx == 0:
             self.home_page.refresh_all()
         elif idx == 1:
@@ -476,6 +504,18 @@ class MainWindow(QMainWindow):
             self.insights_page.refresh()
         elif idx == 7:
             self.settings_page.load_from_config()
+        elif idx == 8:
+            self.calendar_page.refresh()
+
+    def _on_prepare_notetaker_from_calendar(self, meeting: object) -> None:
+        self.navigate_to_workspace("notetaker")
+        if hasattr(self.notetaker_page, "prepare_for_calendar_meeting"):
+            self.notetaker_page.prepare_for_calendar_meeting(meeting)
+
+    def _on_open_recording_from_calendar(self, recording_id: int) -> None:
+        self.navigate_to_workspace("notetaker")
+        if hasattr(self.notetaker_page, "select_meeting"):
+            self.notetaker_page.select_meeting(int(recording_id))
 
     def open_and_focus_tab(self, tab_idx: Union[int, str] = 0, maximize: bool = False) -> None:
         use_legacy = isinstance(tab_idx, int)
@@ -644,6 +684,7 @@ class MainWindow(QMainWindow):
             self.scratchpad_page,
             self.insights_page,
             self.settings_page,
+            self.calendar_page,
         ):
             if hasattr(page, "apply_theme"):
                 page.apply_theme(self._theme)
