@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QProgressBar,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
@@ -250,6 +251,12 @@ class MainWindow(QMainWindow):
         self.controller.notification_requested.connect(self.show_toast)
         if hasattr(self.controller, "upgrade_dialog_requested"):
             self.controller.upgrade_dialog_requested.connect(self._show_pro_upgrade_dialog)
+        if hasattr(self.controller, "entitlement_changed"):
+            self.controller.entitlement_changed.connect(lambda ent: self._update_plan_card(entitlement_data=ent))
+        if hasattr(self.controller, "usage_updated"):
+            self.controller.usage_updated.connect(lambda usg: self._update_plan_card(usage_data=usg))
+        if hasattr(self.controller, "auth_state_changed"):
+            self.controller.auth_state_changed.connect(lambda *_: self._update_plan_card())
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -383,6 +390,52 @@ class MainWindow(QMainWindow):
         self.btn_toggle_float.clicked.connect(self._toggle_floating_bar)
         sb_lay.addWidget(self.btn_toggle_float)
 
+        # ---- Left Sidebar Plan Status Card (Milestone 2) ----
+        sb_lay.addStretch()
+
+        self.plan_card = QFrame()
+        self.plan_card.setObjectName("planStatusCard")
+        plan_card_lay = QVBoxLayout(self.plan_card)
+        plan_card_lay.setContentsMargins(12, 10, 12, 12)
+        plan_card_lay.setSpacing(6)
+
+        plan_header_row = QHBoxLayout()
+        plan_header_row.setSpacing(6)
+        lbl_plan_title = QLabel("PLAN")
+        lbl_plan_title.setObjectName("planSectionHeader")
+        lbl_plan_title.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        plan_header_row.addWidget(lbl_plan_title)
+        plan_header_row.addStretch()
+
+        self.lbl_plan_badge = QLabel("VOX Free")
+        self.lbl_plan_badge.setObjectName("planBadge")
+        self.lbl_plan_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        plan_header_row.addWidget(self.lbl_plan_badge)
+        plan_card_lay.addLayout(plan_header_row)
+
+        self.lbl_quota_words = QLabel("Words: 0 / 3,000")
+        self.lbl_quota_words.setObjectName("planQuotaLabel")
+        plan_card_lay.addWidget(self.lbl_quota_words)
+
+        self.bar_quota_words = QProgressBar()
+        self.bar_quota_words.setObjectName("planQuotaProgress")
+        self.bar_quota_words.setFixedHeight(6)
+        self.bar_quota_words.setTextVisible(False)
+        self.bar_quota_words.setRange(0, 3000)
+        self.bar_quota_words.setValue(0)
+        plan_card_lay.addWidget(self.bar_quota_words)
+
+        self.btn_plan_upgrade = QPushButton("⚡ Upgrade to Pro")
+        self.btn_plan_upgrade.setObjectName("planUpgradeBtn")
+        self.btn_plan_upgrade.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_plan_upgrade.setFixedHeight(28)
+        self.btn_plan_upgrade.setAccessibleName("Upgrade or manage plan")
+        self.btn_plan_upgrade.clicked.connect(self._on_plan_button_clicked)
+        plan_card_lay.addWidget(self.btn_plan_upgrade)
+
+        sb_lay.addWidget(self.plan_card)
+        sb_lay.addSpacing(4)
+
         self.lbl_privacy_badge = QLabel("100% Local AI · Offline")
         self.lbl_privacy_badge.setObjectName("sbMutedLabel")
         self.lbl_privacy_badge.setAlignment(Qt.AlignmentFlag.AlignLeft)
@@ -398,6 +451,7 @@ class MainWindow(QMainWindow):
         self.setTabOrder(self.btn_open_scratchpad, self.btn_open_drawer)
         self.setTabOrder(self.btn_open_drawer, self.btn_replay_tour)
         self.setTabOrder(self.btn_replay_tour, self.btn_toggle_float)
+        self.setTabOrder(self.btn_toggle_float, self.btn_plan_upgrade)
 
         root.addWidget(self.sidebar)
 
@@ -458,6 +512,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.workspace_stack, 1)
         self.navigate_to_workspace(0)
         self._update_float_btn_text()
+        self._update_plan_card()
 
     def _setup_shortcuts(self) -> None:
         for idx, ws in enumerate(self.WORKSPACES):
@@ -675,6 +730,22 @@ class MainWindow(QMainWindow):
                 padding: 5px 10px;
                 color: {t['text_muted']};
             }}
+            QFrame#planStatusCard {{
+                background-color: {t['surface']};
+                border: 1px solid {t['line']};
+                border-radius: 10px;
+            }}
+            QLabel#planSectionHeader {{
+                color: {t['text_dim']};
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.8px;
+            }}
+            QLabel#planQuotaLabel {{
+                color: {t['text_secondary']};
+                font-size: 11px;
+                font-weight: 500;
+            }}
             """
         )
 
@@ -691,6 +762,8 @@ class MainWindow(QMainWindow):
         ):
             if hasattr(page, "apply_theme"):
                 page.apply_theme(self._theme)
+
+        self._update_plan_card()
 
     set_theme = apply_theme
 
@@ -716,6 +789,103 @@ class MainWindow(QMainWindow):
     def _remove_toast(self, toast: ToastNotification) -> None:
         if toast in self._toasts:
             self._toasts.remove(toast)
+
+    def _on_plan_button_clicked(self) -> None:
+        effective_ent = self.controller.entitlement.get_effective_entitlement() if hasattr(self.controller, "entitlement") else {}
+        is_pro = bool(effective_ent.get("is_pro", False))
+        reason = "Manage VOX Pro Plan" if is_pro else "Upgrade to VOX Pro"
+        if hasattr(self.controller, "request_upgrade_dialog"):
+            self.controller.request_upgrade_dialog(reason=reason)
+        else:
+            self._show_pro_upgrade_dialog(reason=reason)
+
+    def _update_plan_card(
+        self,
+        entitlement_data: Optional[Dict[str, Any]] = None,
+        usage_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update Plan Badge, Word Quota Meter, and Upgrade button in sidebar."""
+        if not hasattr(self, "plan_card"):
+            return
+        try:
+            ent = entitlement_data or (
+                self.controller.entitlement.get_effective_entitlement()
+                if hasattr(self.controller, "entitlement")
+                else {}
+            )
+            usage = usage_data or (
+                self.controller.metering.get_weekly_usage()
+                if hasattr(self.controller, "metering")
+                else {}
+            )
+            is_pro = bool(ent.get("is_pro", False))
+            words_used = int(usage.get("dictation_words", 0))
+
+            limits = ent.get("limits", {})
+            word_limit = int(limits.get("dictation_words_weekly", 3000))
+
+            t = get_theme_tokens(self._theme)
+
+            if is_pro:
+                self.lbl_plan_badge.setText("👑 VOX Pro")
+                self.lbl_plan_badge.setStyleSheet(
+                    f"background: {t['accent_emerald_tint']}; color: {t['accent_emerald']}; "
+                    f"border: 1px solid {t['accent_emerald']}; border-radius: 999px; "
+                    f"padding: 2px 8px; font-size: 11px; font-weight: 700;"
+                )
+                self.lbl_quota_words.setText("Words: Unlimited")
+                self.bar_quota_words.setRange(0, 100)
+                self.bar_quota_words.setValue(100)
+                self.bar_quota_words.setStyleSheet(
+                    f"QProgressBar {{ border: none; background: {t['surface_well']}; border-radius: 3px; }} "
+                    f"QProgressBar::chunk {{ background: {t['accent_emerald']}; border-radius: 3px; }}"
+                )
+                self.btn_plan_upgrade.setText("👑 Manage Plan")
+                self.btn_plan_upgrade.setStyleSheet(
+                    f"QPushButton#planUpgradeBtn {{ "
+                    f"background: transparent; color: {t['accent_emerald']}; "
+                    f"border: 1px solid {t['accent_emerald']}; border-radius: 6px; "
+                    f"font-size: 11.5px; font-weight: 600; padding: 4px 8px; "
+                    f"}} "
+                    f"QPushButton#planUpgradeBtn:hover {{ "
+                    f"background: {t['accent_emerald_tint']}; "
+                    f"}}"
+                )
+            else:
+                self.lbl_plan_badge.setText("VOX Free")
+                self.lbl_plan_badge.setStyleSheet(
+                    f"background: {t['surface_secondary']}; color: {t['text_muted']}; "
+                    f"border: 1px solid {t['border']}; border-radius: 999px; "
+                    f"padding: 2px 8px; font-size: 11px; font-weight: 700;"
+                )
+                self.lbl_quota_words.setText(f"Words: {words_used:,} / {word_limit:,}")
+                self.bar_quota_words.setRange(0, word_limit)
+                self.bar_quota_words.setValue(min(word_limit, words_used))
+
+                if words_used >= word_limit:
+                    chunk_color = "#EF4444"
+                elif words_used >= word_limit * 0.8:
+                    chunk_color = t.get("accent_gold", "#D97706")
+                else:
+                    chunk_color = t["accent"]
+
+                self.bar_quota_words.setStyleSheet(
+                    f"QProgressBar {{ border: none; background: {t['surface_well']}; border-radius: 3px; }} "
+                    f"QProgressBar::chunk {{ background: {chunk_color}; border-radius: 3px; }}"
+                )
+                self.btn_plan_upgrade.setText("⚡ Upgrade to Pro")
+                self.btn_plan_upgrade.setStyleSheet(
+                    f"QPushButton#planUpgradeBtn {{ "
+                    f"background: {t['accent']}; color: #FFFFFF; "
+                    f"border: none; border-radius: 6px; "
+                    f"font-size: 11.5px; font-weight: 700; padding: 4px 8px; "
+                    f"}} "
+                    f"QPushButton#planUpgradeBtn:hover {{ "
+                    f"background: {t.get('accent_fathom_hover', '#4338CA')}; "
+                    f"}}"
+                )
+        except Exception as exc:
+            logger.debug("Failed updating Plan Status Card: %s", exc)
 
     def _show_pro_upgrade_dialog(self, reason: str = "") -> None:
         """Show the modern 2026 VOX Pro upgrade modal."""

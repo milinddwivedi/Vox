@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500;1,600&family=Figtree:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="assets/vox-auth.js" defer></script>
   <style>
     :root {
@@ -145,14 +146,14 @@
 
       <div class="actions-row">
         <a href="pricing.html" class="btn btn-primary" id="btnUpgrade">Upgrade to VOX Pro (₹199/mo) →</a>
-        <button class="btn btn-secondary" id="btnAccountGoogle" onclick="window.openVoxAuthModal()">
+        <button class="btn btn-secondary" id="btnAccountGoogle" onclick="handleAuthButtonClick()">
           <svg width="16" height="16" viewBox="0 0 24 24" style="margin-right:4px;">
             <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
             <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
             <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
             <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
           </svg>
-          Sign In with Google
+          <span id="btnAuthText">Sign In with Google</span>
         </button>
         <a href="https://github.com/milinddwivedi/Vox/releases/latest/download/VoxLocal-Setup.exe" class="btn btn-secondary">Download Windows App</a>
       </div>
@@ -168,59 +169,125 @@
   </footer>
 
   <script>
-    function refreshAccountView(user) {
-      user = user || (window.voxAuth ? window.voxAuth.getUser() : null);
-      const isPro = (user && user.plan === 'Pro') || localStorage.getItem('vox_plan') === 'pro';
+    let activeUser = null;
+
+    async function handleAuthButtonClick() {
+      if (activeUser) {
+        if (window.voxAuth && window.voxAuth.signOut) {
+          await window.voxAuth.signOut();
+        }
+      } else {
+        if (window.voxAuth && window.voxAuth.signInWithGoogle) {
+          await window.voxAuth.signInWithGoogle({ redirectTo: window.location.origin + '/account.html' });
+        }
+      }
+    }
+
+    async function refreshAccountView(user) {
+      if (!user && window.voxAuth && window.voxAuth.getCurrentUser) {
+        user = await window.voxAuth.getCurrentUser();
+      }
+      activeUser = user;
 
       const elAvatar = document.getElementById('userAvatar');
       const elName = document.getElementById('userName');
       const elEmail = document.getElementById('userEmail');
       const elBadge = document.getElementById('planBadge');
       const btnUpgrade = document.getElementById('btnUpgrade');
-      const btnGoogle = document.getElementById('btnAccountGoogle');
+      const btnAuthText = document.getElementById('btnAuthText');
 
       if (user) {
-        if (elAvatar) elAvatar.innerText = user.avatar || user.name.charAt(0).toUpperCase();
-        if (elName) elName.innerText = user.name;
-        if (elEmail) elEmail.innerText = user.email + ' · Connected';
-        if (btnGoogle) {
-          btnGoogle.innerText = 'Switch Account';
+        if (elAvatar) {
+          if (user.avatar_url) {
+            elAvatar.innerHTML = '<img src="' + user.avatar_url + '" alt="' + (user.name || '') + '" style="width:100%;height:100%;border-radius:50%;object-fit:cover;" />';
+          } else {
+            elAvatar.innerText = user.avatar || (user.name ? user.name.charAt(0).toUpperCase() : 'U');
+          }
+        }
+        if (elName) elName.innerText = user.name || 'VOX User';
+        if (elEmail) elEmail.innerText = (user.email || '') + ' · Connected';
+        if (btnAuthText) {
+          btnAuthText.innerText = 'Sign Out (' + (user.email ? user.email.split('@')[0] : 'Connected') + ')';
+        }
+
+        const isPro = Boolean(user.is_pro);
+
+        // Fetch genuine weekly usage from Supabase
+        let usage = { dictation_words: 0, meeting_minutes: 0, meeting_count: 0, ask_vox_queries: 0 };
+        if (window.voxAuth && window.voxAuth.getWeeklyUsage) {
+          try {
+            usage = await window.voxAuth.getWeeklyUsage(user.id);
+          } catch (e) {
+            console.warn('Could not query weekly usage:', e);
+          }
+        }
+
+        const words = Number(usage.dictation_words) || 0;
+        const minutes = Number(usage.meeting_minutes) || 0;
+        const meetings = Number(usage.meeting_count) || 0;
+        const queries = Number(usage.ask_vox_queries) || 0;
+
+        if (isPro) {
+          if (elBadge) {
+            elBadge.className = 'plan-badge pro';
+            elBadge.innerText = 'VOX Pro (Active)';
+          }
+          if (btnUpgrade) {
+            btnUpgrade.innerText = 'Manage Subscription →';
+            btnUpgrade.href = 'pricing.html';
+          }
+
+          document.getElementById('txtWords').innerText = words.toLocaleString() + ' words (Unlimited / Pro Plan Active)';
+          document.getElementById('txtMinutes').innerText = minutes.toLocaleString() + ' mins (Unlimited / Pro Plan Active)';
+          document.getElementById('txtMeetings').innerText = meetings.toLocaleString() + ' sessions (Unlimited / Pro Plan Active)';
+          document.getElementById('txtQueries').innerText = queries.toLocaleString() + ' queries (Unlimited / Pro Plan Active)';
+
+          document.getElementById('barWords').style.width = '100%';
+          document.getElementById('barMinutes').style.width = '100%';
+          document.getElementById('barMeetings').style.width = '100%';
+          document.getElementById('barQueries').style.width = '100%';
+
+          document.getElementById('barWords').style.background = '#10B981';
+          document.getElementById('barMinutes').style.background = '#10B981';
+          document.getElementById('barMeetings').style.background = '#10B981';
+          document.getElementById('barQueries').style.background = '#10B981';
+        } else {
+          if (elBadge) {
+            elBadge.className = 'plan-badge free';
+            elBadge.innerText = 'VOX Free (₹0/mo)';
+          }
+          if (btnUpgrade) {
+            btnUpgrade.innerText = 'Upgrade to VOX Pro (₹199/mo) →';
+            btnUpgrade.href = 'pricing.html';
+          }
+
+          const pctWords = Math.min(100, Math.round((words / 3000) * 100));
+          const pctMinutes = Math.min(100, Math.round((minutes / 180) * 100));
+          const pctMeetings = Math.min(100, Math.round((meetings / 5) * 100));
+          const pctQueries = Math.min(100, Math.round((queries / 10) * 100));
+
+          document.getElementById('txtWords').innerText = words.toLocaleString() + ' / 3,000 words (' + pctWords + '%)';
+          document.getElementById('txtMinutes').innerText = minutes.toLocaleString() + ' / 180 mins (' + pctMinutes + '%)';
+          document.getElementById('txtMeetings').innerText = meetings.toLocaleString() + ' / 5 sessions (' + pctMeetings + '%)';
+          document.getElementById('txtQueries').innerText = queries.toLocaleString() + ' / 10 queries (' + pctQueries + '%)';
+
+          document.getElementById('barWords').style.width = pctWords + '%';
+          document.getElementById('barMinutes').style.width = pctMinutes + '%';
+          document.getElementById('barMeetings').style.width = pctMeetings + '%';
+          document.getElementById('barQueries').style.width = pctQueries + '%';
+
+          document.getElementById('barWords').style.background = '';
+          document.getElementById('barMinutes').style.background = '';
+          document.getElementById('barMeetings').style.background = '';
+          document.getElementById('barQueries').style.background = '';
         }
       } else {
+        // Clean Guest state
         if (elAvatar) elAvatar.innerText = 'G';
         if (elName) elName.innerText = 'Guest User';
         if (elEmail) elEmail.innerText = 'Local PC Mode · Not synced to cloud';
-        if (btnGoogle) {
-          btnGoogle.innerHTML = `
-            <svg width="16" height="16" viewBox="0 0 24 24" style="margin-right:4px;">
-              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
-              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
-            </svg>
-            Sign In with Google
-          `;
-        }
-      }
+        if (btnAuthText) btnAuthText.innerText = 'Sign In with Google';
 
-      if (isPro) {
-        if (elBadge) {
-          elBadge.className = 'plan-badge pro';
-          elBadge.innerText = 'VOX Pro (Active)';
-        }
-        if (btnUpgrade) {
-          btnUpgrade.innerText = 'Manage Subscription →';
-          btnUpgrade.href = 'pricing.html';
-        }
-        document.getElementById('txtWords').innerText = 'Unlimited (Pro Plan Active)';
-        document.getElementById('txtMinutes').innerText = 'Unlimited (Pro Plan Active)';
-        document.getElementById('txtMeetings').innerText = 'Unlimited (Pro Plan Active)';
-        document.getElementById('txtQueries').innerText = 'Unlimited (Pro Plan Active)';
-        document.getElementById('barWords').style.width = '100%';
-        document.getElementById('barMinutes').style.width = '100%';
-        document.getElementById('barMeetings').style.width = '100%';
-        document.getElementById('barQueries').style.width = '100%';
-      } else {
         if (elBadge) {
           elBadge.className = 'plan-badge free';
           elBadge.innerText = 'VOX Free (₹0/mo)';
@@ -229,19 +296,31 @@
           btnUpgrade.innerText = 'Upgrade to VOX Pro (₹199/mo) →';
           btnUpgrade.href = 'pricing.html';
         }
-        document.getElementById('txtWords').innerText = '420 / 3,000 words (14%)';
-        document.getElementById('txtMinutes').innerText = '35 / 180 mins (19%)';
-        document.getElementById('txtMeetings').innerText = '2 / 5 sessions (40%)';
-        document.getElementById('txtQueries').innerText = '3 / 10 queries (30%)';
-        document.getElementById('barWords').style.width = '14%';
-        document.getElementById('barMinutes').style.width = '19%';
-        document.getElementById('barMeetings').style.width = '40%';
-        document.getElementById('barQueries').style.width = '30%';
+
+        document.getElementById('txtWords').innerText = '0 / 3,000 words (0%)';
+        document.getElementById('txtMinutes').innerText = '0 / 180 mins (0%)';
+        document.getElementById('txtMeetings').innerText = '0 / 5 sessions (0%)';
+        document.getElementById('txtQueries').innerText = '0 / 10 queries (0%)';
+
+        document.getElementById('barWords').style.width = '0%';
+        document.getElementById('barMinutes').style.width = '0%';
+        document.getElementById('barMeetings').style.width = '0%';
+        document.getElementById('barQueries').style.width = '0%';
+
+        document.getElementById('barWords').style.background = '';
+        document.getElementById('barMinutes').style.background = '';
+        document.getElementById('barMeetings').style.background = '';
+        document.getElementById('barQueries').style.background = '';
       }
     }
 
-    window.onVoxAuthChanged = refreshAccountView;
-    document.addEventListener('DOMContentLoaded', () => refreshAccountView());
+    window.onVoxAuthChanged = function(user) {
+      refreshAccountView(user);
+    };
+
+    document.addEventListener('DOMContentLoaded', function() {
+      refreshAccountView();
+    });
   </script>
 </body>
 </html>

@@ -1,8 +1,8 @@
 module.exports = async function handler(req, res) {
-  const { redirect_uri = 'http://127.0.0.1:8400/auth/callback', code_challenge = '', state = '' } = req.query;
+  const { redirect_uri = 'http://127.0.0.1:8400/callback', code_challenge = '', state = '' } = req.query;
 
   // Supabase Project URL for Google OAuth
-  const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co';
+  const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://qiigoipgoedexmdowtvj.supabase.co';
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -133,7 +133,8 @@ module.exports = async function handler(req, res) {
     function initiateOAuth() {
       // In production with Supabase configured:
       if (supabaseUrl && !supabaseUrl.includes('placeholder')) {
-        const authUrl = supabaseUrl + '/auth/v1/authorize?provider=google&redirect_to=' + encodeURIComponent(window.location.origin + '/api/auth/desktop-callback?target=' + encodeURIComponent(redirectUri) + '&state=' + encodeURIComponent(state));
+        const callbackUrl = window.location.origin + '/api/auth/desktop-callback?target=' + encodeURIComponent(redirectUri) + '&state=' + encodeURIComponent(state);
+        const authUrl = supabaseUrl + '/auth/v1/authorize?provider=custom:google&redirect_to=' + encodeURIComponent(callbackUrl);
         window.location.href = authUrl;
       } else {
         // Direct loopback simulation for dev/test verification

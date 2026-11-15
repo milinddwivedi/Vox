@@ -1,44 +1,310 @@
 /**
- * VOX Local AI — Web Auth & Razorpay Commerce Client (2026 Edition)
- * Handles Google Sign-in modal, account state synchronization across pages,
- * direct Razorpay checkout links with full fallbacks (back-button, reload, offline),
- * and desktop deep-linking (voxlocal://).
+ * VOX Local AI — Web Auth & Razorpay Commerce Client (2026 Production Edition)
+ * Central Supabase GoTrue Auth client (Google OAuth 2.0), real subscription & usage queries,
+ * authenticated state synchronization across web pages, and direct Razorpay checkout integration.
  */
 
 (function () {
   'use strict';
+
+  const SUPABASE_PROJECT_URL = 'https://qiigoipgoedexmdowtvj.supabase.co';
+  const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFpaWdvaXBnb2VkZXhtZG93dHZqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ3NTM2NjQsImV4cCI6MjExMDMyOTY2NH0.C9Bz6OYqxB5uBUa0kEBJpiMvwW6SbKYWhAEcVZoFvYM';
 
   const RAZORPAY_LINKS = {
     monthly: 'https://rzp.io/rzp/ugv7JBF2',
     annual: 'https://rzp.io/rzp/fycKln1w'
   };
 
-  const STORAGE_KEY_USER = 'vox_user';
   const STORAGE_KEY_CHECKOUT = 'vox_pending_checkout';
 
-  // --- Auth State Management ---
-  function getUser() {
+  let _supabaseClient = null;
+
+  // --- Initialize Supabase Client ---
+  function ensureSupabaseSdk() {
+    if (typeof window === 'undefined' || window.supabase) return;
+    if (!document.getElementById('supabaseJsSdk')) {
+      const s = document.createElement('script');
+      s.id = 'supabaseJsSdk';
+      s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+      s.onload = function () {
+        getSupabase();
+        initAuth();
+      };
+      document.head.appendChild(s);
+    }
+  }
+
+  function getSupabase() {
+    if (_supabaseClient) return _supabaseClient;
+    if (typeof window !== 'undefined' && window.supabase && typeof window.supabase.createClient === 'function') {
+      _supabaseClient = window.supabase.createClient(SUPABASE_PROJECT_URL, SUPABASE_ANON_KEY, {
+        auth: {
+          persistSession: true,
+          autoRefreshToken: true,
+          detectSessionInUrl: true
+        }
+      });
+      return _supabaseClient;
+    }
+    return null;
+  }
+
+  // --- Real Auth State Management ---
+  async function getCurrentUser() {
+    const sb = getSupabase();
+    if (!sb) return null;
     try {
-      const raw = localStorage.getItem(STORAGE_KEY_USER);
-      return raw ? JSON.parse(raw) : null;
-    } catch (e) {
+      const { data: { session }, error } = await sb.auth.getSession();
+      if (error || !session || !session.user) {
+        return null;
+      }
+      const user = session.user;
+      const metadata = user.user_metadata || {};
+      let fullName = metadata.full_name || metadata.name || (user.email ? user.email.split('@')[0] : 'VOX User');
+      let avatarUrl = metadata.avatar_url || metadata.picture || '';
+
+      // Check profiles table if populated
+      try {
+        const { data: profile } = await sb
+          .from('profiles')
+          .select('full_name, avatar_url')
+          .eq('id', user.id)
+          .maybeSingle();
+
+        if (profile) {
+          if (profile.full_name) fullName = profile.full_name;
+          if (profile.avatar_url) avatarUrl = profile.avatar_url;
+        }
+      } catch (profileErr) {
+        // Fall back gracefully to user_metadata
+      }
+
+      // Check real subscription
+      const sub = await getSubscription(user.id, session.access_token);
+
+      return {
+        id: user.id,
+        email: user.email || '',
+        name: fullName,
+        avatar: avatarUrl || (fullName ? fullName.charAt(0).toUpperCase() : 'U'),
+        avatar_url: avatarUrl,
+        plan: sub.is_pro ? 'Pro' : 'Free',
+        plan_id: sub.plan_id,
+        is_pro: sub.is_pro,
+        session: session
+      };
+    } catch (err) {
+      console.warn('Error fetching current user:', err);
       return null;
     }
   }
 
-  function setUser(userObj) {
+  // --- Real Subscription Query ---
+  async function getSubscription(userId, accessToken) {
+    const sb = getSupabase();
+    if (!sb || !userId) {
+      return { is_pro: false, plan: 'free', plan_name: 'VOX Free', plan_id: 'free', status: 'none' };
+    }
+
     try {
-      if (!userObj) {
-        localStorage.removeItem(STORAGE_KEY_USER);
-      } else {
-        localStorage.setItem(STORAGE_KEY_USER, JSON.stringify(userObj));
-      }
-      renderAuthNavbar();
-      if (typeof window.onVoxAuthChanged === 'function') {
-        window.onVoxAuthChanged(userObj);
+      const { data: sub, error } = await sb
+        .from('subscriptions')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!error && sub) {
+        const isPro = sub.plan_id === 'pro' || sub.plan_id === 'pro_monthly' || sub.plan_id === 'pro_annual';
+        return {
+          is_pro: isPro,
+          plan: isPro ? 'pro' : 'free',
+          plan_name: isPro ? 'VOX Pro' : 'VOX Free',
+          plan_id: sub.plan_id,
+          status: sub.status,
+          current_period_end: sub.current_period_end,
+          billing_interval: sub.billing_interval
+        };
       }
     } catch (e) {
-      console.error('Failed to save vox_user:', e);
+      console.warn('Subscription query notice:', e);
+    }
+
+    // Fallback: Query backend /api/entitlements if accessToken is available
+    if (accessToken) {
+      try {
+        const res = await fetch('/api/entitlements', {
+          headers: { 'Authorization': 'Bearer ' + accessToken }
+        });
+        if (res.ok) {
+          const ent = await res.json();
+          const isPro = Boolean(ent.is_pro);
+          return {
+            is_pro: isPro,
+            plan: isPro ? 'pro' : 'free',
+            plan_name: isPro ? 'VOX Pro' : 'VOX Free',
+            plan_id: ent.plan || 'free',
+            status: isPro ? 'active' : 'free',
+            limits: ent.limits
+          };
+        }
+      } catch (e) {
+        console.warn('Entitlements API notice:', e);
+      }
+    }
+
+    return { is_pro: false, plan: 'free', plan_name: 'VOX Free', plan_id: 'free', status: 'none' };
+  }
+
+  // --- Real Weekly Usage Query ---
+  async function getWeeklyUsage(userId) {
+    const sb = getSupabase();
+    if (!sb || !userId) {
+      return {
+        dictation_words: 0,
+        meeting_minutes: 0,
+        meeting_count: 0,
+        ask_vox_queries: 0
+      };
+    }
+
+    // Compute Monday 00:00:00 UTC cycle
+    const now = new Date();
+    const day = now.getUTCDay(); // 0 is Sunday, 1 is Monday...
+    const diff = (day === 0 ? -6 : 1) - day;
+    const monday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + diff, 0, 0, 0, 0));
+    
+    const yyyy = monday.getUTCFullYear();
+    const mm = String(monday.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(monday.getUTCDate()).padStart(2, '0');
+    
+    const keyDesktop = `utc_week_${yyyy}_${mm}_${dd}`;
+    const keySchema = `${yyyy}-${mm}-${dd}_utc`;
+    const keyIso = `${yyyy}-${mm}-${dd}`;
+
+    try {
+      const { data, error } = await sb
+        .from('usage_periods')
+        .select('*')
+        .eq('user_id', userId)
+        .in('period_key', [keyDesktop, keySchema, keyIso])
+        .maybeSingle();
+
+      if (!error && data) {
+        return {
+          dictation_words: Number(data.dictation_words_committed) || 0,
+          meeting_minutes: Math.round((Number(data.meeting_duration_sec) || 0) / 60),
+          meeting_count: Number(data.meeting_count) || 0,
+          ask_vox_queries: Number(data.ask_vox_queries) || 0,
+          raw_duration_sec: Number(data.meeting_duration_sec) || 0,
+          period_key: data.period_key
+        };
+      }
+
+      // Fallback: fetch most recent period if exists
+      const { data: latest } = await sb
+        .from('usage_periods')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (latest) {
+        return {
+          dictation_words: Number(latest.dictation_words_committed) || 0,
+          meeting_minutes: Math.round((Number(latest.meeting_duration_sec) || 0) / 60),
+          meeting_count: Number(latest.meeting_count) || 0,
+          ask_vox_queries: Number(latest.ask_vox_queries) || 0,
+          raw_duration_sec: Number(latest.meeting_duration_sec) || 0,
+          period_key: latest.period_key
+        };
+      }
+    } catch (e) {
+      console.warn('Usage periods query notice:', e);
+    }
+
+    // Default clean 0 counts
+    return {
+      dictation_words: 0,
+      meeting_minutes: 0,
+      meeting_count: 0,
+      ask_vox_queries: 0
+    };
+  }
+
+  // --- Real Google OAuth Sign-In ---
+  async function signInWithGoogle(options = {}) {
+    const sb = getSupabase();
+    if (!sb) {
+      alert('Authentication service is initializing. Please try again.');
+      return;
+    }
+    const redirectTo = options.redirectTo || window.location.href;
+    let { error } = await sb.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: redirectTo
+      }
+    });
+    if (error && error.message && error.message.includes('not enabled')) {
+      const fallback = await sb.auth.signInWithOAuth({
+        provider: 'custom:google',
+        options: {
+          redirectTo: redirectTo
+        }
+      });
+      error = fallback.error;
+    }
+    if (error) {
+      alert('Google Sign-in failed: ' + error.message);
+    }
+  }
+
+  // --- Sign Out ---
+  async function signOut() {
+    const sb = getSupabase();
+    if (sb) {
+      try {
+        await sb.auth.signOut();
+      } catch (e) {}
+    }
+    renderAuthNavbar(null);
+    if (typeof window.onVoxAuthChanged === 'function') {
+      window.onVoxAuthChanged(null);
+    }
+    if (window.location.pathname.includes('account.html') || window.location.pathname.includes('login.html')) {
+      window.location.reload();
+    }
+  }
+
+  // --- Auth Initialization & State Listener ---
+  async function initAuth(callback) {
+    const sb = getSupabase();
+    if (!sb) return;
+
+    // Listen for real auth state changes
+    sb.auth.onAuthStateChange(async (event, session) => {
+      const user = await getCurrentUser();
+      renderAuthNavbar(user);
+      if (typeof callback === 'function') {
+        callback(user, session);
+      }
+      if (typeof window.onVoxAuthChanged === 'function') {
+        window.onVoxAuthChanged(user, session);
+      }
+    });
+
+    // Check initial session
+    const currentUser = await getCurrentUser();
+    renderAuthNavbar(currentUser);
+    if (typeof callback === 'function') {
+      callback(currentUser, null);
+    }
+    if (typeof window.onVoxAuthChanged === 'function') {
+      window.onVoxAuthChanged(currentUser, null);
     }
   }
 
@@ -56,7 +322,7 @@
               <img src="assets/vox_logo.svg" alt="VOX" width="38" height="38" style="border-radius:10px;" />
             </div>
             <h2 id="voxAuthTitle" class="vox-modal-title">Sign in to VOX</h2>
-            <p class="vox-modal-subtitle">Sync your subscription, access weekly usage metrics, and link your Windows desktop assistant.</p>
+            <p class="vox-modal-subtitle">Connect your account to access your VOX Pro subscription, sync weekly usage, and link your Windows desktop assistant.</p>
           </div>
 
           <div id="voxAuthBody">
@@ -71,26 +337,19 @@
             </button>
 
             <div class="vox-auth-divider">
-              <span>or enter custom email for testing</span>
+              <span>or sign in with email</span>
             </div>
 
             <div class="vox-auth-form">
               <input type="email" id="voxAuthEmailInput" placeholder="name@company.com" class="vox-auth-input" />
-              <button class="vox-btn-auth-submit" onclick="window.submitManualEmailAuth()">Sign In / Verify</button>
+              <button class="vox-btn-auth-submit" onclick="window.submitManualEmailAuth()">Send Magic Link</button>
             </div>
-
-            <div class="vox-auth-presets">
-              <span style="font-size:11px; color:#64748B; font-weight:600;">1-Click Quick Accounts:</span>
-              <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
-                <button type="button" class="vox-preset-pill" onclick="window.quickAuth('Milind Dwivedi', 'milinddwivedi7@gmail.com')">milinddwivedi7@gmail.com</button>
-                <button type="button" class="vox-preset-pill" onclick="window.quickAuth('Alex Morgan', 'alex.morgan@test.com')">alex.morgan@test.com</button>
-              </div>
-            </div>
+            <div id="voxAuthNotice" style="font-size:12px; color:#475569; text-align:center; display:none; margin-top:8px;"></div>
           </div>
 
           <div id="voxAuthSuccess" style="display:none; text-align:center; padding: 12px 0;">
             <div style="width:54px; height:54px; border-radius:50%; background:rgba(6,182,212,0.12); color:#06B6D4; display:flex; align-items:center; justify-content:center; margin: 0 auto 16px; font-size:24px; font-weight:800;">✓</div>
-            <h3 style="font-size:18px; font-weight:700; margin-bottom:6px; color:#0F172A;">Successfully Signed In</h3>
+            <h3 style="font-size:18px; font-weight:700; margin-bottom:6px; color:#0F172A;">Signed In</h3>
             <p id="voxAuthSuccessMsg" style="font-size:14px; color:#475569; margin-bottom:20px;"></p>
             <div style="display:flex; flex-direction:column; gap:10px;">
               <a id="voxDesktopDeepLink" href="voxlocal://auth/callback" class="vox-btn-deep-link">
@@ -111,7 +370,6 @@
     wrapper.innerHTML = modalHtml;
     document.body.appendChild(wrapper.firstElementChild);
 
-    // Close on backdrop click or ESC
     const modalEl = document.getElementById('voxAuthModal');
     modalEl.addEventListener('click', (e) => {
       if (e.target === modalEl) window.closeVoxAuthModal();
@@ -144,77 +402,53 @@
   };
 
   window.triggerGoogleSignIn = function () {
-    // Official Google OAuth Simulator / Test account
-    const user = {
-      name: 'Google User',
-      email: 'user@google.com',
-      avatar: 'G',
-      plan: localStorage.getItem('vox_plan') || 'Free',
-      token: 'vox_oauth_tok_' + Math.random().toString(36).substring(2, 10),
-      signedInAt: new Date().toISOString()
-    };
-    completeSignIn(user);
+    signInWithGoogle();
   };
 
-  window.submitManualEmailAuth = function () {
+  window.submitManualEmailAuth = async function () {
     const emailInp = document.getElementById('voxAuthEmailInput');
-    const val = (emailInp ? emailInp.value : '').trim();
-    if (!val || !val.includes('@')) {
+    const notice = document.getElementById('voxAuthNotice');
+    const email = (emailInp ? emailInp.value : '').trim();
+    if (!email || !email.includes('@')) {
       alert('Please enter a valid email address.');
       return;
     }
-    const namePart = val.split('@')[0].replace(/[._-]/g, ' ');
-    const displayName = namePart.charAt(0).toUpperCase() + namePart.slice(1);
-    const user = {
-      name: displayName,
-      email: val,
-      avatar: displayName.charAt(0).toUpperCase(),
-      plan: localStorage.getItem('vox_plan') || 'Free',
-      token: 'vox_email_tok_' + Math.random().toString(36).substring(2, 10),
-      signedInAt: new Date().toISOString()
-    };
-    completeSignIn(user);
-  };
+    const sb = getSupabase();
+    if (!sb) return;
 
-  window.quickAuth = function (name, email) {
-    const user = {
-      name: name,
-      email: email,
-      avatar: name.charAt(0).toUpperCase(),
-      plan: localStorage.getItem('vox_plan') || 'Free',
-      token: 'vox_quick_tok_' + Math.random().toString(36).substring(2, 10),
-      signedInAt: new Date().toISOString()
-    };
-    completeSignIn(user);
-  };
-
-  function completeSignIn(user) {
-    setUser(user);
-    const bodyEl = document.getElementById('voxAuthBody');
-    const successEl = document.getElementById('voxAuthSuccess');
-    const msgEl = document.getElementById('voxAuthSuccessMsg');
-    const deepLinkEl = document.getElementById('voxDesktopDeepLink');
-
-    if (bodyEl && successEl && msgEl) {
-      bodyEl.style.display = 'none';
-      msgEl.innerHTML = `Signed in as <b>${user.name}</b> (${user.email})<br>Plan: <b style="color:${user.plan === 'Pro' ? '#06B6D4' : '#64748B'};">${user.plan}</b>`;
-      if (deepLinkEl) {
-        deepLinkEl.href = `voxlocal://auth/callback?email=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name)}&token=${encodeURIComponent(user.token)}`;
-      }
-      successEl.style.display = 'block';
+    if (notice) {
+      notice.style.display = 'block';
+      notice.textContent = 'Sending magic link...';
     }
-  }
+
+    try {
+      const { error } = await sb.auth.signInWithOtp({
+        email: email,
+        options: {
+          emailRedirectTo: window.location.origin + '/account.html'
+        }
+      });
+      if (error) {
+        alert('Could not send magic link: ' + error.message);
+        if (notice) notice.style.display = 'none';
+      } else {
+        if (notice) {
+          notice.style.color = '#059669';
+          notice.textContent = '✓ Magic link sent! Please check your email inbox to verify.';
+        }
+      }
+    } catch (e) {
+      alert('Authentication error: ' + e.message);
+      if (notice) notice.style.display = 'none';
+    }
+  };
 
   window.signOutVox = function () {
-    setUser(null);
-    if (window.location.pathname.includes('account.html')) {
-      window.location.reload();
-    }
+    signOut();
   };
 
   // --- Render Auth Navigation Pill ---
-  function renderAuthNavbar() {
-    const user = getUser();
+  function renderAuthNavbar(user) {
     const navLinks = document.querySelector('.nav-links');
     if (!navLinks) return;
 
@@ -241,11 +475,16 @@
         </button>
       `;
     } else {
-      const isPro = user.plan === 'Pro' || localStorage.getItem('vox_plan') === 'pro';
+      const isPro = Boolean(user.is_pro);
+      const initial = user.name ? user.name.charAt(0).toUpperCase() : 'U';
+      const avatarMarkup = user.avatar_url 
+        ? `<img src="${user.avatar_url}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;" />` 
+        : initial;
+
       authSlot.innerHTML = `
         <div class="vox-user-dropdown-wrap" style="position:relative; display:inline-block;">
           <button type="button" class="vox-nav-user-pill" onclick="window.toggleUserMenu(event)">
-            <span class="vox-nav-avatar">${user.avatar || 'U'}</span>
+            <span class="vox-nav-avatar">${avatarMarkup}</span>
             <span class="vox-nav-username">${user.name.split(' ')[0]}</span>
             <span class="vox-nav-plan-badge ${isPro ? 'pro' : 'free'}">${isPro ? 'PRO' : 'FREE'}</span>
           </button>
@@ -277,27 +516,23 @@
     if (menu) menu.style.display = 'none';
   });
 
-  // --- Razorpay Direct Checkout Routing with Full Edge Case Resilience ---
+  // --- Razorpay Direct Checkout Routing with Resilience ---
   window.handleDirectRazorpayCheckout = function (interval, sourceBtn) {
     interval = interval || 'monthly';
     const targetUrl = RAZORPAY_LINKS[interval] || RAZORPAY_LINKS.monthly;
 
-    // Check connectivity
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
       alert('You appear to be offline. Please verify your internet connection before accessing Razorpay checkout.');
       return;
     }
 
     const btn = sourceBtn || document.getElementById('btnSubscribe');
-    const originalText = btn ? btn.innerText : 'Upgrade to VOX Pro';
-
     if (btn) {
       btn.innerText = 'Opening Razorpay Secure Checkout... ⏳';
       btn.disabled = true;
       btn.style.opacity = '0.85';
     }
 
-    // Save state in case of reload or back navigation
     try {
       sessionStorage.setItem(STORAGE_KEY_CHECKOUT, JSON.stringify({
         interval: interval,
@@ -306,7 +541,6 @@
       }));
     } catch (e) {}
 
-    // Show fallback container in case popup/redirect is blocked or slow
     let fallback = document.getElementById('voxRazorpayFallback');
     if (!fallback && btn && btn.parentNode) {
       fallback = document.createElement('div');
@@ -324,15 +558,13 @@
       `;
     }
 
-    // Proceed to Razorpay checkout page
     setTimeout(() => {
       window.location.href = targetUrl;
     }, 150);
   };
 
-  // --- Back-Button & PageShow Fallback Handler ---
-  // When user returns via Back button or BFCache, reset checkout buttons
-  window.addEventListener('pageshow', function (event) {
+  // Reset checkout buttons on pageshow / BFCache
+  window.addEventListener('pageshow', function () {
     const btn = document.getElementById('btnSubscribe');
     if (btn) {
       btn.disabled = false;
@@ -350,24 +582,17 @@
     const status = params.get('status') || params.get('payment_status');
 
     if (paymentId || status === 'success' || status === 'upgraded') {
-      localStorage.setItem('vox_plan', 'pro');
-      const currentUser = getUser();
-      if (currentUser) {
-        currentUser.plan = 'Pro';
-        setUser(currentUser);
-      }
-
-      // Display Top Notification Banner
+      // Display Payment Success Banner (Never set localStorage plan backdoor)
       const banner = document.createElement('div');
       banner.className = 'vox-payment-success-banner';
       banner.innerHTML = `
         <div class="vox-success-content">
           <span style="font-size:18px;">🎉</span>
           <div>
-            <b>Payment Successful!</b> Your VOX Pro plan is now active. ${paymentId ? `(Ref: <code>${paymentId}</code>)` : ''}
+            <b>Payment Received!</b> Your subscription is activating. ${paymentId ? `(Ref: <code>${paymentId}</code>)` : ''}
           </div>
-          <a href="voxlocal://entitlements/activate?plan=pro&payment_id=${encodeURIComponent(paymentId || '')}" class="vox-btn-activate-desktop">
-            Activate in VOX Desktop
+          <a href="account.html" class="vox-btn-activate-desktop">
+            View Account Dashboard
           </a>
         </div>
       `;
@@ -436,7 +661,7 @@
       }
       .vox-auth-divider span { padding: 0 10px; }
 
-      .vox-auth-form { display: flex; gap: 8px; margin-bottom: 16px; }
+      .vox-auth-form { display: flex; gap: 8px; margin-bottom: 8px; }
       .vox-auth-input {
         flex: 1; padding: 10px 14px; border: 1.5px solid #E2E8F0; border-radius: 999px;
         font-size: 13px; outline: none; transition: border-color 0.2s;
@@ -445,15 +670,9 @@
       .vox-btn-auth-submit {
         background: #4F46E5; color: #FFFFFF; border: none; border-radius: 999px;
         padding: 10px 18px; font-size: 13px; font-weight: 600; cursor: pointer;
-        transition: background 0.2s;
+        transition: background 0.2s; white-space: nowrap;
       }
       .vox-btn-auth-submit:hover { background: #4338CA; }
-
-      .vox-preset-pill {
-        background: #F1F5F9; border: 1px solid #E2E8F0; border-radius: 999px;
-        padding: 4px 10px; font-size: 11px; color: #475569; cursor: pointer; transition: all 0.15s;
-      }
-      .vox-preset-pill:hover { background: #E2E8F0; color: #0F172A; }
 
       .vox-btn-deep-link {
         display: inline-block; width: 100%; text-align: center;
@@ -493,12 +712,12 @@
       .vox-nav-avatar {
         width: 24px; height: 24px; border-radius: 50%; background: #4F46E5;
         color: #FFFFFF; display: inline-flex; align-items: center; justify-content: center;
-        font-size: 11px; font-weight: 700;
+        font-size: 11px; font-weight: 700; overflow: hidden;
       }
       .vox-nav-plan-badge {
         font-size: 10px; font-weight: 800; padding: 2px 6px; border-radius: 999px; letter-spacing: 0.04em;
       }
-      .vox-nav-plan-badge.pro { background: rgba(6, 182, 212, 0.15); color: #0891B2; }
+      .vox-nav-plan-badge.pro { background: rgba(16, 185, 129, 0.15); color: #10B981; }
       .vox-nav-plan-badge.free { background: rgba(100, 116, 139, 0.15); color: #475569; }
 
       .vox-user-menu {
@@ -537,9 +756,10 @@
 
   // --- Initializer ---
   function init() {
+    ensureSupabaseSdk();
     injectAuthStyles();
     injectAuthModal();
-    renderAuthNavbar();
+    initAuth();
     checkPaymentReturnStatus();
   }
 
@@ -551,8 +771,12 @@
 
   // Export globally
   window.voxAuth = {
-    getUser: getUser,
-    setUser: setUser,
+    initAuth: initAuth,
+    signInWithGoogle: signInWithGoogle,
+    signOut: signOut,
+    getCurrentUser: getCurrentUser,
+    getSubscription: getSubscription,
+    getWeeklyUsage: getWeeklyUsage,
     openModal: window.openVoxAuthModal,
     closeModal: window.closeVoxAuthModal,
     checkout: window.handleDirectRazorpayCheckout,

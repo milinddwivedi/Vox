@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import datetime
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -38,10 +39,18 @@ WARNING_THRESHOLD_RATIO = 0.80  # 80% usage triggers early friendly warning
 
 
 class OverrunStatus(dict):
-    """Dictionary subclass that can also be unpacked as a 2-tuple (warning, message)."""
+    """Dictionary subclass that can also be unpacked as a 2-tuple (warning, message)
+    and allows attribute-style access (e.g. status.warning, status.overrun, status.message)."""
+
     def __iter__(self):
         yield self.get("warning", False)
         yield self.get("message", "")
+
+    def __getattr__(self, item: str) -> Any:
+        try:
+            return self[item]
+        except KeyError:
+            raise AttributeError(f"'OverrunStatus' object has no attribute '{item}'")
 
 
 def count_committed_words(text: str) -> int:
@@ -115,6 +124,24 @@ class UsageSnapshot:
     is_meeting_warning: bool = False
     is_ask_vox_warning: bool = False
 
+    @property
+    def dictation_pct(self) -> float:
+        if self.dictation_words_limit <= 0:
+            return 0.0
+        return min(100.0, round((self.dictation_words_used / self.dictation_words_limit) * 100.0, 2))
+
+    @property
+    def meeting_pct(self) -> float:
+        if self.meeting_minutes_limit <= 0:
+            return 0.0
+        return min(100.0, round((self.meeting_minutes_used / self.meeting_minutes_limit) * 100.0, 2))
+
+    @property
+    def ask_vox_pct(self) -> float:
+        if self.ask_vox_limit <= 0:
+            return 0.0
+        return min(100.0, round((self.ask_vox_used / self.ask_vox_limit) * 100.0, 2))
+
 
 class UsageMeteringEngine:
     """
@@ -136,10 +163,15 @@ class UsageMeteringEngine:
         self._device_id: str = self._resolve_device_id()
         self._ensure_metering_tables()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_connection(self):
         con = sqlite3.connect(str(self.db_path), timeout=15.0)
-        con.execute("PRAGMA journal_mode=WAL;")
-        return con
+        try:
+            con.execute("PRAGMA journal_mode=WAL;")
+            with con:
+                yield con
+        finally:
+            con.close()
 
     def _resolve_device_id(self) -> str:
         """Resolve a stable, anonymous Windows hardware GUID."""
@@ -195,6 +227,20 @@ class UsageMeteringEngine:
     def is_pro(self) -> bool:
         with self.lock:
             return self._plan_code in ("pro_monthly", "pro_annual", "pro")
+
+    def _resolve_pro_status(self, entitlement: Any = None) -> bool:
+        """
+        Determines effective Pro status. If entitlement object is supplied,
+        it is the SOLE authority (evaluating dynamic 72h offline grace and subscription period).
+        Only falls back to local user context plan if entitlement is omitted (None).
+        """
+        if entitlement is not None:
+            if hasattr(entitlement, "is_pro") and callable(entitlement.is_pro):
+                return bool(entitlement.is_pro())
+            if hasattr(entitlement, "get_effective_entitlement") and callable(entitlement.get_effective_entitlement):
+                return bool(entitlement.get_effective_entitlement().get("is_pro", False))
+            return False
+        return self.is_pro()
 
     def _seal_payload(self, p_dict: Dict[str, Any]) -> bytes:
         raw = json.dumps(
@@ -253,11 +299,11 @@ class UsageMeteringEngine:
         con.commit()
         return new_period
 
-    def get_usage_snapshot(self, now_dt: Optional[datetime.datetime] = None) -> UsageSnapshot:
+    def get_usage_snapshot(self, now_dt: Optional[datetime.datetime] = None, is_pro: Optional[bool] = None) -> UsageSnapshot:
         with self.lock, self._get_connection() as con:
             p = self._get_or_create_period_row(con, now_dt)
 
-        pro = self.is_pro()
+        pro = self.is_pro() if is_pro is None else bool(is_pro)
         words_limit = 999999999 if pro else FREE_WEEKLY_WORD_LIMIT
         meeting_mins_limit = 999999.0 if pro else FREE_WEEKLY_MEETING_MINUTES
         meeting_count_limit = 999999 if pro else FREE_WEEKLY_MEETING_COUNT
@@ -307,14 +353,9 @@ class UsageMeteringEngine:
         )
 
     def can_start_dictation(self, entitlement: Any = None) -> Tuple[bool, str]:
-        if entitlement is not None:
-            if hasattr(entitlement, "get_effective_entitlement") and entitlement.get_effective_entitlement().get("is_pro"):
-                return True, ""
-            if hasattr(entitlement, "is_pro") and entitlement.is_pro():
-                return True, ""
-        if self.is_pro():
+        if self._resolve_pro_status(entitlement):
             return True, ""
-        snap = self.get_usage_snapshot()
+        snap = self.get_usage_snapshot(is_pro=False)
         if snap.dictation_is_exhausted:
             return (
                 False,
@@ -366,14 +407,9 @@ class UsageMeteringEngine:
         return words
 
     def can_start_meeting(self, entitlement: Any = None) -> Tuple[bool, str]:
-        if entitlement is not None:
-            if hasattr(entitlement, "get_effective_entitlement") and entitlement.get_effective_entitlement().get("is_pro"):
-                return True, ""
-            if hasattr(entitlement, "is_pro") and entitlement.is_pro():
-                return True, ""
-        if self.is_pro():
+        if self._resolve_pro_status(entitlement):
             return True, ""
-        snap = self.get_usage_snapshot()
+        snap = self.get_usage_snapshot(is_pro=False)
         if snap.meeting_count_remaining <= 0:
             return (
                 False,
@@ -394,12 +430,7 @@ class UsageMeteringEngine:
         Policy: 80% (72 min) gives a non-intrusive warning; 90 min explains session cap.
         Live call is NEVER forcefully killed.
         """
-        if entitlement is not None:
-            if hasattr(entitlement, "get_effective_entitlement") and entitlement.get_effective_entitlement().get("is_pro"):
-                return OverrunStatus({"warning": False, "overrun": False, "message": ""})
-            if hasattr(entitlement, "is_pro") and entitlement.is_pro():
-                return OverrunStatus({"warning": False, "overrun": False, "message": ""})
-        if self.is_pro():
+        if self._resolve_pro_status(entitlement):
             return OverrunStatus({"warning": False, "overrun": False, "message": ""})
 
         mins = elapsed_sec / 60.0
@@ -478,18 +509,13 @@ class UsageMeteringEngine:
         return dur, new_count
 
     def can_ask_vox(self, entitlement: Any = None) -> Tuple[bool, str]:
-        if entitlement is not None:
-            if hasattr(entitlement, "get_effective_entitlement") and entitlement.get_effective_entitlement().get("is_pro"):
-                return True, ""
-            if hasattr(entitlement, "is_pro") and entitlement.is_pro():
-                return True, ""
-        if self.is_pro():
+        if self._resolve_pro_status(entitlement):
             return True, ""
-        snap = self.get_usage_snapshot()
+        snap = self.get_usage_snapshot(is_pro=False)
         if snap.ask_vox_is_exhausted:
             return (
                 False,
-                f"Weekly Ask VOX limit reached ({snap.ask_vox_used} / {snap.ask_vox_limit} queries). "
+                f"Weekly Ask VOX query allowance reached ({snap.ask_vox_used} / {snap.ask_vox_limit} queries). "
                 f"Resets on {snap.reset_display_ist}, or upgrade to VOX Pro for unlimited intelligence queries.",
             )
         return True, ""
@@ -519,14 +545,9 @@ class UsageMeteringEngine:
 
     def check_early_warnings(self, entitlement: Any = None) -> List[Dict[str, Any]]:
         """Returns any 80% quota threshold warnings for the active week."""
-        if entitlement is not None:
-            if hasattr(entitlement, "get_effective_entitlement") and entitlement.get_effective_entitlement().get("is_pro"):
-                return []
-            if hasattr(entitlement, "is_pro") and entitlement.is_pro():
-                return []
-        if self.is_pro():
+        if self._resolve_pro_status(entitlement):
             return []
-        snap = self.get_usage_snapshot()
+        snap = self.get_usage_snapshot(is_pro=False)
         warnings = []
         if snap.is_dictation_warning:
             warnings.append({

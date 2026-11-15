@@ -20,9 +20,9 @@ from voxlocal.core.metering import (
 from voxlocal.core.entitlement import (
     EntitlementManager,
     EntitlementState,
-    sign_entitlement_payload,
     verify_and_decode_entitlement_token,
 )
+from tests.token_test_helper import sign_entitlement_payload
 
 
 class TestMultilingualWordCounting:
@@ -141,7 +141,11 @@ class TestMeteringEngine:
 
 
 class TestEntitlementsAndOfflineGrace:
-    """Tests for signed entitlement tokens, DPAPI vault, and 72-hour grace period."""
+    """Tests for signed Ed25519 entitlement tokens, DPAPI vault, and 72-hour grace period."""
+
+    TEST_PRIV_KEY = "eCqPit3zEc3qLCPuzKLqf/QTf1gyHqHGVR6v4qDoLEE="
+    TEST_PUB_KEY = "YsgKdWBVb1ZfhvSxZeietMw9BZokUSRcR8WgH7GoMLI="
+    WRONG_PUB_KEY = "+b69nERUz3JmT6uO6i+e66lzLUEIa5KS4YyIENDu534="
 
     def test_sign_and_verify_valid_token(self):
         payload = {
@@ -150,8 +154,8 @@ class TestEntitlementsAndOfflineGrace:
             "is_pro": True,
             "exp": int(time.time()) + 3600,
         }
-        token = sign_entitlement_payload(payload, secret_key="test_secret_key_12345")
-        valid, decoded, err = verify_and_decode_entitlement_token(token, verify_key="test_secret_key_12345")
+        token = sign_entitlement_payload(payload, private_key=self.TEST_PRIV_KEY)
+        valid, decoded, err = verify_and_decode_entitlement_token(token, verify_key=self.TEST_PUB_KEY)
         assert valid is True
         assert decoded is not None
         assert decoded["user_id"] == "usr_test_123"
@@ -159,30 +163,39 @@ class TestEntitlementsAndOfflineGrace:
 
     def test_tampered_token_rejected(self):
         payload = {"user_id": "usr_test_123", "plan_code": "pro", "is_pro": True}
-        token = sign_entitlement_payload(payload, secret_key="test_secret_key_12345")
+        token = sign_entitlement_payload(payload, private_key=self.TEST_PRIV_KEY)
         tampered_token = token[:-4] + "fake"
-        valid, decoded, err = verify_and_decode_entitlement_token(tampered_token, verify_key="test_secret_key_12345")
+        valid, decoded, err = verify_and_decode_entitlement_token(tampered_token, verify_key=self.TEST_PUB_KEY)
         assert valid is False
         assert decoded is None
 
-    def test_wrong_secret_rejected(self):
+    def test_wrong_public_key_rejected(self):
         payload = {"user_id": "usr_test_123", "plan_code": "pro", "is_pro": True}
-        token = sign_entitlement_payload(payload, secret_key="test_secret_key_12345")
-        valid, decoded, err = verify_and_decode_entitlement_token(token, verify_key="wrong_secret_key")
+        token = sign_entitlement_payload(payload, private_key=self.TEST_PRIV_KEY)
+        valid, decoded, err = verify_and_decode_entitlement_token(token, verify_key=self.WRONG_PUB_KEY)
         assert valid is False
         assert decoded is None
+
+    def test_user_id_mismatch_rejected(self):
+        payload = {"user_id": "user_alice", "plan_code": "pro", "is_pro": True}
+        token = sign_entitlement_payload(payload, private_key=self.TEST_PRIV_KEY)
+        valid, decoded, err = verify_and_decode_entitlement_token(
+            token, verify_key=self.TEST_PUB_KEY, expected_user_id="user_bob"
+        )
+        assert valid is False
+        assert "user_alice" in err and "user_bob" in err
 
     def test_entitlement_manager_offline_grace(self):
         temp_dir = tempfile.mkdtemp()
         vault_path = Path(temp_dir) / "test_entitlement.vault"
-        mgr = EntitlementManager(cache_file=vault_path)
+        mgr = EntitlementManager(cache_file=vault_path, verify_key=self.TEST_PUB_KEY)
 
         # By default, starts in Free tier
         ent = mgr.get_effective_entitlement()
         assert ent["is_pro"] is False
         assert ent["plan"] == "free"
 
-        # Simulate offline grace
+        # Simulate offline grace within 72 hours (e.g. 48 hours remaining)
         mgr._current_state = EntitlementState(
             user_id="usr_offline",
             plan_code="pro",
@@ -195,11 +208,112 @@ class TestEntitlementsAndOfflineGrace:
         assert ent_grace["in_offline_grace"] is True
         assert ent_grace["offline_hours_remaining"] == 48.0
 
-        # When expired, safe fallback
+        # When cleared, safe fallback
         mgr.clear_entitlement()
         ent_expired = mgr.get_effective_entitlement()
         assert ent_expired["is_pro"] is False
         assert ent_expired["plan"] == "free"
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_offline_grace_72h_expiration_enforcement(self):
+        temp_dir = tempfile.mkdtemp()
+        vault_path = Path(temp_dir) / "test_entitlement.vault"
+        mgr = EntitlementManager(cache_file=vault_path, verify_key=self.TEST_PUB_KEY)
+
+        # Token payload with Pro plan
+        now_utc = datetime.now(timezone.utc)
+        payload = {
+            "user_id": "usr_offline_exp",
+            "plan_code": "pro_monthly",
+            "is_pro": True,
+            "enabled_features": ["dictation", "dual_track_recording", "meeting_summaries", "executive_export"],
+            "expires_at_utc": (now_utc + timedelta(days=30)).isoformat(),
+        }
+
+        # Simulate online verification 73 hours ago (grace expired)
+        last_verified_73h_ago = (now_utc - timedelta(hours=73)).isoformat()
+        mgr._apply_payload(payload, last_verified_73h_ago)
+
+        state = mgr.get_state()
+        eff = mgr.get_effective_entitlement()
+
+        assert state.is_offline_expired is True
+        assert state.is_pro is False
+        assert eff["is_pro"] is False
+        assert mgr.is_pro() is False
+        assert mgr.is_offline_expired() is True
+        assert mgr.is_feature_enabled("executive_export") is False
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_offline_expired_operation_boundary_gating(self):
+        temp_dir = tempfile.mkdtemp()
+        db_path = Path(temp_dir) / "test_vox.db"
+        metering = UsageMeteringEngine(db_path)
+        vault_path = Path(temp_dir) / "test_entitlement.vault"
+        mgr = EntitlementManager(cache_file=vault_path, verify_key=self.TEST_PUB_KEY)
+
+        # Set up expired offline state (verified 73 hours ago)
+        now_utc = datetime.now(timezone.utc)
+        payload = {
+            "user_id": "usr_offline_exp",
+            "plan_code": "pro_monthly",
+            "is_pro": True,
+            "expires_at_utc": (now_utc + timedelta(days=30)).isoformat(),
+        }
+        mgr._apply_payload(payload, (now_utc - timedelta(hours=73)).isoformat())
+
+        # 1. Dictation boundary under expired offline: Free cap is 3,000 words
+        can_start, _ = metering.can_start_dictation(mgr)
+        assert can_start is True
+
+        metering.record_committed_dictation("word " * 3000)
+        can_start, reason = metering.can_start_dictation(mgr)
+        assert can_start is False
+        assert "3,000 words" in reason
+
+        # 2. Ask VOX boundary under expired offline: Free cap is 10 queries
+        for i in range(10):
+            metering.record_ask_vox_query(f"Q{i}")
+        can_ask, reason = metering.can_ask_vox(mgr)
+        assert can_ask is False
+        assert "10 queries" in reason
+
+        # 3. Meeting session boundary under expired offline: Free cap is 5 sessions
+        for i in range(5):
+            metering.record_completed_meeting(60.0, meeting_id=i + 1)
+        can_start_m, reason_m = metering.can_start_meeting(mgr)
+        assert can_start_m is False
+        assert "5 meetings" in reason_m
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_ongoing_recording_preserved_past_grace_boundary(self):
+        """Active recording in progress must NOT be terminated when grace expires mid-call."""
+        temp_dir = tempfile.mkdtemp()
+        db_path = Path(temp_dir) / "test_vox.db"
+        metering = UsageMeteringEngine(db_path)
+        vault_path = Path(temp_dir) / "test_entitlement.vault"
+        mgr = EntitlementManager(cache_file=vault_path, verify_key=self.TEST_PUB_KEY)
+
+        # Meeting has been running for 5500 seconds (~91 mins) while offline grace expires
+        now_utc = datetime.now(timezone.utc)
+        payload = {
+            "user_id": "usr_active_mtg",
+            "plan_code": "pro_monthly",
+            "is_pro": True,
+            "expires_at_utc": (now_utc + timedelta(days=30)).isoformat(),
+        }
+        mgr._apply_payload(payload, (now_utc - timedelta(hours=74)).isoformat())
+
+        # Evaluate overrun during live meeting
+        overrun = metering.evaluate_live_meeting_overrun(5500.0, mgr)
+        assert overrun["warning"] is True
+        assert overrun["overrun"] is True
+        assert "90-minute" in overrun["message"]
+        # Policy guarantee: message explicitly informs call continues uninterrupted
+        assert "continue recording uninterrupted" in overrun["message"]
 
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -214,7 +328,7 @@ class TestEntitlementsAndOfflineGrace:
 
         # Downgrade to Free
         vault_path = Path(temp_dir) / "test_entitlement.vault"
-        mgr = EntitlementManager(cache_file=vault_path)
+        mgr = EntitlementManager(cache_file=vault_path, verify_key=self.TEST_PUB_KEY)
         mgr.revert_to_free()
 
         # Verify data is 100% intact

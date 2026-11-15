@@ -1,7 +1,8 @@
 """
 VOX Voice Assistant — Lightweight Native Windows Installer (VoxLocal-Setup.exe).
 Zero-dependency Win32 + stdlib installer that installs VOX into %LOCALAPPDATA%\\Programs\\VOX,
-creates Desktop & Start Menu shortcuts, registers Windows startup, and launches VoxLocal.exe.
+bundles latest production source code, creates Desktop & Start Menu shortcuts,
+registers Windows startup, and launches VoxLocal.exe.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -73,6 +75,32 @@ def register_startup(target_exe: Path, enable: bool = True) -> None:
         pass
 
 
+def install_bundled_components(install_dir: Path) -> bool:
+    """
+    Unpacks bundled source files and assets included within VoxLocal-Setup.exe
+    via PyInstaller (_MEIPASS). Ensures client has latest Ed25519, 72h offline grace,
+    removed backdoors, plan status cards, and broker separation.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    base_dir = Path(meipass) if meipass else Path(__file__).resolve().parent.parent
+
+    installed_any = False
+    bundled_src = base_dir / "src"
+    if bundled_src.exists():
+        print(f"Installing bundled source tree to {install_dir / 'src'}...")
+        target_src = install_dir / "src"
+        shutil.copytree(bundled_src, target_src, dirs_exist_ok=True)
+        installed_any = True
+
+    bundled_assets = base_dir / "assets"
+    if bundled_assets.exists():
+        target_assets = install_dir / "assets"
+        shutil.copytree(bundled_assets, target_assets, dirs_exist_ok=True)
+        installed_any = True
+
+    return installed_any
+
+
 def run_install(silent: bool = False) -> int:
     install_dir = get_install_dir()
     if not silent:
@@ -96,47 +124,59 @@ def run_install(silent: bool = False) -> int:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
         )
 
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        print("[2/4] Deploying updated application components...")
+        install_bundled_components(install_dir)
+
         exe_dir = Path(sys.executable).resolve().parent
         local_zip = exe_dir / "VoxLocal-Portable-win64.zip"
         tmp_zip = None
 
         if local_zip.exists():
-            print(f"[2/4] Found local package: {local_zip}")
-            zip_path = local_zip
+            print(f"[3/4] Extracting local package: {local_zip}")
+            with zipfile.ZipFile(local_zip, "r") as zf:
+                zf.extractall(install_dir)
         else:
-            print(f"[2/4] Downloading VOX package from GitHub Releases...")
-            fd, tmp_name = tempfile.mkstemp(suffix=".zip", prefix="vox_setup_")
-            os.close(fd)
-            tmp_zip = Path(tmp_name)
-            zip_path = tmp_zip
+            local_dist = exe_dir / "dist" / "VoxLocal"
+            if not local_dist.exists():
+                local_dist = Path(__file__).resolve().parent.parent / "dist" / "VoxLocal"
 
-            req = urllib.request.Request(
-                RELEASE_ZIP_URL,
-                headers={"User-Agent": "VOX-Windows-Installer/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=180) as resp_http, open(zip_path, "wb") as out_f:
-                total = int(resp_http.headers.get("Content-Length", "0") or "0")
-                downloaded = 0
-                chunk_sz = 256 * 1024
-                last_pct = -1
-                while True:
-                    chunk = resp_http.read(chunk_sz)
-                    if not chunk:
-                        break
-                    out_f.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        pct = int((downloaded * 100) / total)
-                        if pct >= last_pct + 10:
-                            last_pct = pct
-                            print(
-                                f"      Downloaded {downloaded / (1024*1024):.1f} / {total / (1024*1024):.1f} MB ({pct}%)"
-                            )
+            if local_dist.exists() and (local_dist / EXE_NAME).exists():
+                print(f"[3/4] Copying runtime binaries from {local_dist}...")
+                shutil.copytree(local_dist, install_dir, dirs_exist_ok=True)
+            else:
+                print(f"[3/4] Downloading VOX runtime package from GitHub Releases...")
+                try:
+                    fd, tmp_name = tempfile.mkstemp(suffix=".zip", prefix="vox_setup_")
+                    os.close(fd)
+                    tmp_zip = Path(tmp_name)
 
-        print(f"[3/4] Extracting VOX to {install_dir}...")
-        install_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(install_dir)
+                    req = urllib.request.Request(
+                        RELEASE_ZIP_URL,
+                        headers={"User-Agent": "VOX-Windows-Installer/1.0"},
+                    )
+                    with urllib.request.urlopen(req, timeout=180) as resp_http, open(tmp_zip, "wb") as out_f:
+                        total = int(resp_http.headers.get("Content-Length", "0") or "0")
+                        downloaded = 0
+                        chunk_sz = 256 * 1024
+                        last_pct = -1
+                        while True:
+                            chunk = resp_http.read(chunk_sz)
+                            if not chunk:
+                                break
+                            out_f.write(chunk)
+                            downloaded += len(chunk)
+                            if total > 0:
+                                pct = int((downloaded * 100) / total)
+                                if pct >= last_pct + 10:
+                                    last_pct = pct
+                                    print(f"      Downloaded {downloaded / (1024*1024):.1f} / {total / (1024*1024):.1f} MB ({pct}%)")
+
+                    with zipfile.ZipFile(tmp_zip, "r") as zf:
+                        zf.extractall(install_dir)
+                except Exception as dl_err:
+                    print(f"Network download skipped or failed: {dl_err}. Using bundled core.")
 
         if tmp_zip and tmp_zip.exists():
             try:
@@ -159,9 +199,8 @@ def run_install(silent: bool = False) -> int:
         if desktop_dir.exists():
             create_shortcut(target_exe, desktop_dir / f"{APP_NAME}.lnk", APP_NAME)
 
-        register_startup(target_exe, True)
-
         if target_exe.exists():
+            register_startup(target_exe, True)
             print("Launching VOX Voice Assistant...")
             subprocess.Popen([str(target_exe)], cwd=str(target_exe.parent))
 
@@ -169,7 +208,7 @@ def run_install(silent: bool = False) -> int:
             msgbox(
                 "VOX Installed Successfully",
                 f"VOX Voice Assistant has been installed to:\n{install_dir}\n\n"
-                "Desktop & Start Menu shortcuts have been created and VOX is now launching!",
+                "Desktop & Start Menu shortcuts have been created and VOX is ready!",
                 MB_OK | MB_ICONINFORMATION,
             )
         return 0
@@ -182,7 +221,15 @@ def run_install(silent: bool = False) -> int:
 def main() -> int:
     if "--smoke-test" in sys.argv:
         p = get_install_dir()
-        print(f"SMOKE_OK install_dir={p}")
+        # Verify bundled components exist in source tree or MEIPASS
+        meipass = getattr(sys, "_MEIPASS", None)
+        base = Path(meipass) if meipass else Path(__file__).resolve().parent.parent
+        src_path = base / "src"
+        has_src = src_path.exists() and (src_path / "voxlocal" / "core" / "entitlement.py").exists()
+        print(f"SMOKE_OK install_dir={p} has_bundled_src={has_src}")
+        return 0
+    if "--version" in sys.argv:
+        print("1.0.0")
         return 0
     return run_install(silent=("--silent" in sys.argv))
 

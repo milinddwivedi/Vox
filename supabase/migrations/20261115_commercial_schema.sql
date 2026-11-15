@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS public.subscriptions (
 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON public.subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON public.subscriptions(status);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_plan_id ON public.subscriptions(plan_id);
 
 -- 4. ENTITLEMENTS TABLE
 CREATE TABLE IF NOT EXISTS public.entitlements (
@@ -115,6 +116,8 @@ CREATE TABLE IF NOT EXISTS public.entitlements (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_entitlements_plan_id ON public.entitlements(plan_id);
 
 -- 5. USAGE PERIODS TABLE (Aggregated weekly ledger by Monday 00:00 UTC)
 CREATE TABLE IF NOT EXISTS public.usage_periods (
@@ -155,10 +158,28 @@ CREATE TABLE IF NOT EXISTS public.devices (
     os_version TEXT,
     app_version TEXT,
     last_seen_at TIMESTAMPTZ DEFAULT NOW(),
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 8. PAYMENT EVENTS AUDIT TABLE (Webhooks ledger)
+CREATE INDEX IF NOT EXISTS idx_devices_user_id ON public.devices(user_id);
+
+-- 8. DEVICE RECORDS TABLE (Enterprise & Desktop device registry)
+CREATE TABLE IF NOT EXISTS public.device_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL,
+    device_name TEXT,
+    os_version TEXT,
+    app_version TEXT,
+    last_seen_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_records_user ON public.device_records(user_id);
+
+-- 9. PAYMENT EVENTS AUDIT TABLE (Webhooks ledger)
 CREATE TABLE IF NOT EXISTS public.payment_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     event_id TEXT NOT NULL UNIQUE,
@@ -178,17 +199,20 @@ ALTER TABLE public.entitlements ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.usage_periods ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.usage_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.devices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.device_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.payment_events ENABLE ROW LEVEL SECURITY;
 
 -- Plans are publicly readable
 CREATE POLICY "Plans are readable by all users" ON public.plans
     FOR SELECT USING (true);
 
--- Profiles: users can select/update their own profile
+-- Profiles: users can select/update/insert their own profile
 CREATE POLICY "Users can view own profile" ON public.profiles
     FOR SELECT USING (auth.uid() = id);
 CREATE POLICY "Users can update own profile" ON public.profiles
     FOR UPDATE USING (auth.uid() = id);
+CREATE POLICY "Users can insert own profile" ON public.profiles
+    FOR INSERT WITH CHECK (auth.uid() = id);
 
 -- Subscriptions: users can view own subscriptions
 CREATE POLICY "Users can view own subscriptions" ON public.subscriptions
@@ -198,11 +222,15 @@ CREATE POLICY "Users can view own subscriptions" ON public.subscriptions
 CREATE POLICY "Users can view own entitlements" ON public.entitlements
     FOR SELECT USING (auth.uid() = user_id);
 
--- Usage Periods: users can view own usage
+-- Usage Periods: users can view and manage own usage periods
 CREATE POLICY "Users can view own usage periods" ON public.usage_periods
     FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can insert own usage periods" ON public.usage_periods
+    FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own usage periods" ON public.usage_periods
+    FOR UPDATE USING (auth.uid() = user_id);
 
--- Usage Events: users can insert their own usage events
+-- Usage Events: users can insert and view their own usage events
 CREATE POLICY "Users can insert own usage events" ON public.usage_events
     FOR INSERT WITH CHECK (auth.uid() = user_id);
 CREATE POLICY "Users can view own usage events" ON public.usage_events
@@ -212,12 +240,69 @@ CREATE POLICY "Users can view own usage events" ON public.usage_events
 CREATE POLICY "Users can manage own devices" ON public.devices
     FOR ALL USING (auth.uid() = user_id);
 
+-- Device Records: users can manage their own device records
+CREATE POLICY "Users can manage own device records" ON public.device_records
+    FOR ALL USING (auth.uid() = user_id);
+
+-- Payment Events: users can inspect events linked to their user_id
+CREATE POLICY "Users can view own payment events" ON public.payment_events
+    FOR SELECT USING (payload->>'user_id' = auth.uid()::text);
+
+-- =============================================================================
+-- UPDATED_AT TRIGGER FUNCTION
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION public.update_updated_at_column()
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+    NEW.updated_at = clock_timestamp();
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS update_profiles_updated_at ON public.profiles;
+CREATE TRIGGER update_profiles_updated_at
+    BEFORE UPDATE ON public.profiles
+    FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_subscriptions_updated_at ON public.subscriptions;
+CREATE TRIGGER update_subscriptions_updated_at
+    BEFORE UPDATE ON public.subscriptions
+    FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_entitlements_updated_at ON public.entitlements;
+CREATE TRIGGER update_entitlements_updated_at
+    BEFORE UPDATE ON public.entitlements
+    FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_usage_periods_updated_at ON public.usage_periods;
+CREATE TRIGGER update_usage_periods_updated_at
+    BEFORE UPDATE ON public.usage_periods
+    FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_devices_updated_at ON public.devices;
+CREATE TRIGGER update_devices_updated_at
+    BEFORE UPDATE ON public.devices
+    FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_device_records_updated_at ON public.device_records;
+CREATE TRIGGER update_device_records_updated_at
+    BEFORE UPDATE ON public.device_records
+    FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
 -- =============================================================================
 -- AUTOMATIC PROFILE & FREE ENTITLEMENT PROVISIONING TRIGGER
 -- =============================================================================
 
 CREATE OR REPLACE FUNCTION public.handle_new_user()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
 DECLARE
     free_limits JSONB;
 BEGIN
@@ -230,7 +315,12 @@ BEGIN
         NEW.email,
         COALESCE(NEW.raw_user_meta_data->>'full_name', NEW.raw_user_meta_data->>'name', ''),
         COALESCE(NEW.raw_user_meta_data->>'avatar_url', NEW.raw_user_meta_data->>'picture', '')
-    );
+    )
+    ON CONFLICT (id) DO UPDATE SET
+        email = EXCLUDED.email,
+        full_name = CASE WHEN EXCLUDED.full_name <> '' THEN EXCLUDED.full_name ELSE public.profiles.full_name END,
+        avatar_url = CASE WHEN EXCLUDED.avatar_url <> '' THEN EXCLUDED.avatar_url ELSE public.profiles.avatar_url END,
+        updated_at = NOW();
 
     -- 2. Create Free entitlement
     INSERT INTO public.entitlements (user_id, plan_id, is_pro, limits, token_version)
@@ -240,19 +330,26 @@ BEGIN
         FALSE,
         free_limits,
         1
-    );
+    )
+    ON CONFLICT (user_id) DO NOTHING;
 
-    -- 3. Create initial Free subscription record
-    INSERT INTO public.subscriptions (user_id, plan_id, status)
-    VALUES (
-        NEW.id,
-        'free',
-        'active'
-    );
+    -- 3. Create initial Free subscription record if none exists
+    IF NOT EXISTS (SELECT 1 FROM public.subscriptions WHERE user_id = NEW.id) THEN
+        INSERT INTO public.subscriptions (user_id, plan_id, status)
+        VALUES (
+            NEW.id,
+            'free',
+            'active'
+        );
+    END IF;
 
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$;
+
+REVOKE EXECUTE ON FUNCTION public.handle_new_user() FROM public;
+REVOKE EXECUTE ON FUNCTION public.handle_new_user() FROM anon;
+REVOKE EXECUTE ON FUNCTION public.handle_new_user() FROM authenticated;
 
 -- Trigger on user creation in auth.users
 DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;

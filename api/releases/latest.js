@@ -1,3 +1,5 @@
+const { signManifest } = require('../_lib/token');
+
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -12,8 +14,8 @@ module.exports = async function handler(req, res) {
     product_name: 'VOX — Local AI Voice Assistant',
     release_date: '2026-11-15',
     installer_url: 'https://vox-voice-assistant.vercel.app/downloads/VoxLocal-Setup.exe',
-    installer_size_bytes: 7927808, // ~7.56 MB
-    sha256: '9a8d4f0c72e4b31a89c7d12f5a6b0c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b',
+    installer_size_bytes: 10070068,
+    sha256: 'a361938d9031cb2e6e577cc58637651192b41050cada520214c4dc8204ef6fad',
     min_os_version: 'Windows 10 Build 19041 (64-bit)',
     mandatory: false,
     release_notes: [
@@ -24,6 +26,8 @@ module.exports = async function handler(req, res) {
       'Unified Calendar Hub: 1-click sync for Microsoft 365, Google Calendar, and Zoom.'
     ],
   };
+
+  manifest.signature = signManifest(manifest);
 
   return res.status(200).json(manifest);
 };

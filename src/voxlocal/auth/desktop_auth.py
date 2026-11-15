@@ -156,6 +156,28 @@ class DesktopAuthBroker:
         with self.lock:
             return self._current_user
 
+    def load_session(self) -> Optional[Dict[str, Any]]:
+        """Return active authenticated user session dictionary or None."""
+        with self.lock:
+            if self._current_user is None:
+                self._load_cached_session()
+            if self._current_user is None or not self._current_user.user_id:
+                return None
+            return {
+                "user_id": self._current_user.user_id,
+                "access_token": self._current_user.access_token,
+                "refresh_token": self._current_user.refresh_token,
+                "expires_at": self._current_user.expires_at,
+                "user": {
+                    "id": self._current_user.user_id,
+                    "email": self._current_user.email,
+                    "name": self._current_user.display_name,
+                    "picture": self._current_user.avatar_url,
+                    "plan": self._current_user.plan_code,
+                    "is_pro": self._current_user.is_pro,
+                },
+            }
+
     def is_authenticated(self) -> bool:
         with self.lock:
             return self._current_user is not None and bool(self._current_user.user_id and self._current_user.email)
@@ -169,6 +191,30 @@ class DesktopAuthBroker:
                     pass
             self._current_user = None
             logger.info("Desktop user signed out")
+
+    def clear_session(self) -> None:
+        """Alias for sign_out."""
+        self.sign_out()
+
+    def start_login(
+        self,
+        callback: Optional[Callable[[bool, str, Optional[Dict[str, Any]]], None]] = None,
+        timeout_sec: float = 120.0,
+    ) -> None:
+        """High-level login invocation wrapping start_browser_login with unified callback."""
+        def _on_success(profile: UserProfile) -> None:
+            if callback:
+                callback(True, "Authentication successful", profile.to_dict())
+
+        def _on_error(err_msg: str) -> None:
+            if callback:
+                callback(False, err_msg, None)
+
+        self.start_browser_login(
+            on_success=_on_success,
+            on_error=_on_error,
+            timeout_sec=timeout_sec,
+        )
 
     def start_browser_login(
         self,

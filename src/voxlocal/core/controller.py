@@ -201,6 +201,8 @@ class AppController(QObject):
     meeting_overrun_warning = pyqtSignal(str, float)  # (warning_message, elapsed_sec)
     auth_state_changed = pyqtSignal(dict)             # (user_profile_dict)
     upgrade_dialog_requested = pyqtSignal(str)        # (reason_string)
+    usage_updated = pyqtSignal(dict)                  # (weekly_usage_dict)
+    update_check_completed = pyqtSignal(bool, dict, str) # (is_available, manifest, message)
 
     def __init__(self, config: Optional[AppConfig] = None) -> None:
         super().__init__()
@@ -210,7 +212,17 @@ class AppController(QObject):
         # Initialize Commercial Ledger & Entitlements (100% Local DPAPI Vault)
         self.metering = UsageMeteringEngine(self.db.db_path)
         self.entitlement = EntitlementManager()
-        self.auth_broker = DesktopAuthBroker()
+        self.desktop_auth_broker = DesktopAuthBroker()
+        self.auth_broker = self.desktop_auth_broker  # Backward compatibility alias
+        self._restore_user_session()
+
+        # Update Manager & Release Trust Chain (Milestone 5)
+        try:
+            from voxlocal.core.updater import UpdateManager
+            self.update_manager = UpdateManager()
+        except Exception as exc:
+            logger.debug("UpdateManager initialization: %s", exc)
+            self.update_manager = None
 
         # Initialize Local LLM engine lazily
         try:
@@ -425,6 +437,32 @@ class AppController(QObject):
 
         # Enterprise crash recovery: auto-detect and rescue interrupted/unfinalized meetings
         self._recover_unfinalized_meetings()
+
+    def _restore_user_session(self) -> None:
+        """Restore active user session, configure user context in metering, and sync entitlement."""
+        try:
+            broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
+            if broker and hasattr(broker, "load_session"):
+                session = broker.load_session()
+                if session:
+                    user_info = session.get("user", {})
+                    user_id = session.get("user_id") or user_info.get("id") or "default"
+                    plan_code = user_info.get("plan") or session.get("plan_code") or "free"
+                    if hasattr(self, "metering") and self.metering is not None:
+                        self.metering.set_user_context(user_id, plan_code)
+                    if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
+                        self.entitlement.set_user_context(user_id)
+                    return
+            if hasattr(self, "metering") and self.metering is not None:
+                self.metering.set_user_context(None, "free")
+            if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
+                self.entitlement.set_user_context(None)
+        except Exception as exc:
+            logger.warning("Session restoration failed: %s", exc)
+
+    def request_upgrade_dialog(self, reason: str = "Upgrade to VOX Pro") -> None:
+        """Trigger upgrade dialog request signal."""
+        self.upgrade_dialog_requested.emit(reason)
 
     def _recover_unfinalized_meetings(self) -> None:
         """
@@ -908,7 +946,7 @@ class AppController(QObject):
             storage_dir.mkdir(parents=True, exist_ok=True)
             user_id = getattr(self.config, "current_user_id", "default") or "default"
 
-            self.auth_broker = CalendarAuthBroker(
+            self.calendar_auth_broker = CalendarAuthBroker(
                 db=self.db,
                 backend_url=getattr(self.config, "auth_backend_url", ""),
             )
@@ -916,7 +954,7 @@ class AppController(QObject):
             # Migrate any legacy plaintext OAuth secrets out of config into DPAPI vault
             migrated_secret = False
             if getattr(self.config, "google_calendar_client_secret", ""):
-                self.auth_broker.save_app_secret(
+                self.calendar_auth_broker.save_app_secret(
                     "google_calendar_client_secret",
                     self.config.google_calendar_client_secret,
                     user_id=user_id,
@@ -924,7 +962,7 @@ class AppController(QObject):
                 self.config.google_calendar_client_secret = ""
                 migrated_secret = True
             if getattr(self.config, "zoom_client_secret", ""):
-                self.auth_broker.save_app_secret(
+                self.calendar_auth_broker.save_app_secret(
                     "zoom_client_secret",
                     self.config.zoom_client_secret,
                     user_id=user_id,
@@ -938,7 +976,7 @@ class AppController(QObject):
                 parent=self,
                 db=self.db,
                 user_id=user_id,
-                auth_broker=self.auth_broker,
+                auth_broker=self.calendar_auth_broker,
             )
             self.calendar_manager = self.calendar_engine  # Backward-compatibility alias
 
@@ -960,29 +998,29 @@ class AppController(QObject):
                             account_hint=email or None,
                             account_id=acc_id,
                             user_id=user_id,
-                            auth_broker=self.auth_broker,
+                            auth_broker=self.calendar_auth_broker,
                         )
                     elif ptype == CalendarProviderType.GOOGLE.value:
                         prov = GoogleCalendarProvider(
                             client_id=(getattr(self.config, "google_calendar_client_id", "") or None),
-                            client_secret=self.auth_broker.load_app_secret("google_calendar_client_secret", user_id=user_id) or None,
+                            client_secret=self.calendar_auth_broker.load_app_secret("google_calendar_client_secret", user_id=user_id) or None,
                             account_id=acc_id,
                             user_id=user_id,
-                            auth_broker=self.auth_broker,
+                            auth_broker=self.calendar_auth_broker,
                         )
                     elif ptype == CalendarProviderType.ZOOM.value:
                         prov = ZoomCalendarProvider(
                             client_id=(getattr(self.config, "zoom_client_id", "") or None),
-                            client_secret=self.auth_broker.load_app_secret("zoom_client_secret", user_id=user_id) or None,
+                            client_secret=self.calendar_auth_broker.load_app_secret("zoom_client_secret", user_id=user_id) or None,
                             account_id=acc_id,
                             user_id=user_id,
-                            auth_broker=self.auth_broker,
+                            auth_broker=self.calendar_auth_broker,
                         )
                     elif ptype == CalendarProviderType.ICS.value:
                         prov = IcsCalendarProvider(
                             account_id=acc_id,
                             user_id=user_id,
-                            auth_broker=self.auth_broker,
+                            auth_broker=self.calendar_auth_broker,
                         )
                     elif ptype == CalendarProviderType.LOCAL_MAPI.value:
                         from voxlocal.calendar.mapi_provider import LocalMapiCalendarProvider
@@ -1019,7 +1057,7 @@ class AppController(QObject):
                         tenant_id=(getattr(self.config, "calendar_tenant_id", "common") or "common"),
                         auth_file_path=ms_auth,
                         user_id=user_id,
-                        auth_broker=self.auth_broker,
+                        auth_broker=self.calendar_auth_broker,
                     )
                     if ms_prov.is_authenticated():
                         acc_id = ms_prov.get_provider_status().get("account_id") or CalendarProviderType.MS_GRAPH.value
@@ -1034,10 +1072,10 @@ class AppController(QObject):
                 try:
                     g_prov = GoogleCalendarProvider(
                         client_id=(getattr(self.config, "google_calendar_client_id", "") or None),
-                        client_secret=self.auth_broker.load_app_secret("google_calendar_client_secret", user_id=user_id) or None,
+                        client_secret=self.calendar_auth_broker.load_app_secret("google_calendar_client_secret", user_id=user_id) or None,
                         auth_file_path=google_auth,
                         user_id=user_id,
-                        auth_broker=self.auth_broker,
+                        auth_broker=self.calendar_auth_broker,
                     )
                     if g_prov.is_authenticated():
                         acc_id = g_prov.get_provider_status().get("account_id") or CalendarProviderType.GOOGLE.value
@@ -1052,10 +1090,10 @@ class AppController(QObject):
                 try:
                     z_prov = ZoomCalendarProvider(
                         client_id=(getattr(self.config, "zoom_client_id", "") or None),
-                        client_secret=self.auth_broker.load_app_secret("zoom_client_secret", user_id=user_id) or None,
+                        client_secret=self.calendar_auth_broker.load_app_secret("zoom_client_secret", user_id=user_id) or None,
                         auth_file_path=zoom_auth,
                         user_id=user_id,
-                        auth_broker=self.auth_broker,
+                        auth_broker=self.calendar_auth_broker,
                     )
                     if z_prov.is_authenticated():
                         acc_id = z_prov.get_provider_status().get("account_id") or CalendarProviderType.ZOOM.value
@@ -1073,7 +1111,7 @@ class AppController(QObject):
                         feed_url=ics_url,
                         auth_file_path=ics_path,
                         user_id=user_id,
-                        auth_broker=self.auth_broker,
+                        auth_broker=self.calendar_auth_broker,
                     )
                     if ics_prov.is_authenticated():
                         acc_id = ics_prov.get_provider_status().get("account_id") or CalendarProviderType.ICS.value
@@ -1167,7 +1205,7 @@ class AppController(QObject):
                 from voxlocal.calendar.graph_provider import MsGraphCalendarProvider
                 from voxlocal.calendar.base import CalendarProviderType
                 user_id = getattr(self.config, "current_user_id", "default") or "default"
-                auth_broker = getattr(self, "auth_broker", None)
+                auth_broker = getattr(self, "calendar_auth_broker", None) or getattr(self, "auth_broker", None)
                 temp_account_id = make_account_id(CalendarProviderType.MS_GRAPH.value, hint_str)
                 auth_path = Path(self.config.storage_dir or "data") / f"calendar_ms_{abs(hash(temp_account_id)) % 100000}.dat"
                 ms_prov = MsGraphCalendarProvider(
@@ -1259,7 +1297,7 @@ class AppController(QObject):
             return
 
         user_id = getattr(self.config, "current_user_id", "default") or "default"
-        auth_broker = getattr(self, "auth_broker", None)
+        auth_broker = getattr(self, "calendar_auth_broker", None) or getattr(self, "auth_broker", None)
         if client_id is not None:
             self.config.google_calendar_client_id = client_id
         if client_secret:
@@ -1322,7 +1360,7 @@ class AppController(QObject):
     ) -> None:
         """Connect Zoom account via OAuth 2.0 + PKCE to retrieve scheduled & upcoming meetings."""
         user_id = getattr(self.config, "current_user_id", "default") or "default"
-        auth_broker = getattr(self, "auth_broker", None)
+        auth_broker = getattr(self, "calendar_auth_broker", None) or getattr(self, "auth_broker", None)
         if client_id is not None:
             self.config.zoom_client_id = client_id
         if client_secret:
@@ -1386,7 +1424,7 @@ class AppController(QObject):
                 from voxlocal.calendar.ics_provider import IcsCalendarProvider
                 from voxlocal.calendar.base import CalendarProviderType
                 user_id = getattr(self.config, "current_user_id", "default") or "default"
-                auth_broker = getattr(self, "auth_broker", None)
+                auth_broker = getattr(self, "calendar_auth_broker", None) or getattr(self, "auth_broker", None)
                 canon_id = make_account_id(CalendarProviderType.ICS.value, fallback_label=feed_url)
                 ics_path = Path(self.config.storage_dir or "data") / f"calendar_{canon_id.replace(':', '_')}.dat"
                 prov = IcsCalendarProvider(
@@ -2315,6 +2353,7 @@ class AppController(QObject):
                         final_text,
                         dictation_id=getattr(self, "_last_dictation_id", None),
                     )
+                    self.usage_updated.emit(self.metering.get_weekly_usage())
                 except Exception as m_exc:
                     logger.debug("Metering dictation record error: %s", m_exc)
 
@@ -3828,6 +3867,7 @@ class AppController(QObject):
                 if hasattr(self, "metering") and self.metering is not None:
                     try:
                         self.metering.record_completed_meeting(dur_val, meeting_id=meeting_id)
+                        self.usage_updated.emit(self.metering.get_weekly_usage())
                     except Exception as m_exc:
                         logger.debug("Metering record_completed_meeting error: %s", m_exc)
 
@@ -4644,6 +4684,7 @@ class AppController(QObject):
             res = self.intelligence.query(question, meeting_id=meeting_id)
             if hasattr(self, "metering") and self.metering is not None:
                 self.metering.record_ask_vox_query(question)
+                self.usage_updated.emit(self.metering.get_weekly_usage())
             return res
         except Exception as exc:
             logger.error("Error in query_meeting_memory: %s", exc, exc_info=True)
@@ -4702,6 +4743,7 @@ class AppController(QObject):
                 if self._ask_vox_query_id == current_qid and not self._cancel_ask_vox:
                     if hasattr(self, "metering") and self.metering is not None:
                         self.metering.record_ask_vox_query(question)
+                        self.usage_updated.emit(self.metering.get_weekly_usage())
                     self.ask_vox_stream_finished.emit(current_qid, res)
             except Exception as exc:
                 logger.error("Error in query_meeting_memory_stream: %s", exc, exc_info=True)
@@ -4745,7 +4787,8 @@ class AppController(QObject):
 
     def get_account_status(self) -> Dict[str, Any]:
         """Returns the current user profile, entitlement plan, and weekly usage statistics."""
-        session = self.auth_broker.load_session() if hasattr(self, "auth_broker") else None
+        broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
+        session = broker.load_session() if broker and hasattr(broker, "load_session") else None
         ent = self.entitlement.get_effective_entitlement() if hasattr(self, "entitlement") else {
             "plan": "free", "plan_name": "VOX Free", "is_pro": False, "limits": {}
         }
@@ -4768,23 +4811,50 @@ class AppController(QObject):
     def login_with_google(self, callback: Optional[Any] = None) -> None:
         """Starts loopback OAuth PKCE flow to sign in the user."""
         def _on_done(ok: bool, msg: str, data: Optional[Dict[str, Any]] = None):
-            if ok and data:
+            if ok:
+                broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
+                session = broker.load_session() if broker and hasattr(broker, "load_session") else None
+                if session:
+                    user_info = session.get("user", {})
+                    user_id = session.get("user_id") or user_info.get("id") or (data.get("user_id") if data else "default")
+                    plan_code = user_info.get("plan") or session.get("plan_code") or (data.get("plan_code") if data else "free")
+                    if hasattr(self, "metering") and self.metering is not None:
+                        self.metering.set_user_context(user_id, plan_code)
+                    if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
+                        self.entitlement.set_user_context(user_id)
                 self.sync_entitlements_with_cloud()
             self.auth_state_changed.emit(self.get_account_status())
+            if hasattr(self, "entitlement") and self.entitlement is not None:
+                self.entitlement_changed.emit(self.entitlement.get_effective_entitlement())
+            if hasattr(self, "metering") and self.metering is not None:
+                self.usage_updated.emit(self.metering.get_weekly_usage())
             if callback:
                 callback(ok, msg)
 
-        threading.Thread(target=lambda: self.auth_broker.start_login(callback=_on_done), daemon=True).start()
+        broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
+        if broker and hasattr(broker, "start_login"):
+            threading.Thread(target=lambda: broker.start_login(callback=_on_done), daemon=True).start()
+        elif callback:
+            callback(False, "Auth broker unavailable")
 
     def logout_user(self) -> None:
         """Logs out user, clears session vault, and reverts to Free tier safely."""
-        if hasattr(self, "auth_broker"):
-            self.auth_broker.clear_session()
-        if hasattr(self, "entitlement"):
-            self.entitlement.revert_to_free()
+        broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
+        if broker and hasattr(broker, "clear_session"):
+            broker.clear_session()
+        elif broker and hasattr(broker, "sign_out"):
+            broker.sign_out()
+        if hasattr(self, "entitlement") and self.entitlement is not None:
+            self.entitlement.clear_entitlement()
+            if hasattr(self.entitlement, "set_user_context"):
+                self.entitlement.set_user_context(None)
+        if hasattr(self, "metering") and self.metering is not None:
+            self.metering.set_user_context(None, "free")
         self.auth_state_changed.emit(self.get_account_status())
-        if hasattr(self, "entitlement"):
+        if hasattr(self, "entitlement") and self.entitlement is not None:
             self.entitlement_changed.emit(self.entitlement.get_effective_entitlement())
+        if hasattr(self, "metering") and self.metering is not None:
+            self.usage_updated.emit(self.metering.get_weekly_usage())
 
     def sync_entitlements_with_cloud(self) -> None:
         """Non-blocking sync of unsynced usage events and refresh of entitlement token."""
@@ -4792,9 +4862,10 @@ class AppController(QObject):
 
     def _sync_commercial_worker(self) -> None:
         try:
-            if not hasattr(self, "auth_broker") or not hasattr(self, "metering"):
+            broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
+            if not broker or not hasattr(self, "metering"):
                 return
-            session = self.auth_broker.load_session()
+            session = broker.load_session() if hasattr(broker, "load_session") else None
             token = session.get("access_token") if session else None
             import urllib.request
             import json
@@ -4836,6 +4907,35 @@ class AppController(QObject):
                             self.auth_state_changed.emit(self.get_account_status())
         except Exception as exc:
             logger.debug("Cloud commercial sync warning (offline or warming): %s", exc)
+
+    def check_for_updates(self, timeout_sec: int = 15) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+        """
+        Queries the release endpoint and cryptographically verifies the manifest Ed25519 signature.
+        Returns: (is_update_available, verified_manifest_or_none, message)
+        """
+        if not getattr(self, "update_manager", None):
+            try:
+                from voxlocal.core.updater import UpdateManager
+                self.update_manager = UpdateManager()
+            except Exception as exc:
+                return False, None, f"Update manager unavailable: {exc}"
+
+        res = self.update_manager.check_for_updates(timeout_sec=timeout_sec)
+        is_avail, manifest, msg = res
+        try:
+            self.update_check_completed.emit(is_avail, manifest or {}, msg)
+        except Exception:
+            pass
+        return res
+
+    def verify_update_package(
+        self, manifest: Dict[str, Any], installer_path_or_bytes: Any
+    ) -> Tuple[bool, str]:
+        """
+        Verifies release manifest signature and installer binary SHA-256 integrity.
+        """
+        from voxlocal.core.updater import verify_release_trust_chain
+        return verify_release_trust_chain(manifest, installer_path_or_bytes)
 
     def shutdown(self) -> None:
         """Cleanly stop all timers, hooks, and audio streams on application exit."""

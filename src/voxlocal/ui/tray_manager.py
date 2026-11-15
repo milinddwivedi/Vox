@@ -44,6 +44,19 @@ class SystemTrayManager:
         self.act_status = QAction("● Ready", self.menu)
         self.act_status.setEnabled(False)
         self.menu.addAction(self.act_status)
+
+        # Plan status & Upgrade action (Milestone 2)
+        self.act_plan = QAction("Plan: VOX Free", self.menu)
+        self.act_plan.setEnabled(False)
+        self.menu.addAction(self.act_plan)
+
+        self.act_upgrade = QAction("⚡ Upgrade to Pro...", self.menu)
+        self.act_upgrade.triggered.connect(
+            lambda: self.controller.request_upgrade_dialog("Upgrade to VOX Pro")
+            if hasattr(self.controller, "request_upgrade_dialog")
+            else None
+        )
+        self.menu.addAction(self.act_upgrade)
         self.menu.addSeparator()
 
         # Primary window & floating surfaces
@@ -135,6 +148,12 @@ class SystemTrayManager:
         self.controller.meeting_state_changed.connect(lambda *_: self._refresh_state())
         self.controller.screen_recording_state_changed.connect(lambda *_: self._refresh_state())
         self.controller.theme_changed.connect(self.apply_theme)
+        if hasattr(self.controller, "entitlement_changed"):
+            self.controller.entitlement_changed.connect(lambda *_: self._refresh_state())
+        if hasattr(self.controller, "usage_updated"):
+            self.controller.usage_updated.connect(lambda *_: self._refresh_state())
+        if hasattr(self.controller, "auth_state_changed"):
+            self.controller.auth_state_changed.connect(lambda *_: self._refresh_state())
         self.apply_theme(getattr(self.controller, "theme", getattr(self.controller.config, "theme", "light")))
         self._refresh_state()
 
@@ -267,6 +286,21 @@ class SystemTrayManager:
             summary_str = "Ready"
 
         self.act_status.setText(f"● {summary_str}")
+
+        # Refresh plan badge & upgrade text
+        ent = {}
+        if hasattr(self.controller, "entitlement") and hasattr(self.controller.entitlement, "get_effective_entitlement"):
+            try:
+                ent = self.controller.entitlement.get_effective_entitlement()
+            except Exception:
+                pass
+        is_pro = bool(ent.get("is_pro", False))
+        if is_pro:
+            self.act_plan.setText("Plan: VOX Pro")
+            self.act_upgrade.setText("⚡ Manage Pro Plan...")
+        else:
+            self.act_plan.setText("Plan: VOX Free")
+            self.act_upgrade.setText("⚡ Upgrade to Pro...")
 
     def show_notification(self, title: str, message: str) -> None:
         if self.tray.isVisible() and self.tray.supportsMessages():

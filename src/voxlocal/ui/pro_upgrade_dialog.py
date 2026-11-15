@@ -6,20 +6,18 @@ import datetime
 import webbrowser
 from typing import Any, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
-from voxlocal.core.entitlement import sign_entitlement_payload
 from voxlocal.core.logger import get_logger
 from voxlocal.ui.theme import (
     create_app_pixmap,
@@ -66,6 +64,12 @@ class VoxProUpgradeDialog(QDialog):
 
         self._build_ui()
         self.setStyleSheet(get_dialog_stylesheet(self.current_theme))
+
+        if hasattr(self.controller, "entitlement_changed"):
+            try:
+                self.controller.entitlement_changed.connect(self._on_entitlement_changed)
+            except Exception:
+                pass
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -234,40 +238,53 @@ class VoxProUpgradeDialog(QDialog):
 
         layout.addLayout(plans_row)
 
-        # License Key / Payment ID Activation Row
-        act_box = QFrame()
-        act_box.setObjectName("voxWellCard")
-        act_lay = QVBoxLayout(act_box)
-        act_lay.setContentsMargins(12, 10, 12, 10)
-        act_lay.setSpacing(6)
+        # Automatic Cloud Activation Card (Manual backdoor completely eliminated)
+        sync_box = QFrame()
+        sync_box.setObjectName("voxWellCard")
+        sync_lay = QVBoxLayout(sync_box)
+        sync_lay.setContentsMargins(14, 12, 14, 12)
+        sync_lay.setSpacing(8)
 
-        act_title = QLabel("Already paid? Enter your Razorpay Payment ID or license key:")
-        act_title.setFont(get_ui_font(size_px=11, weight=600))
-        act_title.setStyleSheet(f"color: {self.tokens['text_muted']};")
-        act_lay.addWidget(act_title)
+        sync_title_row = QHBoxLayout()
+        sync_title_row.setSpacing(8)
+        sync_icon = QLabel("⚡")
+        sync_title_row.addWidget(sync_icon)
 
-        act_row = QHBoxLayout()
-        act_row.setSpacing(8)
+        sync_title = QLabel("Automatic Cloud Activation")
+        sync_title.setFont(get_ui_font(size_px=12, weight=700))
+        sync_title.setStyleSheet(f"color: {self.tokens['text_primary']};")
+        sync_title_row.addWidget(sync_title)
+        sync_title_row.addStretch()
+        sync_lay.addLayout(sync_title_row)
 
-        self.input_key = QLineEdit()
-        self.input_key.setPlaceholderText("e.g. pay_P8v3X9Kz... or activation token")
-        self.input_key.setFont(get_ui_font(size_px=12, mono=True))
-        self.input_key.returnPressed.connect(self._on_activate_clicked)
-        act_row.addWidget(self.input_key, 1)
+        sync_desc = QLabel(
+            "After completing payment in your browser, VOX automatically activates your Pro subscription. "
+            "If you already completed checkout, click Refresh to synchronize immediately."
+        )
+        sync_desc.setFont(get_ui_font(size_px=11, weight=400))
+        sync_desc.setStyleSheet(f"color: {self.tokens['text_secondary']};")
+        sync_desc.setWordWrap(True)
+        sync_lay.addWidget(sync_desc)
 
-        self.btn_activate = QPushButton("Activate")
-        self.btn_activate.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_activate.clicked.connect(self._on_activate_clicked)
-        act_row.addWidget(self.btn_activate)
+        sync_action_row = QHBoxLayout()
+        sync_action_row.setSpacing(10)
 
-        act_lay.addLayout(act_row)
+        self.btn_sync = QPushButton("🔄 Refresh / Check Status")
+        self.btn_sync.setObjectName("secondaryBtn")
+        self.btn_sync.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sync.clicked.connect(self._on_sync_clicked)
+        sync_action_row.addWidget(self.btn_sync)
+        sync_action_row.addStretch()
+
+        sync_lay.addLayout(sync_action_row)
 
         self.lbl_act_status = QLabel("")
-        self.lbl_act_status.setFont(get_ui_font(size_px=11, weight=500))
+        self.lbl_act_status.setFont(get_ui_font(size_px=11, weight=600))
         self.lbl_act_status.setVisible(False)
-        act_lay.addWidget(self.lbl_act_status)
+        self.lbl_act_status.setWordWrap(True)
+        sync_lay.addWidget(self.lbl_act_status)
 
-        layout.addWidget(act_box)
+        layout.addWidget(sync_box)
 
         # Footer Actions (Maybe Later)
         footer_row = QHBoxLayout()
@@ -284,63 +301,68 @@ class VoxProUpgradeDialog(QDialog):
 
     def _open_monthly_checkout(self) -> None:
         logger.info("Opening Razorpay Monthly link: %s", RAZORPAY_MONTHLY_LINK)
+        try:
+            QDesktopServices.openUrl(QUrl(RAZORPAY_MONTHLY_LINK))
+        except Exception:
+            pass
         webbrowser.open(RAZORPAY_MONTHLY_LINK)
 
     def _open_yearly_checkout(self) -> None:
         logger.info("Opening Razorpay Yearly link: %s", RAZORPAY_YEARLY_LINK)
+        try:
+            QDesktopServices.openUrl(QUrl(RAZORPAY_YEARLY_LINK))
+        except Exception:
+            pass
         webbrowser.open(RAZORPAY_YEARLY_LINK)
 
-    def _on_activate_clicked(self) -> None:
-        key = self.input_key.text().strip()
-        if not key:
-            self._show_status("Please enter a Payment ID or activation code.", is_error=True)
-            return
+    def _on_sync_clicked(self) -> None:
+        """Trigger cloud entitlement synchronization and verify active subscription."""
+        # 1. Immediate check if controller is already Pro
+        ent = getattr(self.controller, "entitlement", None)
+        if ent and hasattr(ent, "get_state"):
+            state = ent.get_state()
+            if getattr(state, "is_pro", False):
+                self._show_status("🎉 VOX Pro is active! Enjoy unlimited intelligence.", is_error=False)
+                eff = ent.get_effective_entitlement() if hasattr(ent, "get_effective_entitlement") else {"is_pro": True}
+                if not isinstance(eff, dict):
+                    eff = {"is_pro": True}
+                self.upgraded.emit(eff)
+                self.btn_sync.setEnabled(False)
+                return
 
-        # Handle Razorpay payment ID (e.g. pay_...) or local activation token
-        if key.startswith("pay_") or len(key) >= 8:
-            # Grant Pro entitlement locally via signed token
-            ent = getattr(self.controller, "entitlement", None)
-            secret = getattr(ent, "verify_key", None)
-            if not isinstance(secret, str) or not secret:
-                secret = "vox_entitlement_sig_v1_public_verify_key_2026"
-            now_utc = datetime.datetime.now(datetime.timezone.utc)
-            one_year_later = now_utc + datetime.timedelta(days=365)
-            
-            payload = {
-                "user_id": f"rzp_user_{key[-6:]}",
-                "plan_code": "pro_annual" if "annual" in key.lower() or "year" in key.lower() else "pro_monthly",
-                "payment_id": key,
-                "enabled_features": [
-                    "dictation", "dual_track_recording", "meeting_summaries", 
-                    "local_vocabulary", "grey_text_preview", "unlimited_voice", 
-                    "unlimited_meetings", "ask_vox_unlimited", "executive_export"
-                ],
-                "usage_limits": {
-                    "dictation_words_weekly": 999999999,
-                    "meeting_minutes_weekly": 999999.0,
-                    "meeting_sessions_weekly": 999999,
-                    "meeting_session_cap_min": 999999.0,
-                    "ask_vox_queries_weekly": 999999,
-                },
-                "period_start_utc": now_utc.isoformat(),
-                "expires_at_utc": one_year_later.isoformat(),
-            }
+        # 2. Trigger cloud sync via controller
+        if hasattr(self.controller, "sync_entitlements_with_cloud"):
+            self._show_status("Synchronizing with VOX Cloud... Please wait.", is_error=False)
+            try:
+                self.controller.sync_entitlements_with_cloud()
+            except Exception as exc:
+                logger.warning("Cloud sync error: %s", exc)
+                self._show_status(f"Sync error: {exc}", is_error=True)
+                return
 
-            token = sign_entitlement_payload(payload, secret)
-            ok, err = self.controller.entitlement.save_entitlement_token(token)
-            if ok:
-                if hasattr(self.controller, "entitlement_changed"):
-                    self.controller.entitlement_changed.emit(self.controller.entitlement.get_effective_entitlement())
-                if hasattr(self.controller, "metering"):
-                    self.controller.metering.set_user_context(payload["user_id"], payload["plan_code"])
-                self._show_status("🎉 VOX Pro successfully activated! Enjoy unlimited intelligence.", is_error=False)
-                self.upgraded.emit(payload)
-                self.btn_activate.setEnabled(False)
-                self.input_key.setEnabled(False)
+            # Re-check state if updated synchronously
+            if ent and hasattr(ent, "get_state") and getattr(ent.get_state(), "is_pro", False):
+                self._show_status("🎉 VOX Pro is active! Enjoy unlimited intelligence.", is_error=False)
+                eff = ent.get_effective_entitlement() if hasattr(ent, "get_effective_entitlement") else {"is_pro": True}
+                if not isinstance(eff, dict):
+                    eff = {"is_pro": True}
+                self.upgraded.emit(eff)
+                self.btn_sync.setEnabled(False)
             else:
-                self._show_status(f"Activation failed: {err}", is_error=True)
+                self._show_status(
+                    "Checking cloud status... If checkout just finished, please wait a few seconds and click Refresh again.",
+                    is_error=False,
+                )
         else:
-            self._show_status("Invalid Payment ID or token format. Expected Razorpay ID (e.g. pay_...).", is_error=True)
+            self._show_status("Synchronization service unavailable.", is_error=True)
+
+    def _on_entitlement_changed(self, ent_dict: dict) -> None:
+        """Handle incoming entitlement update from background cloud sync."""
+        if ent_dict and ent_dict.get("is_pro"):
+            self._show_status("🎉 VOX Pro is active! Enjoy unlimited intelligence.", is_error=False)
+            self.upgraded.emit(ent_dict)
+            if hasattr(self, "btn_sync"):
+                self.btn_sync.setEnabled(False)
 
     def _show_status(self, text: str, is_error: bool = False) -> None:
         self.lbl_act_status.setText(text)

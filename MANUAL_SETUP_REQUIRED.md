@@ -1,77 +1,88 @@
-# VOX — Production Deployment: Manual Setup Checklist for User
+# VOX — Production Deployment & External Configuration Record
 
-Antigravity has implemented the complete end-to-end commercial architecture across the Windows application, Supabase schema, serverless API backend, and website. 
-
-To connect your live commercial production environment, please complete the following manual configuration steps in your third-party developer consoles:
+This record documents the exact production configurations, verified credentials, and external service links for the VOX Commercial Platform.
 
 ---
 
-## 1. Supabase Project Setup (5 minutes)
+## 1. Supabase Production Cloud Database
 
-1. Open your **Supabase Dashboard** at [supabase.com/dashboard](https://supabase.com/dashboard).
-2. Create a new project or select your existing VOX project.
-3. In the **SQL Editor**, paste and run the contents of:
-   `supabase/migrations/20261115_commercial_schema.sql`
-4. Under **Project Settings &gt; API**, copy:
-   - **Project URL** (e.g. `https://xxxx.supabase.co`)
-   - **anon / public key**
-   - **service_role key** (keep secret)
-
----
-
-## 2. Google OAuth 2.0 Credentials (5 minutes)
-
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/apis/credentials).
-2. Under **OAuth 2.0 Client IDs**, create or open your Web Application client:
-   - **Name:** VOX Local AI
-   - **Authorized JavaScript Origins:**
-     `https://vox-voice-assistant.vercel.app`
-   - **Authorized Redirect URIs:**
-     `https://<YOUR_SUPABASE_PROJECT_REF>.supabase.co/auth/v1/callback`
-3. Back in **Supabase Dashboard &gt; Authentication &gt; Providers &gt; Google**:
-   - Enable Google.
-   - Enter your **Google Client ID** and **Client Secret**.
-4. In **Supabase Dashboard &gt; Authentication &gt; URL Configuration**:
-   - **Site URL:** `https://vox-voice-assistant.vercel.app`
-   - **Redirect URLs:** Add:
-     - `https://vox-voice-assistant.vercel.app/account.html`
-     - `https://vox-voice-assistant.vercel.app/api/auth/desktop-login`
-     - `http://127.0.0.1:8400/auth/callback`
-     - `http://127.0.0.1:8401/auth/callback`
-     - `http://127.0.0.1:8402/auth/callback`
-     - `http://127.0.0.1:8403/auth/callback`
+- **Project Name:** Vox
+- **Project Reference:** `qiigoipgoedexmdowtvj`
+- **Dashboard URL:** `https://supabase.com/dashboard/project/qiigoipgoedexmdowtvj`
+- **Project URL:** `https://qiigoipgoedexmdowtvj.supabase.co`
+- **Database Host:** `db.qiigoipgoedexmdowtvj.supabase.co`
+- **Region:** `ap-southeast-1` (PostgreSQL 17.11)
+- **Status:** `ACTIVE_HEALTHY`
+- **Public Anon Key:** `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFpaWdvaXBnb2VkZXhtZG93dHZqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ3NTM2NjQsImV4cCI6MjExMDMyOTY2NH0.C9Bz6OYqxB5uBUa0kEBJpiMvwW6SbKYWhAEcVZoFvYM`
+- **Published Tables:**
+  - `public.plans` (Seeded: `free` and `pro`)
+  - `public.profiles` (Mirrors auth.users with updated_at trigger)
+  - `public.subscriptions` (User subscriptions with interval, status, Razorpay IDs)
+  - `public.entitlements` (Ed25519 asymmetric entitlement records)
+  - `public.usage_periods` (Weekly aggregated usage by Monday 00:00 UTC)
+  - `public.usage_events` (Idempotent event sync queue)
+  - `public.devices` (Registered Windows client instances)
+  - `public.device_records` (Enterprise & Desktop device registry)
+  - `public.payment_events` (Audited Razorpay webhook events ledger)
+- **Security & RLS:** Row Level Security active on all 9 tables; automated provisioning trigger `handle_new_user` on `auth.users`; timestamp triggers on all updated tables; zero security lint warnings.
 
 ---
 
-## 3. Razorpay Account & Webhook Setup (5 minutes)
+## 2. Google Cloud OAuth 2.0 Credentials
 
-1. Log in to the [Razorpay Dashboard](https://dashboard.razorpay.com/).
-2. Under **Settings &gt; API Keys**, generate your **Key ID** and **Key Secret** (use Test Mode first, then switch to Live Mode when ready).
-3. Under **Settings &gt; Webhooks**, click **Add New Webhook**:
-   - **Webhook URL:** `https://vox-voice-assistant.vercel.app/api/webhooks/razorpay`
-   - **Secret:** Create a secret string (e.g. `vox_razorpay_webhook_secret_2026`).
-   - **Alert Email:** Your notifications email.
-   - **Active Events:**
-     - `order.paid`
-     - `payment.captured`
-     - `payment.failed`
-     - `subscription.charged`
-     - `subscription.cancelled`
+- **Google Cloud Project ID:** `dozy-io`
+- **Client ID:** `541845334167-k9sa1dem22flsddu5721tsr173snbppo.apps.googleusercontent.com` (configured in Supabase Auth & Google Cloud Console)
+- **Client Secret:** `[SECURED_IN_SUPABASE_AND_GCP_CONSOLE]`
+- **Authorized JavaScript Origins:**
+  - `https://vox-voice-assistant.vercel.app`
+- **Authorized Redirect URIs:**
+  - `https://qiigoipgoedexmdowtvj.supabase.co/auth/v1/callback`
+  - `https://vox-voice-assistant.vercel.app/api/auth/desktop-callback`
+  - `https://vox-voice-assistant.vercel.app/account.html`
+  - `http://127.0.0.1:8400/callback`
+  - `http://127.0.0.1:8400/auth/callback`
+  - `http://localhost`
 
 ---
 
-## 4. Set Environment Variables in Vercel (2 minutes)
+## 3. Razorpay Subscription & Webhook Configuration
 
-In your Vercel Dashboard for `vox-voice-assistant` (or via `npx vercel env add`), add:
+- **Merchant Account:** VOX Local AI
+- **Monthly Subscription:**
+  - **Plan ID:** `plan_U0JlftJ0ZkwAbY`
+  - **Price:** ₹199.00 / month
+  - **Subscription ID:** `sub_U0Joq0iTO49N2E`
+  - **Direct Checkout Link:** `https://rzp.io/rzp/ugv7JBF2`
+- **Annual Subscription:**
+  - **Plan ID:** `plan_U0JmYZAfwuRlyg`
+  - **Price:** ₹1,599.00 / year
+  - **Subscription ID:** `sub_U0Jpy7OH6TnN5N`
+  - **Direct Checkout Link:** `https://rzp.io/rzp/fycKln1w`
+- **Webhook Endpoint:**
+  - **URL:** `https://vox-voice-assistant.vercel.app/api/webhooks/razorpay`
+  - **Secret:** Configured in Vercel `RAZORPAY_WEBHOOK_SECRET`
+  - **Subscribed Events:**
+    - `order.paid`
+    - `payment.captured`
+    - `payment.failed`
+    - `subscription.activated`
+    - `subscription.charged`
+    - `subscription.cancelled`
+    - `subscription.paused`
+    - `subscription.resumed`
+    - `refund.processed`
 
-```bash
-SUPABASE_URL=https://<YOUR_PROJECT_REF>.supabase.co
-SUPABASE_ANON_KEY=eyJ...
-SUPABASE_SERVICE_ROLE_KEY=eyJ...
-RAZORPAY_KEY_ID=rzp_live_...
-RAZORPAY_KEY_SECRET=...
-RAZORPAY_WEBHOOK_SECRET=...
-VOX_ENTITLEMENT_SECRET=vox_production_entitlement_hmac_secret_2026
-```
+---
 
-Once these environment variables are saved, Vercel will automatically redeploy and connect all live commercial endpoints!
+## 4. Vercel Production Deployment
+
+- **Deployment URL:** `https://vox-voice-assistant.vercel.app`
+- **Project ID:** `prj_Y6TLPTWm2XQ6bbynt5uhcPiZdgG6`
+- **Team ID:** `team_hqbF6b2Jog07amnjeBfPAGTx`
+- **Verified Environment Variables:**
+  - `SUPABASE_URL`: `https://qiigoipgoedexmdowtvj.supabase.co`
+  - `SUPABASE_ANON_KEY`: `eyJhbGciOi...`
+  - `SUPABASE_SERVICE_ROLE_KEY`: Service role secret key
+  - `ENTITLEMENT_PRIVATE_KEY_PEM`: Asymmetric Ed25519 private key (RFC 8410 PKCS#8)
+  - `VOX_ENTITLEMENT_PRIVATE_KEY_ED25519`: RFC 8410 Ed25519 private signing key
+  - `RAZORPAY_WEBHOOK_SECRET`: HMAC-SHA256 signature verification secret
