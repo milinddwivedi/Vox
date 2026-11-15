@@ -65,6 +65,9 @@ VK_MAP: Dict[str, int] = {
     "capslock": 0x14,
     "pause": 0x13,
     "fn": 0x77,  # Default hardware Function Key alias to VK_F8 (0x77)
+    "fn key": 0x77,
+    "function": 0x77,
+    "function key": 0x77,
     "`": 0xC0,
     "tilde": 0xC0,
     "-": 0xBD,
@@ -507,8 +510,10 @@ class GlobalHotkeyManager:
 
             is_standalone_ptt = bool(
                 self._enable_voice_typing_hotkey
-                and len(self._ptt_vks) == 1
-                and vk in self._ptt_vks
+                and (
+                    (len(self._ptt_vks) == 1 and vk in self._ptt_vks)
+                    or (len(self._dictation_vks) == 1 and vk in self._dictation_vks)
+                )
                 and (0x70 <= vk <= 0x87 or vk in (0x13, 0x14, 0xC0))
             )
             return is_standalone_ptt

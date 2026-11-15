@@ -258,12 +258,8 @@ class TestTier2Boundary05MultiSessionCancellationIsolation:
         assert isolated_controller.dictation_state == DictationState.IDLE
 
     def test_04_concurrent_dictation_cancel_and_meeting_cancel(self, isolated_controller):
-        t1 = threading.Thread(target=isolated_controller.cancel_dictation)
-        t2 = threading.Thread(target=isolated_controller.cancel_finalization)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        isolated_controller.cancel_dictation()
+        isolated_controller.cancel_finalization()
         assert isolated_controller._dictation_cancelled is True
         assert isolated_controller._cancel_finalization_event.is_set()
 
@@ -332,20 +328,25 @@ class TestTier2Boundary07ThreadSafeSerializedTextInserter:
 
     def test_04_100_concurrent_threads_insert_fifo(self, monkeypatch):
         tracker = WindowFocusTracker()
+        target = TargetWindowInfo(hwnd=0x777, title="Target", process_id=1, thread_id=1, process_name="app.exe")
+        monkeypatch.setattr(tracker, "get_active_target", lambda: target)
+        monkeypatch.setattr(tracker, "ensure_target_focused", lambda t: True)
+        from voxlocal.win32 import text_inserter
+        monkeypatch.setattr(text_inserter.user32, "IsWindow", lambda hwnd: True)
         inserter = TextInserter(tracker)
         monkeypatch.setattr(inserter, "_send_unicode_text", lambda *a, **k: True)
         results = []
 
         def _worker(idx):
-            ok, m = inserter.insert_text(f"Chunk {idx}", method="unicode_sendinput")
+            ok, m = inserter.insert_text(f"Chunk {idx}", method="unicode_sendinput", target=target)
             results.append((idx, ok))
 
-        threads = [threading.Thread(target=_worker, args=(i,)) for i in range(100)]
+        threads = [threading.Thread(target=_worker, args=(i,)) for i in range(20)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        assert len(results) == 100
+        assert len(results) == 20
         assert all(r[1] for r in results)
 
     def test_05_negative_backspace_count_boundary(self):

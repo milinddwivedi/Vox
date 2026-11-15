@@ -411,6 +411,7 @@ class MainWindow(QMainWindow):
         self.notetaker_page = NotetakerPage(self.controller, parent=self)
         self.notetaker_page.status_toast.connect(self.show_toast)
         self.notetaker_page.open_calendar_requested.connect(lambda: self.navigate_to_workspace("calendar"))
+        self.notetaker_page.open_settings_requested.connect(self.show_settings_dialog)
 
         self.dictionary_page = DictionaryPage(self.controller, parent=self)
         self.dictionary_page.status_toast.connect(self.show_toast)

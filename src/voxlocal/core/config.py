@@ -51,6 +51,7 @@ class AppConfig:
     meeting_hotkey: str = "ctrl+alt+r"
     auto_record_calls: bool = True   # Read-AI style: detect calls when Zoom/Teams starts
     prompt_on_call: bool = True      # Explicit user consent popup before recording a detected call
+    notetaker_auto_start_banner_dismissed: bool = False  # Auto-start prompt banner dismissal on Notetaker page
     record_meeting_screen: bool = True # Read-AI style: record screen video (slides, video, code) at low fps
     meeting_recording_mode: str = "audio_video"  # "audio_only" | "audio_video" (persisted last-used mode)
     screen_fps: int = 15              # 15 fps default (smooth motion, user-selectable 10-60 fps with file size estimates)

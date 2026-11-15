@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -299,7 +300,12 @@ class SettingsWorkspaceWidget(QWidget):
 
         self._build_ui()
         self.mic_level_updated.connect(lambda lvl: self.mic_level_bar.set_level(lvl) if hasattr(self, "mic_level_bar") else None)
+        if hasattr(self.controller, "auth_state_changed"):
+            self.controller.auth_state_changed.connect(lambda _: self._update_account_ui())
+        if hasattr(self.controller, "entitlement_changed"):
+            self.controller.entitlement_changed.connect(lambda _: self._update_account_ui())
         self.load_from_config()
+        self._update_account_ui()
         self.apply_theme(self._theme)
 
     def _build_ui(self) -> None:
@@ -753,6 +759,12 @@ class SettingsWorkspaceWidget(QWidget):
             "Show a non-intrusive card when an active call window starts.",
             lambda v: self._save_cfg("prompt_on_call", v),
         )
+        self.sw_auto_start_call = self._add_toggle_row(
+            nt_lay,
+            "Start Notetaker Automatically on Call",
+            "Turn on Notetaker as soon as your meeting begins without waiting for confirmation.",
+            self._on_auto_start_call_toggled,
+        )
         self.combo_rec_mode = QComboBox()
         self.combo_rec_mode.setAccessibleName("Default call capture mode")
         self.combo_rec_mode.setAccessibleDescription("Capture only the meeting window (never your desktop)")
@@ -848,8 +860,112 @@ class SettingsWorkspaceWidget(QWidget):
         return page
 
     def _build_account_page(self) -> QWidget:
-        page, lay = self._page_shell("Account & Calendar", "Connected meeting calendars (Microsoft 365, Google Calendar, Zoom).")
+        page, lay = self._page_shell("Account & Subscription", "VOX Pro entitlements, weekly usage meters, and connected meeting calendars.")
 
+        # 1. Commercial Subscription & Metering Card (P0)
+        card_sub, s_lay = self._make_card()
+
+        # Header Row: Plan Badge + Status
+        hdr_row = QHBoxLayout()
+        self.lbl_user_email = QLabel("Signed in as: <b>Guest / Local Mode</b>")
+        self.lbl_user_email.setWordWrap(True)
+        self.lbl_user_email.setStyleSheet("font-size: 13px; font-weight: 500;")
+        hdr_row.addWidget(self.lbl_user_email, 1)
+
+        self.lbl_plan_badge = QLabel("VOX FREE TIER · ₹0/mo")
+        self.lbl_plan_badge.setStyleSheet("color: #f59e0b; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(245, 158, 11, 0.12);")
+        hdr_row.addWidget(self.lbl_plan_badge)
+        s_lay.addLayout(hdr_row)
+
+        s_lay.addSpacing(6)
+
+        # Quota Meters
+        meter_grid = QVBoxLayout()
+        meter_grid.setSpacing(8)
+
+        # 1. Voice Typing Words
+        w_box = QVBoxLayout()
+        self.lbl_usage_words = QLabel("Voice Typing: 0 / 3,000 words this week")
+        self.lbl_usage_words.setStyleSheet("font-size: 11px; font-weight: 600;")
+        self.bar_words = QProgressBar()
+        self.bar_words.setFixedHeight(6)
+        self.bar_words.setTextVisible(False)
+        self.bar_words.setStyleSheet("QProgressBar { background: rgba(120, 120, 120, 0.2); border-radius: 3px; } QProgressBar::chunk { background: #3b82f6; border-radius: 3px; }")
+        w_box.addWidget(self.lbl_usage_words)
+        w_box.addWidget(self.bar_words)
+        meter_grid.addLayout(w_box)
+
+        # 2. Meeting Audio Minutes
+        m_box = QVBoxLayout()
+        self.lbl_usage_minutes = QLabel("Meeting Audio: 0 / 180 mins this week")
+        self.lbl_usage_minutes.setStyleSheet("font-size: 11px; font-weight: 600;")
+        self.bar_minutes = QProgressBar()
+        self.bar_minutes.setFixedHeight(6)
+        self.bar_minutes.setTextVisible(False)
+        self.bar_minutes.setStyleSheet("QProgressBar { background: rgba(120, 120, 120, 0.2); border-radius: 3px; } QProgressBar::chunk { background: #10b981; border-radius: 3px; }")
+        m_box.addWidget(self.lbl_usage_minutes)
+        m_box.addWidget(self.bar_minutes)
+        meter_grid.addLayout(m_box)
+
+        # 3. Meeting Count
+        c_box = QVBoxLayout()
+        self.lbl_usage_meetings = QLabel("Meetings Recorded: 0 / 5 sessions this week")
+        self.lbl_usage_meetings.setStyleSheet("font-size: 11px; font-weight: 600;")
+        self.bar_meetings = QProgressBar()
+        self.bar_meetings.setFixedHeight(6)
+        self.bar_meetings.setTextVisible(False)
+        self.bar_meetings.setStyleSheet("QProgressBar { background: rgba(120, 120, 120, 0.2); border-radius: 3px; } QProgressBar::chunk { background: #8b5cf6; border-radius: 3px; }")
+        c_box.addWidget(self.lbl_usage_meetings)
+        c_box.addWidget(self.bar_meetings)
+        meter_grid.addLayout(c_box)
+
+        # 4. Ask VOX Queries
+        q_box = QVBoxLayout()
+        self.lbl_usage_ask_vox = QLabel("Ask VOX Queries: 0 / 10 queries this week")
+        self.lbl_usage_ask_vox.setStyleSheet("font-size: 11px; font-weight: 600;")
+        self.bar_ask_vox = QProgressBar()
+        self.bar_ask_vox.setFixedHeight(6)
+        self.bar_ask_vox.setTextVisible(False)
+        self.bar_ask_vox.setStyleSheet("QProgressBar { background: rgba(120, 120, 120, 0.2); border-radius: 3px; } QProgressBar::chunk { background: #f59e0b; border-radius: 3px; }")
+        q_box.addWidget(self.lbl_usage_ask_vox)
+        q_box.addWidget(self.bar_ask_vox)
+        meter_grid.addLayout(q_box)
+
+        s_lay.addLayout(meter_grid)
+
+        s_lay.addSpacing(6)
+        lbl_reset_note = QLabel("ℹ️ Quota resets every Monday at 00:00 UTC (05:30 IST). Audio, notes, and local files never leave your PC.")
+        lbl_reset_note.setStyleSheet("font-size: 11px; opacity: 0.7;")
+        lbl_reset_note.setWordWrap(True)
+        s_lay.addWidget(lbl_reset_note)
+
+        # Action Buttons Row
+        sub_btns = QHBoxLayout()
+        sub_btns.setSpacing(8)
+
+        self.btn_auth_action = QPushButton("Sign In with Google")
+        self.btn_auth_action.setObjectName("secondaryBtn")
+        self.btn_auth_action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_auth_action.clicked.connect(self._on_login_clicked)
+        sub_btns.addWidget(self.btn_auth_action)
+
+        self.btn_upgrade_pro = QPushButton("Upgrade to VOX Pro — ₹199/mo →")
+        self.btn_upgrade_pro.setObjectName("dawnBtn")
+        self.btn_upgrade_pro.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_upgrade_pro.clicked.connect(self._on_upgrade_pro_clicked)
+        sub_btns.addWidget(self.btn_upgrade_pro)
+
+        self.btn_sync_sub = QPushButton("Sync Plan")
+        self.btn_sync_sub.setObjectName("secondaryBtn")
+        self.btn_sync_sub.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sync_sub.clicked.connect(self._on_sync_subscription_clicked)
+        sub_btns.addWidget(self.btn_sync_sub)
+
+        sub_btns.addStretch(1)
+        s_lay.addLayout(sub_btns)
+        lay.addWidget(card_sub)
+
+        # 2. Calendar Integrations Card
         card_acct, a_lay = self._make_card()
         lbl_local = QLabel("Unified Calendar Integrations · Retrieve real meetings, detect conferencing links, and 1-click capture.")
         lbl_local.setWordWrap(True)
@@ -941,6 +1057,100 @@ class SettingsWorkspaceWidget(QWidget):
         lay.addWidget(card_acct)
         lay.addStretch(1)
         return page
+
+    def _update_account_ui(self) -> None:
+        """Dynamically refresh account status, plan badge, and quota meters."""
+        if not hasattr(self, "lbl_user_email") or not hasattr(self.controller, "get_account_status"):
+            return
+        status = self.controller.get_account_status()
+        is_pro = status.get("is_pro", False)
+        signed_in = status.get("signed_in", False)
+        email = status.get("email")
+        name = status.get("name") or "Guest User"
+        usage = status.get("usage", {})
+        limits = status.get("limits", {})
+
+        if signed_in and email:
+            self.lbl_user_email.setText(f"Signed in as: <b>{name}</b> ({email})")
+            self.btn_auth_action.setText("Sign Out")
+            try:
+                self.btn_auth_action.clicked.disconnect()
+            except Exception:
+                pass
+            self.btn_auth_action.clicked.connect(self._on_logout_clicked)
+        else:
+            self.lbl_user_email.setText("Signed in as: <b>Guest / Local Mode</b>")
+            self.btn_auth_action.setText("Sign In with Google")
+            try:
+                self.btn_auth_action.clicked.disconnect()
+            except Exception:
+                pass
+            self.btn_auth_action.clicked.connect(self._on_login_clicked)
+
+        if is_pro:
+            self.lbl_plan_badge.setText("VOX PRO (Active) · ₹199/mo")
+            self.lbl_plan_badge.setStyleSheet("color: #10b981; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(16, 185, 129, 0.12);")
+            self.btn_upgrade_pro.setVisible(False)
+            self.lbl_usage_words.setText(f"Voice Typing: {usage.get('dictation_words', 0):,} words this week (Unlimited)")
+            self.bar_words.setMaximum(100)
+            self.bar_words.setValue(100)
+            self.lbl_usage_minutes.setText(f"Meeting Audio: {int(usage.get('meeting_duration_sec', 0) / 60)} mins this week (Unlimited)")
+            self.bar_minutes.setMaximum(100)
+            self.bar_minutes.setValue(100)
+            self.lbl_usage_meetings.setText(f"Meetings Recorded: {usage.get('meeting_count', 0)} sessions this week (Unlimited)")
+            self.bar_meetings.setMaximum(100)
+            self.bar_meetings.setValue(100)
+            self.lbl_usage_ask_vox.setText(f"Ask VOX Queries: {usage.get('ask_vox_count', 0)} queries this week (Unlimited)")
+            self.bar_ask_vox.setMaximum(100)
+            self.bar_ask_vox.setValue(100)
+        else:
+            self.lbl_plan_badge.setText("VOX FREE TIER · ₹0/mo")
+            self.lbl_plan_badge.setStyleSheet("color: #f59e0b; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(245, 158, 11, 0.12);")
+            self.btn_upgrade_pro.setVisible(True)
+
+            w_used = usage.get("dictation_words", 0)
+            w_lim = limits.get("dictation_words_per_week", 3000)
+            self.lbl_usage_words.setText(f"Voice Typing: {w_used:,} / {w_lim:,} words this week")
+            self.bar_words.setMaximum(w_lim)
+            self.bar_words.setValue(min(w_used, w_lim))
+
+            m_sec = usage.get("meeting_duration_sec", 0.0)
+            m_min = int(m_sec / 60)
+            m_lim = int(limits.get("meeting_duration_sec_per_week", 10800) / 60)
+            self.lbl_usage_minutes.setText(f"Meeting Audio: {m_min} / {m_lim} mins this week")
+            self.bar_minutes.setMaximum(m_lim)
+            self.bar_minutes.setValue(min(m_min, m_lim))
+
+            c_used = usage.get("meeting_count", 0)
+            c_lim = limits.get("meeting_count_per_week", 5)
+            self.lbl_usage_meetings.setText(f"Meetings Recorded: {c_used} / {c_lim} sessions this week")
+            self.bar_meetings.setMaximum(c_lim)
+            self.bar_meetings.setValue(min(c_used, c_lim))
+
+            q_used = usage.get("ask_vox_count", 0)
+            q_lim = limits.get("ask_vox_queries_per_week", 10)
+            self.lbl_usage_ask_vox.setText(f"Ask VOX Queries: {q_used} / {q_lim} queries this week")
+            self.bar_ask_vox.setMaximum(q_lim)
+            self.bar_ask_vox.setValue(min(q_used, q_lim))
+
+    def _on_login_clicked(self) -> None:
+        self.status_toast.emit("Signing In", "Opening browser for Google Authentication...")
+        if hasattr(self.controller, "login_with_google"):
+            self.controller.login_with_google(callback=lambda ok, msg: self.status_toast.emit("Sign In", msg))
+
+    def _on_logout_clicked(self) -> None:
+        if hasattr(self.controller, "logout_user"):
+            self.controller.logout_user()
+            self.status_toast.emit("Signed Out", "Reverted to Free tier successfully.")
+
+    def _on_upgrade_pro_clicked(self) -> None:
+        import webbrowser
+        webbrowser.open("https://vox-voice-assistant.vercel.app/pricing")
+
+    def _on_sync_subscription_clicked(self) -> None:
+        if hasattr(self.controller, "sync_entitlements_with_cloud"):
+            self.controller.sync_entitlements_with_cloud()
+            self.status_toast.emit("Synchronizing", "Refreshing entitlement token and usage with cloud...")
 
     def _build_privacy_page(self) -> QWidget:
         page, lay = self._page_shell("Data and Privacy", "Manage local SQLite retention, backups, and selective data removal.")
@@ -1055,6 +1265,12 @@ class SettingsWorkspaceWidget(QWidget):
             sw.setChecked(bool(getattr(cfg, attr, default)))
             sw.blockSignals(False)
 
+        if hasattr(self, "sw_auto_start_call"):
+            self.sw_auto_start_call.blockSignals(True)
+            is_auto_on = bool(getattr(cfg, "auto_record_calls", True)) and not bool(getattr(cfg, "prompt_on_call", True))
+            self.sw_auto_start_call.setChecked(is_auto_on)
+            self.sw_auto_start_call.blockSignals(False)
+
         self._populate_mics()
         gain_val = int(round(float(getattr(cfg, "mic_gain", 1.0) or 1.0) * 100))
         self.slider_mic_gain.blockSignals(True)
@@ -1131,6 +1347,18 @@ class SettingsWorkspaceWidget(QWidget):
     def _on_dict_mode_changed(self) -> None:
         val = str(self.combo_dict_mode.currentData() or "push_to_talk")
         self._save_cfg("dictation_mode", val, apply_hotkeys=True)
+
+    def _on_auto_start_call_toggled(self, checked: bool) -> None:
+        if checked:
+            self.controller.config.auto_record_calls = True
+            self.controller.config.prompt_on_call = False
+        else:
+            self.controller.config.prompt_on_call = True
+        self.controller.config.save()
+        if hasattr(self, "sw_prompt_call"):
+            self.sw_prompt_call.blockSignals(True)
+            self.sw_prompt_call.setChecked(self.controller.config.prompt_on_call)
+            self.sw_prompt_call.blockSignals(False)
 
     def _on_mic_gain_changed(self, value: int) -> None:
         gain = round(value / 100.0, 2)

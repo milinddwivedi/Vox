@@ -41,6 +41,7 @@ Desktop.ini
 
 # Scratch files
 scratch/
+.vercel/
 
 # Local user data (recordings, DB, logs, models) - never commit
 data/
@@ -63,3 +64,6 @@ External References/
 .env.*
 *.pem
 *.key
+
+# Node
+node_modules/

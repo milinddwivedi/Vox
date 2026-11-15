@@ -1,0 +1,23 @@
+.venv
+.pyenv
+.pytest_cache
+src
+data
+dist
+build
+temp_test_rec*
+extensions
+models
+packaging
+tests
+scripts
+*.mp4
+*.zip
+*.exe
+*.wav
+*.bin
+*.pt
+*.safetensors
+*.log
+*.tmp
+External References

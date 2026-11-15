@@ -66,6 +66,9 @@ from voxlocal.win32.hotkeys import GlobalHotkeyManager
 from voxlocal.win32.startup import StartupManager
 from voxlocal.win32.text_inserter import TextInserter
 from voxlocal.win32.window_focus import TargetWindowInfo, WindowFocusTracker
+from voxlocal.core.metering import UsageMeteringEngine, count_committed_words
+from voxlocal.core.entitlement import EntitlementManager
+from voxlocal.auth.desktop_auth import DesktopAuthBroker
 
 logger = get_logger("controller")
 
@@ -192,10 +195,21 @@ class AppController(QObject):
     ask_vox_citations_ready = pyqtSignal(int, list) # (query_id, citations list)
     ask_vox_stream_finished = pyqtSignal(int, dict) # (query_id, full response dict)
 
+    # Commercial Entitlement & Usage Metering Signals (P0)
+    entitlement_changed = pyqtSignal(dict)           # (entitlement_dict: plan, is_pro, limits, etc.)
+    quota_warning = pyqtSignal(str, float, float)     # (metric_name, current_val, limit_val)
+    meeting_overrun_warning = pyqtSignal(str, float)  # (warning_message, elapsed_sec)
+    auth_state_changed = pyqtSignal(dict)             # (user_profile_dict)
+
     def __init__(self, config: Optional[AppConfig] = None) -> None:
         super().__init__()
         self.config = config or AppConfig.load()
         self.db = LocalDatabase(self.config.db_path)
+
+        # Initialize Commercial Ledger & Entitlements (100% Local DPAPI Vault)
+        self.metering = UsageMeteringEngine(self.db.db_path)
+        self.entitlement = EntitlementManager()
+        self.auth_broker = DesktopAuthBroker()
 
         # Initialize Local LLM engine lazily
         try:
@@ -2245,6 +2259,23 @@ class AppController(QObject):
         if self._is_in_app_target(target):
             ok, method_used = True, "in_app_qt"
             w = getattr(self, "_explicit_in_app_widget_ref", None)
+            if w is None:
+                try:
+                    from PyQt6.QtWidgets import QApplication, QLineEdit, QPlainTextEdit, QTextEdit
+                    app = QApplication.instance()
+                    if app is not None:
+                        fw = app.focusWidget()
+                        if isinstance(fw, (QTextEdit, QPlainTextEdit, QLineEdit)):
+                            w = fw
+                        else:
+                            active_win = app.activeWindow()
+                            if active_win is not None:
+                                editors = active_win.findChildren((QTextEdit, QPlainTextEdit, QLineEdit))
+                                if editors:
+                                    w = editors[0]
+                except Exception as focus_err:
+                    logger.debug("Failed resolving focused in-app editor: %s", focus_err)
+
             if w is not None:
                 try:
                     from PyQt6.QtWidgets import QTextEdit, QPlainTextEdit, QLineEdit
@@ -2260,6 +2291,13 @@ class AppController(QObject):
                         w.insert(text_to_insert)
                 except Exception as in_app_err:
                     logger.debug("Direct in-app widget insertion error: %s", in_app_err)
+            else:
+                ok, method_used = self.text_inserter.insert_text(
+                    text_to_insert,
+                    method=self.config.insertion_method,
+                    restore_clipboard=self.config.restore_clipboard,
+                    target=target,
+                )
         else:
             ok, method_used = self.text_inserter.insert_text(
                 text_to_insert,
@@ -2270,6 +2308,14 @@ class AppController(QObject):
 
         if ok:
             self._session_committed_any = True
+            if hasattr(self, "metering") and self.metering is not None:
+                try:
+                    self.metering.record_committed_dictation(
+                        final_text,
+                        dictation_id=getattr(self, "_last_dictation_id", None),
+                    )
+                except Exception as m_exc:
+                    logger.debug("Metering dictation record error: %s", m_exc)
 
         self._last_dictation_id = self.db.add_dictation_entry(
             raw_text=raw_text,
@@ -2474,6 +2520,14 @@ class AppController(QObject):
 
     def start_dictation(self) -> bool:
         """Push-to-Talk or single-shot dictation start."""
+        if hasattr(self, "metering") and hasattr(self, "entitlement"):
+            can_start, reason = self.metering.can_start_dictation(self.entitlement)
+            if not can_start:
+                msg = reason or "Weekly dictation quota reached (3,000 words). Upgrade to VOX Pro for unlimited voice typing."
+                self.notification_requested.emit("Weekly Dictation Limit Reached", msg)
+                self.quota_warning.emit("dictation_words", 3000, 3000)
+                return False
+
         with self._state_lock:
             if self._capture_state in ("recording", "paused"):
                 self.notification_requested.emit(
@@ -2767,6 +2821,13 @@ class AppController(QObject):
                 return False, "A meeting recording is already active. Click 'Stop & Save' to finalize it."
             if self._screen_rec_state in ("recording", "paused"):
                 return False, "A PC screen recording is currently active. Please stop screen recording before starting Meeting Studio."
+            if hasattr(self, "metering") and hasattr(self, "entitlement"):
+                can_start, reason = self.metering.can_start_meeting(self.entitlement)
+                if not can_start:
+                    msg = reason or "Weekly meeting quota reached. Upgrade to VOX Pro for unlimited meetings."
+                    self.notification_requested.emit("Meeting Limit Reached", msg)
+                    self.quota_warning.emit("meeting_count", 5, 5)
+                    return False, msg
             if getattr(self, "_hands_free_active", False):
                 self.stop_hands_free_typing()
             self._is_manual_meeting = not is_auto_detected
@@ -3252,6 +3313,12 @@ class AppController(QObject):
         sys_ok: bool,
     ) -> None:
         self.meeting_tick.emit(elapsed, mic_lvl, sys_lvl, mic_ok, sys_ok)
+
+        # Check Free tier meeting overrun every 15s without interrupting or terminating the call
+        if int(elapsed) > 0 and int(elapsed) % 15 == 0 and hasattr(self, "metering") and hasattr(self, "entitlement"):
+            status = self.metering.evaluate_live_meeting_overrun(elapsed, self.entitlement)
+            if status.get("warning"):
+                self.meeting_overrun_warning.emit(status.get("message", ""), elapsed)
 
         # Trigger progressive live transcription every `progressive_interval_sec`
         if (
@@ -3755,6 +3822,12 @@ class AppController(QObject):
                             MeetingLifecycleState.COMPLETED,
                             f"Meeting #{meeting_id} completed & saved",
                         )
+                if hasattr(self, "metering") and self.metering is not None:
+                    try:
+                        self.metering.record_completed_meeting(dur_val, meeting_id=meeting_id)
+                    except Exception as m_exc:
+                        logger.debug("Metering record_completed_meeting error: %s", m_exc)
+
                 self._safe_emit_finalization_progress("idle", "Meeting saved & transcribed")
                 self._safe_emit(self.meeting_saved_and_transcribed, meeting_id)
                 self._safe_emit(self.history_updated)
@@ -4433,7 +4506,11 @@ class AppController(QObject):
                 if call_key:
                     self._dismissed_call_keys.discard(call_key)
                 self.call_ended.emit(app_name)
-                if self._capture_state in ("recording", "paused"):
+                if (
+                    self._capture_state in ("recording", "paused")
+                    and not getattr(self, "_is_manual_meeting", False)
+                    and bool(getattr(self.config, "notetaker_auto_end", True))
+                ):
                     # CRITICAL: Verify meeting target liveness against genuine Call Stage windows or presentation sessions
                     meeting_target_alive = False
                     from voxlocal.audio.call_detector import is_leaving_title, is_non_call_hub
@@ -4547,8 +4624,22 @@ class AppController(QObject):
         Ask Vox: Comprehensive 100% offline local AI & algorithmic cognitive reasoning
         across recorded meetings (or scoped to meeting_id) with grounded citations.
         """
+        if hasattr(self, "metering") and hasattr(self, "entitlement"):
+            can_ask, reason = self.metering.can_ask_vox(self.entitlement)
+            if not can_ask:
+                return {
+                    "question": question,
+                    "answer": f"### ⚠️ Ask VOX Weekly Limit Reached\n\n{reason or 'You have reached your 10 weekly Ask VOX queries.'}\n\nUpgrade to **VOX Pro** (₹199/mo) for unlimited cognitive queries across all your recorded meetings.",
+                    "citations": [],
+                    "intent": "quota_exceeded",
+                    "suggestions": ["Upgrade to VOX Pro (₹199/mo)", "View weekly usage"],
+                }
+
         try:
-            return self.intelligence.query(question, meeting_id=meeting_id)
+            res = self.intelligence.query(question, meeting_id=meeting_id)
+            if hasattr(self, "metering") and self.metering is not None:
+                self.metering.record_ask_vox_query(question)
+            return res
         except Exception as exc:
             logger.error("Error in query_meeting_memory: %s", exc, exc_info=True)
             return {
@@ -4579,6 +4670,19 @@ class AppController(QObject):
         current_qid = self._ask_vox_query_id
         self._cancel_ask_vox = False
 
+        if hasattr(self, "metering") and hasattr(self, "entitlement"):
+            can_ask, reason = self.metering.can_ask_vox(self.entitlement)
+            if not can_ask:
+                err_dict = {
+                    "question": question,
+                    "answer": f"### ⚠️ Ask VOX Weekly Limit Reached\n\n{reason or 'You have reached your 10 weekly Ask VOX queries.'}\n\nUpgrade to **VOX Pro** (₹199/mo) for unlimited cognitive queries across all your recorded meetings.",
+                    "citations": [],
+                    "intent": "quota_exceeded",
+                    "suggestions": ["Upgrade to VOX Pro (₹199/mo)", "View weekly usage"],
+                }
+                self.ask_vox_stream_finished.emit(current_qid, err_dict)
+                return
+
         def _worker() -> None:
             try:
                 res = self.intelligence.query_stream(
@@ -4589,6 +4693,8 @@ class AppController(QObject):
                     cancel_check=lambda: self._cancel_ask_vox or (self._ask_vox_query_id != current_qid),
                 )
                 if self._ask_vox_query_id == current_qid and not self._cancel_ask_vox:
+                    if hasattr(self, "metering") and self.metering is not None:
+                        self.metering.record_ask_vox_query(question)
                     self.ask_vox_stream_finished.emit(current_qid, res)
             except Exception as exc:
                 logger.error("Error in query_meeting_memory_stream: %s", exc, exc_info=True)
@@ -4625,6 +4731,104 @@ class AppController(QObject):
     def get_recurring_topics(self, limit: int = 15) -> List[Dict[str, Any]]:
         """Retrieve recurring topics across meetings."""
         return self.intelligence.get_recurring_topics(limit=limit)
+
+    # -------------------------------------------------------------------------
+    # Commercial Account, Entitlements & Metering Integration (P0)
+    # -------------------------------------------------------------------------
+
+    def get_account_status(self) -> Dict[str, Any]:
+        """Returns the current user profile, entitlement plan, and weekly usage statistics."""
+        session = self.auth_broker.load_session() if hasattr(self, "auth_broker") else None
+        ent = self.entitlement.get_effective_entitlement() if hasattr(self, "entitlement") else {
+            "plan": "free", "plan_name": "VOX Free", "is_pro": False, "limits": {}
+        }
+        usage = self.metering.get_weekly_usage() if hasattr(self, "metering") else {}
+        limits = ent.get("limits", {})
+        user_info = session.get("user", {}) if session else {}
+        return {
+            "signed_in": session is not None,
+            "email": user_info.get("email"),
+            "name": user_info.get("name") or "Guest User",
+            "picture": user_info.get("picture"),
+            "plan": ent.get("plan", "free"),
+            "plan_name": ent.get("plan_name", "VOX Free"),
+            "is_pro": ent.get("is_pro", False),
+            "usage": usage,
+            "limits": limits,
+            "days_until_reset": self.metering.days_until_next_reset() if hasattr(self, "metering") else 7,
+        }
+
+    def login_with_google(self, callback: Optional[Any] = None) -> None:
+        """Starts loopback OAuth PKCE flow to sign in the user."""
+        def _on_done(ok: bool, msg: str, data: Optional[Dict[str, Any]] = None):
+            if ok and data:
+                self.sync_entitlements_with_cloud()
+            self.auth_state_changed.emit(self.get_account_status())
+            if callback:
+                callback(ok, msg)
+
+        threading.Thread(target=lambda: self.auth_broker.start_login(callback=_on_done), daemon=True).start()
+
+    def logout_user(self) -> None:
+        """Logs out user, clears session vault, and reverts to Free tier safely."""
+        if hasattr(self, "auth_broker"):
+            self.auth_broker.clear_session()
+        if hasattr(self, "entitlement"):
+            self.entitlement.revert_to_free()
+        self.auth_state_changed.emit(self.get_account_status())
+        if hasattr(self, "entitlement"):
+            self.entitlement_changed.emit(self.entitlement.get_effective_entitlement())
+
+    def sync_entitlements_with_cloud(self) -> None:
+        """Non-blocking sync of unsynced usage events and refresh of entitlement token."""
+        threading.Thread(target=self._sync_commercial_worker, daemon=True).start()
+
+    def _sync_commercial_worker(self) -> None:
+        try:
+            if not hasattr(self, "auth_broker") or not hasattr(self, "metering"):
+                return
+            session = self.auth_broker.load_session()
+            token = session.get("access_token") if session else None
+            import urllib.request
+            import json
+
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+            # 1. Sync unsynced usage events (idempotent UUIDs, aggregate counters only)
+            unsynced = self.metering.get_unsynced_events(limit=50)
+            if unsynced and token:
+                req = urllib.request.Request(
+                    "https://vox-voice-assistant.vercel.app/api/usage/sync",
+                    data=json.dumps({"events": unsynced}).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status == 200:
+                        sync_res = json.loads(resp.read().decode("utf-8"))
+                        acked_ids = sync_res.get("acked_event_ids", [])
+                        if acked_ids:
+                            self.metering.mark_events_synced(acked_ids)
+
+            # 2. Refresh active entitlement token
+            if token and hasattr(self, "entitlement"):
+                req_ent = urllib.request.Request(
+                    "https://vox-voice-assistant.vercel.app/api/entitlements",
+                    headers=headers,
+                    method="GET",
+                )
+                with urllib.request.urlopen(req_ent, timeout=10) as resp:
+                    if resp.status == 200:
+                        ent_data = json.loads(resp.read().decode("utf-8"))
+                        raw_jwt = ent_data.get("token")
+                        if raw_jwt:
+                            self.entitlement.save_token_to_vault(raw_jwt)
+                            self.entitlement_changed.emit(self.entitlement.get_effective_entitlement())
+                            self.auth_state_changed.emit(self.get_account_status())
+        except Exception as exc:
+            logger.debug("Cloud commercial sync warning (offline or warming): %s", exc)
 
     def shutdown(self) -> None:
         """Cleanly stop all timers, hooks, and audio streams on application exit."""

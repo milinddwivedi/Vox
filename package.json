@@ -1,0 +1,14 @@
+{
+  "name": "vox-voice-assistant",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VOX Local AI Voice Assistant & Meeting Intelligence",
+  "scripts": {
+    "build": "echo 'Build complete'"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "jsonwebtoken": "^9.0.2",
+    "razorpay": "^2.9.5"
+  }
+}

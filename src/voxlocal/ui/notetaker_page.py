@@ -53,11 +53,78 @@ if TYPE_CHECKING:
 logger = get_logger("ui.notetaker_page")
 
 
+class VoxAutoStartBanner(QFrame):
+    """
+    Top-of-Notetaker activation banner:
+    'Want Notetaker to start automatically?'
+    'This will turn on Notetaker as soon as your meeting begins'
+    with 'Not now' (dismiss) and 'Turn on' (auto-record without prompt).
+    """
+
+    turn_on_clicked = pyqtSignal()
+    not_now_clicked = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("ntAutoStartBanner")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(14)
+
+        # Left Icon badge with concentric circles (◎)
+        self.icon_badge = QFrame()
+        self.icon_badge.setFixedSize(36, 36)
+        self.icon_badge.setObjectName("ntAutoBadge")
+        badge_lay = QVBoxLayout(self.icon_badge)
+        badge_lay.setContentsMargins(0, 0, 0, 0)
+        badge_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_icon = QLabel("◎")
+        self.lbl_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_icon.setFont(get_ui_font(18, 600))
+        badge_lay.addWidget(self.lbl_icon)
+        lay.addWidget(self.icon_badge)
+
+        # Middle text column
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        self.lbl_title = QLabel("Want Notetaker to start automatically?")
+        self.lbl_title.setFont(get_ui_font(13, 600))
+        self.lbl_sub = QLabel("This will turn on Notetaker as soon as your meeting begins")
+        self.lbl_sub.setObjectName("ntMuted")
+        self.lbl_sub.setWordWrap(True)
+        text_col.addWidget(self.lbl_title)
+        text_col.addWidget(self.lbl_sub)
+        lay.addLayout(text_col, 1)
+
+        # Right action buttons
+        btn_box = QHBoxLayout()
+        btn_box.setSpacing(10)
+        btn_box.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+
+        self.btn_not_now = QPushButton("Not now")
+        self.btn_not_now.setObjectName("ghostBtn")
+        self.btn_not_now.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_not_now.clicked.connect(self.not_now_clicked.emit)
+        btn_box.addWidget(self.btn_not_now)
+
+        self.btn_turn_on = QPushButton("Turn on")
+        self.btn_turn_on.setObjectName("ntTurnOnBtn")
+        self.btn_turn_on.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_turn_on.clicked.connect(self.turn_on_clicked.emit)
+        btn_box.addWidget(self.btn_turn_on)
+
+        lay.addLayout(btn_box)
+
+
 class NotetakerPage(QWidget):
     """Notetaker Hub workspace combining Calendar upcoming meetings, library, playback, and Studio."""
 
     status_toast = pyqtSignal(str, str)
     open_calendar_requested = pyqtSignal()
+    open_settings_requested = pyqtSignal(int)
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -125,7 +192,17 @@ class NotetakerPage(QWidget):
         )
         hdr.addWidget(self.btn_drawer)
 
-        self.btn_start_adhoc = QPushButton("Start Notetaker")
+        self.btn_settings = QPushButton("⚙")
+        self.btn_settings.setFixedSize(34, 34)
+        self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_settings.setToolTip("Notetaker Settings")
+        self.btn_settings.setObjectName("ghostBtn")
+        self.btn_settings.setAccessibleName("Notetaker settings")
+        self.btn_settings.setAccessibleDescription("Open Notetaker preferences in Settings")
+        self.btn_settings.clicked.connect(lambda: self.open_settings_requested.emit(2))
+        hdr.addWidget(self.btn_settings)
+
+        self.btn_start_adhoc = QPushButton("◎  Start Notetaker")
         self.btn_start_adhoc.setObjectName("dawnBtn")
         self.btn_start_adhoc.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_start_adhoc.setAccessibleName("Toggle Notetaker recording")
@@ -133,6 +210,12 @@ class NotetakerPage(QWidget):
         self.btn_start_adhoc.clicked.connect(self._on_toggle_recording_clicked)
         hdr.addWidget(self.btn_start_adhoc)
         root.addLayout(hdr)
+
+        # Auto-Start Activation Banner (Shown at the very top of Notetaker)
+        self.auto_start_banner = VoxAutoStartBanner(self)
+        self.auto_start_banner.turn_on_clicked.connect(self._on_auto_start_turn_on)
+        self.auto_start_banner.not_now_clicked.connect(self._on_auto_start_not_now)
+        root.addWidget(self.auto_start_banner)
 
         # Live recording status banner (shown only during active capture)
         self.rec_banner = QFrame()
@@ -435,10 +518,39 @@ class NotetakerPage(QWidget):
     # Refreshers & Handlers
     # ------------------------------------------------------------------
     def refresh_all(self) -> None:
+        self._refresh_auto_start_banner()
         self._refresh_recording_banner()
         self._refresh_calendar_strip()
         self.refresh_folders()
         self.refresh_meetings_list()
+
+    def _on_auto_start_turn_on(self) -> None:
+        if self.controller and hasattr(self.controller, "config"):
+            self.controller.config.auto_record_calls = True
+            self.controller.config.prompt_on_call = False
+            self.controller.config.notetaker_auto_start_banner_dismissed = True
+            if hasattr(self.controller.config, "save"):
+                self.controller.config.save()
+        self.auto_start_banner.hide()
+        self.status_toast.emit(
+            "Auto-Start Enabled",
+            "Notetaker will turn on automatically as soon as your meeting begins.",
+        )
+
+    def _on_auto_start_not_now(self) -> None:
+        if self.controller and hasattr(self.controller, "config"):
+            self.controller.config.notetaker_auto_start_banner_dismissed = True
+            if hasattr(self.controller.config, "save"):
+                self.controller.config.save()
+        self.auto_start_banner.hide()
+
+    def _refresh_auto_start_banner(self) -> None:
+        if not hasattr(self, "auto_start_banner") or not self.controller or not hasattr(self.controller, "config"):
+            return
+        cfg = self.controller.config
+        dismissed = bool(getattr(cfg, "notetaker_auto_start_banner_dismissed", False))
+        auto_on = bool(getattr(cfg, "auto_record_calls", True)) and not bool(getattr(cfg, "prompt_on_call", True))
+        self.auto_start_banner.setVisible(not dismissed and not auto_on)
 
     def _set_cal_filter(self, filter_name: str) -> None:
         self._cal_filter = filter_name
@@ -1140,6 +1252,40 @@ class NotetakerPage(QWidget):
                 border-radius: 8px;
                 padding: 6px 14px;
                 font-weight: 700;
+            }}
+            QFrame#ntAutoStartBanner {{
+                background-color: {t['surface']};
+                border: 1px solid {t['border']};
+                border-radius: 14px;
+            }}
+            QFrame#ntAutoBadge {{
+                background-color: {t['surface_well']};
+                border: 1px solid {t['border']};
+                border-radius: 18px;
+            }}
+            QPushButton#ntTurnOnBtn {{
+                background-color: {t['surface']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                border-radius: 8px;
+                padding: 5px 16px;
+                font-weight: 600;
+                font-size: 13px;
+            }}
+            QPushButton#ntTurnOnBtn:hover {{
+                background-color: {t['sidebar_active']};
+                border: 1px solid {t['text_muted']};
+            }}
+            QPushButton#ghostBtn {{
+                background: transparent;
+                border: none;
+                color: {t['text']};
+                padding: 6px 12px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton#ghostBtn:hover {{
+                color: {t['text_muted']};
             }}
             """
         )
