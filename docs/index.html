@@ -1,0 +1,1284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VOX — Local-First Voice Typing &amp; Meeting Notetaker for Windows</title>
+  <meta name="description" content="Don't type, just speak. VOX turns natural speech into clear, polished writing in every Windows app and records meetings 100% locally on your PC." />
+  <link rel="icon" href="assets/favicon.ico" type="image/x-icon" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500;1,600&family=Figtree:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --cream: #FBF8EE;
+      --cream-deep: #F3EFE2;
+      --forest: #0C2D25;
+      --forest-deep: #06211A;
+      --pine: #0B3B32;
+      --black: #141414;
+      --obsidian: #080808;
+      --lilac: #E8D5FF;
+      --lilac-bright: #D4BFFF;
+      --amber: #F59E0B;
+      --sage: #E3E8DC;
+      --emerald: #30C382;
+      --ink: #111827;
+      --ink-muted: #52525B;
+      --serif: 'EB Garamond', Georgia, serif;
+      --sans: 'Figtree', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --radius-xl: 32px;
+      --radius-lg: 22px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; background: var(--cream); color: var(--ink); font-family: var(--sans); -webkit-font-smoothing: antialiased; }
+    body { background: var(--cream); overflow-x: clip; line-height: 1.5; }
+    a { color: inherit; text-decoration: none; }
+    button { font-family: inherit; cursor: pointer; }
+
+    /* Top Announcement Strip */
+    .announce-bar {
+      background: var(--cream-deep);
+      border-bottom: 1px solid rgba(17,24,39,0.08);
+      text-align: center;
+      padding: 10px 16px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--ink);
+    }
+    .announce-bar a { font-weight: 600; border-bottom: 1px solid rgba(17,24,39,0.35); margin-left: 6px; }
+    .announce-bar a:hover { color: var(--forest); border-color: var(--forest); }
+
+    /* Floating Capsule Navbar */
+    .nav-wrap {
+      position: sticky;
+      top: 14px;
+      z-index: 60;
+      display: flex;
+      justify-content: center;
+      padding: 0 18px;
+      margin-top: 14px;
+      pointer-events: none;
+    }
+    .navbar {
+      pointer-events: auto;
+      width: 100%;
+      max-width: 1080px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 8px 10px 8px 18px;
+      border-radius: 999px;
+      background: rgba(251, 248, 238, 0.88);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      border: 1px solid rgba(17,24,39,0.10);
+      box-shadow: 0 10px 30px rgba(17, 24, 39, 0.06);
+    }
+    .nav-brand {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-weight: 800;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+    .nav-brand img { width: 26px; height: 26px; border-radius: 7px; }
+
+    .nav-segment {
+      display: inline-flex;
+      background: rgba(17, 24, 39, 0.06);
+      padding: 3px;
+      border-radius: 999px;
+      gap: 2px;
+    }
+    .nav-seg-btn {
+      border: none;
+      background: transparent;
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink-muted);
+      transition: all 0.2s ease;
+    }
+    .nav-seg-btn.active {
+      background: #FFFFFF;
+      color: var(--ink);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 22px;
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--ink-muted);
+    }
+    .nav-links a:hover { color: var(--ink); }
+
+    .btn-lilac {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      background: var(--lilac);
+      color: var(--ink);
+      border: 1px solid rgba(17,24,39,0.10);
+      padding: 10px 18px;
+      border-radius: 999px;
+      font-weight: 600;
+      font-size: 14px;
+      transition: transform 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+    }
+    .btn-lilac:hover {
+      background: var(--lilac-bright);
+      transform: translateY(-1px);
+      box-shadow: 0 8px 20px rgba(17,24,39,0.12);
+    }
+    .btn-lilac.lg { padding: 14px 26px; font-size: 16px; }
+    .btn-ghost {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(17,24,39,0.05);
+      color: var(--ink);
+      border: 1px solid rgba(17,24,39,0.12);
+      padding: 14px 22px;
+      border-radius: 999px;
+      font-weight: 600;
+      font-size: 15px;
+      transition: all 0.18s ease;
+    }
+    .btn-ghost:hover { background: rgba(17,24,39,0.09); }
+
+    /* Container & Editorial Typography */
+    .container { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.11em;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--ink-muted);
+    }
+    .serif { font-family: var(--serif); font-weight: 400; letter-spacing: -0.025em; line-height: 1.04; }
+    .serif em { font-style: italic; }
+
+    /* Scroll Reveal */
+    .reveal { opacity: 0; transform: translateY(26px); transition: opacity 0.7s cubic-bezier(0.22,1,0.36,1), transform 0.7s cubic-bezier(0.22,1,0.36,1); }
+    .reveal.visible { opacity: 1; transform: translateY(0); }
+
+    /* Section 1: Hero */
+    .hero { padding: 72px 0 56px; text-align: center; position: relative; }
+    .hero h1 { font-size: clamp(54px, 7.6vw, 96px); margin: 18px auto 22px; max-width: 900px; }
+    .hero-sub { font-size: clamp(17px, 2vw, 20px); color: var(--ink-muted); max-width: 660px; margin: 0 auto 30px; }
+    .hero-ctas { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; margin-bottom: 14px; }
+    .hero-meta { font-size: 13px; color: var(--ink-muted); margin-bottom: 42px; }
+
+    /* Interactive Hero Ribbon + VOX Toggle Bar Replica */
+    .hero-stage {
+      position: relative;
+      max-width: 960px;
+      margin: 0 auto;
+      background: radial-gradient(circle at 50% 45%, rgba(232,213,255,0.45), rgba(227,232,220,0.32) 55%, rgba(251,248,238,0.4));
+      border: 1px solid rgba(17,24,39,0.09);
+      border-radius: var(--radius-xl);
+      padding: 40px 28px 34px;
+      overflow: hidden;
+      box-shadow: 0 24px 60px rgba(17,24,39,0.06);
+    }
+    .ribbon-flow {
+      display: flex;
+      gap: 14px;
+      white-space: nowrap;
+      font-family: var(--serif);
+      font-style: italic;
+      font-size: 24px;
+      color: rgba(17,24,39,0.28);
+      margin-bottom: 26px;
+      animation: ribbonScroll 22s linear infinite;
+      user-select: none;
+    }
+    @keyframes ribbonScroll {
+      0% { transform: translateX(0); }
+      100% { transform: translateX(-50%); }
+    }
+
+    .app-canvas-mock {
+      background: #FFFFFF;
+      border: 1px solid rgba(17,24,39,0.09);
+      border-radius: 20px;
+      max-width: 680px;
+      margin: 0 auto 28px;
+      padding: 20px 24px;
+      text-align: left;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.04);
+      min-height: 138px;
+      position: relative;
+    }
+    .app-mock-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 12px; color: var(--ink-muted); font-weight: 600; }
+    .app-mock-dots { display: flex; gap: 6px; }
+    .app-mock-dots span { width: 9px; height: 9px; border-radius: 50%; background: rgba(17,24,39,0.14); }
+    .app-mock-text { font-size: 16px; line-height: 1.55; color: var(--ink); min-height: 54px; }
+    .cursor-caret { display: inline-block; width: 2px; height: 18px; background: var(--forest); vertical-align: middle; animation: blink 1s infinite; margin-left: 2px; }
+    @keyframes blink { 0%,49%{opacity:1} 50%,100%{opacity:0} }
+
+    /* Interactive VOX Toggle Bar Widget Simulator */
+    .vox-pill-playground {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 14px;
+    }
+    .vox-tooltip-sim {
+      background: var(--obsidian);
+      color: #FFFFFF;
+      height: 32px;
+      padding: 0 14px;
+      border-radius: 16px;
+      font-size: 13px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.22);
+      transition: all 0.18s ease;
+    }
+    .vox-bar-row {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 44px;
+    }
+    .vox-pill-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .vox-cap-resting {
+      width: 44px; height: 9px; border-radius: 99px;
+      background: rgba(12,12,14,0.84);
+      border: 1px solid rgba(255,255,255,0.18);
+      transition: all 0.25s ease;
+    }
+    .vox-cap-btn {
+      height: 32px;
+      background: var(--obsidian);
+      border: 1px solid rgba(255,255,255,0.16);
+      border-radius: 16px;
+      color: #FFFFFF;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 0 13px;
+      transition: all 0.2s cubic-bezier(0.22,1,0.36,1);
+    }
+    .vox-cap-btn:hover { background: #1A1A1D; border-color: rgba(255,255,255,0.34); transform: translateY(-1px); }
+    .vox-cap-dictate { width: 52px; }
+    .vox-cap-note { width: 32px; padding: 0; }
+    .vox-cap-note.expanded { width: 56px; padding: 0 10px; }
+    .vox-cap-active-dict {
+      width: 112px; height: 32px; border-radius: 16px; background: var(--obsidian);
+      border: 1px solid rgba(255,255,255,0.18);
+      display: inline-flex; align-items: center; justify-content: space-between; padding: 0 5px;
+    }
+    .vox-cap-emerald {
+      width: 78px; height: 32px; border-radius: 16px; background: var(--obsidian);
+      border: 1.5px solid var(--emerald);
+      box-shadow: 0 0 18px rgba(48, 195, 130, 0.35);
+      display: inline-flex; align-items: center; justify-content: space-between; padding: 0 6px 0 10px;
+      transition: all 0.2s ease;
+    }
+    .vox-cap-emerald:hover { border-color: rgba(255,255,255,0.28); box-shadow: none; background: #18181A; }
+    .vox-circle-sm {
+      width: 22px; height: 22px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: 700; border: none;
+    }
+    .vox-chevron-sat {
+      width: 28px; height: 28px; border-radius: 50%; background: var(--obsidian);
+      border: 1px solid rgba(255,255,255,0.2); color: #fff;
+      display: inline-flex; align-items: center; justify-content: center; font-size: 12px;
+    }
+    .sim-eq { display: inline-flex; align-items: center; gap: 2.5px; height: 18px; }
+    .sim-eq i {
+      display: block; width: 2.2px; background: #FFFFFF; border-radius: 2px;
+      animation: eqPulse 0.9s ease-in-out infinite;
+    }
+    .sim-eq i:nth-child(1){ height: 4px; animation-delay: 0.0s; }
+    .sim-eq i:nth-child(2){ height: 9px; animation-delay: 0.15s; }
+    .sim-eq i:nth-child(3){ height: 15px; animation-delay: 0.3s; }
+    .sim-eq i:nth-child(4){ height: 11px; animation-delay: 0.45s; }
+    .sim-eq i:nth-child(5){ height: 16px; animation-delay: 0.2s; }
+    .sim-eq i:nth-child(6){ height: 8px; animation-delay: 0.35s; }
+    @keyframes eqPulse { 0%,100%{ transform: scaleY(0.55); } 50%{ transform: scaleY(1.15); } }
+
+    .sim-controls { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 6px; }
+    .sim-chip {
+      border: 1px solid rgba(17,24,39,0.14);
+      background: rgba(255,255,255,0.75);
+      color: var(--ink-muted);
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      transition: all 0.15s ease;
+    }
+    .sim-chip.active { background: var(--obsidian); color: #FFFFFF; border-color: var(--obsidian); }
+
+    .apps-strip { margin-top: 44px; text-align: center; }
+    .apps-strip-label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--ink-muted); font-weight: 600; margin-bottom: 14px; }
+    .apps-pills { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+    .app-tag {
+      background: rgba(17,24,39,0.045);
+      border: 1px solid rgba(17,24,39,0.08);
+      padding: 7px 14px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink);
+    }
+
+    /* Section 2: 4x Faster Deep Forest Green */
+    .section-band { padding: 34px 0; }
+    .forest-card {
+      background: var(--forest);
+      color: #FFFFFF;
+      border-radius: var(--radius-xl);
+      padding: 68px 46px;
+    }
+    .forest-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 20px; margin-bottom: 42px; }
+    .forest-head h2 { font-size: clamp(40px, 5.2vw, 66px); color: #FFFFFF; }
+    .forest-head p { color: rgba(255,255,255,0.75); max-width: 420px; font-size: 16px; }
+    .speed-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 22px; }
+    .speed-pane {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: var(--radius-lg);
+      padding: 26px;
+      min-height: 220px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .speed-pane.vox-win { background: #FFFFFF; color: var(--ink); border-color: transparent; }
+    .speed-pane-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+    .speed-badge { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; padding: 5px 11px; border-radius: 999px; }
+    .speed-badge.kb { background: rgba(255,255,255,0.12); color: rgba(255,255,255,0.85); }
+    .speed-badge.vox { background: var(--lilac); color: var(--ink); }
+    .speed-wpm { font-size: 28px; font-weight: 800; letter-spacing: -0.02em; }
+    .speed-output { font-size: 16px; line-height: 1.55; min-height: 92px; }
+    .btn-replay {
+      margin-top: 24px;
+      background: rgba(255,255,255,0.12);
+      color: #FFFFFF;
+      border: 1px solid rgba(255,255,255,0.22);
+      padding: 10px 18px;
+      border-radius: 999px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .btn-replay:hover { background: rgba(255,255,255,0.2); }
+
+    /* Section 3: Sticky Scroll-Driven 3-Stage Showcase */
+    .sticky-section { padding: 92px 0; }
+    .section-title-center { text-align: center; max-width: 780px; margin: 0 auto 60px; }
+    .section-title-center h2 { font-size: clamp(38px, 5vw, 62px); margin-top: 12px; }
+    .sticky-grid { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 48px; align-items: start; }
+    .sticky-visual-col { position: sticky; top: 102px; }
+    .sticky-stage {
+      background: var(--obsidian);
+      color: #FFFFFF;
+      border-radius: var(--radius-xl);
+      padding: 32px;
+      min-height: 410px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      border: 1px solid rgba(255,255,255,0.10);
+      box-shadow: 0 28px 65px rgba(17,24,39,0.16);
+      position: relative;
+      overflow: hidden;
+    }
+    .stage-panel { display: none; animation: fadeUp 0.35s ease; }
+    .stage-panel.active { display: block; }
+    @keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+    .strike-word { text-decoration: line-through; color: #F87171; opacity: 0.72; margin: 0 3px; }
+    .glow-pill {
+      display: inline-flex; align-items: center; gap: 7px; padding: 6px 14px; border-radius: 999px;
+      background: rgba(232,213,255,0.14); border: 1px solid rgba(232,213,255,0.45);
+      color: #E8D5FF; font-size: 12px; font-weight: 600; margin-top: 14px;
+    }
+    .steps-col { display: flex; flex-direction: column; gap: 26px; }
+    .step-card {
+      padding: 32px;
+      border-radius: var(--radius-lg);
+      background: rgba(255,255,255,0.55);
+      border: 1px solid rgba(17,24,39,0.08);
+      transition: all 0.28s ease;
+      cursor: pointer;
+    }
+    .step-card.active {
+      background: #FFFFFF;
+      border-color: var(--forest);
+      box-shadow: 0 18px 42px rgba(17,24,39,0.08);
+    }
+    .step-num { font-size: 12px; font-weight: 800; letter-spacing: 0.1em; color: var(--pine); text-transform: uppercase; }
+    .step-card h3 { font-family: var(--serif); font-size: 32px; font-weight: 400; margin: 8px 0 10px; }
+    .step-card p { color: var(--ink-muted); font-size: 15.5px; }
+
+    /* Section 4: Adaptive Workflows Bento */
+    .workflows-section { padding: 48px 0 88px; }
+    .brush-wrap { position: relative; display: inline-block; }
+    .brush-line { position: absolute; left: 0; right: 0; bottom: -4px; height: 10px; }
+    .bento-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 22px; }
+    .bento-card {
+      background: #FFFFFF;
+      border: 1px solid rgba(17,24,39,0.09);
+      border-radius: var(--radius-xl);
+      padding: 32px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 20px;
+    }
+    .bento-card h3 { font-family: var(--serif); font-size: 31px; font-weight: 400; margin-bottom: 8px; }
+    .bento-card p { color: var(--ink-muted); font-size: 15px; }
+    .bento-demo {
+      background: var(--cream);
+      border: 1px solid rgba(17,24,39,0.07);
+      border-radius: 16px;
+      padding: 18px;
+      font-size: 14px;
+    }
+    .style-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+    .style-tab {
+      border: 1px solid rgba(17,24,39,0.12);
+      background: #FFFFFF;
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-size: 12.5px;
+      font-weight: 600;
+    }
+    .style-tab.active { background: var(--forest); color: #FFFFFF; border-color: var(--forest); }
+
+    /* Section 5: Privacy Banner (Sage) */
+    .sage-card {
+      background: var(--sage);
+      border-radius: var(--radius-xl);
+      padding: 56px 46px;
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 32px;
+      align-items: center;
+    }
+    .sage-card h2 { font-size: clamp(38px, 4.6vw, 56px); margin-bottom: 14px; }
+    .sage-card p { font-size: 16.5px; color: #27322B; max-width: 540px; }
+    .seals-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+    .seal-badge {
+      background: rgba(255,255,255,0.68);
+      border: 1px solid rgba(17,24,39,0.10);
+      border-radius: 18px;
+      padding: 18px;
+      text-align: center;
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+    }
+    .seal-badge span { display: block; font-size: 11px; font-weight: 500; color: var(--ink-muted); margin-top: 4px; }
+
+    /* Section 6: Stark Black Real Outcomes */
+    .black-card {
+      background: var(--black);
+      color: #FFFFFF;
+      border-radius: var(--radius-xl);
+      padding: 68px 46px;
+    }
+    .black-card .eyebrow { color: rgba(255,255,255,0.62); }
+    .black-card h2 { font-size: clamp(38px, 5vw, 60px); color: #FFFFFF; margin: 10px 0 38px; }
+    .outcome-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    .outcome-item { border-radius: 22px; padding: 28px; display: flex; flex-direction: column; justify-content: space-between; min-height: 230px; }
+    .outcome-item.lilac { background: var(--lilac); color: var(--ink); }
+    .outcome-item.amber { background: var(--amber); color: var(--ink); }
+    .outcome-item.pine { background: var(--pine); color: #FFFFFF; }
+    .outcome-stat { font-size: 42px; font-weight: 800; letter-spacing: -0.03em; line-height: 1; margin-bottom: 10px; }
+    .outcome-item p { font-size: 14.5px; opacity: 0.9; }
+
+    /* Section 7: Interactive Split FAQ */
+    .faq-section { padding: 84px 0; }
+    .faq-grid { display: grid; grid-template-columns: 0.95fr 1.05fr; gap: 22px; margin-top: 34px; }
+    .faq-menu {
+      background: var(--forest);
+      border-radius: var(--radius-xl);
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .faq-q-btn {
+      text-align: left;
+      background: transparent;
+      border: 1px solid transparent;
+      color: rgba(255,255,255,0.78);
+      padding: 15px 18px;
+      border-radius: 14px;
+      font-size: 15px;
+      font-weight: 600;
+      transition: all 0.18s ease;
+    }
+    .faq-q-btn:hover { background: rgba(255,255,255,0.08); color: #FFFFFF; }
+    .faq-q-btn.active { background: rgba(255,255,255,0.14); border-color: rgba(255,255,255,0.22); color: #FFFFFF; }
+
+    .faq-answer-card {
+      background: var(--sage);
+      border-radius: var(--radius-xl);
+      padding: 32px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 20px;
+    }
+    .chat-user {
+      align-self: flex-end;
+      background: #FFFFFF;
+      color: var(--ink);
+      padding: 13px 18px;
+      border-radius: 18px 18px 4px 18px;
+      font-weight: 600;
+      font-size: 14.5px;
+      max-width: 85%;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.05);
+    }
+    .chat-vox-row { display: flex; gap: 12px; align-items: flex-start; }
+    .chat-avatar { width: 38px; height: 38px; border-radius: 12px; background: var(--obsidian); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .chat-avatar img { width: 22px; height: 22px; }
+    .chat-vox-bubble {
+      background: #FFFFFF;
+      padding: 20px 22px;
+      border-radius: 18px 18px 18px 4px;
+      font-size: 15.5px;
+      line-height: 1.6;
+      color: var(--ink);
+      box-shadow: 0 8px 22px rgba(0,0,0,0.05);
+    }
+
+    /* Section 8: Dual-Product Download Section */
+    .download-section { padding: 28px 0 84px; }
+    .dual-cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 22px; margin-bottom: 24px; }
+    .prod-card { border-radius: var(--radius-xl); padding: 38px; display: flex; flex-direction: column; justify-content: space-between; gap: 22px; }
+    .prod-card.lilac { background: var(--lilac); color: var(--ink); }
+    .prod-card.pine { background: var(--pine); color: #FFFFFF; }
+    .prod-card h3 { font-family: var(--serif); font-size: 36px; font-weight: 400; }
+
+    .install-hub {
+      background: #FFFFFF;
+      border: 1px solid rgba(17,24,39,0.10);
+      border-radius: var(--radius-xl);
+      padding: 36px;
+    }
+    .install-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 18px 0 22px; }
+    .cmd-box {
+      background: var(--obsidian);
+      color: #E4E4E7;
+      padding: 15px 18px;
+      border-radius: 14px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 13px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      overflow-x: auto;
+    }
+    .copy-btn {
+      background: #27272A;
+      color: #FFFFFF;
+      border: 1px solid rgba(255,255,255,0.16);
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+    .copy-btn:hover { background: #3F3F46; }
+
+    /* Footer & Monumental Wordmark */
+    footer {
+      border-top: 1px solid rgba(17,24,39,0.09);
+      padding: 58px 0 28px;
+      background: var(--cream-deep);
+    }
+    .footer-cols { display: grid; grid-template-columns: 1.3fr repeat(3, 1fr); gap: 32px; margin-bottom: 44px; }
+    .footer-cols h4 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 14px; color: var(--ink-muted); }
+    .footer-cols ul { list-style: none; display: flex; flex-direction: column; gap: 9px; font-size: 14.5px; font-weight: 500; }
+    .footer-cols a:hover { text-decoration: underline; }
+    .monumental-mark {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      padding: 18px 0 26px;
+      font-family: var(--serif);
+      font-style: italic;
+      font-size: clamp(78px, 16vw, 190px);
+      line-height: 0.9;
+      color: var(--forest);
+      user-select: none;
+    }
+    .monumental-bars { display: inline-flex; align-items: center; gap: 8px; height: 76px; }
+    .monumental-bars span { display: block; width: 10px; border-radius: 99px; background: var(--forest); }
+    .footer-legal { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; font-size: 13px; color: var(--ink-muted); border-top: 1px solid rgba(17,24,39,0.08); padding-top: 20px; }
+
+    @media (max-width: 900px) {
+      .nav-links, .nav-segment { display: none; }
+      .speed-grid, .sticky-grid, .bento-grid, .sage-card, .outcome-grid, .faq-grid, .dual-cards, .footer-cols {
+        grid-template-columns: 1fr;
+      }
+      .sticky-visual-col { position: static; }
+      .forest-card, .black-card, .sage-card { padding: 36px 24px; }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="announce-bar">
+    VOX Desktop with Wispr-grade Floating Toggle Bar &amp; Unified Calendar Sync for Windows is here
+    <a href="#download">Download for free →</a>
+  </div>
+
+  <div class="nav-wrap">
+    <nav class="navbar" aria-label="Primary navigation">
+      <a class="nav-brand" href="#">
+        <img src="assets/vox_logo.svg" alt="VOX logo" />
+        <span>VOX</span>
+      </a>
+
+      <div class="nav-segment" role="tablist" aria-label="Product surface">
+        <button class="nav-seg-btn active" id="segDictation" onclick="setProductFocus('dictation')">Dictation</button>
+        <button class="nav-seg-btn" id="segNotetaker" onclick="setProductFocus('notetaker')">Notetaker</button>
+      </div>
+
+      <div class="nav-links">
+        <a href="#speed">Speed</a>
+        <a href="#capabilities">Capabilities</a>
+        <a href="#workflows">Workflows</a>
+        <a href="#privacy">Privacy</a>
+        <a href="#faq">FAQ</a>
+      </div>
+
+      <a class="btn-lilac" href="https://github.com/milinddwivedi/Vox/releases/latest/download/VoxLocal-Setup.exe" title="Download VOX for Windows">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path d="M0 2.2L6.6 1.3v6.2H0V2.2zm7.5-1L16 0v7.5H7.5V1.2zM0 8.5h6.6v6.2L0 13.8V8.5zm7.5 0H16V16l-8.5-1.2V8.5z"/>
+        </svg>
+        Download Windows
+      </a>
+    </nav>
+  </div>
+
+  <header class="hero">
+    <div class="container">
+      <div class="eyebrow">VOX VOICE OS • WINDOWS 10 &amp; 11 • 100% LOCAL AI</div>
+      <h1 class="serif">Don't type, <em>just speak.</em></h1>
+      <p class="hero-sub">
+        The local-first voice assistant that turns everyday speech into crisp writing in every Windows app, and captures Zoom, Teams &amp; Meet calls with live notes — completely on your PC.
+      </p>
+
+      <div class="hero-ctas">
+        <a class="btn-lilac lg" href="https://github.com/milinddwivedi/Vox/releases/latest/download/VoxLocal-Setup.exe">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <path d="M0 2.2L6.6 1.3v6.2H0V2.2zm7.5-1L16 0v7.5H7.5V1.2zM0 8.5h6.6v6.2L0 13.8V8.5zm7.5 0H16V16l-8.5-1.2V8.5z"/>
+          </svg>
+          Download VOX Installer (.exe)
+        </a>
+        <a class="btn-ghost" href="#download">Setup &amp; Portable ZIP ↓</a>
+      </div>
+      <div class="hero-meta">Free &amp; local-first · Powered by faster-whisper + Llama 3.2 · Works offline after setup</div>
+
+      <!-- Hero Animated Stage + Live Interactive VOX Floating Toggle Bar -->
+      <div class="hero-stage reveal visible">
+        <div class="ribbon-flow" aria-hidden="true">
+          <span>Hey team, pushed the Q4 release notes to main —</span>
+          <span>Actually make that Thursday 3 PM IST on Zoom —</span>
+          <span>Aaj ki call mein summary aur action items ready hain —</span>
+          <span>Hey team, pushed the Q4 release notes to main —</span>
+          <span>Actually make that Thursday 3 PM IST on Zoom —</span>
+        </div>
+
+        <div class="app-canvas-mock">
+          <div class="app-mock-head">
+            <div class="app-mock-dots"><span></span><span></span><span></span></div>
+            <span id="heroMockAppLabel">Active App: Microsoft Outlook · Clean Mode</span>
+          </div>
+          <div class="app-mock-text" id="heroMockText">
+            Hi Sarah — I reviewed the onboarding deck and updated the timeline for Thursday afternoon. Let's lock the final Windows build after today's sync.<span class="cursor-caret"></span>
+          </div>
+        </div>
+
+        <div class="vox-pill-playground">
+          <div class="vox-tooltip-sim" id="simTooltip">Dictate <strong>Ctrl+Win</strong></div>
+          <div class="vox-bar-row" id="simBar">
+            <!-- Rendered by JS to showcase real VOX Floating Toggle Bar states -->
+          </div>
+          <div class="sim-controls" aria-label="Interactive toggle bar preview states">
+            <button class="sim-chip active" onclick="setSimMode('ready', this)">Ready Dual Capsule</button>
+            <button class="sim-chip" onclick="setSimMode('dictating', this)">Live Dictation Waveform</button>
+            <button class="sim-chip" onclick="setSimMode('recording', this)">Active Notetaker Capsule</button>
+            <button class="sim-chip" onclick="setSimMode('resting', this)">Resting Edge Pill</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="apps-strip reveal">
+        <div class="apps-strip-label">Types directly at your cursor in every Windows application</div>
+        <div class="apps-pills">
+          <span class="app-tag">Microsoft Outlook</span>
+          <span class="app-tag">Microsoft Teams</span>
+          <span class="app-tag">Zoom</span>
+          <span class="app-tag">Google Meet</span>
+          <span class="app-tag">Slack</span>
+          <span class="app-tag">VS Code</span>
+          <span class="app-tag">Gmail &amp; Docs</span>
+          <span class="app-tag">WhatsApp Desktop</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Section 2: 4x Faster Comparison -->
+  <section class="section-band" id="speed">
+    <div class="container">
+      <div class="forest-card reveal">
+        <div class="forest-head">
+          <div>
+            <div class="eyebrow" style="color: rgba(255,255,255,0.65); margin-bottom: 10px;">SPEED BENCHMARK</div>
+            <h2 class="serif">4x faster <em>than typing</em></h2>
+          </div>
+          <p>Speak at conversational pace and let local Whisper + VOX endpointing stream formatted paragraphs while a keyboard is still on sentence one.</p>
+        </div>
+
+        <div class="speed-grid">
+          <div class="speed-pane">
+            <div>
+              <div class="speed-pane-top">
+                <span class="speed-badge kb">Traditional Keyboard</span>
+                <span class="speed-wpm" style="color: rgba(255,255,255,0.75);">45 WPM</span>
+              </div>
+              <div class="speed-output" id="kbTyped" style="color: rgba(255,255,255,0.88);"></div>
+            </div>
+            <div style="font-size: 13px; color: rgba(255,255,255,0.55); margin-top: 16px;">Manual spelling, backspaces, and switching focus slows down flow.</div>
+          </div>
+
+          <div class="speed-pane vox-win">
+            <div>
+              <div class="speed-pane-top">
+                <span class="speed-badge vox">VOX Local AI</span>
+                <span class="speed-wpm">220 WPM</span>
+              </div>
+              <div class="speed-output" id="voxTyped"></div>
+            </div>
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-top: 16px; font-size: 13px; color: var(--ink-muted);">
+              <span>Auto-punctuated · Zero filler words</span>
+              <span class="vox-cap-btn" style="height:26px; padding:0 10px; font-size:11px;">
+                <span class="sim-eq" style="height:12px;"><i></i><i></i><i></i><i></i></span> Speaking
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <button class="btn-replay" onclick="runSpeedDemo()">↻ Replay live comparison</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section 3: Sticky Scroll-Driven Capabilities -->
+  <section class="sticky-section" id="capabilities">
+    <div class="container">
+      <div class="section-title-center reveal">
+        <div class="eyebrow">CORE CAPABILITIES</div>
+        <h2 class="serif">Speak at the speed you think, <em>in every app, locally.</em></h2>
+      </div>
+
+      <div class="sticky-grid">
+        <div class="sticky-visual-col reveal">
+          <div class="sticky-stage">
+            <div class="stage-panel active" id="stagePanel0">
+              <div class="eyebrow" style="color: var(--lilac);">STAGE 01 · UNIVERSAL OVERLAY</div>
+              <h3 class="serif" style="font-size: 34px; margin: 12px 0 18px; color:#fff;">Hands-free typing anywhere</h3>
+              <div style="background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 16px; padding: 20px; font-size: 15.5px; line-height: 1.65;">
+                "Hey Ananya, please merge the calendar PR before 5 PM and send me the test log."
+              </div>
+              <div class="glow-pill">Win32 Unicode SendInput · 0.65s pause detection</div>
+            </div>
+
+            <div class="stage-panel" id="stagePanel1">
+              <div class="eyebrow" style="color: var(--lilac);">STAGE 02 · INTELLIGENT CLEANUP</div>
+              <h3 class="serif" style="font-size: 34px; margin: 12px 0 18px; color:#fff;">Edits as you speak</h3>
+              <div style="background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 16px; padding: 20px; font-size: 15px; line-height: 1.7;">
+                <span class="strike-word">Um, so like</span> let's push the client demo to <span class="strike-word">Tuesday, actually make that</span> <strong>Wednesday at 11 AM</strong>.
+              </div>
+              <div class="glow-pill">✦ Cleaning up filler words &amp; self-corrections</div>
+            </div>
+
+            <div class="stage-panel" id="stagePanel2">
+              <div class="eyebrow" style="color: var(--emerald);">STAGE 03 · MEETING NOTETAKER</div>
+              <h3 class="serif" style="font-size: 34px; margin: 12px 0 18px; color:#fff;">Both voices + 1080p capture</h3>
+              <div style="background: rgba(255,255,255,0.06); border: 1px solid rgba(48,195,130,0.45); border-radius: 16px; padding: 18px; font-size: 14px; line-height: 1.6;">
+                <div style="color: var(--emerald); font-weight:700; margin-bottom:6px;">● Live Dual-Track · Zoom Meeting</div>
+                <div><strong>You (Mic):</strong> Let's ship the installer workflow tonight.</div>
+                <div style="color: #D4D4D8;"><strong>Remote (WASAPI):</strong> Agreed — auto-build on release tag makes updates seamless.</div>
+              </div>
+              <div class="glow-pill" style="border-color: rgba(48,195,130,0.5); color: #A7F3D0;">Local Llama-3.2 Summary + Ask VOX Q&amp;A</div>
+            </div>
+
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:26px; font-size:12.5px; color:rgba(255,255,255,0.55);">
+              <span>Scroll steps on the right to switch live view</span>
+              <span id="stageIndicator">01 / 03</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="steps-col">
+          <div class="step-card active" data-stage="0" onclick="activateStage(0)">
+            <div class="step-num">01 · Dictate Everywhere</div>
+            <h3>Speak naturally</h3>
+            <p>Hold your shortcut (`Ctrl+Win`) or use hands-free toggle mode. VOX docks discreetly on your screen edge and types crisp text wherever your cursor sits — Slack, Outlook, VS Code, or browsers.</p>
+          </div>
+          <div class="step-card" data-stage="1" onclick="activateStage(1)">
+            <div class="step-num">02 · Smart Editing</div>
+            <h3>Edits as you speak</h3>
+            <p>Say "uh", pause to gather a thought, or change your mind mid-sentence. VOX strips filler words, resolves verbal self-corrections, and applies punctuation cleanly before pasting.</p>
+          </div>
+          <div class="step-card" data-stage="2" onclick="activateStage(2)">
+            <div class="step-num">03 · Dual-Track Calls</div>
+            <h3>One Toggle Bar, full Notetaker</h3>
+            <p>Click the compact Notetaker button or calendar join card to record both your mic and Windows WASAPI system audio alongside optional 1080p MP4 screen capture and local AI summaries.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section 4: Adaptive Workflows Bento -->
+  <section class="workflows-section" id="workflows">
+    <div class="container">
+      <div class="section-title-center reveal">
+        <div class="eyebrow">ADAPTIVE WORKFLOWS</div>
+        <h2 class="serif">
+          Built around
+          <span class="brush-wrap"><em>how you work,</em>
+            <svg class="brush-line" viewBox="0 0 220 12" fill="none" preserveAspectRatio="none">
+              <path d="M2 8C55 2 140 11 218 4" stroke="#C084FC" stroke-width="5" stroke-linecap="round"/>
+            </svg>
+          </span>
+          not rigid templates.
+        </h2>
+      </div>
+
+      <div class="bento-grid">
+        <div class="bento-card reveal">
+          <div>
+            <h3>English, Hindi &amp; Hinglish</h3>
+            <p>Code-switch effortlessly between English (`en`), Devanagari Hindi (`hi`), and Romanized Hinglish (`hi_latn`) powered locally by `large-v3-turbo`.</p>
+          </div>
+          <div class="bento-demo">
+            <div style="font-weight:700; margin-bottom:6px;">Detected mode: Auto (en+hi)</div>
+            <div>"Kal morning 10 AM client demo rakhna hai, please share the Google Meet link."</div>
+          </div>
+        </div>
+
+        <div class="bento-card reveal">
+          <div>
+            <h3>Make VOX sound like you</h3>
+            <p>Switch writing styles from the right-click menu or contextual meeting panel and match your tone automatically.</p>
+          </div>
+          <div class="bento-demo">
+            <div class="style-tabs">
+              <button class="style-tab active" onclick="setStylePreview('clean', this)">Clean</button>
+              <button class="style-tab" onclick="setStylePreview('email', this)">Email</button>
+              <button class="style-tab" onclick="setStylePreview('structured', this)">Structured</button>
+              <button class="style-tab" onclick="setStylePreview('casual', this)">Polished</button>
+            </div>
+            <div id="stylePreviewText" style="color: var(--ink); line-height:1.5;">
+              We finalized the Windows installer and pushed the latest floating bar update to GitHub today.
+            </div>
+          </div>
+        </div>
+
+        <div class="bento-card reveal">
+          <div>
+            <h3>Learns your vocabulary</h3>
+            <p>Add colleague names, product terms, and company acronyms once in your local dictionary so transcription spells them right every single time.</p>
+          </div>
+          <div class="bento-demo">
+            <span class="app-tag">VoxLocal</span>
+            <span class="app-tag">WASAPI</span>
+            <span class="app-tag">CTranslate2</span>
+            <span class="app-tag">PyInstaller</span>
+          </div>
+        </div>
+
+        <div class="bento-card reveal">
+          <div>
+            <h3>Unified Calendar &amp; Ask VOX</h3>
+            <p>Connect Google Calendar, Microsoft Outlook (Personal or Work), or Zoom links in one flow. Preview upcoming calls right from the floating toggle bar.</p>
+          </div>
+          <div class="bento-demo" style="display:flex; justify-content:space-between; align-items:center;">
+            <div>
+              <strong>Product Weekly Sync</strong>
+              <div style="font-size:12.5px; color:var(--ink-muted);">Starts in 4 min · Zoom / Google Meet</div>
+            </div>
+            <span style="background:var(--obsidian); color:#fff; padding:6px 12px; border-radius:9px; font-weight:600; font-size:12.5px;">Start notes</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section 5: Privacy Banner -->
+  <section class="section-band" id="privacy">
+    <div class="container">
+      <div class="sage-card reveal">
+        <div>
+          <div class="eyebrow" style="margin-bottom: 10px;">PRIVACY ARCHITECTURE</div>
+          <h2 class="serif">Your voice <em>stays yours.</em></h2>
+          <p>Audio never leaves your Windows machine. Voice dictation (`faster-whisper`), speaker separation, SQLite storage, and local Q&amp;A (`Llama-3.2-1B-Instruct`) all run on your CPU or NVIDIA GPU. Enable Strict Offline Mode in one click.</p>
+        </div>
+        <div class="seals-grid">
+          <div class="seal-badge">100% LOCAL AI<span>Zero audio leaves PC</span></div>
+          <div class="seal-badge">STRICT OFFLINE<span>Optional air-gap toggle</span></div>
+          <div class="seal-badge">CUDA + CPU<span>Auto hardware acceleration</span></div>
+          <div class="seal-badge">LOCAL SQLITE<span>Instant searchable history</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section 6: Real Workflows Card (Stark Black) -->
+  <section class="section-band">
+    <div class="container">
+      <div class="black-card reveal">
+        <div class="eyebrow">ENGINEERED FOR WINDOWS POWER USERS</div>
+        <h2 class="serif">From rapid messages <em>to full meeting recaps.</em></h2>
+        <div class="outcome-grid">
+          <div class="outcome-item lilac">
+            <div>
+              <div class="outcome-stat">0.65s</div>
+              <strong>Hands-Free Endpointing</strong>
+            </div>
+            <p>Pause naturally after any sentence and watch VOX clean, punctuate, and insert your words straight into your active app.</p>
+          </div>
+          <div class="outcome-item amber">
+            <div>
+              <div class="outcome-stat">Dual Track</div>
+              <strong>Mic + System Loopback</strong>
+            </div>
+            <p>Separates "You (Mic)" and "Remote Speakers" natively over Windows WASAPI without joining calls as an awkward bot.</p>
+          </div>
+          <div class="outcome-item pine">
+            <div>
+              <div class="outcome-stat">10 MB/hr</div>
+              <strong>1080p Call Video Sync</strong>
+            </div>
+            <p>Captures crisp shared slides and screens in compact H.264 MP4 alongside searchable speaker-labeled transcripts.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section 7: Interactive Split FAQ -->
+  <section class="faq-section" id="faq">
+    <div class="container">
+      <div class="eyebrow reveal">FAQS</div>
+      <h2 class="serif reveal" style="font-size: clamp(38px, 5vw, 58px); margin-top: 8px;">Good <em>questions.</em></h2>
+
+      <div class="faq-grid reveal">
+        <div class="faq-menu" id="faqMenu"></div>
+        <div class="faq-answer-card">
+          <div class="chat-user" id="faqQuestionBubble"></div>
+          <div class="chat-vox-row">
+            <div class="chat-avatar"><img src="assets/vox_logo.svg" alt="VOX avatar" /></div>
+            <div class="chat-vox-bubble" id="faqAnswerBubble"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section 8: Dual Product Download & Installer Hub -->
+  <section class="download-section" id="download">
+    <div class="container">
+      <div class="section-title-center reveal" style="margin-bottom: 38px;">
+        <h2 class="serif">You have a way with words. <em>Now, two.</em></h2>
+        <p style="color: var(--ink-muted); font-size: 17px; margin-top: 12px;">
+          Talk thoughts into crisp writing with VOX Dictation and capture every meeting locally with VOX Notetaker — both in one Windows app, free.
+        </p>
+      </div>
+
+      <div class="dual-cards reveal">
+        <div class="prod-card lilac">
+          <div>
+            <div class="eyebrow">DESKTOP DICTATION</div>
+            <h3>VOX Dictation</h3>
+            <p style="margin-top: 10px;">Floating Wispr-grade dual capsule toggle bar, filler-word scrubbing, Hinglish/Hindi/English code-switching, and instant undo toast.</p>
+          </div>
+          <a class="btn-ghost" style="background:#fff; width:fit-content;" href="https://github.com/milinddwivedi/Vox/releases/latest/download/VoxLocal-Setup.exe">Download Installer (.exe) →</a>
+        </div>
+
+        <div class="prod-card pine">
+          <div>
+            <div class="eyebrow" style="color: rgba(255,255,255,0.68);">MEETING INTELLIGENCE</div>
+            <h3>VOX Notetaker</h3>
+            <p style="margin-top: 10px; color: rgba(255,255,255,0.82);">No bots in calls. Records Mic + WASAPI Loopback, syncs Google/Microsoft/Zoom calendars, records screen share, and generates local AI summaries.</p>
+          </div>
+          <a class="btn-lilac" style="width:fit-content;" href="https://github.com/milinddwivedi/Vox/releases/latest/download/VoxLocal-Portable-win64.zip">Download Portable (.zip) →</a>
+        </div>
+      </div>
+
+      <div class="install-hub reveal">
+        <h3 class="serif" style="font-size: 30px; margin-bottom: 6px;">Install &amp; run locally on Windows 10 / 11</h3>
+        <p style="color: var(--ink-muted); font-size: 15px;">
+          Choose the one-click Windows installer from GitHub Releases or run the automated source setup script directly on your PC. Models cache locally into <code>data\models\</code> on first run.
+        </p>
+
+        <div class="install-actions">
+          <a class="btn-lilac" href="https://github.com/milinddwivedi/Vox/releases/latest/download/VoxLocal-Setup.exe">Download VoxLocal-Setup.exe</a>
+          <a class="btn-ghost" style="padding:10px 18px; font-size:14px;" href="https://github.com/milinddwivedi/Vox/releases/latest/download/VoxLocal-Portable-win64.zip">Portable Win64 ZIP</a>
+          <a class="btn-ghost" style="padding:10px 18px; font-size:14px;" href="https://github.com/milinddwivedi/Vox/releases" target="_blank" rel="noopener">All GitHub Releases ↗</a>
+        </div>
+
+        <div style="font-size: 13px; font-weight: 600; color: var(--ink-muted); margin-bottom: 8px;">Developer / Early Access Quick Install (runs today from main branch):</div>
+        <div class="cmd-box">
+          <code id="psInstallCmd">git clone https://github.com/milinddwivedi/Vox.git &amp;&amp; cd Vox &amp;&amp; powershell -ExecutionPolicy Bypass -File .\install_and_setup.ps1</code>
+          <button class="copy-btn" onclick="copyInstallCmd()">Copy</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="container">
+      <div class="footer-cols">
+        <div>
+          <div class="nav-brand" style="margin-bottom:10px;"><img src="assets/vox_logo.svg" alt="VOX logo" /><span>VOX</span></div>
+          <p style="font-size:14px; color:var(--ink-muted); max-width: 280px;">100% local-first AI voice typing &amp; private meeting intelligence for Windows.</p>
+        </div>
+        <div>
+          <h4>Product</h4>
+          <ul>
+            <li><a href="#download">Download Windows</a></li>
+            <li><a href="#speed">Speed Comparison</a></li>
+            <li><a href="#capabilities">Toggle Bar &amp; Notetaker</a></li>
+            <li><a href="#workflows">Adaptive Styles</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Architecture</h4>
+          <ul>
+            <li><a href="#privacy">100% Offline Privacy</a></li>
+            <li><a href="https://github.com/milinddwivedi/Vox" target="_blank" rel="noopener">GitHub Repository</a></li>
+            <li><a href="https://github.com/milinddwivedi/Vox/releases" target="_blank" rel="noopener">Releases &amp; Checksums</a></li>
+            <li><a href="https://github.com/milinddwivedi/Vox/blob/main/USER_GUIDE.md" target="_blank" rel="noopener">User Guide</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Shortcuts</h4>
+          <ul>
+            <li><span>Ctrl+Win · Dictate</span></li>
+            <li><span>Ctrl+Alt+R · Meeting Capture</span></li>
+            <li><span>Ctrl+Shift+N · Scratchpad</span></li>
+            <li><span>Ctrl+Win+Space · Command</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="monumental-mark" aria-hidden="true">
+        <span class="monumental-bars">
+          <span style="height:26px;"></span>
+          <span style="height:56px;"></span>
+          <span style="height:74px;"></span>
+          <span style="height:44px;"></span>
+          <span style="height:64px;"></span>
+          <span style="height:30px;"></span>
+        </span>
+        <span>VOX</span>
+      </div>
+
+      <div class="footer-legal">
+        <span>© VOX Local AI 2026 · Built for private local execution on Windows</span>
+        <span>Source &amp; Releases hosted on <a href="https://github.com/milinddwivedi/Vox" target="_blank" rel="noopener" style="text-decoration:underline;">github.com/milinddwivedi/Vox</a></span>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    // Hero Interactive VOX Floating Toggle Bar Simulator
+    const simBar = document.getElementById('simBar');
+    const simTooltip = document.getElementById('simTooltip');
+    const heroMockText = document.getElementById('heroMockText');
+    const heroMockLabel = document.getElementById('heroMockAppLabel');
+
+    function setSimMode(mode, btn) {
+      document.querySelectorAll('.sim-chip').forEach(b => b.classList.remove('active'));
+      if (btn) btn.classList.add('active');
+
+      if (mode === 'resting') {
+        simTooltip.style.opacity = '0.25';
+        simTooltip.innerHTML = 'Hover edge capsule to expand';
+        simBar.innerHTML = '<div class="vox-cap-resting" title="Hover pill on screen edge"></div>';
+      } else if (mode === 'dictating') {
+        simTooltip.style.opacity = '1';
+        simTooltip.innerHTML = 'Finish and paste <strong>✓</strong>';
+        simBar.innerHTML = `
+          <div class="vox-cap-active-dict">
+            <span class="vox-circle-sm" style="background:#3A3A3C;color:#fff;">✕</span>
+            <span class="sim-eq"><i></i><i></i><i></i><i></i><i></i><i></i></span>
+            <span class="vox-circle-sm" style="background:#FFFFFF;color:#080808;">✓</span>
+          </div>`;
+        heroMockLabel.textContent = 'Active App: Microsoft Outlook · Dictating Live';
+        heroMockText.innerHTML = 'Thanks for joining today — we just shipped the local installer pipeline and calendar sync.<span class="cursor-caret"></span>';
+      } else if (mode === 'recording') {
+        simTooltip.style.opacity = '1';
+        simTooltip.innerHTML = 'Show Notepad · Meeting Live';
+        simBar.innerHTML = `
+          <div class="vox-pill-group">
+            <div class="vox-cap-emerald">
+              <span class="sim-eq"><i></i><i></i><i></i><i></i></span>
+              <span class="vox-circle-sm" style="background:#363634;color:#fff;width:20px;height:20px;">■</span>
+            </div>
+            <div class="vox-chevron-sat" title="Open Contextual Meeting Panel">⌃</div>
+          </div>`;
+        heroMockLabel.textContent = 'Notetaker Active · Dual-Track Mic + WASAPI';
+        heroMockText.innerHTML = '<strong>Live Transcript:</strong> Capturing your mic + call speakers in parallel without any bot joining your call.<span class="cursor-caret"></span>';
+      } else {
+        simTooltip.style.opacity = '1';
+        simTooltip.innerHTML = 'Dictate <strong>Ctrl+Win</strong>';
+        simBar.innerHTML = `
+          <div class="vox-pill-group">
+            <button class="vox-cap-btn vox-cap-dictate" onclick="setSimMode('dictating')" title="Click to dictate">
+              <svg width="13" height="15" viewBox="0 0 14 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <rect x="4.5" y="1" width="5" height="8" rx="2.5" fill="currentColor" stroke="none"/>
+                <path d="M2 7.5a5 5 0 0 0 10 0M7 12.5v2.5M4.5 15h5"/>
+              </svg>
+            </button>
+            <button class="vox-cap-btn vox-cap-note expanded" onclick="setSimMode('recording')" title="Start Notetaker or expand calendar">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="2.2" fill="currentColor"/></svg>
+              <span style="font-size:10px;opacity:0.8;">⌃</span>
+            </button>
+          </div>`;
+      }
+    }
+    setSimMode('ready');
+
+    function setProductFocus(mode) {
+      document.getElementById('segDictation').classList.toggle('active', mode === 'dictation');
+      document.getElementById('segNotetaker').classList.toggle('active', mode === 'notetaker');
+      setSimMode(mode === 'notetaker' ? 'recording' : 'ready');
+    }
+
+    // 4x Speed Comparison Demo
+    const kbSample = "Hi team, just sharing a quick update — wait let me fix that typo — updated the build for Windows testing.";
+    const voxSample = "Hi team, sharing a quick update: we finalized the Windows installer build, verified local Whisper and Llama 3.2 execution, and pushed everything to GitHub for testing.";
+    let speedTimer1, speedTimer2;
+    function runSpeedDemo() {
+      clearInterval(speedTimer1);
+      clearInterval(speedTimer2);
+      const kbEl = document.getElementById('kbTyped');
+      const voxEl = document.getElementById('voxTyped');
+      kbEl.textContent = '';
+      voxEl.textContent = '';
+      let i = 0, j = 0;
+      const voxWords = voxSample.split(' ');
+      speedTimer1 = setInterval(() => {
+        if (i < kbSample.length) kbEl.textContent += kbSample[i++];
+        else clearInterval(speedTimer1);
+      }, 65);
+      speedTimer2 = setInterval(() => {
+        if (j < voxWords.length) voxEl.textContent += (j ? ' ' : '') + voxWords[j++];
+        else clearInterval(speedTimer2);
+      }, 85);
+    }
+
+    // Sticky 3-Stage Scroll & Click Switcher
+    function activateStage(idx) {
+      document.querySelectorAll('.step-card').forEach((el, n) => el.classList.toggle('active', n === idx));
+      document.querySelectorAll('.stage-panel').forEach((el, n) => el.classList.toggle('active', n === idx));
+      document.getElementById('stageIndicator').textContent = `0${idx + 1} / 03`;
+    }
+    const stepObserver = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          activateStage(Number(entry.target.dataset.stage));
+        }
+      });
+    }, { rootMargin: '-38% 0px -42% 0px', threshold: 0.1 });
+    document.querySelectorAll('.step-card').forEach(card => stepObserver.observe(card));
+
+    // Adaptive Writing Style Switcher
+    const styleSamples = {
+      clean: "We finalized the Windows installer and pushed the latest floating bar update to GitHub today.",
+      email: "Hi team,\n\nWe've finalized the Windows installer package and pushed today's floating toggle bar updates to GitHub. Ready for your review.\n\nBest regards,",
+      structured: "• Finalized Windows installer script\n• Pushed latest floating toggle bar build\n• Published download page to GitHub",
+      casual: "Hey! Just wrapped the Windows installer and pushed the new floating pill bar up to GitHub — give it a spin!"
+    };
+    function setStylePreview(style, btn) {
+      document.querySelectorAll('.style-tab').forEach(b => b.classList.remove('active'));
+      if (btn) btn.classList.add('active');
+      document.getElementById('stylePreviewText').innerText = styleSamples[style] || styleSamples.clean;
+    }
+
+    // Split FAQ Simulator
+    const faqs = [
+      { q: "How do users install and run VOX on Windows?", a: "Download VoxLocal-Setup.exe (or the Portable Win64 ZIP) from the GitHub Releases page, run the installer to add Desktop & Start Menu shortcuts, and hold Ctrl+Win anytime to start dictating." },
+      { q: "Does audio or meeting recording ever leave my PC?", a: "Never. Speech recognition (faster-whisper CTranslate2), dual-track WASAPI + mic capture, SQLite history storage, and local Llama 3.2 Q&A run strictly on your Windows machine." },
+      { q: "Do I need an NVIDIA GPU?", a: "No. VOX automatically accelerates with CUDA when an NVIDIA GPU is present, and falls back smoothly to multi-threaded INT8 CPU execution on standard laptops." },
+      { q: "Which apps and languages does VOX support?", a: "Any Windows text field — Outlook, Teams, Zoom, Meet, Slack, VS Code, Chrome, WhatsApp — supporting English, Hindi (Devanagari), Romanized Hinglish, and auto code-switching." },
+      { q: "How do Google, Microsoft Outlook, and Zoom calendars connect?", a: "Sign in under Calendar Settings with Google, Microsoft (personal or work), or Zoom to surface upcoming join reminders right from the floating toggle bar." }
+    ];
+    const faqMenu = document.getElementById('faqMenu');
+    const faqQ = document.getElementById('faqQuestionBubble');
+    const faqA = document.getElementById('faqAnswerBubble');
+    function selectFaq(idx) {
+      document.querySelectorAll('.faq-q-btn').forEach((b, n) => b.classList.toggle('active', n === idx));
+      faqQ.textContent = faqs[idx].q;
+      faqA.textContent = faqs[idx].a;
+    }
+    faqs.forEach((item, idx) => {
+      const b = document.createElement('button');
+      b.className = 'faq-q-btn' + (idx === 0 ? ' active' : '');
+      b.textContent = item.q;
+      b.onclick = () => selectFaq(idx);
+      faqMenu.appendChild(b);
+    });
+    selectFaq(0);
+
+    // Reveal on scroll + auto start speed demo when visible
+    const revObserver = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('visible');
+          if (entry.target.classList.contains('forest-card') && !entry.target.dataset.started) {
+            entry.target.dataset.started = '1';
+            runSpeedDemo();
+          }
+        }
+      });
+    }, { threshold: 0.12 });
+    document.querySelectorAll('.reveal').forEach(el => revObserver.observe(el));
+
+    function copyInstallCmd() {
+      const txt = document.getElementById('psInstallCmd').textContent;
+      navigator.clipboard.writeText(txt).then(() => {
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
+      });
+    }
+  </script>
+</body>
+</html>

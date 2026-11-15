@@ -12,6 +12,7 @@ ENV/
 # Distribution & Build
 build/
 dist/
+release_artifacts/
 *.manifest
 *.spec.bak
 

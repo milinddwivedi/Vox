@@ -1,24 +1,34 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+import importlib.util
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_dynamic_libs
 
-ROOT_DIR = Path('D:/Milind/Voice Assistant')
+ROOT_DIR = Path(os.path.abspath(SPECPATH)) if 'SPECPATH' in globals() else Path(os.getcwd())
 
 datas = []
 binaries = []
 datas += collect_data_files('faster_whisper')
 datas += [
-    ('D:\\Milind\\Voice Assistant\\.venv\\Lib\\site-packages\\faster_whisper\\assets\\silero_vad_v6.onnx', 'faster_whisper/assets'),
     ('extensions/vox_meet_tab_capture', 'extensions/vox_meet_tab_capture'),
     ('assets', 'assets'),
 ]
 
+# Explicitly include Silero VAD ONNX asset when present in site-packages
+_fw_spec = importlib.util.find_spec('faster_whisper')
+if _fw_spec and _fw_spec.origin:
+    _vad_onnx = Path(_fw_spec.origin).resolve().parent / 'assets' / 'silero_vad_v6.onnx'
+    if _vad_onnx.exists():
+        datas.append((str(_vad_onnx), 'faster_whisper/assets'))
+
 # Add av.libs DLLs for PyAV H.264 screen recorder (without duplicating to root)
-av_libs_dir = Path('D:/Milind/Voice Assistant/.venv/Lib/site-packages/av.libs')
-if av_libs_dir.exists():
-    for dll in av_libs_dir.glob('*.dll'):
-        binaries.append((str(dll), 'av.libs'))
+_av_spec = importlib.util.find_spec('av')
+if _av_spec and _av_spec.origin:
+    av_libs_dir = Path(_av_spec.origin).resolve().parent.parent / 'av.libs'
+    if av_libs_dir.exists():
+        for dll in av_libs_dir.glob('*.dll'):
+            binaries.append((str(dll), 'av.libs'))
 
 # NVIDIA CUDA runtime DLLs are loaded at runtime from .venv/Lib/site-packages/nvidia to avoid 2GB duplication
 
