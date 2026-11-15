@@ -248,6 +248,8 @@ class MainWindow(QMainWindow):
         self.controller.dictation_state_changed.connect(lambda *_: self._update_float_btn_text())
         self.controller.meeting_state_changed.connect(lambda *_: self._update_float_btn_text())
         self.controller.notification_requested.connect(self.show_toast)
+        if hasattr(self.controller, "upgrade_dialog_requested"):
+            self.controller.upgrade_dialog_requested.connect(self._show_pro_upgrade_dialog)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -714,6 +716,16 @@ class MainWindow(QMainWindow):
     def _remove_toast(self, toast: ToastNotification) -> None:
         if toast in self._toasts:
             self._toasts.remove(toast)
+
+    def _show_pro_upgrade_dialog(self, reason: str = "") -> None:
+        """Show the modern 2026 VOX Pro upgrade modal."""
+        try:
+            from voxlocal.ui.pro_upgrade_dialog import VoxProUpgradeDialog
+            dlg = VoxProUpgradeDialog(self.controller, reason=reason, theme=self._theme, parent=self)
+            dlg.exec()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).error("Failed to show Pro Upgrade Dialog: %s", exc)
 
     def prepare_force_quit(self) -> None:
         self._force_quit = True

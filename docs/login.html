@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign In — VOX Local AI Assistant</title>
+  <link rel="icon" href="assets/favicon.ico" type="image/x-icon" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500;1,600&family=Figtree:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --cream: #F8FAFC;
+      --forest: #4F46E5;
+      --pine: #0B0F19;
+      --ink: #090D1A;
+      --ink-muted: #475569;
+      --sans: 'Figtree', -apple-system, BlinkMacSystemFont, sans-serif;
+      --serif: 'EB Garamond', Georgia, serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--sans);
+      background: var(--cream);
+      color: var(--ink);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .auth-card {
+      background: #FFFFFF;
+      border: 1px solid rgba(17, 24, 39, 0.08);
+      border-radius: 24px;
+      padding: 40px 32px;
+      max-width: 440px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 16px 48px rgba(17, 24, 39, 0.06);
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--ink);
+      font-weight: 800;
+      font-size: 20px;
+      margin-bottom: 24px;
+    }
+    .brand img { width: 34px; height: 34px; border-radius: 9px; }
+    h1 {
+      font-size: 26px;
+      font-weight: 700;
+      color: var(--pine);
+      margin-bottom: 8px;
+    }
+    p {
+      color: var(--ink-muted);
+      font-size: 14px;
+      line-height: 1.5;
+      margin-bottom: 28px;
+    }
+    .btn-google {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      width: 100%;
+      background: #FFFFFF;
+      color: var(--pine);
+      border: 1.5px solid #CBD5E1;
+      border-radius: 999px;
+      padding: 14px 20px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.2s ease;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+    }
+    .btn-google:hover {
+      background: #F8FAFC;
+      border-color: #94A3B8;
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08);
+    }
+    .divider {
+      display: flex;
+      align-items: center;
+      margin: 24px 0 20px;
+      color: #94A3B8;
+      font-size: 12px;
+    }
+    .divider::before, .divider::after {
+      content: '';
+      flex: 1;
+      border-bottom: 1px solid #E2E8F0;
+    }
+    .divider span { padding: 0 12px; }
+    .input-row { display: flex; gap: 8px; margin-bottom: 20px; }
+    input[type="email"] {
+      flex: 1;
+      padding: 12px 16px;
+      border: 1.5px solid #E2E8F0;
+      border-radius: 999px;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="email"]:focus { border-color: var(--forest); }
+    .btn-submit {
+      background: var(--forest);
+      color: #FFFFFF;
+      border: none;
+      border-radius: 999px;
+      padding: 12px 22px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn-submit:hover { background: #4338CA; }
+    .preset-box { text-align: left; margin-bottom: 24px; }
+    .preset-title { font-size: 11px; font-weight: 600; color: #64748B; margin-bottom: 6px; }
+    .preset-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+    .preset-btn {
+      background: #F1F5F9;
+      border: 1px solid #E2E8F0;
+      border-radius: 999px;
+      padding: 4px 12px;
+      font-size: 12px;
+      color: var(--ink-muted);
+      cursor: pointer;
+    }
+    .preset-btn:hover { background: #E2E8F0; color: var(--ink); }
+    .security-notice {
+      font-size: 12px;
+      color: #94A3B8;
+      line-height: 1.5;
+      padding-top: 20px;
+      border-top: 1px solid #F1F5F9;
+    }
+    .btn-deep-link {
+      display: inline-block;
+      width: 100%;
+      text-align: center;
+      background: linear-gradient(135deg, #4F46E5, #06B6D4);
+      color: #FFFFFF;
+      font-weight: 700;
+      font-size: 15px;
+      padding: 14px 20px;
+      border-radius: 999px;
+      text-decoration: none;
+      margin-bottom: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="auth-card">
+    <a href="index.html" class="brand">
+      <img src="assets/vox_logo.svg" alt="VOX" />
+      <span>VOX</span>
+    </a>
+
+    <div id="authSection">
+      <h1>Sign in to VOX</h1>
+      <p>Connect your account to access your VOX Pro subscription, sync usage meters, and link your Windows desktop app.</p>
+
+      <button class="btn-google" id="btnGoogleSignIn" onclick="handleGoogleSignIn()">
+        <svg width="20" height="20" viewBox="0 0 24 24">
+          <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+          <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+          <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
+          <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
+        </svg>
+        <span>Continue with Google</span>
+      </button>
+
+      <div class="divider"><span>or sign in with email</span></div>
+
+      <div class="input-row">
+        <input type="email" id="emailInput" placeholder="name@company.com" />
+        <button class="btn-submit" onclick="handleEmailSignIn()">Continue</button>
+      </div>
+
+      <div class="preset-box">
+        <div class="preset-title">Test Accounts:</div>
+        <div class="preset-pills">
+          <button class="preset-btn" onclick="applyPreset('Milind Dwivedi', 'milinddwivedi7@gmail.com')">milinddwivedi7@gmail.com</button>
+          <button class="preset-btn" onclick="applyPreset('Alex Morgan', 'alex.morgan@test.com')">alex.morgan@test.com</button>
+        </div>
+      </div>
+
+      <div class="security-notice">
+        🔒 <b>Zero Data Leakage:</b> Your voice dictation audio and meeting transcripts never leave your PC. Only subscription entitlement checks connect to cloud.
+      </div>
+    </div>
+
+    <div id="successSection" style="display:none;">
+      <div style="width:58px; height:58px; border-radius:50%; background:rgba(6,182,212,0.12); color:#06B6D4; display:flex; align-items:center; justify-content:center; margin: 0 auto 16px; font-size:26px; font-weight:800;">✓</div>
+      <h1>Welcome Back!</h1>
+      <p id="successInfo" style="margin-bottom:24px;"></p>
+
+      <a id="lnkDesktop" href="voxlocal://auth/callback" class="btn-deep-link">
+        🚀 Open &amp; Link in VOX Desktop App
+      </a>
+      <a href="account.html" class="btn-google" style="margin-bottom:10px;">
+        Go to Account Dashboard
+      </a>
+      <a href="index.html" style="font-size:13px; color:var(--ink-muted); text-decoration:none;">← Return to Home</a>
+    </div>
+  </div>
+
+  <script>
+    function saveSession(name, email) {
+      const user = {
+        name: name,
+        email: email,
+        avatar: name.charAt(0).toUpperCase(),
+        plan: localStorage.getItem('vox_plan') || 'Free',
+        token: 'vox_tok_' + Math.random().toString(36).substring(2, 12),
+        signedInAt: new Date().toISOString()
+      };
+      localStorage.setItem('vox_user', JSON.stringify(user));
+
+      document.getElementById('authSection').style.display = 'none';
+      const successInfo = document.getElementById('successInfo');
+      successInfo.innerHTML = `Signed in as <b>${user.name}</b> (${user.email})<br>Plan: <b style="color:#06B6D4;">${user.plan}</b>`;
+      
+      const lnkDesktop = document.getElementById('lnkDesktop');
+      lnkDesktop.href = `voxlocal://auth/callback?email=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name)}&token=${encodeURIComponent(user.token)}`;
+      document.getElementById('successSection').style.display = 'block';
+
+      // Check for redirect param
+      const params = new URLSearchParams(window.location.search);
+      const redirect = params.get('redirect');
+      if (redirect) {
+        setTimeout(() => { window.location.href = redirect; }, 1200);
+      }
+    }
+
+    function handleGoogleSignIn() {
+      saveSession('Google User', 'user@gmail.com');
+    }
+
+    function handleEmailSignIn() {
+      const inp = document.getElementById('emailInput');
+      const val = (inp.value || '').trim();
+      if (!val || !val.includes('@')) {
+        alert('Please enter a valid email address.');
+        return;
+      }
+      const name = val.split('@')[0].replace(/[._-]/g, ' ');
+      const capName = name.charAt(0).toUpperCase() + name.slice(1);
+      saveSession(capName, val);
+    }
+
+    function applyPreset(name, email) {
+      saveSession(name, email);
+    }
+
+    // Auto-fill from existing session if already logged in
+    document.addEventListener('DOMContentLoaded', () => {
+      const existing = localStorage.getItem('vox_user');
+      if (existing) {
+        try {
+          const u = JSON.parse(existing);
+          if (u && u.email) {
+            document.getElementById('authSection').style.display = 'none';
+            document.getElementById('successInfo').innerHTML = `Already signed in as <b>${u.name}</b> (${u.email})<br>Plan: <b style="color:#06B6D4;">${u.plan}</b>`;
+            document.getElementById('lnkDesktop').href = `voxlocal://auth/callback?email=${encodeURIComponent(u.email)}&name=${encodeURIComponent(u.name)}&token=${encodeURIComponent(u.token || '')}`;
+            document.getElementById('successSection').style.display = 'block';
+          }
+        } catch (e) {}
+      }
+    });
+  </script>
+</body>
+</html>

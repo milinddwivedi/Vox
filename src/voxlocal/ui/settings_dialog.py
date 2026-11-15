@@ -1144,8 +1144,19 @@ class SettingsWorkspaceWidget(QWidget):
             self.status_toast.emit("Signed Out", "Reverted to Free tier successfully.")
 
     def _on_upgrade_pro_clicked(self) -> None:
-        import webbrowser
-        webbrowser.open("https://vox-voice-assistant.vercel.app/pricing")
+        try:
+            from voxlocal.ui.pro_upgrade_dialog import VoxProUpgradeDialog
+            theme = getattr(self.controller, "config", None) and getattr(self.controller.config, "theme", "light") or "light"
+            dlg = VoxProUpgradeDialog(
+                self.controller,
+                reason="Upgrade to VOX Pro to unlock unlimited dictation, unlimited meetings, and cognitive AI memory.",
+                theme=theme,
+                parent=self,
+            )
+            dlg.exec()
+        except Exception:
+            import webbrowser
+            webbrowser.open("https://vox-voice-assistant.vercel.app/pricing")
 
     def _on_sync_subscription_clicked(self) -> None:
         if hasattr(self.controller, "sync_entitlements_with_cloud"):

@@ -54,122 +54,122 @@ SPACING_BUTTON_GROUP_ITEMS_PX: int = 6
 
 
 LIGHT_TOKENS: ThemeTokenDict = ThemeTokenDict({
-    # Core Wispr Flow Sand Light Surfaces
-    "background": "#FCFCFB",
-    "bg": "#FCFCFB",
+    # Core Nordic Studio Clean Light Surfaces
+    "background": "#F8FAFC",
+    "bg": "#F8FAFC",
     "surface": "#FFFFFF",
-    "surface_secondary": "#FAF9F7",
-    "surface_alt": "#FAF9F7",
-    "surface_well": "#F5F4F0",
-    "surface_elevated": "#F8F7F3",
-    "sidebar_bg": "#FAF9F7",
-    "sidebar_hover": "#F0EFEA",
-    "sidebar_active": "#EEEBE3",
-    "ivory": "#FCFCFB",
-    "canvas_ivory": "#FAF9F7",
-    "surface_canvas": "#FCFCFB",
+    "surface_secondary": "#F1F5F9",
+    "surface_alt": "#F1F5F9",
+    "surface_well": "#E2E8F0",
+    "surface_elevated": "#F8FAFC",
+    "sidebar_bg": "#F8FAFC",
+    "sidebar_hover": "#F1F5F9",
+    "sidebar_active": "#E2E8F0",
+    "ivory": "#F8FAFC",
+    "canvas_ivory": "#F1F5F9",
+    "surface_canvas": "#F8FAFC",
 
     # Borders & Hairlines
-    "line": "#EEEBE3",
-    "border": "#E5E2D9",
-    "line_hover": "#D5D0C5",
-    "toggle_border": "#C5C0B3",
-    "keycap_border": "#D3CED6",
+    "line": "#E2E8F0",
+    "border": "#CBD5E1",
+    "line_hover": "#94A3B8",
+    "toggle_border": "#94A3B8",
+    "keycap_border": "#CBD5E1",
 
-    # Ink & Typography
-    "text_primary": "#1A1A1A",
-    "text": "#1A1A1A",
-    "text_muted": "#736E62",
-    "text_secondary": "#5E5B53",
-    "text_dim": "#8E897E",
-    "text_tertiary": "#71716E",
+    # Ink & Typography (Deep Midnight Obsidian)
+    "text_primary": "#0F172A",
+    "text": "#0F172A",
+    "text_muted": "#64748B",
+    "text_secondary": "#475569",
+    "text_dim": "#94A3B8",
+    "text_tertiary": "#64748B",
 
-    # Signature Accents (Dawn, Fathom, Lumen, Coral, Glow, Signal)
-    "accent": "#1A1A1A",
-    "accent_primary": "#1A1A1A",
-    "accent_dawn": "#F0D7FF",
-    "accent_dawn_tint": "#FCF7FF",
-    "accent_dawn_hover": "#E6BEFF",
-    "accent_dawn_text": "#3B1954",
-    "accent_fathom": "#034F46",
-    "accent_fathom_tint": "#E2F5F2",
-    "accent_fathom_hover": "#06665A",
-    "accent_lumen": "#FFFFEB",
-    "accent_lumen_border": "#E8E6C3",
-    "accent_gold": "#926C15",
-    "accent_sky": "#034F46",
-    "accent_emerald": "#369489",
-    "accent_crimson": "#FF5757",
-    "accent_amber": "#FFA946",
-    "accent_purple": "#A26EC1",
-    "signal_pink": "#FFBCF2",
+    # Signature Accents (Electric Indigo, Sonic Cyan, Cobalt, Crimson)
+    "accent": "#4F46E5",
+    "accent_primary": "#4F46E5",
+    "accent_dawn": "#EEF2FF",
+    "accent_dawn_tint": "#F5F3FF",
+    "accent_dawn_hover": "#E0E7FF",
+    "accent_dawn_text": "#312E81",
+    "accent_fathom": "#4F46E5",
+    "accent_fathom_tint": "#EEF2FF",
+    "accent_fathom_hover": "#4338CA",
+    "accent_lumen": "#F0FDF4",
+    "accent_lumen_border": "#BBF7D0",
+    "accent_gold": "#D97706",
+    "accent_sky": "#0284C7",
+    "accent_emerald": "#0D9488",
+    "accent_crimson": "#EF4444",
+    "accent_amber": "#F59E0B",
+    "accent_purple": "#6366F1",
+    "signal_pink": "#EC4899",
 
     # Interactive Controls
-    "primary_btn_bg": "#1A1A1A",
-    "primary_btn_text": "#FCFCFB",
+    "primary_btn_bg": "#0F172A",
+    "primary_btn_text": "#FFFFFF",
     "primary_btn_border": "transparent",
-    "primary_btn_hover": "#30302F",
-    "dawn_btn_bg": "#F0D7FF",
-    "dawn_btn_text": "#1A1A1A",
-    "dawn_btn_border": "#D2ACE9",
-    "fathom_btn_bg": "#034F46",
-    "fathom_btn_text": "#FCFCFB",
-    "fathom_btn_border": "#023D36",
-    "fathom_btn_hover": "#06665A",
+    "primary_btn_hover": "#1E293B",
+    "dawn_btn_bg": "#EEF2FF",
+    "dawn_btn_text": "#312E81",
+    "dawn_btn_border": "#C7D2FE",
+    "fathom_btn_bg": "#4F46E5",
+    "fathom_btn_text": "#FFFFFF",
+    "fathom_btn_border": "#4338CA",
+    "fathom_btn_hover": "#4338CA",
     "secondary_btn_bg": "#FFFFFF",
-    "secondary_btn_text": "#1A1A1A",
-    "secondary_btn_border": "#E5E2D9",
-    "secondary_btn_hover": "#F5F4F0",
-    "glass_bg": "rgba(252, 252, 251, 0.96)",
-    "glass_border": "#EEEBE3",
+    "secondary_btn_text": "#0F172A",
+    "secondary_btn_border": "#E2E8F0",
+    "secondary_btn_hover": "#F8FAFC",
+    "glass_bg": "rgba(248, 250, 252, 0.96)",
+    "glass_border": "#E2E8F0",
 
     # Inputs & Tables
     "input_bg": "#FFFFFF",
-    "input_border": "#E5E2D9",
-    "input_focus_border": "#4D4A42",
+    "input_border": "#CBD5E1",
+    "input_focus_border": "#4F46E5",
     "tab_bg": "transparent",
-    "tab_hover": "#F5F4F0",
+    "tab_hover": "#F1F5F9",
     "tab_selected_bg": "#FFFFFF",
-    "tab_selected_text": "#1A1A1A",
-    "tab_selected_border": "#E5E2D9",
-    "table_header_bg": "#FAF9F7",
-    "table_header_text": "#736E62",
-    "table_row_alt": "#FAF9F7",
-    "scrollbar_handle": "rgba(115, 110, 98, 0.25)",
-    "scrollbar_hover": "rgba(115, 110, 98, 0.45)",
+    "tab_selected_text": "#0F172A",
+    "tab_selected_border": "#CBD5E1",
+    "table_header_bg": "#F8FAFC",
+    "table_header_text": "#64748B",
+    "table_row_alt": "#F8FAFC",
+    "scrollbar_handle": "rgba(100, 116, 139, 0.25)",
+    "scrollbar_hover": "rgba(100, 116, 139, 0.45)",
 
-    # FlowBar Pill & Floating Surfaces (FlowBar stays sleek Obsidian Black across Light & Dark)
-    "pill_bg": "#000000",
-    "pill_resting_bg": "rgba(0, 0, 0, 0.50)",
-    "pill_border": "#30302F",
-    "pill_text": "#FCFCFB",
-    "pill_button_bg": "#4D4A42",
-    "chip_bg": "#F5F4F0",
-    "chip_text": "#1A1A1A",
-    "chip_border": "#EEEBE3",
-    "progressbar_bg": "#EEEBE3",
+    # FlowBar Pill & Floating Surfaces (Obsidian with Electric Indigo/Cyan Rim)
+    "pill_bg": "#0B0F19",
+    "pill_resting_bg": "rgba(11, 15, 25, 0.65)",
+    "pill_border": "#1E293B",
+    "pill_text": "#F8FAFC",
+    "pill_button_bg": "#1E293B",
+    "chip_bg": "#F1F5F9",
+    "chip_text": "#0F172A",
+    "chip_border": "#E2E8F0",
+    "progressbar_bg": "#E2E8F0",
 
-    # Centralized Semantic Tokens (Milestone 8)
-    "surface_pill": "#000000",
-    "surface_pill_resting": "rgba(0, 0, 0, 0.50)",
-    "surface_pill_card": "#1F1F1F",
-    "border_pill": "#30302F",
-    "border_pill_focus": "#4D4A42",
-    "text_pill_primary": "#FCFCFB",
-    "text_pill_muted": "#8E897E",
-    "accent_coral": "#FF5757",
-    "accent_coral_hover": "#E04545",
-    "accent_coral_tint": "rgba(255, 87, 87, 0.12)",
-    "accent_emerald_tint": "rgba(16, 185, 129, 0.12)",
+    # Centralized Semantic Tokens
+    "surface_pill": "#0B0F19",
+    "surface_pill_resting": "rgba(11, 15, 25, 0.65)",
+    "surface_pill_card": "#111827",
+    "border_pill": "#1E293B",
+    "border_pill_focus": "#4F46E5",
+    "text_pill_primary": "#F8FAFC",
+    "text_pill_muted": "#94A3B8",
+    "accent_coral": "#EF4444",
+    "accent_coral_hover": "#DC2626",
+    "accent_coral_tint": "rgba(239, 68, 68, 0.12)",
+    "accent_emerald_tint": "rgba(13, 148, 136, 0.12)",
     "card_background": "#FFFFFF",
-    "card_background_alt": "#FAF9F7",
-    "split_button_fill": "#E8DFC8",
+    "card_background_alt": "#F8FAFC",
+    "split_button_fill": "#E2E8F0",
     "padding_card": "16px",
     "padding_toolbar": "12px",
     "padding_btn_group": "8px",
-    "tooltip_bg": "#1A1A1A",
-    "tooltip_text": "#FCFCFB",
-    "tooltip_border": "#30302F",
+    "tooltip_bg": "#0F172A",
+    "tooltip_text": "#F8FAFC",
+    "tooltip_border": "#1E293B",
     "platform_teams": "#6264A7",
     "platform_zoom": "#2D8CFF",
     "platform_meet": "#0F9D58",
@@ -179,122 +179,122 @@ LIGHT_TOKENS: ThemeTokenDict = ThemeTokenDict({
 
 
 DARK_TOKENS: ThemeTokenDict = ThemeTokenDict({
-    # Core Wispr Flow Vast Dark Surfaces
-    "background": "#1A1A1A",
-    "bg": "#1A1A1A",
-    "surface": "#202020",
-    "surface_secondary": "#262625",
-    "surface_alt": "#262625",
-    "surface_well": "#141414",
-    "surface_elevated": "#30302F",
-    "sidebar_bg": "#141414",
-    "sidebar_hover": "#262625",
-    "sidebar_active": "#30302F",
-    "obsidian": "#1A1A1A",
-    "canvas_obsidian": "#1A1A1A",
-    "surface_canvas": "#202020",
+    # Core Midnight Obsidian Surfaces
+    "background": "#0B0F19",
+    "bg": "#0B0F19",
+    "surface": "#111827",
+    "surface_secondary": "#162032",
+    "surface_alt": "#162032",
+    "surface_well": "#070A12",
+    "surface_elevated": "#1E293B",
+    "sidebar_bg": "#070A12",
+    "sidebar_hover": "#162032",
+    "sidebar_active": "#1E293B",
+    "obsidian": "#0B0F19",
+    "canvas_obsidian": "#0B0F19",
+    "surface_canvas": "#111827",
 
     # Borders & Hairlines
-    "line": "#30302F",
-    "border": "#383836",
-    "line_hover": "#4A4A48",
-    "toggle_border": "#5B5B59",
-    "keycap_border": "#5B5B59",
+    "line": "#1E293B",
+    "border": "#283548",
+    "line_hover": "#3B4B64",
+    "toggle_border": "#4B5563",
+    "keycap_border": "#374151",
 
     # Ink & Typography
-    "text_primary": "#E9E8E1",
-    "text": "#E9E8E1",
-    "text_muted": "#9D9C98",
-    "text_secondary": "#DEDDD7",
-    "text_dim": "#71716E",
-    "text_tertiary": "#9D9C98",
+    "text_primary": "#F8FAFC",
+    "text": "#F8FAFC",
+    "text_muted": "#94A3B8",
+    "text_secondary": "#CBD5E1",
+    "text_dim": "#64748B",
+    "text_tertiary": "#94A3B8",
 
     # Signature Accents
-    "accent": "#F0D7FF",
-    "accent_primary": "#F0D7FF",
-    "accent_dawn": "#F0D7FF",
-    "accent_dawn_tint": "#2A1F33",
-    "accent_dawn_hover": "#E6BEFF",
-    "accent_dawn_text": "#3B1954",
-    "accent_fathom": "#4DAA9D",
-    "accent_fathom_tint": "#132D2A",
-    "accent_fathom_hover": "#84CDC1",
-    "accent_lumen": "#2C2B1E",
-    "accent_lumen_border": "#595530",
-    "accent_gold": "#D6C5A2",
-    "accent_sky": "#84CDC1",
-    "accent_emerald": "#4DAA9D",
-    "accent_crimson": "#FF5757",
-    "accent_amber": "#FFA946",
-    "accent_purple": "#D2ACE9",
-    "signal_pink": "#FFBCF2",
+    "accent": "#6366F1",
+    "accent_primary": "#6366F1",
+    "accent_dawn": "#818CF8",
+    "accent_dawn_tint": "#1E1B4B",
+    "accent_dawn_hover": "#A5B4FC",
+    "accent_dawn_text": "#E0E7FF",
+    "accent_fathom": "#38BDF8",
+    "accent_fathom_tint": "#082F49",
+    "accent_fathom_hover": "#7DD3FC",
+    "accent_lumen": "#064E3B",
+    "accent_lumen_border": "#065F46",
+    "accent_gold": "#FBBF24",
+    "accent_sky": "#38BDF8",
+    "accent_emerald": "#2DD4BF",
+    "accent_crimson": "#EF4444",
+    "accent_amber": "#F59E0B",
+    "accent_purple": "#818CF8",
+    "signal_pink": "#F472B6",
 
     # Interactive Controls
-    "primary_btn_bg": "#E9E8E1",
-    "primary_btn_text": "#1A1A1A",
+    "primary_btn_bg": "#F8FAFC",
+    "primary_btn_text": "#0B0F19",
     "primary_btn_border": "transparent",
     "primary_btn_hover": "#FFFFFF",
-    "dawn_btn_bg": "#F0D7FF",
-    "dawn_btn_text": "#1A1A1A",
-    "dawn_btn_border": "#D2ACE9",
-    "fathom_btn_bg": "#0D6156",
-    "fathom_btn_text": "#FCFCFB",
-    "fathom_btn_border": "#318C7F",
-    "fathom_btn_hover": "#12786B",
-    "secondary_btn_bg": "#30302F",
-    "secondary_btn_text": "#E9E8E1",
-    "secondary_btn_border": "#464544",
-    "secondary_btn_hover": "#464544",
-    "glass_bg": "rgba(26, 26, 26, 0.96)",
-    "glass_border": "#30302F",
+    "dawn_btn_bg": "#6366F1",
+    "dawn_btn_text": "#FFFFFF",
+    "dawn_btn_border": "#4F46E5",
+    "fathom_btn_bg": "#0284C7",
+    "fathom_btn_text": "#FFFFFF",
+    "fathom_btn_border": "#0369A1",
+    "fathom_btn_hover": "#0369A1",
+    "secondary_btn_bg": "#1E293B",
+    "secondary_btn_text": "#F8FAFC",
+    "secondary_btn_border": "#334155",
+    "secondary_btn_hover": "#334155",
+    "glass_bg": "rgba(11, 15, 25, 0.96)",
+    "glass_border": "#1E293B",
 
     # Inputs & Tables
-    "input_bg": "#141414",
-    "input_border": "#383836",
-    "input_focus_border": "#F0D7FF",
+    "input_bg": "#070A12",
+    "input_border": "#283548",
+    "input_focus_border": "#6366F1",
     "tab_bg": "transparent",
-    "tab_hover": "#262625",
-    "tab_selected_bg": "#30302F",
-    "tab_selected_text": "#E9E8E1",
-    "tab_selected_border": "#464544",
-    "table_header_bg": "#202020",
-    "table_header_text": "#9D9C98",
-    "table_row_alt": "#1D1D1C",
-    "scrollbar_handle": "rgba(233, 232, 225, 0.16)",
-    "scrollbar_hover": "rgba(233, 232, 225, 0.34)",
+    "tab_hover": "#162032",
+    "tab_selected_bg": "#1E293B",
+    "tab_selected_text": "#F8FAFC",
+    "tab_selected_border": "#334155",
+    "table_header_bg": "#111827",
+    "table_header_text": "#94A3B8",
+    "table_row_alt": "#0D1322",
+    "scrollbar_handle": "rgba(248, 250, 252, 0.16)",
+    "scrollbar_hover": "rgba(248, 250, 252, 0.34)",
 
     # FlowBar Pill
-    "pill_bg": "#000000",
-    "pill_resting_bg": "rgba(0, 0, 0, 0.55)",
-    "pill_border": "#30302F",
-    "pill_text": "#FCFCFB",
-    "pill_button_bg": "#4D4A42",
-    "chip_bg": "#262625",
-    "chip_text": "#E9E8E1",
-    "chip_border": "#383836",
-    "progressbar_bg": "#30302F",
+    "pill_bg": "#0B0F19",
+    "pill_resting_bg": "rgba(11, 15, 25, 0.65)",
+    "pill_border": "#1E293B",
+    "pill_text": "#F8FAFC",
+    "pill_button_bg": "#1E293B",
+    "chip_bg": "#162032",
+    "chip_text": "#F8FAFC",
+    "chip_border": "#283548",
+    "progressbar_bg": "#1E293B",
 
-    # Centralized Semantic Tokens (Milestone 8)
-    "surface_pill": "#000000",
-    "surface_pill_resting": "rgba(0, 0, 0, 0.55)",
-    "surface_pill_card": "#1F1F1F",
-    "border_pill": "#30302F",
-    "border_pill_focus": "#5B5B59",
-    "text_pill_primary": "#FCFCFB",
-    "text_pill_muted": "#71716E",
-    "accent_coral": "#FF5757",
-    "accent_coral_hover": "#E04545",
-    "accent_coral_tint": "rgba(255, 87, 87, 0.16)",
-    "accent_emerald_tint": "rgba(16, 185, 129, 0.16)",
-    "card_background": "#202020",
-    "card_background_alt": "#262625",
-    "split_button_fill": "#383836",
+    # Centralized Semantic Tokens
+    "surface_pill": "#0B0F19",
+    "surface_pill_resting": "rgba(11, 15, 25, 0.65)",
+    "surface_pill_card": "#111827",
+    "border_pill": "#1E293B",
+    "border_pill_focus": "#6366F1",
+    "text_pill_primary": "#F8FAFC",
+    "text_pill_muted": "#64748B",
+    "accent_coral": "#EF4444",
+    "accent_coral_hover": "#DC2626",
+    "accent_coral_tint": "rgba(239, 68, 68, 0.16)",
+    "accent_emerald_tint": "rgba(13, 148, 136, 0.16)",
+    "card_background": "#111827",
+    "card_background_alt": "#162032",
+    "split_button_fill": "#283548",
     "padding_card": "16px",
     "padding_toolbar": "12px",
     "padding_btn_group": "8px",
-    "tooltip_bg": "#141414",
-    "tooltip_text": "#E9E8E1",
-    "tooltip_border": "#383836",
+    "tooltip_bg": "#070A12",
+    "tooltip_text": "#F8FAFC",
+    "tooltip_border": "#283548",
     "platform_teams": "#6264A7",
     "platform_zoom": "#2D8CFF",
     "platform_meet": "#0F9D58",
@@ -872,11 +872,11 @@ def create_info_badge(tooltip: str) -> QLabel:
 
 def create_app_pixmap(state: str = "idle", size: int = 64, theme: str = "light") -> QPixmap:
     """
-    Render a high-DPI original VOX waveform squircle emblem adapting to state:
-    - 'idle': Crisp obsidian squircle with warm Sand soundbars & subtle Dawn rim
-    - 'listening': Emerald/Fathom luminous soundbars
-    - 'processing': Warm amber/Dawn pulse soundbars
-    - 'recording': Obsidian squircle with Coral (#FF5757) live badge dot
+    Render a high-DPI modern VOX Acoustic V squircle emblem adapting to state:
+    - 'idle': Midnight obsidian squircle with Electric Indigo/Sonic Cyan V and soundbars
+    - 'listening': Electric Cyan / Sky luminous acoustic V
+    - 'processing': Radiant Indigo / Violet pulse acoustic V
+    - 'recording': Midnight obsidian squircle with Coral (#EF4444) live badge dot
     - 'both': Active listening + Coral badge dot
     """
     pixmap = QPixmap(size, size)
@@ -887,68 +887,101 @@ def create_app_pixmap(state: str = "idle", size: int = 64, theme: str = "light")
     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
     scale = size / 512.0
-    margin = 28.0 * scale
+    margin = 22.0 * scale
     rect = QRectF(margin, margin, size - 2 * margin, size - 2 * margin)
-    corner = 112.0 * scale
+    corner = 118.0 * scale
 
     bg_grad = QLinearGradient(0, 0, size, size)
     if state == "listening":
-        bg_grad.setColorAt(0.0, QColor("#034F46"))
-        bg_grad.setColorAt(1.0, QColor("#022E29"))
+        bg_grad.setColorAt(0.0, QColor("#0A1926"))
+        bg_grad.setColorAt(1.0, QColor("#030D14"))
     elif state == "recording":
-        bg_grad.setColorAt(0.0, QColor("#291416"))
-        bg_grad.setColorAt(1.0, QColor("#1A0D0E"))
+        bg_grad.setColorAt(0.0, QColor("#220D12"))
+        bg_grad.setColorAt(1.0, QColor("#120508"))
     elif state == "processing":
-        bg_grad.setColorAt(0.0, QColor("#2B1F34"))
-        bg_grad.setColorAt(1.0, QColor("#1A1420"))
+        bg_grad.setColorAt(0.0, QColor("#140E26"))
+        bg_grad.setColorAt(1.0, QColor("#080512"))
     else:
-        bg_grad.setColorAt(0.0, QColor("#1E1E1D"))
-        bg_grad.setColorAt(1.0, QColor("#0D0D0C"))
+        bg_grad.setColorAt(0.0, QColor("#0B0F19"))
+        bg_grad.setColorAt(0.5, QColor("#090D16"))
+        bg_grad.setColorAt(1.0, QColor("#040711"))
 
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(QBrush(bg_grad))
     painter.drawRoundedRect(rect, corner, corner)
 
-    # Subtle Dawn / warm sandstone hairline rim
-    rim_color = QColor("#F0D7FF" if state in ("idle", "processing") else "#84CDC1" if state == "listening" else "#FF5757")
-    rim_color.setAlpha(90)
-    painter.setPen(QPen(rim_color, max(1.2, 4.0 * scale)))
+    # Hairline rim
+    rim_grad = QLinearGradient(0, 0, size, size)
+    if state == "listening":
+        rim_grad.setColorAt(0.0, QColor(6, 182, 212, 160))
+        rim_grad.setColorAt(1.0, QColor(14, 165, 233, 100))
+    elif state == "recording":
+        rim_grad.setColorAt(0.0, QColor(239, 68, 68, 160))
+        rim_grad.setColorAt(1.0, QColor(244, 63, 94, 100))
+    elif state == "processing":
+        rim_grad.setColorAt(0.0, QColor(168, 85, 247, 160))
+        rim_grad.setColorAt(1.0, QColor(99, 102, 241, 100))
+    else:
+        rim_grad.setColorAt(0.0, QColor(99, 102, 241, 140))
+        rim_grad.setColorAt(0.5, QColor(56, 189, 248, 90))
+        rim_grad.setColorAt(1.0, QColor(6, 182, 212, 115))
+
+    painter.setPen(QPen(QBrush(rim_grad), max(1.2, 3.5 * scale)))
     painter.setBrush(Qt.BrushStyle.NoBrush)
     painter.drawRoundedRect(rect, corner, corner)
 
-    # Original VOX 5-bar symmetrical voice emblem inside
+    # Dynamic gradient for the V
+    v_grad = QLinearGradient(120 * scale, 120 * scale, 390 * scale, 390 * scale)
+    if state == "listening":
+        v_grad.setColorAt(0.0, QColor("#38BDF8"))
+        v_grad.setColorAt(1.0, QColor("#06B6D4"))
+    elif state == "recording":
+        v_grad.setColorAt(0.0, QColor("#F43F5E"))
+        v_grad.setColorAt(1.0, QColor("#EF4444"))
+    elif state == "processing":
+        v_grad.setColorAt(0.0, QColor("#A855F7"))
+        v_grad.setColorAt(1.0, QColor("#6366F1"))
+    else:
+        v_grad.setColorAt(0.0, QColor("#6366F1"))  # Electric Indigo
+        v_grad.setColorAt(0.45, QColor("#3B82F6")) # Cobalt
+        v_grad.setColorAt(1.0, QColor("#06B6D4"))  # Sonic Cyan
+
+    stroke_w = max(2.5, 46.0 * scale)
+    pen = QPen(QBrush(v_grad), stroke_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    path = QPainterPath()
+    path.moveTo(138 * scale, 148 * scale)
+    path.lineTo(256 * scale, 362 * scale)
+    path.lineTo(374 * scale, 148 * scale)
+    painter.drawPath(path)
+
+    # Soundbars inside V
     painter.setPen(Qt.PenStyle.NoPen)
-    bar_color = QColor(
-        "#84CDC1" if state == "listening"
-        else "#F0D7FF" if state == "processing"
-        else "#FF5757" if state == "recording"
-        else "#FCFCFB"
-    )
-    painter.setBrush(QBrush(bar_color))
+    c_bar_color = QColor(255, 255, 255, 245)
+    s_bar_color = QColor(255, 255, 255, 204)
 
-    bars = [
-        (134.0, 96.0),
-        (188.0, 176.0),
-        (242.0, 252.0),
-        (296.0, 176.0),
-        (350.0, 96.0),
-    ]
-    bar_w = max(2.0, 28.0 * scale)
-    center_y = size / 2.0
-    for bx, bh in bars:
-        h_s = max(4.0, bh * scale)
-        x_s = bx * scale
-        painter.drawRoundedRect(
-            QRectF(x_s, center_y - h_s / 2.0, bar_w, h_s),
-            bar_w / 2.0,
-            bar_w / 2.0,
-        )
+    # Center bar
+    painter.setBrush(QBrush(c_bar_color))
+    cb_w = max(1.5, 18 * scale)
+    cb_h = max(4.0, 105 * scale)
+    painter.drawRoundedRect(QRectF((256.0 - 9.0) * scale, 162 * scale, cb_w, cb_h), cb_w / 2.0, cb_w / 2.0)
 
+    # Left & Right bars (draw only if size >= 32 for crispness)
+    if size >= 32:
+        painter.setBrush(QBrush(s_bar_color))
+        sb_w = max(1.2, 14 * scale)
+        sb_h = max(3.0, 60 * scale)
+        painter.drawRoundedRect(QRectF(208 * scale, 192 * scale, sb_w, sb_h), sb_w / 2.0, sb_w / 2.0)
+        painter.drawRoundedRect(QRectF(290 * scale, 192 * scale, sb_w, sb_h), sb_w / 2.0, sb_w / 2.0)
+
+    # Live recording badge dot if recording
     if state in ("recording", "both"):
-        dot_center = QPointF(size - 84.0 * scale, 84.0 * scale)
-        painter.setPen(QPen(QColor("#FCFCFB"), max(1.5, 6.0 * scale)))
-        painter.setBrush(QColor("#FF5757"))
-        painter.drawEllipse(dot_center, 34.0 * scale, 34.0 * scale)
+        dot_center = QPointF(size - 78.0 * scale, 78.0 * scale)
+        painter.setPen(QPen(QColor("#FFFFFF"), max(1.5, 6.0 * scale)))
+        painter.setBrush(QColor("#EF4444"))
+        painter.drawEllipse(dot_center, 30.0 * scale, 30.0 * scale)
 
     painter.end()
     return pixmap

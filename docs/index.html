@@ -9,22 +9,24 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500;1,600&family=Figtree:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <script src="assets/vox-auth.js" defer></script>
   <style>
     :root {
-      --cream: #FBF8EE;
-      --cream-deep: #F3EFE2;
-      --forest: #0C2D25;
-      --forest-deep: #06211A;
-      --pine: #0B3B32;
-      --black: #141414;
-      --obsidian: #080808;
-      --lilac: #E8D5FF;
-      --lilac-bright: #D4BFFF;
+      --cream: #F8FAFC;
+      --cream-deep: #F1F5F9;
+      --forest: #4F46E5;
+      --forest-deep: #4338CA;
+      --pine: #0B0F19;
+      --black: #0B0F19;
+      --obsidian: #050811;
+      --lilac: #EEF2FF;
+      --lilac-bright: #E0E7FF;
       --amber: #F59E0B;
-      --sage: #E3E8DC;
-      --emerald: #30C382;
-      --ink: #111827;
-      --ink-muted: #52525B;
+      --sage: #F1F5F9;
+      --emerald: #06B6D4;
+      --cyan: #06B6D4;
+      --ink: #090D1A;
+      --ink-muted: #475569;
       --serif: 'EB Garamond', Georgia, serif;
       --sans: 'Figtree', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       --radius-xl: 32px;
@@ -71,7 +73,7 @@
       gap: 14px;
       padding: 8px 10px 8px 18px;
       border-radius: 999px;
-      background: rgba(251, 248, 238, 0.88);
+      background: rgba(248, 250, 252, 0.88);
       backdrop-filter: blur(18px);
       -webkit-backdrop-filter: blur(18px);
       border: 1px solid rgba(17,24,39,0.10);
@@ -124,9 +126,9 @@
       display: inline-flex;
       align-items: center;
       gap: 9px;
-      background: var(--lilac);
-      color: var(--ink);
-      border: 1px solid rgba(17,24,39,0.10);
+      background: var(--forest);
+      color: #FFFFFF;
+      border: 1px solid rgba(255,255,255,0.15);
       padding: 10px 18px;
       border-radius: 999px;
       font-weight: 600;
@@ -134,9 +136,9 @@
       transition: transform 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
     }
     .btn-lilac:hover {
-      background: var(--lilac-bright);
+      background: var(--forest-deep);
       transform: translateY(-1px);
-      box-shadow: 0 8px 20px rgba(17,24,39,0.12);
+      box-shadow: 0 8px 20px rgba(79,70,229,0.30);
     }
     .btn-lilac.lg { padding: 14px 26px; font-size: 16px; }
     .btn-ghost {
@@ -343,10 +345,12 @@
       color: var(--ink);
     }
 
-    /* Section 2: 4x Faster Deep Forest Green */
+    /* Section 2: 4x Faster Deep Obsidian & Electric Indigo */
     .section-band { padding: 34px 0; }
     .forest-card {
-      background: var(--forest);
+      background: linear-gradient(135deg, #090D16 0%, #0F172A 55%, #1E1B4B 100%);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      box-shadow: 0 24px 64px rgba(15, 23, 42, 0.22);
       color: #FFFFFF;
       border-radius: var(--radius-xl);
       padding: 68px 46px;
@@ -369,7 +373,7 @@
     .speed-pane-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
     .speed-badge { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; padding: 5px 11px; border-radius: 999px; }
     .speed-badge.kb { background: rgba(255,255,255,0.12); color: rgba(255,255,255,0.85); }
-    .speed-badge.vox { background: var(--lilac); color: var(--ink); }
+    .speed-badge.vox { background: var(--lilac); color: var(--forest); font-weight: 800; }
     .speed-wpm { font-size: 28px; font-weight: 800; letter-spacing: -0.02em; }
     .speed-output { font-size: 16px; line-height: 1.55; min-height: 92px; }
     .btn-replay {
@@ -467,9 +471,10 @@
     }
     .style-tab.active { background: var(--forest); color: #FFFFFF; border-color: var(--forest); }
 
-    /* Section 5: Privacy Banner (Sage) */
+    /* Section 5: Privacy Banner (Studio Mist) */
     .sage-card {
       background: var(--sage);
+      border: 1px solid rgba(17,24,39,0.08);
       border-radius: var(--radius-xl);
       padding: 56px 46px;
       display: grid;
@@ -478,11 +483,12 @@
       align-items: center;
     }
     .sage-card h2 { font-size: clamp(38px, 4.6vw, 56px); margin-bottom: 14px; }
-    .sage-card p { font-size: 16.5px; color: #27322B; max-width: 540px; }
+    .sage-card p { font-size: 16.5px; color: var(--ink-muted); max-width: 540px; }
     .seals-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
     .seal-badge {
-      background: rgba(255,255,255,0.68);
-      border: 1px solid rgba(17,24,39,0.10);
+      background: #FFFFFF;
+      border: 1px solid rgba(17,24,39,0.08);
+      box-shadow: 0 4px 12px rgba(17, 24, 39, 0.03);
       border-radius: 18px;
       padding: 18px;
       text-align: center;
@@ -505,7 +511,7 @@
     .outcome-item { border-radius: 22px; padding: 28px; display: flex; flex-direction: column; justify-content: space-between; min-height: 230px; }
     .outcome-item.lilac { background: var(--lilac); color: var(--ink); }
     .outcome-item.amber { background: var(--amber); color: var(--ink); }
-    .outcome-item.pine { background: var(--pine); color: #FFFFFF; }
+    .outcome-item.pine { background: var(--pine); color: #FFFFFF; border: 1px solid rgba(255,255,255,0.12); }
     .outcome-stat { font-size: 42px; font-weight: 800; letter-spacing: -0.03em; line-height: 1; margin-bottom: 10px; }
     .outcome-item p { font-size: 14.5px; opacity: 0.9; }
 
@@ -513,7 +519,8 @@
     .faq-section { padding: 84px 0; }
     .faq-grid { display: grid; grid-template-columns: 0.95fr 1.05fr; gap: 22px; margin-top: 34px; }
     .faq-menu {
-      background: var(--forest);
+      background: #0B0F19;
+      border: 1px solid #1E293B;
       border-radius: var(--radius-xl);
       padding: 22px;
       display: flex;
@@ -532,10 +539,12 @@
       transition: all 0.18s ease;
     }
     .faq-q-btn:hover { background: rgba(255,255,255,0.08); color: #FFFFFF; }
-    .faq-q-btn.active { background: rgba(255,255,255,0.14); border-color: rgba(255,255,255,0.22); color: #FFFFFF; }
+    .faq-q-btn.active { background: rgba(79, 70, 229, 0.25); border-color: rgba(99, 102, 241, 0.45); color: #FFFFFF; }
 
     .faq-answer-card {
-      background: var(--sage);
+      background: #FFFFFF;
+      border: 1px solid rgba(17,24,39,0.08);
+      box-shadow: 0 10px 30px rgba(15,23,42,0.04);
       border-radius: var(--radius-xl);
       padding: 32px;
       display: flex;
@@ -646,11 +655,6 @@
 </head>
 <body>
 
-  <div class="announce-bar">
-    VOX Desktop with Wispr-grade Floating Toggle Bar &amp; Unified Calendar Sync for Windows is here
-    <a href="#download">Download for free →</a>
-  </div>
-
   <div class="nav-wrap">
     <nav class="navbar" aria-label="Primary navigation">
       <a class="nav-brand" href="#">
@@ -664,9 +668,6 @@
       </div>
 
       <div class="nav-links">
-        <a href="#speed">Speed</a>
-        <a href="#capabilities">Capabilities</a>
-        <a href="#workflows">Workflows</a>
         <a href="#pricing">Pricing</a>
         <a href="account.html">Account</a>
         <a href="#privacy">Privacy</a>
@@ -684,7 +685,7 @@
 
   <header class="hero">
     <div class="container">
-      <div class="eyebrow">VOX VOICE OS • WINDOWS 10 &amp; 11 • 100% LOCAL AI</div>
+      <div class="eyebrow" style="min-height: 24px;"></div>
       <h1 class="serif">Don't type, <em>just speak.</em></h1>
       <p class="hero-sub">
         The local-first voice assistant that turns everyday speech into crisp writing in every Windows app, and captures Zoom, Teams &amp; Meet calls with live notes — completely on your PC.
@@ -699,7 +700,7 @@
         </a>
         <a class="btn-ghost" href="#download">Setup &amp; Portable ZIP ↓</a>
       </div>
-      <div class="hero-meta">Free &amp; local-first · Powered by faster-whisper + Llama 3.2 · Works offline after setup</div>
+      <div class="hero-meta" style="min-height: 24px;"></div>
 
       <!-- Hero Animated Stage + Live Interactive VOX Floating Toggle Bar -->
       <div class="hero-stage reveal visible">
@@ -717,20 +718,14 @@
             <span id="heroMockAppLabel">Active App: Microsoft Outlook · Clean Mode</span>
           </div>
           <div class="app-mock-text" id="heroMockText">
-            Hi Sarah — I reviewed the onboarding deck and updated the timeline for Thursday afternoon. Let's lock the final Windows build after today's sync.<span class="cursor-caret"></span>
+            Hi Sarah — I reviewed the onboarding deck and updated the timeline for Thursday afternoon. Let's finalize the proposal after today's sync.<span class="cursor-caret"></span>
           </div>
         </div>
 
         <div class="vox-pill-playground">
-          <div class="vox-tooltip-sim" id="simTooltip">Dictate <strong>Ctrl+Win</strong></div>
+          <div class="vox-tooltip-sim" id="simTooltip">Dictate</div>
           <div class="vox-bar-row" id="simBar">
             <!-- Rendered by JS to showcase real VOX Floating Toggle Bar states -->
-          </div>
-          <div class="sim-controls" aria-label="Interactive toggle bar preview states">
-            <button class="sim-chip active" onclick="setSimMode('ready', this)">Ready Dual Capsule</button>
-            <button class="sim-chip" onclick="setSimMode('dictating', this)">Live Dictation Waveform</button>
-            <button class="sim-chip" onclick="setSimMode('recording', this)">Active Notetaker Capsule</button>
-            <button class="sim-chip" onclick="setSimMode('resting', this)">Resting Edge Pill</button>
           </div>
         </div>
       </div>
@@ -831,8 +826,8 @@
               <h3 class="serif" style="font-size: 34px; margin: 12px 0 18px; color:#fff;">Both voices + 1080p capture</h3>
               <div style="background: rgba(255,255,255,0.06); border: 1px solid rgba(48,195,130,0.45); border-radius: 16px; padding: 18px; font-size: 14px; line-height: 1.6;">
                 <div style="color: var(--emerald); font-weight:700; margin-bottom:6px;">● Live Dual-Track · Zoom Meeting</div>
-                <div><strong>You (Mic):</strong> Let's ship the installer workflow tonight.</div>
-                <div style="color: #D4D4D8;"><strong>Remote (WASAPI):</strong> Agreed — auto-build on release tag makes updates seamless.</div>
+                <div><strong>You (Mic):</strong> Let's share the finalized presentation with the client tonight.</div>
+                <div style="color: #D4D4D8;"><strong>Remote (WASAPI):</strong> Agreed — the timeline and deliverables are all approved.</div>
               </div>
               <div class="glow-pill" style="border-color: rgba(48,195,130,0.5); color: #A7F3D0;">Local Llama-3.2 Summary + Ask VOX Q&amp;A</div>
             </div>
@@ -906,7 +901,7 @@
               <button class="style-tab" onclick="setStylePreview('casual', this)">Polished</button>
             </div>
             <div id="stylePreviewText" style="color: var(--ink); line-height:1.5;">
-              We finalized the Windows installer and pushed the latest floating bar update to GitHub today.
+              I reviewed the project proposal, updated the milestones for next week, and shared the finalized presentation with the team.
             </div>
           </div>
         </div>
@@ -964,7 +959,6 @@
   <section class="section-band">
     <div class="container">
       <div class="black-card reveal">
-        <div class="eyebrow">ENGINEERED FOR WINDOWS POWER USERS</div>
         <h2 class="serif">From rapid messages <em>to full meeting recaps.</em></h2>
         <div class="outcome-grid">
           <div class="outcome-item lilac">
@@ -1046,7 +1040,7 @@
         </div>
 
         <!-- Pro Plan Monthly -->
-        <div style="background: #FCFAF5; border: 2px solid var(--forest); border-radius: var(--radius-lg); padding: 36px; display: flex; flex-direction: column; justify-content: space-between; box-shadow: 0 12px 32px rgba(17, 24, 39, 0.08); position: relative;">
+        <div style="background: #FFFFFF; border: 2px solid var(--forest); border-radius: var(--radius-lg); padding: 36px; display: flex; flex-direction: column; justify-content: space-between; box-shadow: 0 16px 40px rgba(79, 70, 229, 0.12); position: relative;">
           <div style="position: absolute; top: -14px; left: 50%; transform: translateX(-50%); background: var(--forest); color: #FFFFFF; font-size: 11px; font-weight: 700; padding: 4px 14px; border-radius: 999px; letter-spacing: 0.05em;">POPULAR</div>
           <div>
             <div style="font-size: 22px; font-weight: 700; margin-bottom: 8px;">VOX Pro Monthly</div>
@@ -1064,7 +1058,7 @@
               <li style="display: flex; gap: 10px; align-items: center;"><span style="color:#10B981; font-weight:800;">✓</span> 72-hour offline grace protection</li>
             </ul>
           </div>
-          <a class="btn-lilac" style="text-align: center; justify-content: center; background: var(--forest); color: #FFFFFF;" href="pricing.html">Get VOX Pro (₹199/mo) →</a>
+          <button type="button" class="btn-lilac" style="text-align: center; justify-content: center; background: var(--forest); color: #FFFFFF; width: 100%; border: none; cursor: pointer; padding: 14px 20px; font-weight: 700; border-radius: 999px;" onclick="window.handleDirectRazorpayCheckout ? window.handleDirectRazorpayCheckout('monthly', this) : window.location.href='https://rzp.io/rzp/ugv7JBF2'">Get VOX Pro (₹199/mo) →</button>
         </div>
 
         <!-- Pro Plan Annual -->
@@ -1087,12 +1081,12 @@
               <li style="display: flex; gap: 10px; align-items: center;"><span style="color:#10B981; font-weight:800;">✓</span> 7-day money-back guarantee</li>
             </ul>
           </div>
-          <a class="btn-ghost" style="text-align: center; justify-content: center; background: rgba(17,24,39,0.06);" href="pricing.html">Get Annual (₹1,599/yr) →</a>
+          <button type="button" class="btn-ghost" style="text-align: center; justify-content: center; background: rgba(17,24,39,0.06); width: 100%; border: 1px solid rgba(17,24,39,0.1); cursor: pointer; padding: 14px 20px; font-weight: 700; border-radius: 999px;" onclick="window.handleDirectRazorpayCheckout ? window.handleDirectRazorpayCheckout('annual', this) : window.location.href='https://rzp.io/rzp/fycKln1w'">Get Annual (₹1,599/yr) →</button>
         </div>
       </div>
 
       <div style="text-align: center; margin-top: 18px;">
-        <a href="pricing.html" style="font-weight: 600; font-size: 14px; color: var(--forest); border-bottom: 1.5px solid var(--forest);">View full feature &amp; competitor comparison table (Wispr Flow vs VOX) →</a>
+        <a href="pricing.html" style="font-weight: 600; font-size: 14px; color: var(--forest); border-bottom: 1.5px solid var(--forest);">View full plan details &amp; features →</a>
       </div>
     </div>
   </section>
@@ -1137,12 +1131,6 @@
           <a class="btn-lilac" href="https://github.com/milinddwivedi/Vox/releases/latest/download/VoxLocal-Setup.exe">Download VoxLocal-Setup.exe</a>
           <a class="btn-ghost" style="padding:10px 18px; font-size:14px;" href="https://github.com/milinddwivedi/Vox/releases/latest/download/VoxLocal-Portable-win64.zip">Portable Win64 ZIP</a>
           <a class="btn-ghost" style="padding:10px 18px; font-size:14px;" href="https://github.com/milinddwivedi/Vox/releases" target="_blank" rel="noopener">All GitHub Releases ↗</a>
-        </div>
-
-        <div style="font-size: 13px; font-weight: 600; color: var(--ink-muted); margin-bottom: 8px;">Developer / Early Access Quick Install (runs today from main branch):</div>
-        <div class="cmd-box">
-          <code id="psInstallCmd">git clone https://github.com/milinddwivedi/Vox.git &amp;&amp; cd Vox &amp;&amp; powershell -ExecutionPolicy Bypass -File .\install_and_setup.ps1</code>
-          <button class="copy-btn" onclick="copyInstallCmd()">Copy</button>
         </div>
       </div>
     </div>
@@ -1236,7 +1224,7 @@
             <span class="vox-circle-sm" style="background:#FFFFFF;color:#080808;">✓</span>
           </div>`;
         heroMockLabel.textContent = 'Active App: Microsoft Outlook · Dictating Live';
-        heroMockText.innerHTML = 'Thanks for joining today — we just shipped the local installer pipeline and calendar sync.<span class="cursor-caret"></span>';
+        heroMockText.innerHTML = 'Thanks for joining today — I have reviewed the quarterly deck and updated the project milestones.<span class="cursor-caret"></span>';
       } else if (mode === 'recording') {
         simTooltip.style.opacity = '1';
         simTooltip.innerHTML = 'Show Notepad · Meeting Live';
@@ -1252,7 +1240,7 @@
         heroMockText.innerHTML = '<strong>Live Transcript:</strong> Capturing your mic + call speakers in parallel without any bot joining your call.<span class="cursor-caret"></span>';
       } else {
         simTooltip.style.opacity = '1';
-        simTooltip.innerHTML = 'Dictate <strong>Ctrl+Win</strong>';
+        simTooltip.innerHTML = 'Dictate';
         simBar.innerHTML = `
           <div class="vox-pill-group">
             <button class="vox-cap-btn vox-cap-dictate" onclick="setSimMode('dictating')" title="Click to dictate">
@@ -1277,8 +1265,8 @@
     }
 
     // 4x Speed Comparison Demo
-    const kbSample = "Hi team, just sharing a quick update — wait let me fix that typo — updated the build for Windows testing.";
-    const voxSample = "Hi team, sharing a quick update: we finalized the Windows installer build, verified local Whisper and Llama 3.2 execution, and pushed everything to GitHub for testing.";
+    const kbSample = "Hi team, just sharing a quick update — wait let me fix that typo — updated the proposal for next week.";
+    const voxSample = "Hi team, sharing a quick update: I reviewed the project proposal, updated the delivery milestones for next week, and shared the finalized presentation with the client.";
     let speedTimer1, speedTimer2;
     function runSpeedDemo() {
       clearInterval(speedTimer1);
@@ -1316,10 +1304,10 @@
 
     // Adaptive Writing Style Switcher
     const styleSamples = {
-      clean: "We finalized the Windows installer and pushed the latest floating bar update to GitHub today.",
-      email: "Hi team,\n\nWe've finalized the Windows installer package and pushed today's floating toggle bar updates to GitHub. Ready for your review.\n\nBest regards,",
-      structured: "• Finalized Windows installer script\n• Pushed latest floating toggle bar build\n• Published download page to GitHub",
-      casual: "Hey! Just wrapped the Windows installer and pushed the new floating pill bar up to GitHub — give it a spin!"
+      clean: "I reviewed the project proposal, updated the milestones for next week, and shared the finalized presentation with the team.",
+      email: "Hi team,\n\nI've reviewed the project proposal and updated the delivery milestones for next week. The finalized presentation is ready for your feedback.\n\nBest regards,",
+      structured: "• Reviewed client project proposal\n• Updated delivery milestones for next week\n• Shared finalized presentation with team",
+      casual: "Hey everyone! Just went through the project proposal and updated our milestones for next week — slides are ready in the shared folder."
     };
     function setStylePreview(style, btn) {
       document.querySelectorAll('.style-tab').forEach(b => b.classList.remove('active'));
@@ -1365,15 +1353,6 @@
       });
     }, { threshold: 0.12 });
     document.querySelectorAll('.reveal').forEach(el => revObserver.observe(el));
-
-    function copyInstallCmd() {
-      const txt = document.getElementById('psInstallCmd').textContent;
-      navigator.clipboard.writeText(txt).then(() => {
-        const btn = document.querySelector('.copy-btn');
-        btn.textContent = 'Copied!';
-        setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
-      });
-    }
   </script>
 </body>
 </html>

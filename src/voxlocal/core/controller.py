@@ -200,6 +200,7 @@ class AppController(QObject):
     quota_warning = pyqtSignal(str, float, float)     # (metric_name, current_val, limit_val)
     meeting_overrun_warning = pyqtSignal(str, float)  # (warning_message, elapsed_sec)
     auth_state_changed = pyqtSignal(dict)             # (user_profile_dict)
+    upgrade_dialog_requested = pyqtSignal(str)        # (reason_string)
 
     def __init__(self, config: Optional[AppConfig] = None) -> None:
         super().__init__()
@@ -2526,6 +2527,7 @@ class AppController(QObject):
                 msg = reason or "Weekly dictation quota reached (3,000 words). Upgrade to VOX Pro for unlimited voice typing."
                 self.notification_requested.emit("Weekly Dictation Limit Reached", msg)
                 self.quota_warning.emit("dictation_words", 3000, 3000)
+                self.upgrade_dialog_requested.emit(msg)
                 return False
 
         with self._state_lock:
@@ -2827,6 +2829,7 @@ class AppController(QObject):
                     msg = reason or "Weekly meeting quota reached. Upgrade to VOX Pro for unlimited meetings."
                     self.notification_requested.emit("Meeting Limit Reached", msg)
                     self.quota_warning.emit("meeting_count", 5, 5)
+                    self.upgrade_dialog_requested.emit(msg)
                     return False, msg
             if getattr(self, "_hands_free_active", False):
                 self.stop_hands_free_typing()
@@ -4627,9 +4630,11 @@ class AppController(QObject):
         if hasattr(self, "metering") and hasattr(self, "entitlement"):
             can_ask, reason = self.metering.can_ask_vox(self.entitlement)
             if not can_ask:
+                msg = reason or "Weekly Ask VOX query quota reached (10/10). Upgrade to VOX Pro for unlimited cognitive queries."
+                self.upgrade_dialog_requested.emit(msg)
                 return {
                     "question": question,
-                    "answer": f"### ⚠️ Ask VOX Weekly Limit Reached\n\n{reason or 'You have reached your 10 weekly Ask VOX queries.'}\n\nUpgrade to **VOX Pro** (₹199/mo) for unlimited cognitive queries across all your recorded meetings.",
+                    "answer": f"### ⚠️ Ask VOX Weekly Limit Reached\n\n{msg}\n\nUpgrade to **VOX Pro** (₹199/mo) for unlimited cognitive queries across all your recorded meetings.",
                     "citations": [],
                     "intent": "quota_exceeded",
                     "suggestions": ["Upgrade to VOX Pro (₹199/mo)", "View weekly usage"],
@@ -4673,9 +4678,11 @@ class AppController(QObject):
         if hasattr(self, "metering") and hasattr(self, "entitlement"):
             can_ask, reason = self.metering.can_ask_vox(self.entitlement)
             if not can_ask:
+                msg = reason or "Weekly Ask VOX query quota reached (10/10). Upgrade to VOX Pro for unlimited cognitive queries."
+                self.upgrade_dialog_requested.emit(msg)
                 err_dict = {
                     "question": question,
-                    "answer": f"### ⚠️ Ask VOX Weekly Limit Reached\n\n{reason or 'You have reached your 10 weekly Ask VOX queries.'}\n\nUpgrade to **VOX Pro** (₹199/mo) for unlimited cognitive queries across all your recorded meetings.",
+                    "answer": f"### ⚠️ Ask VOX Weekly Limit Reached\n\n{msg}\n\nUpgrade to **VOX Pro** (₹199/mo) for unlimited cognitive queries across all your recorded meetings.",
                     "citations": [],
                     "intent": "quota_exceeded",
                     "suggestions": ["Upgrade to VOX Pro (₹199/mo)", "View weekly usage"],
