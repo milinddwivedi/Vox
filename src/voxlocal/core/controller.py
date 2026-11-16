@@ -216,6 +216,7 @@ class AppController(QObject):
         self.entitlement = EntitlementManager()
         self.desktop_auth_broker = DesktopAuthBroker()
         self.auth_broker = self.desktop_auth_broker  # Backward compatibility alias
+        self.desktop_auth_broker.on_session_synced = self._on_desktop_auth_synced
         self._restore_user_session()
 
         # Update Manager & Release Trust Chain (Milestone 5)
@@ -475,6 +476,26 @@ class AppController(QObject):
         except Exception as exc:
             logger.warning("Session restoration failed: %s", exc)
 
+    def _on_desktop_auth_synced(self, profile: Any) -> None:
+        """Called automatically when Web-to-Desktop SSO session sync arrives via loopback."""
+        try:
+            user_id = getattr(profile, "user_id", "default")
+            user_email = getattr(profile, "email", "")
+            plan_code = getattr(profile, "plan_code", "free")
+            logger.info("SSO Session synchronized for user: %s (%s)", user_email, plan_code)
+            if hasattr(self, "metering") and self.metering is not None:
+                self.metering.set_user_context(user_id, plan_code, email=user_email)
+            if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
+                self.entitlement.set_user_context(user_id, email=user_email)
+            self._safe_emit(self.auth_state_changed, self.get_account_status())
+            if hasattr(self, "entitlement") and self.entitlement is not None:
+                self._safe_emit(self.entitlement_changed, self.entitlement.get_effective_entitlement())
+            if hasattr(self, "metering") and self.metering is not None:
+                self._safe_emit(self.usage_updated, self.metering.get_weekly_usage())
+            threading.Thread(target=self._sync_commercial_worker, name="SSOCloudSync", daemon=True).start()
+        except Exception as exc:
+            logger.warning("Error applying synced desktop auth session: %s", exc)
+
     def request_upgrade_dialog(self, reason: str = "Upgrade to VOX Pro") -> None:
         """Trigger upgrade dialog request signal."""
         self.upgrade_dialog_requested.emit(reason)
@@ -636,8 +657,8 @@ class AppController(QObject):
         """Safely emit a Qt signal, ignoring RuntimeError if C/C++ object has been deleted."""
         try:
             sig.emit(*args)
-        except RuntimeError:
-            pass
+        except (RuntimeError, Exception) as exc:
+            logger.debug("Signal emission exception safely caught: %s", exc)
 
     def set_meeting_lifecycle_state(self, state: MeetingLifecycleState | str, message: str = "") -> None:
         try:
@@ -3904,7 +3925,8 @@ class AppController(QObject):
 
                     # Smart Folder auto-classification if not already assigned
                     if smart_folder_id is None:
-                        title_lower = (meeting_obj.get("title", "") + " " + topics_str).lower()
+                        m_title_str = meeting_obj.get("title", "") if meeting_obj else ""
+                        title_lower = (m_title_str + " " + topics_str).lower()
                         folders = self.db.list_folders()
                         for f in folders:
                             fname = f["name"].lower()

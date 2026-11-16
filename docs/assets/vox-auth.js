@@ -30,6 +30,16 @@
         getSupabase();
         initAuth();
       };
+      s.onerror = function () {
+        const s2 = document.createElement('script');
+        s2.id = 'supabaseJsSdkFallback';
+        s2.src = 'https://unpkg.com/@supabase/supabase-js@2';
+        s2.onload = function () {
+          getSupabase();
+          initAuth();
+        };
+        document.head.appendChild(s2);
+      };
       document.head.appendChild(s);
     }
   }
@@ -250,30 +260,80 @@
     };
   }
 
+  // --- Seamless Web-to-Desktop SSO Sync ---
+  async function syncToDesktopApp(session, user) {
+    const activeSession = session || (user && user.session);
+    if (!activeSession || !activeSession.access_token) return false;
+    const ports = [8400, 8401, 8402, 3000];
+    const u = user || {};
+    const payload = JSON.stringify({
+      access_token: activeSession.access_token,
+      refresh_token: activeSession.refresh_token || '',
+      expires_at: activeSession.expires_at || 0,
+      user_id: u.id || (activeSession.user && activeSession.user.id) || '',
+      email: u.email || (activeSession.user && activeSession.user.email) || '',
+      name: u.name || '',
+      avatar_url: u.avatar_url || u.avatar || '',
+      plan_code: u.is_pro ? 'pro_annual' : 'free',
+      is_pro: Boolean(u.is_pro)
+    });
+
+    for (const port of ports) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1200);
+        const resp = await fetch(`http://127.0.0.1:${port}/sync-session`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: payload,
+          mode: 'cors',
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        if (resp.ok) {
+          console.log(`[VOX SSO] Synced authenticated session with VOX Desktop on 127.0.0.1:${port}`);
+          if (typeof window.onVoxDesktopSyncSuccess === 'function') {
+            window.onVoxDesktopSyncSuccess(port);
+          }
+          return true;
+        }
+      } catch (e) {
+        // Port not listening or private network blocked
+      }
+    }
+    return false;
+  }
+
+  let _desktopSyncInterval = null;
+  function startDesktopSyncHeartbeat(session, user) {
+    if (_desktopSyncInterval) clearInterval(_desktopSyncInterval);
+    let attempts = 0;
+    _desktopSyncInterval = setInterval(async () => {
+      attempts++;
+      const synced = await syncToDesktopApp(session, user);
+      if (synced || attempts >= 20) {
+        clearInterval(_desktopSyncInterval);
+        _desktopSyncInterval = null;
+      }
+    }, 2500);
+  }
+
   // --- Real Google OAuth Sign-In ---
   async function signInWithGoogle(options = {}) {
     const sb = getSupabase();
     if (!sb) {
-      alert('Authentication service is initializing. Please try again.');
+      alert('Authentication service is initializing. Please try again in a moment.');
       return;
     }
     const redirectTo = options.redirectTo || window.location.href;
-    let { error } = await sb.auth.signInWithOAuth({
-      provider: 'google',
+    const { error } = await sb.auth.signInWithOAuth({
+      provider: 'custom:google',
       options: {
         redirectTo: redirectTo
       }
     });
-    if (error && error.message && error.message.includes('not enabled')) {
-      const fallback = await sb.auth.signInWithOAuth({
-        provider: 'custom:google',
-        options: {
-          redirectTo: redirectTo
-        }
-      });
-      error = fallback.error;
-    }
     if (error) {
+      console.error('Google Sign-in error:', error);
       alert('Google Sign-in failed: ' + error.message);
     }
   }
@@ -304,6 +364,10 @@
     sb.auth.onAuthStateChange(async (event, session) => {
       const user = await getCurrentUser();
       renderAuthNavbar(user);
+      if (session && user) {
+        syncToDesktopApp(session, user);
+        startDesktopSyncHeartbeat(session, user);
+      }
       if (typeof callback === 'function') {
         callback(user, session);
       }
@@ -315,6 +379,10 @@
     // Check initial session
     const currentUser = await getCurrentUser();
     renderAuthNavbar(currentUser);
+    if (currentUser && currentUser.session) {
+      syncToDesktopApp(currentUser.session, currentUser);
+      startDesktopSyncHeartbeat(currentUser.session, currentUser);
+    }
     if (typeof callback === 'function') {
       callback(currentUser, null);
     }
@@ -792,6 +860,7 @@
     getCurrentUser: getCurrentUser,
     getSubscription: getSubscription,
     getWeeklyUsage: getWeeklyUsage,
+    syncToDesktop: syncToDesktopApp,
     openModal: window.openVoxAuthModal,
     closeModal: window.closeVoxAuthModal,
     checkout: window.handleDirectRazorpayCheckout,

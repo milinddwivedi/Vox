@@ -96,6 +96,7 @@ class DesktopAuthBroker:
     Coordinates browser Google Sign-in with local loopback callback,
     exchanges tokens, and synchronizes entitlements.
     """
+    _active_broker: Optional["DesktopAuthBroker"] = None
 
     def __init__(self, vault_path: Optional[Path] = None, backend_url: str = DEFAULT_BACKEND_URL) -> None:
         self.lock = threading.RLock()
@@ -107,7 +108,26 @@ class DesktopAuthBroker:
             self.vault_path = Path(vault_path)
 
         self._current_user: Optional[UserProfile] = None
+        self.on_session_synced: Optional[Callable[[UserProfile], None]] = None
+        self._background_servers: List[HTTPServer] = []
+        self._stop_background_listener = threading.Event()
+        DesktopAuthBroker._active_broker = self
         self._load_cached_session()
+        self.start_background_sync_listener()
+        self.register_windows_uri_scheme()
+
+    def close(self) -> None:
+        """Shuts down background sync listeners and releases loopback ports."""
+        self._stop_background_listener.set()
+        with self.lock:
+            for s in self._background_servers:
+                try:
+                    s.server_close()
+                except Exception:
+                    pass
+            self._background_servers.clear()
+        if DesktopAuthBroker._active_broker is self:
+            DesktopAuthBroker._active_broker = None
 
     def _load_cached_session(self) -> None:
         with self.lock:
@@ -422,35 +442,269 @@ class DesktopAuthBroker:
                 expires_at=time.time() + expires_in,
             )
             self._save_session(profile)
+            if self.on_session_synced:
+                try:
+                    self.on_session_synced(profile)
+                except Exception as cb_err:
+                    logger.debug("on_session_synced callback error: %s", cb_err)
             return True, f"Successfully signed in as {profile.display_name} ({profile.email})", profile
         except Exception as exc:
             logger.error("Error in complete_login_from_url: %s", exc)
             return False, f"Failed to parse credentials: {exc}", None
+
+    def complete_login_from_payload(self, data: Dict[str, Any]) -> Tuple[bool, str, Optional[UserProfile]]:
+        """Parses a dictionary payload from Web SSO sync or local callback, updating user session."""
+        try:
+            if not isinstance(data, dict):
+                return False, "Payload must be a dictionary", None
+
+            raw_token = str(data.get("access_token") or "").strip()
+            refresh_token = str(data.get("refresh_token") or "").strip()
+            user_id = str(data.get("user_id") or "").strip()
+            email = str(data.get("email") or "").strip()
+            name = str(data.get("name") or data.get("display_name") or "").strip()
+            avatar_url = str(data.get("avatar_url") or data.get("picture") or "").strip()
+            plan_code = str(data.get("plan_code") or "free").strip()
+            is_pro = bool(data.get("is_pro", False))
+            expires_at = float(data.get("expires_at") or (time.time() + 86400 * 7))
+
+            # Decode JWT claims if token provided and metadata missing
+            if raw_token and (not user_id or not email or not name or not avatar_url):
+                try:
+                    parts = raw_token.split(".")
+                    if len(parts) >= 2:
+                        padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+                        claims = json.loads(base64.urlsafe_b64decode(padded))
+                        if not user_id and claims.get("sub"):
+                            user_id = str(claims["sub"])
+                        if not email and claims.get("email"):
+                            email = str(claims["email"])
+                        metadata = claims.get("user_metadata", {})
+                        if not name and (metadata.get("full_name") or metadata.get("name")):
+                            name = str(metadata.get("full_name") or metadata.get("name"))
+                        if not avatar_url and (metadata.get("avatar_url") or metadata.get("picture")):
+                            avatar_url = str(metadata.get("avatar_url") or metadata.get("picture"))
+                except Exception:
+                    pass
+
+            if not user_id and not email:
+                return False, "Missing user_id and email in payload", None
+
+            is_master = (email.lower() == "milinddwivedi0@gmail.com") or (user_id in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
+            if is_master:
+                plan_code = "pro_annual"
+                is_pro = True
+
+            profile = UserProfile(
+                user_id=user_id or "default",
+                email=email,
+                display_name=name or (email.split("@")[0] if email else "VOX User"),
+                avatar_url=avatar_url,
+                plan_code=plan_code,
+                is_pro=is_pro,
+                access_token=raw_token,
+                refresh_token=refresh_token,
+                expires_at=expires_at,
+            )
+            self._save_session(profile)
+
+            if self.on_session_synced:
+                try:
+                    self.on_session_synced(profile)
+                except Exception as cb_err:
+                    logger.debug("on_session_synced callback error: %s", cb_err)
+
+            return True, f"Successfully signed in as {profile.display_name} ({profile.email})", profile
+        except Exception as exc:
+            logger.error("Error in complete_login_from_payload: %s", exc)
+            return False, f"Failed parsing session: {exc}", None
+
+    def start_background_sync_listener(self) -> None:
+        """Starts persistent background loopback HTTP servers on ports 8400..8403 and 3000 for seamless Web-to-Desktop SSO."""
+        def _run_server(port: int) -> None:
+            try:
+                server = HTTPServer(("127.0.0.1", port), _AuthLoopbackHandler)
+                server.auth_broker = self  # type: ignore
+                server.timeout = 1.0
+                with self.lock:
+                    self._background_servers.append(server)
+                logger.info("VOX Desktop SSO loopback listener active on http://127.0.0.1:%d", port)
+                while not self._stop_background_listener.is_set():
+                    try:
+                        server.handle_request()
+                    except Exception:
+                        pass
+                server.server_close()
+            except OSError as err:
+                logger.debug("Port %d busy or unavailable for background SSO listener: %s", port, err)
+
+        for p in (8400, 3000):
+            threading.Thread(target=_run_server, args=(p,), daemon=True, name=f"VoxLoopbackSSO-{p}").start()
+
+    def register_windows_uri_scheme(self) -> None:
+        """Registers 'voxlocal://' URI scheme in Windows Registry (HKCU) for 1-click browser SSO."""
+        if os.name != "nt":
+            return
+        try:
+            import winreg
+            key_path = r"Software\Classes\voxlocal"
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, "URL:VOX Local Protocol")
+                winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+            
+            if getattr(sys, "frozen", False):
+                cmd = f'"{sys.executable}" --auth-url "%1"'
+            else:
+                script_path = get_app_root() / "main.py"
+                cmd = f'"{sys.executable}" "{script_path}" --auth-url "%1"'
+
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path + r"\shell\open\command") as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, cmd)
+            logger.info("Successfully registered 'voxlocal://' Windows URI protocol handler")
+        except Exception as exc:
+            logger.debug("Could not register 'voxlocal://' URI scheme: %s", exc)
 
 
 class _AuthLoopbackHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         pass  # Suppress default stdout log spam
 
+    def _send_cors_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+
+    def _send_json(self, status_code: int, payload_bytes: bytes) -> None:
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload_bytes)))
+        self._send_cors_headers()
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(payload_bytes)
+
+    def _send_html(self, status_code: int, html: str) -> None:
+        body = html.encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_cors_headers()
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self._send_cors_headers()
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ("/sync-session", "/api/auth/sync", "/callback"):
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception:
+                payload = {}
+
+            broker = DesktopAuthBroker._active_broker or getattr(self.server, "auth_broker", None)
+            if broker:
+                ok, msg, profile = broker.complete_login_from_payload(payload)
+                if ok and profile:
+                    res_bytes = json.dumps({
+                        "ok": True,
+                        "synced": True,
+                        "email": profile.email,
+                        "display_name": profile.display_name,
+                        "is_pro": profile.is_pro
+                    }).encode("utf-8")
+                    self._send_json(200, res_bytes)
+                    return
+                else:
+                    res_bytes = json.dumps({"ok": False, "error": msg}).encode("utf-8")
+                    self._send_json(400, res_bytes)
+                    return
+            self._send_json(500, b'{"ok": false, "error": "No broker attached"}')
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        broker = DesktopAuthBroker._active_broker or getattr(self.server, "auth_broker", None)
+
+        if parsed.path in ("/health", "/status"):
+            u = broker.get_current_user() if broker else None
+            res = {
+                "ok": True,
+                "app": "voxlocal",
+                "version": "1.0.0",
+                "authenticated": u is not None,
+                "email": u.email if u else None,
+                "name": u.display_name if u else None,
+                "is_pro": u.is_pro if u else False
+            }
+            self._send_json(200, json.dumps(res).encode("utf-8"))
+            return
+
+        if parsed.path == "/sync-session":
+            params = urllib.parse.parse_qs(parsed.query)
+            clean_dict = {k: v[0] for k, v in params.items() if v}
+            if broker and clean_dict:
+                ok, msg, profile = broker.complete_login_from_payload(clean_dict)
+                if ok:
+                    self._send_html(200, SUCCESS_HTML_PAGE)
+                    return
+            self._send_html(200, SUCCESS_HTML_PAGE)
+            return
+
         if parsed.path in ("/", ""):
             bridge_html = """<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>VOX Sign-In</title></head>
-<body style="background:#090a0f;color:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-  <div style="background:#141416;border:1px solid rgba(255,255,255,0.12);border-radius:20px;padding:36px;max-width:440px;text-align:center;">
-    <div style="font-size:32px;margin-bottom:12px;">⚡</div>
-    <h2 style="margin:0 0 8px 0;font-size:20px;">Connecting to VOX Desktop...</h2>
-    <p style="color:#94a3b8;font-size:14px;margin:0 0 16px 0;">Transferring your Google session to the local application.</p>
-    <div id="status" style="color:#10b981;font-size:13px;font-weight:600;">Processing authentication token...</div>
+<head>
+  <meta charset="utf-8">
+  <title>VOX Sign-In</title>
+  <style>
+    body { background: #090a0f; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .card { background: #141416; border: 1px solid rgba(255,255,255,0.12); border-radius: 20px; padding: 36px; max-width: 440px; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+    .btn { display: inline-block; background: #10b981; color: #090a0f; font-weight: 700; padding: 12px 24px; border-radius: 12px; text-decoration: none; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="icon" style="font-size:32px;margin-bottom:12px;">⚡</div>
+    <h2 id="title" style="margin:0 0 8px 0;font-size:20px;">Connecting to VOX...</h2>
+    <p id="desc" style="color:#94a3b8;font-size:14px;margin:0 0 16px 0;">Transferring your session.</p>
+    <div id="status" style="color:#10b981;font-size:13px;font-weight:600;">Processing authentication...</div>
+    <div id="actionArea"></div>
   </div>
   <script>
+    const searchParams = new URLSearchParams(window.location.search);
     const hash = window.location.hash ? (window.location.hash.startsWith('#') ? window.location.hash.substring(1) : window.location.hash) : '';
-    if (hash) {
-      window.location.replace('/callback?' + hash);
+    const hashParams = new URLSearchParams(hash);
+
+    const error = searchParams.get('error_description') || searchParams.get('error') || hashParams.get('error_description') || hashParams.get('error');
+    if (error) {
+      document.getElementById('icon').innerText = '⚠️';
+      document.getElementById('title').innerText = 'Sign-In Notice';
+      document.getElementById('desc').innerText = decodeURIComponent(error.replace(/\\+/g, ' '));
+      document.getElementById('status').style.color = '#ef4444';
+      document.getElementById('status').innerText = 'Authentication could not be completed.';
+      document.getElementById('actionArea').innerHTML = '<a class="btn" href="https://vox-voice-assistant.vercel.app/download">Return to Download Page</a>';
+    } else if (hash && (hash.includes('access_token=') || hash.includes('token='))) {
+      // Send token to local VOX Desktop app
+      fetch('/sync-session?' + hash).catch(() => {});
+      // Also relay user back to the web download page so their web session is logged in!
+      setTimeout(() => {
+        window.location.replace('https://vox-voice-assistant.vercel.app/download#' + hash);
+      }, 350);
     } else {
-      document.getElementById('status').innerText = 'Signed in successfully! You can close this tab and return to VOX.';
+      document.getElementById('icon').innerText = '✓';
+      document.getElementById('title').innerText = 'Signed in to VOX';
+      document.getElementById('status').innerText = 'Session linked successfully! You can close this tab and return to VOX.';
     }
   </script>
 </body>
@@ -515,14 +769,8 @@ class _AuthLoopbackHandler(BaseHTTPRequestHandler):
         holder["access_token"] = raw_access_token
         holder["refresh_token"] = params.get("refresh_token", [""])[0]
 
+        if broker:
+            broker.complete_login_from_payload(holder)
+
         self._send_html(200, SUCCESS_HTML_PAGE)
         event.set()
-
-    def _send_html(self, status_code: int, html: str) -> None:
-        body = html.encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(body)

@@ -1540,8 +1540,14 @@ class InsightsPage(QWidget):
         self._build_ui()
         self.apply_theme(self._theme)
         self.controller.history_updated.connect(self.refresh)
-        self.controller.meeting_saved_and_transcribed.connect(lambda *_: self.refresh())
+        self.controller.meeting_saved_and_transcribed.connect(self._on_meeting_saved_refresh)
         self.refresh()
+
+    def _on_meeting_saved_refresh(self, *args: Any) -> None:
+        try:
+            self.refresh()
+        except Exception:
+            pass
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)

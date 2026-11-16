@@ -635,6 +635,17 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def handle_meeting_saved_and_transcribed(self, meeting_id: int) -> None:
+        """Safely invoked on the GUI thread via Qt QueuedConnection when a meeting is finalized."""
+        try:
+            if getattr(self.controller.config, "notetaker_auto_open_summary", True):
+                self.open_and_focus_tab("notetaker")
+                if hasattr(self.notetaker_page, "select_meeting"):
+                    self.notetaker_page.select_meeting(int(meeting_id))
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug("handle_meeting_saved_and_transcribed notice: %s", exc)
+
     def show_settings_dialog(self, section_index: int = 0) -> None:
         self.open_and_focus_tab(7, maximize=False)
         self.settings_page.select_section(section_index)
@@ -874,6 +885,24 @@ class MainWindow(QMainWindow):
             self._toasts.remove(toast)
 
     def _on_plan_button_clicked(self) -> None:
+        account = self.controller.get_account_status() if hasattr(self.controller, "get_account_status") else {}
+        if not account.get("signed_in"):
+            from PyQt6.QtWidgets import QMessageBox
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Sign in to VOX")
+            msg_box.setText("Please sign in with your Google account first.")
+            msg_box.setInformativeText(
+                "Signing in ensures your VOX Pro subscription is permanently linked to your profile "
+                "and accessible across all your devices."
+            )
+            btn_signin = msg_box.addButton("Continue with Google", QMessageBox.ButtonRole.AcceptRole)
+            btn_cancel = msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            msg_box.setDefaultButton(btn_signin)
+            msg_box.exec()
+            if msg_box.clickedButton() == btn_signin:
+                self._on_google_signin_clicked()
+            return
+
         effective_ent = self.controller.entitlement.get_effective_entitlement() if hasattr(self.controller, "entitlement") else {}
         is_pro = bool(effective_ent.get("is_pro", False))
         reason = "Manage VOX Pro Plan" if is_pro else "Upgrade to VOX Pro"

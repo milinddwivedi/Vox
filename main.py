@@ -76,6 +76,12 @@ def main() -> int:
         default=0,
         help="Run full GUI initialization and exit automatically after N milliseconds (for automated testing)",
     )
+    parser.add_argument(
+        "--auth-url",
+        type=str,
+        default="",
+        help="Deep link authorization payload or redirect URL (from voxlocal:// protocol)",
+    )
     args = parser.parse_args()
 
     setup_logging()
@@ -117,6 +123,16 @@ def main() -> int:
 
     if already_running and args.smoke_test_ms <= 0:
         logger.info("Another instance of VoxLocal is already running; bringing it to the front...")
+        if getattr(args, "auth_url", None):
+            try:
+                import urllib.parse
+                import urllib.request
+                auth_val = getattr(args, "auth_url", "")
+                query_str = urllib.parse.urlsplit(auth_val).query or auth_val
+                sync_url = f"http://127.0.0.1:8400/sync-session?{query_str}"
+                urllib.request.urlopen(sync_url, timeout=1.5)
+            except Exception as fwd_exc:
+                logger.debug("Could not forward auth-url to running instance: %s", fwd_exc)
         user32 = ctypes.windll.user32
         SW_RESTORE = 9
         hwnd = user32.FindWindowW(None, "VoxLocal - Local AI Voice Assistant")
@@ -147,6 +163,8 @@ def main() -> int:
 
     config = AppConfig.load()
     controller = AppController(config=config)
+    if getattr(args, "auth_url", None):
+        controller.complete_login_from_url(args.auth_url)
 
     main_win_ref = []
     tray_ref = []
@@ -247,10 +265,10 @@ def main() -> int:
         if st == "recording" and getattr(config, "notetaker_notepad_on_start", "open") == "open"
         else None
     )
+    from PyQt6.QtCore import Qt
     controller.meeting_saved_and_transcribed.connect(
-        lambda mid: open_dashboard_tab("notetaker")
-        if getattr(config, "notetaker_auto_open_summary", True) and args.smoke_test_ms <= 0
-        else None
+        main_window.handle_meeting_saved_and_transcribed,
+        Qt.ConnectionType.QueuedConnection,
     )
     cal_prompt.start_capture_requested.connect(
         lambda mtg: controller.start_meeting_recording(title=getattr(mtg, "title", "Scheduled Meeting"))

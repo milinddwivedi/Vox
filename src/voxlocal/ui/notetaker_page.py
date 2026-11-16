@@ -963,9 +963,13 @@ class NotetakerPage(QWidget):
         self.select_meeting(mid)
 
     def _on_meeting_saved(self, meeting_id: int) -> None:
-        self._selected_meeting_id = meeting_id
-        self.refresh_meetings_list()
-        self.select_meeting(meeting_id)
+        try:
+            self._selected_meeting_id = meeting_id
+            self.refresh_meetings_list()
+            self.select_meeting(meeting_id)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug("_on_meeting_saved error: %s", exc)
 
     def _on_meeting_item_selected(self, current: Optional[QListWidgetItem], _prev: Optional[QListWidgetItem]) -> None:
         if current is None:

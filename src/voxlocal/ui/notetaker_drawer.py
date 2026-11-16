@@ -469,13 +469,16 @@ class VoxNotetakerDrawer(QWidget):
         self._render_live_segments()
 
     def _on_meeting_finalized(self, meeting_id: int) -> None:
-        if self.controller and self.controller.is_meeting_recording:
-            return
-        if getattr(self, "_active_displayed_meeting_id", None) not in (None, meeting_id):
-            return
-        self._tasks_tab_hidden_during_call = False
-        self._display_meeting(meeting_id)
-        self._sync_controls_state("idle")
+        try:
+            if self.controller and self.controller.is_meeting_recording:
+                return
+            if getattr(self, "_active_displayed_meeting_id", None) not in (None, meeting_id):
+                return
+            self._tasks_tab_hidden_during_call = False
+            self._display_meeting(meeting_id)
+            self._sync_controls_state("idle")
+        except Exception as exc:
+            logger.debug("_on_meeting_finalized notice: %s", exc)
 
     def _filter_transcript_list(self, query: str) -> None:
         q = query.strip().lower()
