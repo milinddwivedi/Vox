@@ -263,6 +263,8 @@ class MainWindow(QMainWindow):
             self.controller.toast_requested.connect(self.show_toast)
         if hasattr(self.controller, "update_check_completed"):
             self.controller.update_check_completed.connect(self._on_update_available)
+        if hasattr(self.controller, "model_status_changed"):
+            self.controller.model_status_changed.connect(self._on_model_status_changed)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -957,6 +959,15 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, lambda: self.show_toast("VOX Up to Date", msg or "You are using the latest version of VOX (v1.0.1)."))
         import threading
         threading.Thread(target=_bg, daemon=True, name="ManualUpdateCheck").start()
+
+    def _on_model_status_changed(self, msg: str) -> None:
+        if not msg:
+            return
+        m_lower = msg.lower()
+        if "ready" in m_lower or "loaded" in m_lower:
+            self.show_toast("AI Engine Ready", msg)
+        elif "downloading" in m_lower or "bootstrapping" in m_lower or "loading" in m_lower:
+            self.show_toast("AI Speech Engine", msg)
 
     def _on_update_available(self, is_avail: bool, manifest: Dict[str, Any], msg: str) -> None:
         """Display an in-app update notification when a new version is detected."""

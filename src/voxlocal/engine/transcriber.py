@@ -998,12 +998,32 @@ class LocalWhisperTranscriber:
                 except Exception:
                     pass
 
-            if not self.is_model_cached(target_model) and self.is_model_cached("large-v3-turbo"):
+            if not self.is_model_cached(target_model):
+                # Progressive model fallback: if target model is not cached, check if any faster model is available locally
+                for fallback_m in ("large-v3-turbo", "small", "base", "tiny"):
+                    if self.is_model_cached(fallback_m):
+                        logger.info(
+                            "Model '%s' not cached locally; automatically using cached '%s' model.",
+                            target_model,
+                            fallback_m,
+                        )
+                        target_model = fallback_m
+                        break
+
+            # Bootstrap tier: On a completely fresh install with NO cached models,
+            # load lightweight 'tiny' (only ~75MB, downloads in 5s) for instant live readiness,
+            # then download full target model in background.
+            needs_bootstrap = (
+                not self.is_model_cached(target_model)
+                and target_model not in ("tiny", "base")
+                and os.environ.get("HF_HUB_OFFLINE") != "1"
+            )
+            bootstrap_target = target_model
+            if needs_bootstrap:
                 logger.info(
-                    "Model '%s' not cached locally; automatically using cached 'large-v3-turbo' model.",
-                    target_model,
+                    "No Whisper model cached locally. Bootstrapping with fast 'tiny' model for sub-5s cold start."
                 )
-                target_model = "large-v3-turbo"
+                target_model = "tiny"
             if self._model is not None and self._loaded_model_name == target_model:
                 return True, f"Model '{target_model}' ready on {self._active_device.upper()}."
 
@@ -1048,6 +1068,14 @@ class LocalWhisperTranscriber:
                     self._active_device = "cuda"
                     elapsed = time.perf_counter() - t0
                     logger.info("Loaded Whisper '%s' on CUDA (%s) in %.2fs", target_model, cuda_compute, elapsed)
+                    if needs_bootstrap:
+                        threading.Thread(
+                            target=self._background_upgrade_to_target_model,
+                            args=(bootstrap_target, status_callback),
+                            name="WhisperBackgroundUpgrade",
+                            daemon=True,
+                        ).start()
+                        return True, f"Loaded fast '{target_model}' on GPU. Downloading '{bootstrap_target}' in background."
                     return True, f"Loaded '{target_model}' on GPU (CUDA {cuda_compute}) in {elapsed:.1f}s"
                 except Exception as cuda_exc:
                     logger.info(
@@ -1072,11 +1100,70 @@ class LocalWhisperTranscriber:
                     self.cpu_threads,
                     elapsed,
                 )
+                if needs_bootstrap:
+                    threading.Thread(
+                        target=self._background_upgrade_to_target_model,
+                        args=(bootstrap_target, status_callback),
+                        name="WhisperBackgroundUpgrade",
+                        daemon=True,
+                    ).start()
+                    return True, f"Loaded fast '{target_model}' on CPU. Downloading '{bootstrap_target}' in background."
                 return True, f"Loaded '{target_model}' on CPU (int8) in {elapsed:.1f}s"
             except Exception as exc:
                 msg = f"Failed to load Whisper model '{target_model}': {exc}"
                 logger.error(msg)
                 return False, msg
+
+    def _background_upgrade_to_target_model(
+        self,
+        target_model: str,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Download and initialize higher-tier model in background, hot-swapping atomically once ready."""
+        try:
+            logger.info("Starting background download/initialization of '%s'...", target_model)
+            model_identifier, dl_root, _ = self.resolve_model_path(target_model)
+            preferred_dev = self.compute_device.lower()
+            if preferred_dev == "auto":
+                try:
+                    preferred_dev = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+                except Exception:
+                    preferred_dev = "cpu"
+
+            upgraded_model = None
+            active_dev = "cpu"
+            if preferred_dev == "cuda":
+                try:
+                    cuda_compute = "int8" if (self.compute_type in ("auto", "default", "int8") or "turbo" in target_model) else self.compute_type
+                    kw = dict(device="cuda", compute_type=cuda_compute)
+                    if dl_root:
+                        kw["download_root"] = dl_root
+                    upgraded_model = WhisperModel(model_identifier, **kw)
+                    dummy = np.zeros(8000, dtype=np.float32)
+                    segs, _ = upgraded_model.transcribe(dummy, beam_size=1)
+                    list(segs)
+                    active_dev = "cuda"
+                except Exception as cuda_err:
+                    logger.debug("CUDA background load notice: %s; trying CPU", cuda_err)
+
+            if upgraded_model is None:
+                kw_cpu = dict(device="cpu", compute_type="int8", cpu_threads=self.cpu_threads)
+                if dl_root:
+                    kw_cpu["download_root"] = dl_root
+                upgraded_model = WhisperModel(model_identifier, **kw_cpu)
+                active_dev = "cpu"
+
+            with self._lock:
+                self._model = upgraded_model
+                self._loaded_model_name = target_model
+                self.model_name = target_model
+                self._active_device = active_dev
+
+            logger.info("Background model upgrade to '%s' (%s) successful!", target_model, active_dev)
+            if status_callback:
+                status_callback(f"Upgraded to high-accuracy model '{target_model}' ({active_dev.upper()}).")
+        except Exception as exc:
+            logger.warning("Background model upgrade to '%s' notice: %s", target_model, exc)
 
     @staticmethod
     def _find_primary_pause_split(audio_16k: np.ndarray, sr: int = TARGET_SAMPLE_RATE) -> Optional[int]:
@@ -1375,6 +1462,13 @@ class LocalWhisperTranscriber:
         automatic language switching, domain hotwords logit biasing, and guaranteed Devanagari script output for Hindi.
         Uses single-pass lazy generator consumption whenever possible to minimize latency.
         """
+        # Ensure model is ready; auto-load if needed
+        if self._model is None:
+            self.ensure_loaded()
+            if self._model is None:
+                logger.warning("Whisper model is still initializing; skipping audio frame.")
+                return [], None
+
         is_en_only = self.model_name.endswith(".en")
         bilingual_modes = ("", "auto", "en+hi", "hinglish", "hi_latn")
 
@@ -1536,6 +1630,13 @@ class LocalWhisperTranscriber:
             audio_16k = audio_16k[-int(4.0 * TARGET_SAMPLE_RATE) :]
 
         norm_audio = normalize_speech_audio(self._trim_edge_silence(audio_16k))
+
+        # Ensure model is ready; auto-load if needed
+        if self._model is None:
+            self.ensure_loaded()
+            if self._model is None:
+                logger.warning("Whisper model is still initializing; skipping audio frame.")
+                return [], None
 
         is_en_only = self.model_name.endswith(".en")
         bilingual_modes = ("", "auto", "en+hi", "hinglish", "hi_latn")

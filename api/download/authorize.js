@@ -7,6 +7,12 @@ const RELEASE_CATALOG = {
     sha256: '300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7',
     size_bytes: 10067409,
   },
+  'releases/1.0.2/VoxLocal-Setup.exe': {
+    version: '1.0.2',
+    filename: 'VoxLocal-Setup.exe',
+    sha256: '1e5dfa31afda87a9f2574966499c6971a94f2a0378dd06e1dd44f912d789213f',
+    size_bytes: 10157669,
+  },
   'releases/1.0.1/VoxLocal-Setup.exe': {
     version: '1.0.1',
     filename: 'VoxLocal-Setup.exe',
@@ -14,10 +20,10 @@ const RELEASE_CATALOG = {
     size_bytes: 10148603,
   },
   'VoxLocal-Setup.exe': {
-    version: '1.0.1',
+    version: '1.0.2',
     filename: 'VoxLocal-Setup.exe',
-    sha256: '77daaf410b3413dd39a3787182d43a79ac7ba109cf305b8ba50db19ace784f48',
-    size_bytes: 10148603,
+    sha256: '1e5dfa31afda87a9f2574966499c6971a94f2a0378dd06e1dd44f912d789213f',
+    size_bytes: 10157669,
   },
 };
 

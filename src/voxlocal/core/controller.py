@@ -3163,6 +3163,8 @@ class AppController(QObject):
                         recorder=self.meeting_recorder,
                         language=self.config.language,
                     )
+                if hasattr(self, "open_notetaker_drawer_requested"):
+                    self.open_notetaker_drawer_requested.emit()
 
             if self._meeting_prompt_popup and self._meeting_prompt_popup.isVisible():
                 try:

@@ -269,7 +269,7 @@ class LiveMeetingStreamingTranscriber:
         mic_rms = float(np.sqrt(np.mean(mic_slice**2))) if mic_slice.size else 0.0
         sys_rms = float(np.sqrt(np.mean(sys_slice**2))) if sys_slice.size else 0.0
 
-        speech_thresh = 0.0012
+        speech_thresh = 0.0006
         is_mic_speech = mic_rms >= speech_thresh
         is_sys_speech = sys_rms >= speech_thresh
 
@@ -359,6 +359,13 @@ class LiveMeetingStreamingTranscriber:
         if audio_slice.size < int(TARGET_SAMPLE_RATE * 0.4):
             return
 
+        # Ensure Whisper model is ready before attempting inference
+        if not self.transcriber.is_model_loaded():
+            self.transcriber.ensure_loaded()
+            if not self.transcriber.is_model_loaded():
+                logger.debug("Transcriber model not yet ready for streaming pass; retaining audio in buffer.")
+                return
+
         # Clamp audio slice to at most 25 seconds to stay safely within Whisper's 30s single-encode window
         max_samples = int(TARGET_SAMPLE_RATE * 25.0)
         if audio_slice.size > max_samples:
@@ -385,14 +392,18 @@ class LiveMeetingStreamingTranscriber:
             word_timestamps=False,
         )
 
-        # Robust fallback: if single-encode returned None (e.g., audio slice edge condition or mock), run standard pass
+        # Robust fallback: if single-encode returned None, run standard pass
         if not res or not res[0]:
             try:
                 res = self.transcriber._run_whisper_pass(
-                    audio_slice,
-                    beam_size=1,
+                    norm_audio=audio_slice,
                     language=self._language,
-                    prompt=prompt,
+                    beam_size=1,
+                    vad_filter=False,
+                    vad_params={},
+                    hotwords=None,
+                    temperatures=0.0,
+                    initial_prompt=prompt,
                 )
             except Exception as fb_err:
                 logger.debug("Streaming transcriber fallback pass warning: %s", fb_err)

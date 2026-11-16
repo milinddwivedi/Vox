@@ -154,6 +154,10 @@ class NotetakerPage(QWidget):
             self.controller.dictation_interim_updated.connect(self._on_dictation_interim_updated)
         if hasattr(self.controller, "dictation_completed"):
             self.controller.dictation_completed.connect(self._on_dictation_completed)
+        if hasattr(self.controller, "meeting_live_partial"):
+            self.controller.meeting_live_partial.connect(self._on_live_meeting_partial)
+        if hasattr(self.controller, "meeting_live_confirmed"):
+            self.controller.meeting_live_confirmed.connect(self._on_live_meeting_confirmed)
 
         self.refresh_all()
 
@@ -229,6 +233,9 @@ class NotetakerPage(QWidget):
         self.lbl_rec_timer = QLabel("00:00")
         b_lay.addWidget(self.lbl_rec_dot)
         b_lay.addWidget(self.lbl_rec_timer)
+        self.lbl_rec_live = QLabel("")
+        self.lbl_rec_live.setStyleSheet("color: #6366f1; font-weight: 500; font-size: 11.5px;")
+        b_lay.addWidget(self.lbl_rec_live, 1)
         b_lay.addStretch(1)
         self.btn_pause_rec = QPushButton("Pause")
         self.btn_pause_rec.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -829,6 +836,22 @@ class NotetakerPage(QWidget):
             self.btn_stop_rec.setVisible(True)
             self.btn_start_adhoc.setText("Start Notetaker")
             self.lbl_rec_timer.setText("00:00")
+            if hasattr(self, "lbl_rec_live"):
+                self.lbl_rec_live.setText("")
+
+    def _on_live_meeting_partial(self, meeting_id: int, partial_dict: dict) -> None:
+        if getattr(self, "lbl_rec_live", None) is not None:
+            txt = str((partial_dict or {}).get("text", "")).strip()
+            spk = str((partial_dict or {}).get("speaker", "Speaker")).strip()
+            if txt:
+                self.lbl_rec_live.setText(f"● {spk}: {txt}")
+
+    def _on_live_meeting_confirmed(self, meeting_id: int, conf_dict: dict) -> None:
+        if getattr(self, "lbl_rec_live", None) is not None:
+            txt = str((conf_dict or {}).get("text", "")).strip()
+            spk = str((conf_dict or {}).get("speaker", "Speaker")).strip()
+            if txt:
+                self.lbl_rec_live.setText(f"✓ {spk}: {txt}")
 
     def _on_meeting_tick(self, elapsed_sec: float, *_extra: Any) -> None:
         self.lbl_rec_timer.setText(format_seconds_hms(float(elapsed_sec or 0.0)))
