@@ -413,6 +413,8 @@ class MainWindow(QMainWindow):
         self.profile_avatar.setObjectName("profileAvatar")
         self.profile_avatar.setFixedSize(28, 28)
         self.profile_avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.profile_avatar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.profile_avatar.mousePressEvent = lambda e: self.show_settings_dialog(4)
         profile_row.addWidget(self.profile_avatar)
 
         profile_text_lay = QVBoxLayout()
@@ -420,11 +422,15 @@ class MainWindow(QMainWindow):
         self.lbl_user_name = QLabel("Guest Mode")
         self.lbl_user_name.setObjectName("profileUserName")
         self.lbl_user_name.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.lbl_user_name.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_user_name.mousePressEvent = lambda e: self.show_settings_dialog(4)
         profile_text_lay.addWidget(self.lbl_user_name)
 
         self.lbl_user_email = QLabel("Offline on this PC")
         self.lbl_user_email.setObjectName("profileUserEmail")
         self.lbl_user_email.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.lbl_user_email.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_user_email.mousePressEvent = lambda e: self.show_settings_dialog(4)
         profile_text_lay.addWidget(self.lbl_user_email)
         profile_row.addLayout(profile_text_lay, 1)
 
@@ -1019,8 +1025,15 @@ class MainWindow(QMainWindow):
             if hasattr(self, "lbl_user_name"):
                 if signed_in and user_email:
                     display_name = user_name if user_name != "Guest User" else user_email.split("@")[0]
-                    self.lbl_user_name.setText(display_name)
-                    self.lbl_user_email.setText(user_email)
+                    # Format display text cleanly with ellipsis so letters never get sliced into vertical lines
+                    fm = self.lbl_user_name.fontMetrics()
+                    elided_name = fm.elidedText(display_name, Qt.TextElideMode.ElideRight, 108)
+                    self.lbl_user_name.setText(elided_name)
+                    self.lbl_user_name.setToolTip(f"{user_name}\n{user_email}\n(Click to view Account & Subscription)")
+
+                    fm_email = self.lbl_user_email.fontMetrics()
+                    elided_email = fm_email.elidedText(user_email, Qt.TextElideMode.ElideRight, 108)
+                    self.lbl_user_email.setText(elided_email)
                     self.lbl_user_email.setToolTip(user_email)
                     self.lbl_user_email.setVisible(True)
 
@@ -1059,7 +1072,11 @@ class MainWindow(QMainWindow):
                 if hasattr(self.controller, "metering")
                 else {}
             )
-            is_pro = bool(ent.get("is_pro", False)) or bool(account_status.get("is_pro", False))
+            is_master = (
+                (user_email and user_email.lower() == "milinddwivedi0@gmail.com")
+                or (account_status.get("email", "").lower() == "milinddwivedi0@gmail.com")
+            )
+            is_pro = is_master or bool(ent.get("is_pro", False)) or bool(account_status.get("is_pro", False))
             words_used = int(usage.get("dictation_words", 0))
 
             limits = ent.get("limits", {})
