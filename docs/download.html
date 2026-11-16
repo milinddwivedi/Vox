@@ -402,7 +402,7 @@
         <div class="download-action-row">
           <div>
             <div style="font-weight:700; font-size:18px; margin-bottom:4px;">VoxLocal-Setup.exe</div>
-            <div style="font-size:13px; color:var(--text-muted);">Version 1.0.0 · Windows 10/11 (64-bit) · 9.6 MB</div>
+            <div style="font-size:13px; color:var(--text-muted);">Version 1.0.1 · Windows 10/11 (64-bit) · 9.7 MB</div>
           </div>
           <button class="btn-download-primary" id="btnDownload" onclick="triggerAuthorizedDownload()">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -415,7 +415,7 @@
         </div>
 
         <div class="checksum-bar">
-          <span>SHA-256 Digest:</span>300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7
+          <span>SHA-256 Digest:</span>77daaf410b3413dd39a3787182d43a79ac7ba109cf305b8ba50db19ace784f48
         </div>
 
         <!-- Seamless Web-to-Desktop SSO Sync Card -->
@@ -470,7 +470,7 @@
       const client = window._sharedSupabase || (typeof window.supabase !== 'undefined' ? window.supabase.createClient(window.SUPABASE_PROJECT_URL, window.SUPABASE_ANON_KEY) : null);
       if (client && client.auth) {
         client.auth.signInWithOAuth({
-          provider: 'custom:google',
+          provider: 'google',
           options: { redirectTo: window.location.href }
         }).catch((e) => {
           console.error("Sign-in redirect error:", e);
@@ -497,7 +497,7 @@
           try {
             const c = window.supabase.createClient(window.SUPABASE_PROJECT_URL, window.SUPABASE_ANON_KEY);
             c.auth.signInWithOAuth({
-              provider: 'custom:google',
+              provider: 'google',
               options: { redirectTo: window.location.href }
             });
             return;
@@ -534,7 +534,7 @@
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + _currentUserSession.access_token,
           },
-          body: JSON.stringify({ artifact: 'releases/1.0.0/VoxLocal-Setup.exe' })
+          body: JSON.stringify({ artifact: 'releases/1.0.1/VoxLocal-Setup.exe' })
         });
 
         const data = await resp.json();

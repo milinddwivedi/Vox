@@ -67,3 +67,5 @@ External References/
 
 # Node
 node_modules/
+
+.env*

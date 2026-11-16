@@ -202,15 +202,33 @@ def verify_and_decode_entitlement_token(
     return True, payload, ""
 
 
-MASTER_DEVELOPER_EMAILS = {"milinddwivedi0@gmail.com"}
-MASTER_DEVELOPER_USER_IDS = {"50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"}
+MASTER_DEVELOPER_EMAILS = {
+    "milinddwivedi0@gmail.com",
+    "amar.vohra3@gmail.com",
+    "hemanthwfx@gmail.com",
+}
+MASTER_DEVELOPER_USER_IDS = {
+    "50d9a219-b06d-4fe9-acb3-7e32bf7cec2f",
+    "09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9",
+    "029cf21a-9fd2-45a3-af3c-70d0fdea5002",
+    "milinddwivedi0@gmail.com",
+}
 
 
 def is_master_developer(user_id: Optional[str] = None, email: Optional[str] = None) -> bool:
-    """Check if the given user ID or email belongs to the Master Developer / Founder."""
+    """
+    Check if the given user ID or email belongs to Founder (Milind) or any
+    employee / stakeholder of World Fashion Exchange (worldfashionexchange.com, WFX).
+    All these users receive permanent, full Pro access by default.
+    """
     if user_id and str(user_id).strip().lower() in MASTER_DEVELOPER_USER_IDS:
         return True
-    if email and str(email).strip().lower() in MASTER_DEVELOPER_EMAILS:
+    if not email:
+        return False
+    em = str(email).strip().lower()
+    if em in MASTER_DEVELOPER_EMAILS:
+        return True
+    if em.endswith("@worldfashionexchange.com") or "worldfashionexchange" in em or "wfx" in em:
         return True
     return False
 

@@ -473,7 +473,8 @@ class AppController(QObject):
                         user_info = {}
                     user_id = session.get("user_id") or user_info.get("id") or "default"
                     user_email = user_info.get("email") or ""
-                    is_master = (user_email and user_email.lower() == "milinddwivedi0@gmail.com") or (str(user_id) in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
+                    from voxlocal.core.entitlement import is_master_developer
+                    is_master = is_master_developer(user_id=user_id, email=user_email)
                     plan_code = "pro_annual" if is_master else (user_info.get("plan") or session.get("plan_code") or "free")
                     if hasattr(self, "metering") and self.metering is not None:
                         self.metering.set_user_context(user_id, plan_code, email=user_email)
@@ -3761,10 +3762,32 @@ class AppController(QObject):
                 eff_prompt = " ".join(prompt_parts).strip()
 
                 existing_segs = self.db.get_transcript_segments(meeting_id) if hasattr(self.db, "get_transcript_segments") else self.db.get_meeting_segments(meeting_id)
-                if existing_segs and len(existing_segs) > 0:
-                    logger.info("Preserving %d live streaming segments for meeting #%d; skipping duplicate offline Whisper pass", len(existing_segs), meeting_id)
+                max_seg_end = max((float(s.get("end_time") or 0.0) for s in existing_segs), default=0.0) if existing_segs else 0.0
+                meeting_dur = float(dur_val or 0.0)
+                # Only bypass offline Whisper pass if live streaming segments captured at least 70% of meeting duration
+                is_substantially_complete = bool(
+                    existing_segs
+                    and len(existing_segs) >= 2
+                    and (meeting_dur <= 20.0 or max_seg_end >= meeting_dur * 0.70)
+                )
+
+                if is_substantially_complete:
+                    logger.info(
+                        "Preserving %d live streaming segments for meeting #%d (coverage=%.1fs/%.1fs); skipping offline Whisper pass",
+                        len(existing_segs),
+                        meeting_id,
+                        max_seg_end,
+                        meeting_dur,
+                    )
                     segments = list(existing_segs)
                 else:
+                    if existing_segs:
+                        logger.info(
+                            "Live streaming segments incomplete (%d segs, end=%.1fs vs meeting=%.1fs); running offline Whisper pass on full recording",
+                            len(existing_segs),
+                            max_seg_end,
+                            meeting_dur,
+                        )
                     self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing speech with local Whisper...")
                     segments = self.transcriber.transcribe_meeting_dual_track(
                         mixed_wav_path=getattr(result, "mixed_wav_path", None),
@@ -4931,10 +4954,8 @@ class AppController(QObject):
             user_info = {}
         user_email = str(user_info.get("email") or "")
         user_id = str((session.get("user_id") if session else None) or user_info.get("id") or "")
-        is_master = (
-            (user_email and user_email.lower() == "milinddwivedi0@gmail.com")
-            or (user_id in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
-        )
+        from voxlocal.core.entitlement import is_master_developer
+        is_master = is_master_developer(user_id=user_id, email=user_email)
 
         ent = self.entitlement.get_effective_entitlement() if hasattr(self, "entitlement") and self.entitlement else {
             "plan": "free", "plan_name": "VOX Free", "is_pro": False, "limits": {}
@@ -4980,7 +5001,8 @@ class AppController(QObject):
                         user_info = {}
                     user_id = str(session.get("user_id") or user_info.get("id") or (data.get("user_id") if isinstance(data, dict) else "default"))
                     user_email = str(user_info.get("email") or "")
-                    is_master = (user_email and user_email.lower() == "milinddwivedi0@gmail.com") or (user_id in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
+                    from voxlocal.core.entitlement import is_master_developer
+                    is_master = is_master_developer(user_id=user_id, email=user_email)
                     plan_code = "pro_annual" if is_master else (user_info.get("plan") or session.get("plan_code") or (data.get("plan_code") if isinstance(data, dict) else "free"))
                     if hasattr(self, "metering") and self.metering is not None:
                         self.metering.set_user_context(user_id, plan_code, email=user_email)

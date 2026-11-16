@@ -328,8 +328,16 @@ class LiveMeetingStreamingTranscriber:
         self._step_accumulated_sec += 0.15
 
         # Trigger partial inference if continuous speech has accumulated >= 2.0s
-        # or if window exceeds max buffer of 10s
-        if self._step_accumulated_sec >= 2.0 or window_dur >= 10.0:
+        # If continuous speech exceeds 10s without a natural pause, force turn boundary flush to prevent runaway buffer
+        if window_dur >= 10.0:
+            self._execute_transcribe_pass(
+                actual_start, now_sec, self._current_track, self._current_speaker, speech_boundary=True
+            )
+            self._speech_active = False
+            self._silence_start_sec = 0.0
+            self._step_accumulated_sec = 0.0
+            self._audio_cursor_sec = now_sec
+        elif self._step_accumulated_sec >= 2.0:
             self._execute_transcribe_pass(
                 actual_start, now_sec, self._current_track, self._current_speaker, speech_boundary=False
             )
@@ -350,6 +358,11 @@ class LiveMeetingStreamingTranscriber:
         audio_slice = mic_slice if track == "mic" else sys_slice
         if audio_slice.size < int(TARGET_SAMPLE_RATE * 0.4):
             return
+
+        # Clamp audio slice to at most 25 seconds to stay safely within Whisper's 30s single-encode window
+        max_samples = int(TARGET_SAMPLE_RATE * 25.0)
+        if audio_slice.size > max_samples:
+            audio_slice = audio_slice[-max_samples:]
 
         vocab = self.db.list_vocabulary(active_only=True) if self.db else []
         prompt = DictationProcessor.build_whisper_prompt(vocab)
@@ -372,11 +385,29 @@ class LiveMeetingStreamingTranscriber:
             word_timestamps=False,
         )
 
+        # Robust fallback: if single-encode returned None (e.g., audio slice edge condition or mock), run standard pass
         if not res or not res[0]:
+            try:
+                res = self.transcriber._run_whisper_pass(
+                    audio_slice,
+                    beam_size=1,
+                    language=self._language,
+                    prompt=prompt,
+                )
+            except Exception as fb_err:
+                logger.debug("Streaming transcriber fallback pass warning: %s", fb_err)
+                res = None
+
+        if not res or not res[0]:
+            # Always advance cursor if window has grown excessively to prevent permanent stall
+            if (end_sec - self._audio_cursor_sec) >= 12.0:
+                self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec - 4.0)
             return
 
         raw_text = " ".join(s.text.strip() for s in res[0] if s.text.strip())
         if not raw_text or is_hallucination(raw_text):
+            if (end_sec - self._audio_cursor_sec) >= 12.0:
+                self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec - 4.0)
             return
 
         # Process with LocalAgreement
@@ -453,3 +484,7 @@ class LiveMeetingStreamingTranscriber:
                 else:
                     dur = max(0.2, (len(confirmed.split()) / max(1, len(raw_text.split()))) * (end_sec - start_sec))
                     self._audio_cursor_sec = min(end_sec, start_sec + dur)
+        else:
+            # If no confirmed text was emitted on this pass and cursor is falling far behind, advance cursor safely
+            if (end_sec - self._audio_cursor_sec) >= 12.0:
+                self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec - 3.0)

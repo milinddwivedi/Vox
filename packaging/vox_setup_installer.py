@@ -229,7 +229,7 @@ def main() -> int:
         print(f"SMOKE_OK install_dir={p} has_bundled_src={has_src}")
         return 0
     if "--version" in sys.argv:
-        print("1.0.0")
+        print("1.0.1")
         return 0
     return run_install(silent=("--silent" in sys.argv))
 

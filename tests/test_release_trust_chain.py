@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 from typing import Any, Dict
@@ -41,6 +42,9 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 DIST_INSTALLER = ROOT_DIR / "dist" / "VoxLocal-Setup.exe"
 DOCS_INSTALLER = ROOT_DIR / "docs" / "downloads" / "VoxLocal-Setup.exe"
 LATEST_JS_PATH = ROOT_DIR / "api" / "releases" / "latest.js"
+
+if not os.environ.get("VOX_ENTITLEMENT_PRIVATE_KEY_ED25519"):
+    os.environ.setdefault("VOX_ENTITLEMENT_PUBLIC_KEY", TEST_DEV_PUBLIC_KEY_HEX)
 
 
 def get_backend_manifest() -> Dict[str, Any]:

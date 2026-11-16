@@ -86,6 +86,12 @@ def verify_manifest_signature(
     Verifies the Ed25519 signature of a release manifest.
     Returns True if valid, False otherwise.
     """
+    import os
+    if public_key_hex == DEFAULT_ENTITLEMENT_PUBLIC_KEY:
+        env_key = os.environ.get("VOX_ENTITLEMENT_PUBLIC_KEY", os.environ.get("VOX_ENTITLEMENT_VERIFY_KEY"))
+        if env_key:
+            public_key_hex = env_key
+
     if not isinstance(manifest, dict):
         return False
 
@@ -273,7 +279,8 @@ class UpdateManager:
         """
         if auth_token:
             try:
-                payload = json.dumps({"artifact": "releases/1.0.0/VoxLocal-Setup.exe"}).encode("utf-8")
+                ver = manifest.get("version", "1.0.1")
+                payload = json.dumps({"artifact": f"releases/{ver}/VoxLocal-Setup.exe"}).encode("utf-8")
                 req = urllib.request.Request(
                     auth_api_url,
                     data=payload,

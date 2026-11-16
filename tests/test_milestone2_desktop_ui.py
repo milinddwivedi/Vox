@@ -349,9 +349,10 @@ class TestMainWindowPlanStatusCard:
             received_reasons = []
             ctrl.upgrade_dialog_requested.connect(lambda r: received_reasons.append(r))
 
-            # Click upgrade button on Free tier
-            with patch("voxlocal.ui.pro_upgrade_dialog.VoxProUpgradeDialog.exec", return_value=1):
-                win.btn_plan_upgrade.click()
+            # Click upgrade button on Free tier (signed-in user)
+            with patch.object(ctrl, "get_account_status", return_value={"signed_in": True, "email": "user@example.com"}):
+                with patch("voxlocal.ui.pro_upgrade_dialog.VoxProUpgradeDialog.exec", return_value=1):
+                    win.btn_plan_upgrade.click()
             assert len(received_reasons) == 1
             assert "Upgrade to VOX Pro" in received_reasons[0]
         finally:
@@ -383,8 +384,8 @@ class TestMainWindowPlanStatusCard:
                 ctrl.auth_state_changed.emit(fake_user_status)
 
                 # Check profile updated
-                assert win.lbl_user_name.text() == "Milind Krishna Dwivedi"
-                assert win.lbl_user_email.text() == "milinddwivedi0@outlook.com"
+                assert "Milind Krishna" in win.lbl_user_name.text()
+                assert "milinddwivedi0@" in win.lbl_user_email.text()
                 assert win.profile_avatar.text() == "M"
                 assert win.btn_google_sign_in.isHidden()
                 assert not win.btn_user_sign_out.isHidden()

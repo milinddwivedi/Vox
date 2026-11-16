@@ -396,6 +396,14 @@ class MainWindow(QMainWindow):
         self.btn_toggle_float.clicked.connect(self._toggle_floating_bar)
         sb_lay.addWidget(self.btn_toggle_float)
 
+        self.btn_check_updates = QPushButton("Check for Updates")
+        self.btn_check_updates.setObjectName("sbUtilBtn")
+        self.btn_check_updates.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_check_updates.setAccessibleName("Check for Updates")
+        self.btn_check_updates.setAccessibleDescription("Check for latest VOX updates and improvements")
+        self.btn_check_updates.clicked.connect(self._on_manual_check_updates)
+        sb_lay.addWidget(self.btn_check_updates)
+
         # ---- Left Sidebar User Profile & Plan Status Card ----
         sb_lay.addStretch()
 
@@ -939,6 +947,17 @@ class MainWindow(QMainWindow):
         else:
             self.show_toast("Sign-In", msg)
 
+    def _on_manual_check_updates(self) -> None:
+        """User clicked 'Check for Updates' in sidebar."""
+        self.show_toast("Checking for Updates", "Connecting to VOX update server...")
+        def _bg():
+            is_avail, manifest, msg = self.controller.check_for_updates(timeout_sec=10)
+            if not is_avail:
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(0, lambda: self.show_toast("VOX Up to Date", msg or "You are using the latest version of VOX (v1.0.1)."))
+        import threading
+        threading.Thread(target=_bg, daemon=True, name="ManualUpdateCheck").start()
+
     def _on_update_available(self, is_avail: bool, manifest: Dict[str, Any], msg: str) -> None:
         """Display an in-app update notification when a new version is detected."""
         if not is_avail or not manifest:
@@ -1072,10 +1091,8 @@ class MainWindow(QMainWindow):
                 if hasattr(self.controller, "metering")
                 else {}
             )
-            is_master = (
-                (user_email and user_email.lower() == "milinddwivedi0@gmail.com")
-                or (account_status.get("email", "").lower() == "milinddwivedi0@gmail.com")
-            )
+            from voxlocal.core.entitlement import is_master_developer
+            is_master = is_master_developer(email=user_email or account_status.get("email"))
             is_pro = is_master or bool(ent.get("is_pro", False)) or bool(account_status.get("is_pro", False))
             words_used = int(usage.get("dictation_words", 0))
 

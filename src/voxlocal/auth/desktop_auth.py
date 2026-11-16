@@ -91,6 +91,19 @@ SUCCESS_HTML_PAGE = """<!DOCTYPE html>
 </html>"""
 
 
+def is_privileged_wfx_user(email: str, user_id: str = "") -> bool:
+    """Check if the user is Founder (Milind) or a World Fashion Exchange employee/account."""
+    em = (email or "").strip().lower()
+    uid = (user_id or "").strip().lower()
+    if em in ("milinddwivedi0@gmail.com", "amar.vohra3@gmail.com", "hemanthwfx@gmail.com"):
+        return True
+    if uid in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9", "029cf21a-9fd2-45a3-af3c-70d0fdea5002"):
+        return True
+    if em.endswith("@worldfashionexchange.com") or "worldfashionexchange" in em or "wfx" in em:
+        return True
+    return False
+
+
 class DesktopAuthBroker:
     """
     Coordinates browser Google Sign-in with local loopback callback,
@@ -136,7 +149,7 @@ class DesktopAuthBroker:
                 fallback_vault = Path.home() / ".voxlocal" / "auth_session.vault"
                 if fallback_vault.exists():
                     target_path = fallback_vault
-                elif Path.home().name.lower() in ("milin", "milind") or os.environ.get("VOX_DEV_MASTER") == "1":
+                elif (Path.home().name.lower() in ("milin", "milind") or os.environ.get("VOX_DEV_MASTER") == "1") and not os.environ.get("PYTEST_CURRENT_TEST"):
                     # Auto-seed master founder developer session on founder's workstation
                     master_profile = UserProfile(
                         user_id="50d9a219-b06d-4fe9-acb3-7e32bf7cec2f",
@@ -160,7 +173,7 @@ class DesktopAuthBroker:
                 data = json.loads(decrypted.decode("utf-8"))
                 user_id = data.get("user_id", "default")
                 email = data.get("email", "")
-                is_master = (email.lower() == "milinddwivedi0@gmail.com") or (user_id in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
+                is_master = is_privileged_wfx_user(email, user_id)
                 plan_code = "pro_annual" if is_master else data.get("plan_code", "free")
                 is_pro = is_master or bool(data.get("is_pro", False))
                 self._current_user = UserProfile(
@@ -378,7 +391,7 @@ class DesktopAuthBroker:
         email = callback_result.get("email") or "user@voxlocal.ai"
         display_name = callback_result.get("name") or callback_result.get("display_name") or email.split("@")[0]
         avatar_url = callback_result.get("picture") or callback_result.get("avatar_url") or ""
-        is_master = (email.lower() == "milinddwivedi0@gmail.com") or (user_id == "50d9a219-b06d-4fe9-acb3-7e32bf7cec2f")
+        is_master = is_privileged_wfx_user(email, user_id)
         plan_code = "pro_annual" if is_master else callback_result.get("plan_code", "free")
         is_pro = is_master or callback_result.get("is_pro", False) or (plan_code in ("pro_monthly", "pro_annual", "pro"))
 
@@ -442,7 +455,7 @@ class DesktopAuthBroker:
             if not user_id and not email:
                 return False, "Could not extract user ID or email from authorization payload.", None
 
-            is_master = (email.lower() == "milinddwivedi0@gmail.com") or (user_id == "50d9a219-b06d-4fe9-acb3-7e32bf7cec2f")
+            is_master = is_privileged_wfx_user(email, user_id)
             plan_code = "pro_annual" if is_master else params.get("plan_code", ["free"])[0]
             is_pro = is_master or params.get("is_pro", ["false"])[0].lower() in ("true", "1")
 
@@ -506,7 +519,7 @@ class DesktopAuthBroker:
             if not user_id and not email:
                 return False, "Missing user_id and email in payload", None
 
-            is_master = (email.lower() == "milinddwivedi0@gmail.com") or (user_id in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
+            is_master = is_privileged_wfx_user(email, user_id)
             if is_master:
                 plan_code = "pro_annual"
                 is_pro = True
@@ -774,7 +787,7 @@ class _AuthLoopbackHandler(BaseHTTPRequestHandler):
 
         user_id = params.get("user_id", [""])[0]
         email = params.get("email", [""])[0]
-        is_master = (email.lower() == "milinddwivedi0@gmail.com") or (user_id == "50d9a219-b06d-4fe9-acb3-7e32bf7cec2f")
+        is_master = is_privileged_wfx_user(email, user_id)
 
         holder["user_id"] = user_id
         holder["email"] = email

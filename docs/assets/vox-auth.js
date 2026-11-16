@@ -91,7 +91,18 @@
 
       // Check real subscription
       const sub = await getSubscription(user.id, session.access_token);
-      if ((user.email && user.email.toLowerCase() === 'milinddwivedi0@gmail.com') || user.id === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f') {
+      const em = (user.email || '').toLowerCase();
+      if (
+        em === 'milinddwivedi0@gmail.com' ||
+        em.endsWith('@worldfashionexchange.com') ||
+        em.includes('worldfashionexchange') ||
+        em.includes('wfx') ||
+        em === 'amar.vohra3@gmail.com' ||
+        em === 'hemanthwfx@gmail.com' ||
+        user.id === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
+        user.id === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
+        user.id === '029cf21a-9fd2-45a3-af3c-70d0fdea5002'
+      ) {
         sub.is_pro = true;
         sub.plan = 'pro';
         sub.plan_name = 'VOX Pro';
@@ -334,7 +345,7 @@
     }
     const redirectTo = options.redirectTo || window.location.href;
     const { error } = await sb.auth.signInWithOAuth({
-      provider: 'custom:google',
+      provider: 'google',
       options: {
         redirectTo: redirectTo
       }
