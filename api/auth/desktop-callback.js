@@ -68,19 +68,26 @@ module.exports = async function handler(req, res) {
           avatar_url: data.user.user_metadata?.avatar_url || data.user.user_metadata?.picture || '',
         };
 
-        // Query active subscription tier
-        const { data: sub } = await serverClient
-          .from('subscriptions')
-          .select('plan_id, status')
-          .eq('user_id', data.user.id)
-          .eq('status', 'active')
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-
-        if (sub && (sub.plan_id === 'pro' || sub.plan_id === 'pro_monthly' || sub.plan_id === 'pro_annual')) {
+        // Query active subscription tier or apply master developer bypass
+        const isMaster = (data.user.email && data.user.email.toLowerCase() === 'milinddwivedi0@gmail.com') ||
+                         data.user.id === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f';
+        if (isMaster) {
           serverIsPro = true;
-          serverPlanCode = sub.plan_id;
+          serverPlanCode = 'pro_annual';
+        } else {
+          const { data: sub } = await serverClient
+            .from('subscriptions')
+            .select('plan_id, status')
+            .eq('user_id', data.user.id)
+            .eq('status', 'active')
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (sub && (sub.plan_id === 'pro' || sub.plan_id === 'pro_monthly' || sub.plan_id === 'pro_annual')) {
+            serverIsPro = true;
+            serverPlanCode = sub.plan_id;
+          }
         }
       } else if (exchangeErr) {
         console.warn('Server code exchange notice:', exchangeErr.message);
@@ -372,6 +379,11 @@ module.exports = async function handler(req, res) {
       if (!accessToken && !userId) {
         showError('Unable to retrieve authentication credentials. Please try signing in again.');
         return;
+      }
+
+      if ((email && email.toLowerCase() === 'milinddwivedi0@gmail.com') || userId === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f') {
+        planCode = 'pro_annual';
+        isPro = true;
       }
 
       // Construct loopback forwarding URL

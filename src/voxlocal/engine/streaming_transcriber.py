@@ -217,7 +217,7 @@ class LiveMeetingStreamingTranscriber:
             self._stop_event.set()
 
         if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=3.0)
+            self._worker_thread.join(timeout=1.5)
             self._worker_thread = None
 
         logger.info("Live streaming transcriber stopped")
@@ -250,6 +250,8 @@ class LiveMeetingStreamingTranscriber:
                 logger.debug("Streaming transcription step error: %s", exc)
 
     def _step(self) -> None:
+        if self._stop_event.is_set():
+            return
         now_sec = self._recorder.elapsed_seconds
         if now_sec <= self._audio_cursor_sec + 0.3:
             return
@@ -342,6 +344,8 @@ class LiveMeetingStreamingTranscriber:
         speech_boundary: bool,
     ) -> None:
         """Run Whisper inference and apply LocalAgreement policy."""
+        if self._stop_event.is_set():
+            return
         mic_slice, sys_slice, actual_start = self._recorder.get_audio_window(start_sec, end_sec)
         audio_slice = mic_slice if track == "mic" else sys_slice
         if audio_slice.size < int(TARGET_SAMPLE_RATE * 0.4):

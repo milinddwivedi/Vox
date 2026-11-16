@@ -202,7 +202,17 @@ def verify_and_decode_entitlement_token(
     return True, payload, ""
 
 
+MASTER_DEVELOPER_EMAILS = {"milinddwivedi0@gmail.com"}
 MASTER_DEVELOPER_USER_IDS = {"50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"}
+
+
+def is_master_developer(user_id: Optional[str] = None, email: Optional[str] = None) -> bool:
+    """Check if the given user ID or email belongs to the Master Developer / Founder."""
+    if user_id and str(user_id).strip().lower() in MASTER_DEVELOPER_USER_IDS:
+        return True
+    if email and str(email).strip().lower() in MASTER_DEVELOPER_EMAILS:
+        return True
+    return False
 
 
 class EntitlementManager:
@@ -227,6 +237,7 @@ class EntitlementManager:
             self.cache_file = Path(cache_file)
 
         self._active_user_id: str = "default"
+        self._active_email: str = ""
         self._current_state = EntitlementState()
         self._load_cached_entitlement()
 
@@ -375,10 +386,14 @@ class EntitlementManager:
             except Exception:
                 return False
 
-    def set_user_context(self, user_id: Optional[str]) -> None:
-        """Sets the active user ID context and validates current entitlement against it."""
+    def set_user_context(self, user_id: Optional[str], email: Optional[str] = None) -> None:
+        """Sets the active user ID and email context and validates current entitlement against it."""
         with self.lock:
             self._active_user_id = str(user_id) if user_id else "default"
+            self._active_email = str(email).strip().lower() if email else ""
+            if is_master_developer(self._active_user_id, self._active_email):
+                logger.info("Master Developer context verified for %s / %s — full Pro access enabled", self._active_email, self._active_user_id)
+                return
             # If current state belongs to another specific user, clear cached token / fall back to free
             if self._active_user_id != "default" and self._current_state.user_id != "default":
                 if self._current_state.user_id != self._active_user_id:
@@ -401,7 +416,7 @@ class EntitlementManager:
         Or unconditionally True for verified Master Developer.
         """
         with self.lock:
-            if getattr(self, "_active_user_id", "") in MASTER_DEVELOPER_USER_IDS:
+            if is_master_developer(getattr(self, "_active_user_id", ""), getattr(self, "_active_email", "")):
                 return True
             state = self._current_state
             if not state.is_pro:
@@ -427,12 +442,12 @@ class EntitlementManager:
     def get_effective_entitlement(self) -> Dict[str, Any]:
         """Returns standard dictionary representing dynamic effective plan, limits, and offline grace."""
         with self.lock:
-            if getattr(self, "_active_user_id", "") in MASTER_DEVELOPER_USER_IDS:
+            if is_master_developer(getattr(self, "_active_user_id", ""), getattr(self, "_active_email", "")):
                 return {
                     "user_id": self._active_user_id,
                     "plan": "pro_annual",
                     "plan_code": "pro_annual",
-                    "plan_name": "VOX Pro (Lifetime Master Developer)",
+                    "plan_name": "VOX Pro",
                     "is_pro": True,
                     "status": "active",
                     "limits": {
@@ -441,6 +456,7 @@ class EntitlementManager:
                         "meeting_sessions_weekly": None,
                         "meeting_session_cap_min": None,
                         "ask_vox_queries_weekly": None,
+                        "allow_meeting_overrun": True,
                     },
                     "features": list(PRO_DEFAULT_FEATURES),
                     "in_offline_grace": False,
