@@ -22,29 +22,38 @@ module.exports = async function handler(req, res) {
     let userId = user ? user.id : 'guest-device';
 
     if (user) {
-      // 1. Check subscriptions table
-      const { data: sub } = await supabase
-        .from('subscriptions')
-        .select('*')
-        .eq('user_id', user.id)
-        .eq('status', 'active')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      const MASTER_DEVELOPER_EMAILS = ['milinddwivedi0@gmail.com'];
+      const isMasterAdmin = (user.email && MASTER_DEVELOPER_EMAILS.includes(user.email.toLowerCase())) ||
+                            user.id === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f';
 
-      if (sub && (sub.plan_id === 'pro' || sub.plan_id === 'pro_monthly' || sub.plan_id === 'pro_annual')) {
-        plan = sub.billing_interval === 'annual' ? 'pro_annual' : 'pro_monthly';
+      if (isMasterAdmin) {
+        plan = 'pro_annual';
         isPro = true;
       } else {
-        // Fallback: check entitlements table directly
-        const { data: ent } = await supabase
-          .from('entitlements')
+        // 1. Check subscriptions table
+        const { data: sub } = await supabase
+          .from('subscriptions')
           .select('*')
           .eq('user_id', user.id)
+          .eq('status', 'active')
+          .order('created_at', { ascending: false })
+          .limit(1)
           .maybeSingle();
-        if (ent && ent.is_pro) {
-          plan = ent.plan_id || 'pro_monthly';
+
+        if (sub && (sub.plan_id === 'pro' || sub.plan_id === 'pro_monthly' || sub.plan_id === 'pro_annual')) {
+          plan = sub.billing_interval === 'annual' ? 'pro_annual' : 'pro_monthly';
           isPro = true;
+        } else {
+          // Fallback: check entitlements table directly
+          const { data: ent } = await supabase
+            .from('entitlements')
+            .select('*')
+            .eq('user_id', user.id)
+            .maybeSingle();
+          if (ent && ent.is_pro) {
+            plan = ent.plan_id || 'pro_monthly';
+            isPro = true;
+          }
         }
       }
     }

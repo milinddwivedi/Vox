@@ -57,6 +57,18 @@ FREE_DEFAULT_FEATURES = [
     "grey_text_preview",
 ]
 
+PRO_DEFAULT_FEATURES = [
+    "dictation",
+    "dual_track_recording",
+    "meeting_summaries",
+    "local_vocabulary",
+    "grey_text_preview",
+    "unlimited_words",
+    "unlimited_meetings",
+    "ask_vox_unlimited",
+    "executive_export",
+]
+
 
 @dataclass
 class EntitlementState:
@@ -188,6 +200,9 @@ def verify_and_decode_entitlement_token(
             )
 
     return True, payload, ""
+
+
+MASTER_DEVELOPER_USER_IDS = {"50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"}
 
 
 class EntitlementManager:
@@ -383,8 +398,11 @@ class EntitlementManager:
         2. Entitlement user_id matches active user context.
         3. Subscription is not expired.
         4. Offline grace period (72 hours) has not lapsed.
+        Or unconditionally True for verified Master Developer.
         """
         with self.lock:
+            if getattr(self, "_active_user_id", "") in MASTER_DEVELOPER_USER_IDS:
+                return True
             state = self._current_state
             if not state.is_pro:
                 return False
@@ -409,6 +427,29 @@ class EntitlementManager:
     def get_effective_entitlement(self) -> Dict[str, Any]:
         """Returns standard dictionary representing dynamic effective plan, limits, and offline grace."""
         with self.lock:
+            if getattr(self, "_active_user_id", "") in MASTER_DEVELOPER_USER_IDS:
+                return {
+                    "user_id": self._active_user_id,
+                    "plan": "pro_annual",
+                    "plan_code": "pro_annual",
+                    "plan_name": "VOX Pro (Lifetime Master Developer)",
+                    "is_pro": True,
+                    "status": "active",
+                    "limits": {
+                        "dictation_words_weekly": None,
+                        "meeting_minutes_weekly": None,
+                        "meeting_sessions_weekly": None,
+                        "meeting_session_cap_min": None,
+                        "ask_vox_queries_weekly": None,
+                    },
+                    "features": list(PRO_DEFAULT_FEATURES),
+                    "in_offline_grace": False,
+                    "offline_hours_remaining": 999999.0,
+                    "is_offline_expired": False,
+                    "is_subscription_expired": False,
+                    "last_verified_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "subscription_expires_at_utc": "2126-11-16T12:00:00Z",
+                }
             state = self.get_state()
             pro_active = self.is_pro()
             offline_exp = self.is_offline_expired()

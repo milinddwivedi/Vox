@@ -243,10 +243,16 @@ def sanitize_oauth_error_for_user(raw_error: str, provider: str = "") -> Tuple[s
             f"{provider_label} temporarily asked VOX to pause requests. Synchronization will resume automatically shortly.",
         )
 
-    if any(tok in low for tok in ("network", "offline", "urlopen", "name resolution", "connection refused", "connection reset", "winerror", "ssl")):
+    if any(tok in low for tok in (
+        "network", "offline", "urlopen", "name resolution", "connection refused",
+        "connection reset", "connection aborted", "broken pipe", "remotedisconnected",
+        "remote disconnected", "socket", "timeout", "timed out", "502", "503", "504",
+        "gateway timeout", "service unavailable", "bad gateway", "temporarily unavailable",
+        "econnreset", "econnrefused", "winerror", "ssl", "11001", "10054", "10060", "10061"
+    )):
         return (
             "NETWORK_OFFLINE",
-            f"Could not reach {provider_label} right now. Check your internet connection — previously synced meetings remain available offline.",
+            f"Could not reach {provider_label} right now (network offline). Previously synced meetings remain available.",
         )
 
     return (

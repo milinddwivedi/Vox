@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import time
+import urllib.parse
 import webbrowser
 from typing import Any, Optional
 
@@ -71,6 +72,11 @@ class VoxProUpgradeDialog(QDialog):
                 self.controller.entitlement_changed.connect(self._on_entitlement_changed)
             except Exception:
                 pass
+        if hasattr(self.controller, "auth_state_changed"):
+            try:
+                self.controller.auth_state_changed.connect(lambda *_: self._refresh_user_account_bar())
+            except Exception:
+                pass
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -108,6 +114,31 @@ class VoxProUpgradeDialog(QDialog):
         header_row.addLayout(header_text_lay)
         header_row.addStretch()
         layout.addLayout(header_row)
+
+        # User Account Context Card
+        self.account_box = QFrame()
+        self.account_box.setObjectName("voxWellCard")
+        self.account_lay = QHBoxLayout(self.account_box)
+        self.account_lay.setContentsMargins(14, 10, 14, 10)
+        self.account_lay.setSpacing(10)
+
+        self.lbl_user_icon = QLabel("👤")
+        self.lbl_user_icon.setFont(get_ui_font(size_px=14, weight=700))
+        self.account_lay.addWidget(self.lbl_user_icon)
+
+        self.lbl_user_info = QLabel("")
+        self.lbl_user_info.setFont(get_ui_font(size_px=12, weight=600))
+        self.lbl_user_info.setWordWrap(True)
+        self.account_lay.addWidget(self.lbl_user_info, 1)
+
+        self.btn_account_action = QPushButton("Sign In")
+        self.btn_account_action.setObjectName("calDawnBtn")
+        self.btn_account_action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_account_action.clicked.connect(self._on_account_action_clicked)
+        self.account_lay.addWidget(self.btn_account_action)
+
+        layout.addWidget(self.account_box)
+        self._refresh_user_account_bar()
 
         # Trigger Context / Notification Box
         if self.reason_text:
@@ -300,22 +331,88 @@ class VoxProUpgradeDialog(QDialog):
         footer_row.addStretch()
         layout.addLayout(footer_row)
 
+    def _refresh_user_account_bar(self) -> None:
+        if not hasattr(self, "lbl_user_info"):
+            return
+        status = self.controller.get_account_status() if hasattr(self.controller, "get_account_status") else {}
+        is_signed_in = bool(status.get("signed_in"))
+        email = status.get("email") or ""
+        name = status.get("name") or "User"
+        is_pro = bool(status.get("is_pro", False))
+        plan_name = status.get("plan_name", "VOX Free")
+
+        if is_signed_in:
+            if is_pro:
+                self.lbl_user_icon.setText("👑")
+                self.lbl_user_info.setText(
+                    f"<b>{name}</b> ({email})<br>"
+                    f"<span style='color: #10b981; font-weight: 700;'>● {plan_name} Active — Unlimited Access</span>"
+                )
+                self.btn_account_action.setText("Pro Active")
+                self.btn_account_action.setEnabled(False)
+            else:
+                self.lbl_user_icon.setText("👤")
+                self.lbl_user_info.setText(
+                    f"<b>{name}</b> ({email})<br>"
+                    f"<span style='color: #94a3b8;'>Current Plan: {plan_name} • Account linked</span>"
+                )
+                self.btn_account_action.setText("Switch Account")
+                self.btn_account_action.setEnabled(True)
+        else:
+            self.lbl_user_icon.setText("⚠️")
+            self.lbl_user_info.setText(
+                "<b>Guest Session (Not Signed In)</b><br>"
+                "<span style='color: #f59e0b;'>Please sign in with Google so your subscription is linked to your account.</span>"
+            )
+            self.btn_account_action.setText("Sign In with Google")
+            self.btn_account_action.setEnabled(True)
+
+    def _on_account_action_clicked(self) -> None:
+        if hasattr(self.controller, "login_with_google"):
+            self._show_status("Opening browser for Google sign-in...", is_error=False)
+            self.controller.login_with_google(callback=lambda ok, msg: self._refresh_user_account_bar())
+
     def _open_checkout_url(self, url: str) -> None:
-        """Safely open checkout link in the default browser without opening duplicate tabs."""
+        """Safely open checkout link in the default browser without opening duplicate tabs, enforcing authentication."""
+        status = self.controller.get_account_status() if hasattr(self.controller, "get_account_status") else {}
+        if not status.get("signed_in"):
+            self._show_status("⚠️ Please sign in with Google first so your VOX Pro subscription is securely linked to your account.", is_error=True)
+            self._on_account_action_clicked()
+            return
+
+        if status.get("is_pro"):
+            self._show_status("🎉 You already have VOX Pro active! All features are unlocked.", is_error=False)
+            return
+
         now = time.monotonic()
         if now - getattr(self, "_last_checkout_open_time", 0.0) < 2.0:
             logger.info("Ignoring duplicate rapid checkout click within 2.0s")
             return
         self._last_checkout_open_time = now
 
-        logger.info("Opening Razorpay checkout link: %s", url)
+        email = status.get("email") or ""
+        name = status.get("name") or ""
+        user_id = status.get("user_id") or ""
+        checkout_url = url
+        params = []
+        if email:
+            params.append(f"prefill[email]={urllib.parse.quote(email)}")
+        if name:
+            params.append(f"prefill[name]={urllib.parse.quote(name)}")
+        if user_id:
+            params.append(f"notes[user_id]={urllib.parse.quote(user_id)}")
+        if params:
+            separator = "&" if "?" in url else "?"
+            checkout_url = f"{url}{separator}{'&'.join(params)}"
+
+        logger.info("Opening Razorpay checkout link for %s: %s", email, checkout_url)
         try:
             # Open URL directly in default browser once
-            webbrowser.open(url, new=2)
+            webbrowser.open(checkout_url, new=2)
         except Exception as exc:
             logger.warning("webbrowser.open failed: %s, falling back to QDesktopServices", exc)
             try:
-                QDesktopServices.openUrl(QUrl(url))
+                QDesktopServices.openUrl(QUrl(checkout_url))
             except Exception as q_exc:
                 logger.error("Failed to open checkout url: %s", q_exc)
 

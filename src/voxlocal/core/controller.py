@@ -4866,6 +4866,25 @@ class AppController(QObject):
         elif callback:
             callback(False, "Auth broker unavailable")
 
+    def complete_login_from_url(self, raw_url_or_token: str) -> Tuple[bool, str]:
+        """Manually completes sign-in from an authorization URL or access token."""
+        broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
+        if not broker or not hasattr(broker, "complete_login_from_url"):
+            return False, "Desktop auth broker unavailable."
+        ok, msg, profile = broker.complete_login_from_url(raw_url_or_token)
+        if ok and profile:
+            if hasattr(self, "metering") and self.metering is not None:
+                self.metering.set_user_context(profile.user_id, profile.plan_code)
+            if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
+                self.entitlement.set_user_context(profile.user_id)
+            self.auth_state_changed.emit(self.get_account_status())
+            if hasattr(self, "entitlement") and self.entitlement is not None:
+                self.entitlement_changed.emit(self.entitlement.get_effective_entitlement())
+            if hasattr(self, "metering") and self.metering is not None:
+                self.usage_updated.emit(self.metering.get_weekly_usage())
+            self.sync_entitlements_with_cloud()
+        return ok, msg
+
     def logout_user(self) -> None:
         """Logs out user, clears session vault, and reverts to Free tier safely."""
         broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)

@@ -49,27 +49,39 @@ def test_pro_upgrade_dialog_open_links(qapp):
     mock_controller = MagicMock()
     mock_controller.config = MagicMock()
     mock_controller.config.theme = "light"
+    # 1. Unauthenticated guest: checkout triggers sign-in prompt and does not open checkout
+    mock_controller.get_account_status.return_value = {"signed_in": False, "is_pro": False}
 
     dlg = VoxProUpgradeDialog(mock_controller, reason="Testing links", theme="light")
 
-    # Primary browser opener: QDesktopServices.openUrl
-    with patch("PyQt6.QtGui.QDesktopServices.openUrl", return_value=True) as mock_qopen:
+    with patch("webbrowser.open") as mock_open:
         dlg._open_monthly_checkout()
-        assert mock_qopen.call_count == 1
-        assert "https://rzp.io/rzp/ugv7JBF2" in mock_qopen.call_args[0][0].toString()
+        assert mock_open.call_count == 0
+        assert mock_controller.login_with_google.call_count == 1
+
+    # 2. Authenticated user: checkout opens browser with prefill parameters
+    mock_controller.get_account_status.return_value = {
+        "signed_in": True,
+        "email": "customer@example.com",
+        "name": "Customer Name",
+        "is_pro": False,
+        "user_id": "usr_abc123",
+    }
+    dlg._last_checkout_open_time = 0.0
+    with patch("webbrowser.open") as mock_open:
+        dlg._open_monthly_checkout()
+        assert mock_open.call_count == 1
+        opened_url = mock_open.call_args[0][0]
+        assert "https://rzp.io/rzp/ugv7JBF2" in opened_url
+        assert "customer%40example.com" in opened_url
 
     dlg._last_checkout_open_time = 0.0
-    with patch("PyQt6.QtGui.QDesktopServices.openUrl", return_value=True) as mock_qopen:
+    with patch("webbrowser.open") as mock_open:
         dlg._open_yearly_checkout()
-        assert mock_qopen.call_count == 1
-        assert "https://rzp.io/rzp/fycKln1w" in mock_qopen.call_args[0][0].toString()
-
-    # Fallback when QDesktopServices returns False
-    dlg._last_checkout_open_time = 0.0
-    with patch("PyQt6.QtGui.QDesktopServices.openUrl", return_value=False):
-        with patch("webbrowser.open") as mock_open:
-            dlg._open_monthly_checkout()
-            mock_open.assert_called_with("https://rzp.io/rzp/ugv7JBF2")
+        assert mock_open.call_count == 1
+        opened_url = mock_open.call_args[0][0]
+        assert "https://rzp.io/rzp/fycKln1w" in opened_url
+        assert "customer%40example.com" in opened_url
 
 
 def test_pro_upgrade_dialog_sync_button_calls_controller(qapp):

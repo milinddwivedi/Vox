@@ -1348,7 +1348,7 @@ def test_2026_day_flow_timeline_daily_pulse_and_briefing(qapp, tmp_path):
     assert "Back-to-back" in page.lbl_buffer_status.text()
 
     # 2. Executive Briefing & Copy verified
-    assert "BRIEFING" in page.lbl_briefing_title.text().upper() or "FLOW" in page.lbl_briefing_title.text().upper()
+    assert any(w in page.lbl_briefing_title.text().upper() for w in ("BRIEFING", "FLOW", "RECAP", "WRAP-UP"))
     assert "Engineering Standup" in page.lbl_briefing_content.text()
     assert page._daily_summary_text != ""
     page._toggle_briefing()

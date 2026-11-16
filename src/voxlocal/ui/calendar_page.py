@@ -1236,6 +1236,14 @@ class CalendarPage(QWidget):
         last_sync = _format_last_sync(acc.get("last_sync_at"))
         raw_err = str(acc.get("last_error") or "")
         friendly_err = sanitize_oauth_error_for_user(raw_err, provider=ptype)[1] if raw_err else ""
+        is_offline_msg = (
+            "offline" in friendly_err.lower()
+            or "internet" in friendly_err.lower()
+            or state in {"offline_cached", "network_offline"}
+        )
+        if is_offline_msg and enabled and acc.get("is_authenticated", True):
+            state_lbl = "Offline (Cached)"
+            state_kind = "muted"
 
         card = QFrame()
         card.setObjectName("calCard")
@@ -1339,7 +1347,7 @@ class CalendarPage(QWidget):
         btn_sync.clicked.connect(lambda _=False, account_id=aid: self._on_sync_account(account_id))
         act_row1.addWidget(btn_sync)
 
-        needs_reauth = enabled and (
+        needs_reauth = enabled and not is_offline_msg and (
             state in {"expired", "admin_approval_required"}
             or (not acc.get("is_authenticated") and state not in {"connected", "syncing", "disabled", "offline_cached"})
         )
@@ -1349,7 +1357,7 @@ class CalendarPage(QWidget):
             btn_reconn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn_reconn.clicked.connect(lambda _=False, account_id=aid, pt=ptype: self._on_reconnect_account(account_id, pt))
             act_row1.addWidget(btn_reconn)
-        elif enabled and not is_healthy and state == "failed":
+        elif enabled and not is_healthy and state == "failed" and not is_offline_msg:
             btn_reconn = QPushButton("Reconnect")
             btn_reconn.setObjectName("calMiniBtn")
             btn_reconn.setCursor(Qt.CursorShape.PointingHandCursor)

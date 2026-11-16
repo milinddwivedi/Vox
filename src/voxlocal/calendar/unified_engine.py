@@ -391,7 +391,7 @@ class UnifiedCalendarEngine(QObject):
             err_state = status.get("error_state")
             last_err = status.get("friendly_error") or status.get("error_detail") or ""
             conn_state = status.get("connection_state")
-            is_healthy = bool(status.get("is_healthy", True)) and not err_state
+            is_healthy = bool(status.get("is_healthy", True)) and (not err_state or err_state == "NETWORK_OFFLINE")
             if is_auth and not err_state:
                 conn_state = AccountConnectionState.CONNECTED.value
                 last_err = ""
@@ -400,7 +400,7 @@ class UnifiedCalendarEngine(QObject):
             err_state = db_meta.get("error_code")
             last_err = db_meta.get("last_error") or ""
             conn_state = db_meta.get("connection_state")
-            is_healthy = not err_state and bool(db_meta.get("is_healthy", True))
+            is_healthy = (not err_state or err_state == "NETWORK_OFFLINE") and bool(db_meta.get("is_healthy", True))
 
         if not enabled:
             conn_state = "disabled"
@@ -412,7 +412,7 @@ class UnifiedCalendarEngine(QObject):
             conn_state = AccountConnectionState.DISCONNECTED.value
         elif err_state == "NETWORK_OFFLINE":
             conn_state = "offline_cached" if is_auth else AccountConnectionState.DISCONNECTED.value
-        elif err_state or is_healthy is False:
+        elif (err_state and err_state != "NETWORK_OFFLINE") or is_healthy is False:
             conn_state = AccountConnectionState.FAILED.value
         elif is_auth:
             conn_state = AccountConnectionState.CONNECTED.value

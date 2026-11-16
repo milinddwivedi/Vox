@@ -134,9 +134,10 @@ class StatefulDictationMachine(RuleBasedStateMachine):
         assert isinstance(processed, str)
         assert len(processed) > 0
 
-        # Invariant: Spoken punctuation tokens must be converted
-        assert "period" not in processed.lower() or "period" in utterance.lower() and "." in processed
-        assert "question mark" not in processed.lower()
+        # Invariant: Spoken punctuation tokens must be converted unless verbatim mode
+        if self.current_mode != "verbatim":
+            assert "period" not in processed.lower() or "period" in utterance.lower() and "." in processed
+            assert "question mark" not in processed.lower()
 
         # Invariant: Filler words must be pruned when in clean mode
         if self.current_mode in ("clean", "cleaned"):
