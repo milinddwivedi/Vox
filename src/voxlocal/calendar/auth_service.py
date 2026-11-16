@@ -305,6 +305,8 @@ class CalendarAuthBroker:
         if self._db is None or not hasattr(self._db, "load_calendar_credentials"):
             return None
         encrypted = self._db.load_calendar_credentials(user_id or "default", account_id)
+        if not encrypted and user_id and user_id != "default":
+            encrypted = self._db.load_calendar_credentials("default", account_id)
         if not encrypted:
             return None
         try:
@@ -336,6 +338,8 @@ class CalendarAuthBroker:
         if env_key and os.environ.get(env_key):
             return os.environ[env_key].strip()
         data = self.load_credentials(user_id, f"app_secret:{secret_name}")
+        if not data and user_id != "default":
+            data = self.load_credentials("default", f"app_secret:{secret_name}")
         if isinstance(data, dict):
             return str(data.get("value") or "")
         return ""

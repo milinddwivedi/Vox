@@ -949,6 +949,13 @@ class SettingsWorkspaceWidget(QWidget):
         self.btn_auth_action.clicked.connect(self._on_login_clicked)
         sub_btns.addWidget(self.btn_auth_action)
 
+        self.btn_manual_auth = QPushButton("Paste Sign-in URL...")
+        self.btn_manual_auth.setObjectName("secondaryBtn")
+        self.btn_manual_auth.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_manual_auth.setToolTip("Paste browser callback URL (e.g. localhost:3000/#access_token=...) if browser did not redirect automatically")
+        self.btn_manual_auth.clicked.connect(self._on_manual_auth_clicked)
+        sub_btns.addWidget(self.btn_manual_auth)
+
         self.btn_upgrade_pro = QPushButton("Upgrade to VOX Pro — ₹199/mo →")
         self.btn_upgrade_pro.setObjectName("dawnBtn")
         self.btn_upgrade_pro.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1073,6 +1080,8 @@ class SettingsWorkspaceWidget(QWidget):
         if signed_in and email:
             self.lbl_user_email.setText(f"Signed in as: <b>{name}</b> ({email})")
             self.btn_auth_action.setText("Sign Out")
+            if hasattr(self, "btn_manual_auth"):
+                self.btn_manual_auth.setVisible(False)
             try:
                 self.btn_auth_action.clicked.disconnect()
             except Exception:
@@ -1081,6 +1090,8 @@ class SettingsWorkspaceWidget(QWidget):
         else:
             self.lbl_user_email.setText("Signed in as: <b>Guest / Local Mode</b>")
             self.btn_auth_action.setText("Sign In with Google")
+            if hasattr(self, "btn_manual_auth"):
+                self.btn_manual_auth.setVisible(True)
             try:
                 self.btn_auth_action.clicked.disconnect()
             except Exception:
@@ -1137,6 +1148,24 @@ class SettingsWorkspaceWidget(QWidget):
         self.status_toast.emit("Signing In", "Opening browser for Google Authentication...")
         if hasattr(self.controller, "login_with_google"):
             self.controller.login_with_google(callback=lambda ok, msg: self.status_toast.emit("Sign In", msg))
+
+    def _on_manual_auth_clicked(self) -> None:
+        from PyQt6.QtWidgets import QInputDialog, QLineEdit
+        url, ok = QInputDialog.getText(
+            self,
+            "Complete Sign-In",
+            "Paste the authorization redirect URL or access token from your browser:\n(e.g. http://localhost:3000/#access_token=...)",
+            QLineEdit.EchoMode.Normal,
+            "",
+        )
+        if ok and url.strip():
+            if hasattr(self.controller, "complete_login_from_url"):
+                success, msg = self.controller.complete_login_from_url(url.strip())
+                self.status_toast.emit("Sign In", msg)
+                if success:
+                    self._update_subscription_display()
+            else:
+                self.status_toast.emit("Sign In", "Manual login helper unavailable.")
 
     def _on_logout_clicked(self) -> None:
         if hasattr(self.controller, "logout_user"):

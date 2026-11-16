@@ -306,6 +306,22 @@ class UnifiedCalendarEngine(QObject):
             self._account_enabled[account_id] = bool(enabled)
             if account_id in self._account_meta:
                 self._account_meta[account_id]["enabled"] = bool(enabled)
+                if enabled:
+                    self._account_meta[account_id]["connection_state"] = "syncing"
+                    self._account_meta[account_id]["last_error"] = ""
+                    self._account_meta[account_id]["error_code"] = ""
+                    self._account_meta[account_id]["is_healthy"] = True
+                else:
+                    self._account_meta[account_id]["connection_state"] = "disabled"
+            prov = self._providers.get(account_id)
+            if prov is not None and hasattr(prov, "_status") and isinstance(prov._status, dict):
+                if enabled:
+                    prov._status["connection_state"] = "syncing"
+                    prov._status["error_state"] = None
+                    prov._status["friendly_error"] = None
+                    prov._status["is_healthy"] = True
+                else:
+                    prov._status["connection_state"] = "disabled"
         if self._db is not None:
             try:
                 self._db.set_calendar_account_enabled(account_id, bool(enabled), user_id=self.user_id)
@@ -409,6 +425,8 @@ class UnifiedCalendarEngine(QObject):
 
         if not enabled:
             conn_state = "disabled"
+        elif conn_state == "syncing" or (prov is not None and getattr(prov, "_is_syncing", False)):
+            conn_state = "syncing"
         elif err_state in ("AUTH_REQUIRED", "AUTH_EXPIRED", "REFRESH_FAILED", "NO_REFRESH_TOKEN"):
             conn_state = AccountConnectionState.EXPIRED.value
         elif err_state == "ADMIN_APPROVAL_REQUIRED":
@@ -419,7 +437,7 @@ class UnifiedCalendarEngine(QObject):
             conn_state = "offline_cached" if is_auth else AccountConnectionState.DISCONNECTED.value
         elif (err_state and err_state != "NETWORK_OFFLINE") or is_healthy is False:
             conn_state = AccountConnectionState.FAILED.value
-        elif is_auth:
+        elif is_auth or conn_state in ("connected", "syncing"):
             conn_state = AccountConnectionState.CONNECTED.value
 
         return {
@@ -465,7 +483,7 @@ class UnifiedCalendarEngine(QObject):
             state = "attention_needed"
         elif degraded:
             state = "partial"
-        elif self._is_syncing:
+        elif self._is_syncing or any(a.get("connection_state") == "syncing" for a in active):
             state = "syncing"
         else:
             state = "healthy"
@@ -683,10 +701,13 @@ class UnifiedCalendarEngine(QObject):
             self._cached_meetings = deduped
             self._last_sync_at = now_iso
 
-        self.upcoming_meetings_updated.emit(deduped)
-        self.emit_providers_status()
-        self.accounts_updated.emit(self.list_accounts())
-        self.sync_finished.emit(len(deduped))
+        try:
+            self.upcoming_meetings_updated.emit(deduped)
+            self.emit_providers_status()
+            self.accounts_updated.emit(self.list_accounts())
+            self.sync_finished.emit(len(deduped))
+        except RuntimeError:
+            pass
         return deduped
 
     def poll_all_sync(self, force: bool = False, use_incremental: bool = False) -> List[CalendarMeeting]:

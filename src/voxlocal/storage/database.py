@@ -2865,10 +2865,16 @@ class LocalDatabase:
             conn.commit()
 
     def get_calendar_account(self, account_id: str, user_id: str = "default") -> Optional[Dict[str, Any]]:
+        uid = user_id or "default"
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM calendar_accounts WHERE user_id = ? AND account_id = ?",
-                (user_id or "default", account_id),
+                """
+                SELECT * FROM calendar_accounts 
+                WHERE account_id = ? AND (user_id = ? OR user_id = 'default')
+                ORDER BY (user_id = ?) DESC, created_at ASC
+                LIMIT 1
+                """,
+                (account_id, uid, uid),
             ).fetchone()
             return self._decode_cal_account_row(row) if row else None
 
@@ -2877,14 +2883,24 @@ class LocalDatabase:
         user_id: str = "default",
         enabled_only: bool = False,
     ) -> List[Dict[str, Any]]:
+        uid = user_id or "default"
         with self._lock, self._connect() as conn:
-            sql = "SELECT * FROM calendar_accounts WHERE user_id = ?"
-            params: List[Any] = [user_id or "default"]
+            sql = "SELECT * FROM calendar_accounts WHERE (user_id = ? OR user_id = 'default')"
+            params: List[Any] = [uid]
             if enabled_only:
                 sql += " AND enabled = 1"
-            sql += " ORDER BY created_at ASC, account_id ASC"
+            sql += " ORDER BY (user_id = ?) DESC, created_at ASC, account_id ASC"
+            params.append(uid)
             rows = conn.execute(sql, params).fetchall()
-            return [self._decode_cal_account_row(r) for r in rows]
+            seen: set[str] = set()
+            results: List[Dict[str, Any]] = []
+            for r in rows:
+                acc = self._decode_cal_account_row(r)
+                aid = str(acc.get("account_id") or "")
+                if aid and aid not in seen:
+                    seen.add(aid)
+                    results.append(acc)
+            return results
 
     def update_calendar_account_state(
         self,
@@ -2896,10 +2912,11 @@ class LocalDatabase:
         existing = self.get_calendar_account(account_id, user_id=uid)
         if not existing:
             return
+        actual_uid = existing.get("user_id", uid) or uid
         self.upsert_calendar_account(
             account_id=account_id,
             provider_type=existing["provider_type"],
-            user_id=uid,
+            user_id=actual_uid,
             **kwargs,
         )
 
@@ -2909,25 +2926,36 @@ class LocalDatabase:
         enabled: bool,
         user_id: str = "default",
     ) -> None:
-        self.update_calendar_account_state(
-            account_id=account_id,
-            user_id=user_id,
-            enabled=bool(enabled),
-        )
+        if enabled:
+            self.update_calendar_account_state(
+                account_id=account_id,
+                user_id=user_id,
+                enabled=True,
+                connection_state="syncing",
+                last_error="",
+                error_code="",
+            )
+        else:
+            self.update_calendar_account_state(
+                account_id=account_id,
+                user_id=user_id,
+                enabled=False,
+                connection_state="disabled",
+            )
 
     def delete_calendar_account(self, account_id: str, user_id: str = "default") -> None:
         uid = user_id or "default"
         with self._lock, self._connect() as conn:
             conn.execute(
-                "DELETE FROM calendar_accounts WHERE user_id = ? AND account_id = ?",
+                "DELETE FROM calendar_accounts WHERE (user_id = ? OR user_id = 'default') AND account_id = ?",
                 (uid, account_id),
             )
             conn.execute(
-                "DELETE FROM calendar_credentials_vault WHERE user_id = ? AND account_id = ?",
+                "DELETE FROM calendar_credentials_vault WHERE (user_id = ? OR user_id = 'default') AND account_id = ?",
                 (uid, account_id),
             )
             conn.execute(
-                "DELETE FROM calendar_events WHERE user_id = ? AND account_id = ?",
+                "DELETE FROM calendar_events WHERE (user_id = ? OR user_id = 'default') AND account_id = ?",
                 (uid, account_id),
             )
             conn.commit()
@@ -2957,8 +2985,13 @@ class LocalDatabase:
         uid = user_id or "default"
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT encrypted_blob FROM calendar_credentials_vault WHERE user_id = ? AND account_id = ?",
-                (uid, account_id),
+                """
+                SELECT encrypted_blob FROM calendar_credentials_vault 
+                WHERE account_id = ? AND (user_id = ? OR user_id = 'default')
+                ORDER BY (user_id = ?) DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (account_id, uid, uid),
             ).fetchone()
             if not row or row["encrypted_blob"] is None:
                 return None
@@ -2968,7 +3001,7 @@ class LocalDatabase:
         uid = user_id or "default"
         with self._lock, self._connect() as conn:
             cur = conn.execute(
-                "DELETE FROM calendar_credentials_vault WHERE user_id = ? AND account_id = ?",
+                "DELETE FROM calendar_credentials_vault WHERE (user_id = ? OR user_id = 'default') AND account_id = ?",
                 (uid, account_id),
             )
             conn.commit()

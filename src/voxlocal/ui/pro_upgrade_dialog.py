@@ -137,6 +137,13 @@ class VoxProUpgradeDialog(QDialog):
         self.btn_account_action.clicked.connect(self._on_account_action_clicked)
         self.account_lay.addWidget(self.btn_account_action)
 
+        self.btn_paste_auth = QPushButton("Paste URL")
+        self.btn_paste_auth.setObjectName("calMiniBtn")
+        self.btn_paste_auth.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_paste_auth.setToolTip("Paste browser authorization redirect URL if not redirected automatically")
+        self.btn_paste_auth.clicked.connect(self._on_paste_auth_clicked)
+        self.account_lay.addWidget(self.btn_paste_auth)
+
         layout.addWidget(self.account_box)
         self._refresh_user_account_bar()
 
@@ -350,6 +357,8 @@ class VoxProUpgradeDialog(QDialog):
                 )
                 self.btn_account_action.setText("Pro Active")
                 self.btn_account_action.setEnabled(False)
+                if hasattr(self, "btn_paste_auth"):
+                    self.btn_paste_auth.setVisible(False)
             else:
                 self.lbl_user_icon.setText("👤")
                 self.lbl_user_info.setText(
@@ -358,6 +367,8 @@ class VoxProUpgradeDialog(QDialog):
                 )
                 self.btn_account_action.setText("Switch Account")
                 self.btn_account_action.setEnabled(True)
+                if hasattr(self, "btn_paste_auth"):
+                    self.btn_paste_auth.setVisible(False)
         else:
             self.lbl_user_icon.setText("⚠️")
             self.lbl_user_info.setText(
@@ -366,6 +377,25 @@ class VoxProUpgradeDialog(QDialog):
             )
             self.btn_account_action.setText("Sign In with Google")
             self.btn_account_action.setEnabled(True)
+            if hasattr(self, "btn_paste_auth"):
+                self.btn_paste_auth.setVisible(True)
+
+    def _on_paste_auth_clicked(self) -> None:
+        from PyQt6.QtWidgets import QInputDialog, QLineEdit
+        url, ok = QInputDialog.getText(
+            self,
+            "Complete Sign-In",
+            "Paste the redirect URL or access token from your browser:\n(e.g. http://localhost:3000/#access_token=...)",
+            QLineEdit.EchoMode.Normal,
+            "",
+        )
+        if ok and url.strip():
+            if hasattr(self.controller, "complete_login_from_url"):
+                success, msg = self.controller.complete_login_from_url(url.strip())
+                self._show_status(msg, is_error=not success)
+                self._refresh_user_account_bar()
+            else:
+                self._show_status("Manual login helper unavailable.", is_error=True)
 
     def _on_account_action_clicked(self) -> None:
         if hasattr(self.controller, "login_with_google"):
