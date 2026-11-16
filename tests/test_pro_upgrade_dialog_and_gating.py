@@ -52,13 +52,24 @@ def test_pro_upgrade_dialog_open_links(qapp):
 
     dlg = VoxProUpgradeDialog(mock_controller, reason="Testing links", theme="light")
 
-    with patch("webbrowser.open") as mock_open:
+    # Primary browser opener: QDesktopServices.openUrl
+    with patch("PyQt6.QtGui.QDesktopServices.openUrl", return_value=True) as mock_qopen:
         dlg._open_monthly_checkout()
-        mock_open.assert_called_with("https://rzp.io/rzp/ugv7JBF2")
+        assert mock_qopen.call_count == 1
+        assert "https://rzp.io/rzp/ugv7JBF2" in mock_qopen.call_args[0][0].toString()
 
-    with patch("webbrowser.open") as mock_open:
+    dlg._last_checkout_open_time = 0.0
+    with patch("PyQt6.QtGui.QDesktopServices.openUrl", return_value=True) as mock_qopen:
         dlg._open_yearly_checkout()
-        mock_open.assert_called_with("https://rzp.io/rzp/fycKln1w")
+        assert mock_qopen.call_count == 1
+        assert "https://rzp.io/rzp/fycKln1w" in mock_qopen.call_args[0][0].toString()
+
+    # Fallback when QDesktopServices returns False
+    dlg._last_checkout_open_time = 0.0
+    with patch("PyQt6.QtGui.QDesktopServices.openUrl", return_value=False):
+        with patch("webbrowser.open") as mock_open:
+            dlg._open_monthly_checkout()
+            mock_open.assert_called_with("https://rzp.io/rzp/ugv7JBF2")
 
 
 def test_pro_upgrade_dialog_sync_button_calls_controller(qapp):

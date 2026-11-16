@@ -390,7 +390,7 @@ class MainWindow(QMainWindow):
         self.btn_toggle_float.clicked.connect(self._toggle_floating_bar)
         sb_lay.addWidget(self.btn_toggle_float)
 
-        # ---- Left Sidebar Plan Status Card (Milestone 2) ----
+        # ---- Left Sidebar User Profile & Plan Status Card ----
         sb_lay.addStretch()
 
         self.plan_card = QFrame()
@@ -399,6 +399,55 @@ class MainWindow(QMainWindow):
         plan_card_lay.setContentsMargins(12, 10, 12, 12)
         plan_card_lay.setSpacing(6)
 
+        # 1. User Profile Row
+        profile_row = QHBoxLayout()
+        profile_row.setSpacing(8)
+
+        self.profile_avatar = QLabel("👤")
+        self.profile_avatar.setObjectName("profileAvatar")
+        self.profile_avatar.setFixedSize(28, 28)
+        self.profile_avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        profile_row.addWidget(self.profile_avatar)
+
+        profile_text_lay = QVBoxLayout()
+        profile_text_lay.setSpacing(1)
+        self.lbl_user_name = QLabel("Guest Mode")
+        self.lbl_user_name.setObjectName("profileUserName")
+        self.lbl_user_name.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        profile_text_lay.addWidget(self.lbl_user_name)
+
+        self.lbl_user_email = QLabel("Offline on this PC")
+        self.lbl_user_email.setObjectName("profileUserEmail")
+        self.lbl_user_email.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        profile_text_lay.addWidget(self.lbl_user_email)
+        profile_row.addLayout(profile_text_lay, 1)
+
+        self.btn_user_sign_out = QPushButton("Sign Out")
+        self.btn_user_sign_out.setObjectName("btnUserSignOut")
+        self.btn_user_sign_out.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_user_sign_out.clicked.connect(self._on_sign_out_clicked)
+        self.btn_user_sign_out.setVisible(False)
+        profile_row.addWidget(self.btn_user_sign_out)
+
+        plan_card_lay.addLayout(profile_row)
+
+        # 2. Google Sign-In Action (shown when not logged in)
+        self.btn_google_sign_in = QPushButton("Sign In with Google")
+        self.btn_google_sign_in.setObjectName("btnGoogleSignIn")
+        self.btn_google_sign_in.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_google_sign_in.setFixedHeight(26)
+        self.btn_google_sign_in.setAccessibleName("Sign In with Google to sync plan")
+        self.btn_google_sign_in.clicked.connect(self._on_google_signin_clicked)
+        plan_card_lay.addWidget(self.btn_google_sign_in)
+
+        # 3. Divider
+        self.profile_divider = QFrame()
+        self.profile_divider.setFrameShape(QFrame.Shape.HLine)
+        self.profile_divider.setFrameShadow(QFrame.Shadow.Sunken)
+        self.profile_divider.setFixedHeight(1)
+        plan_card_lay.addWidget(self.profile_divider)
+
+        # 4. Plan Header Row
         plan_header_row = QHBoxLayout()
         plan_header_row.setSpacing(6)
         lbl_plan_title = QLabel("PLAN")
@@ -746,6 +795,40 @@ class MainWindow(QMainWindow):
                 font-size: 11px;
                 font-weight: 500;
             }}
+            QLabel#profileUserName {{
+                color: {t['text_primary']};
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QLabel#profileUserEmail {{
+                color: {t['text_muted']};
+                font-size: 10px;
+                font-weight: 400;
+            }}
+            QPushButton#btnGoogleSignIn {{
+                background-color: {t['surface_well']};
+                color: {t['text_primary']};
+                border: 1px solid {t['border']};
+                border-radius: 6px;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 8px;
+            }}
+            QPushButton#btnGoogleSignIn:hover {{
+                background-color: {t['surface_secondary']};
+                border-color: {t['accent']};
+            }}
+            QPushButton#btnUserSignOut {{
+                background-color: transparent;
+                color: {t['text_dim']};
+                border: none;
+                font-size: 10px;
+                font-weight: 500;
+                padding: 2px 4px;
+            }}
+            QPushButton#btnUserSignOut:hover {{
+                color: #EF4444;
+            }}
             """
         )
 
@@ -799,15 +882,77 @@ class MainWindow(QMainWindow):
         else:
             self._show_pro_upgrade_dialog(reason=reason)
 
+    def _on_google_signin_clicked(self) -> None:
+        """Launches the Google OAuth flow in the user's browser."""
+        self.show_toast("Connecting...", "Opening browser for Google Authentication...")
+        if hasattr(self.controller, "login_with_google"):
+            def _cb(ok: bool, msg: str) -> None:
+                if ok:
+                    self.show_toast("Signed In", "Welcome to VOX! Account synchronized.")
+                else:
+                    self.show_toast("Sign-In", msg)
+            self.controller.login_with_google(callback=_cb)
+
+    def _on_sign_out_clicked(self) -> None:
+        """Logs out the active user and reverts to Guest Free mode."""
+        if hasattr(self.controller, "logout_user"):
+            self.controller.logout_user()
+            self.show_toast("Signed Out", "Reverted to Guest mode.")
+
     def _update_plan_card(
         self,
         entitlement_data: Optional[Dict[str, Any]] = None,
         usage_data: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Update Plan Badge, Word Quota Meter, and Upgrade button in sidebar."""
+        """Update User Profile, Plan Badge, Word Quota Meter, and Upgrade button in sidebar."""
         if not hasattr(self, "plan_card"):
             return
         try:
+            t = get_theme_tokens(self._theme)
+
+            # 1. Update User Profile Section
+            account_status = (
+                self.controller.get_account_status()
+                if hasattr(self.controller, "get_account_status")
+                else {}
+            )
+            signed_in = bool(account_status.get("signed_in", False))
+            user_name = account_status.get("name") or "Guest User"
+            user_email = account_status.get("email") or ""
+
+            if hasattr(self, "lbl_user_name"):
+                if signed_in and user_email:
+                    display_name = user_name if user_name != "Guest User" else user_email.split("@")[0]
+                    self.lbl_user_name.setText(display_name)
+                    self.lbl_user_email.setText(user_email)
+                    self.lbl_user_email.setToolTip(user_email)
+                    self.lbl_user_email.setVisible(True)
+
+                    initial = (display_name or user_email or "U")[0].upper()
+                    self.profile_avatar.setText(initial)
+                    self.profile_avatar.setStyleSheet(
+                        f"background: {t['accent']}; color: #FFFFFF; "
+                        f"font-weight: 800; font-size: 12px; border-radius: 14px;"
+                    )
+                    if hasattr(self, "btn_google_sign_in"):
+                        self.btn_google_sign_in.setVisible(False)
+                    if hasattr(self, "btn_user_sign_out"):
+                        self.btn_user_sign_out.setVisible(True)
+                else:
+                    self.lbl_user_name.setText("Guest Mode")
+                    self.lbl_user_email.setText("Offline on this PC")
+                    self.lbl_user_email.setVisible(True)
+                    self.profile_avatar.setText("👤")
+                    self.profile_avatar.setStyleSheet(
+                        f"background: {t['surface_well']}; color: {t['text_muted']}; "
+                        f"font-size: 13px; border-radius: 14px;"
+                    )
+                    if hasattr(self, "btn_google_sign_in"):
+                        self.btn_google_sign_in.setVisible(True)
+                    if hasattr(self, "btn_user_sign_out"):
+                        self.btn_user_sign_out.setVisible(False)
+
+            # 2. Entitlement & Usage update
             ent = entitlement_data or (
                 self.controller.entitlement.get_effective_entitlement()
                 if hasattr(self.controller, "entitlement")
@@ -818,7 +963,7 @@ class MainWindow(QMainWindow):
                 if hasattr(self.controller, "metering")
                 else {}
             )
-            is_pro = bool(ent.get("is_pro", False))
+            is_pro = bool(ent.get("is_pro", False)) or bool(account_status.get("is_pro", False))
             words_used = int(usage.get("dictation_words", 0))
 
             limits = ent.get("limits", {})

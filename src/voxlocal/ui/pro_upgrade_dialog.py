@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import time
 import webbrowser
 from typing import Any, Optional
 
@@ -299,21 +300,34 @@ class VoxProUpgradeDialog(QDialog):
         footer_row.addStretch()
         layout.addLayout(footer_row)
 
-    def _open_monthly_checkout(self) -> None:
-        logger.info("Opening Razorpay Monthly link: %s", RAZORPAY_MONTHLY_LINK)
+    def _open_checkout_url(self, url: str) -> None:
+        """Safely open checkout link in the default browser without opening duplicate tabs."""
+        now = time.monotonic()
+        if now - getattr(self, "_last_checkout_open_time", 0.0) < 1.2:
+            logger.info("Ignoring duplicate rapid checkout click within 1.2s")
+            return
+        self._last_checkout_open_time = now
+
+        logger.info("Opening Razorpay checkout link: %s", url)
+        opened = False
         try:
-            QDesktopServices.openUrl(QUrl(RAZORPAY_MONTHLY_LINK))
-        except Exception:
-            pass
-        webbrowser.open(RAZORPAY_MONTHLY_LINK)
+            res = QDesktopServices.openUrl(QUrl(url))
+            opened = (res is True)
+        except Exception as exc:
+            logger.warning("QDesktopServices.openUrl failed: %s", exc)
+            opened = False
+
+        if not opened:
+            try:
+                webbrowser.open(url)
+            except Exception as exc:
+                logger.warning("webbrowser.open failed: %s", exc)
+
+    def _open_monthly_checkout(self) -> None:
+        self._open_checkout_url(RAZORPAY_MONTHLY_LINK)
 
     def _open_yearly_checkout(self) -> None:
-        logger.info("Opening Razorpay Yearly link: %s", RAZORPAY_YEARLY_LINK)
-        try:
-            QDesktopServices.openUrl(QUrl(RAZORPAY_YEARLY_LINK))
-        except Exception:
-            pass
-        webbrowser.open(RAZORPAY_YEARLY_LINK)
+        self._open_checkout_url(RAZORPAY_YEARLY_LINK)
 
     def _on_sync_clicked(self) -> None:
         """Trigger cloud entitlement synchronization and verify active subscription."""

@@ -358,6 +358,61 @@ class TestMainWindowPlanStatusCard:
             win.close()
             ctrl.shutdown()
 
+    def test_sidebar_user_profile_displays_google_account_and_updates_on_auth_state_changed(self, qapp, temp_environment):
+        cfg = temp_environment["cfg"]
+        ctrl = AppController(config=cfg)
+        win = MainWindow(ctrl)
+        try:
+            # 1. Initial Guest Mode
+            assert "Guest" in win.lbl_user_name.text()
+            assert not win.btn_google_sign_in.isHidden()
+            assert win.btn_user_sign_out.isHidden()
+
+            # 2. Simulate User Sign-in with Google Account
+            fake_user_status = {
+                "signed_in": True,
+                "email": "milinddwivedi0@outlook.com",
+                "name": "Milind Krishna Dwivedi",
+                "plan": "pro_monthly",
+                "plan_name": "VOX Pro",
+                "is_pro": True,
+                "usage": {"dictation_words": 1200},
+                "limits": {},
+            }
+            with patch.object(ctrl, "get_account_status", return_value=fake_user_status):
+                ctrl.auth_state_changed.emit(fake_user_status)
+
+                # Check profile updated
+                assert win.lbl_user_name.text() == "Milind Krishna Dwivedi"
+                assert win.lbl_user_email.text() == "milinddwivedi0@outlook.com"
+                assert win.profile_avatar.text() == "M"
+                assert win.btn_google_sign_in.isHidden()
+                assert not win.btn_user_sign_out.isHidden()
+                assert "VOX Pro" in win.lbl_plan_badge.text()
+                assert "Unlimited" in win.lbl_quota_words.text()
+
+            # 3. Simulate Logout / Revert to Guest
+            fake_guest_status = {
+                "signed_in": False,
+                "email": None,
+                "name": "Guest User",
+                "plan": "free",
+                "plan_name": "VOX Free",
+                "is_pro": False,
+                "usage": {"dictation_words": 1200},
+                "limits": {"dictation_words_weekly": 3000},
+            }
+            with patch.object(ctrl, "get_account_status", return_value=fake_guest_status):
+                ctrl.auth_state_changed.emit(fake_guest_status)
+
+                assert "Guest" in win.lbl_user_name.text()
+                assert not win.btn_google_sign_in.isHidden()
+                assert win.btn_user_sign_out.isHidden()
+                assert "VOX Free" in win.lbl_plan_badge.text()
+        finally:
+            win.close()
+            ctrl.shutdown()
+
 
 class TestSystemTrayManagerPlanStatus:
     """Verify that SystemTrayManager displays the current plan and offers an Upgrade CTA."""
