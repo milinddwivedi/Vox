@@ -1242,3 +1242,131 @@ def test_calendar_page_and_main_window_calendar_routing_ui(qapp, tmp_path):
     win.close()
 
 
+# ----------------------------------------------------------------------
+# Test 17: Network Offline Resilience & Zero False Reauth Triggers
+# ----------------------------------------------------------------------
+def test_network_offline_resilience_and_no_reauth_spurious_alert(tmp_path):
+    import time
+    from voxlocal.calendar.graph_provider import MsGraphCalendarProvider
+    from voxlocal.calendar.google_provider import GoogleCalendarProvider
+    from voxlocal.ui.calendar_page import _state_display_info
+
+    # 1. Test MS Graph Provider offline resilience
+    p = MsGraphCalendarProvider(auth_file_path=tmp_path / "ms_test.dat")
+    p._access_token = "valid_tok"
+    p._refresh_token = "valid_refresh"
+    p._expires_at = time.time() - 100  # near expiry
+
+    # Simulate Windows socket DNS failure [Errno 11001] getaddrinfo failed
+    def _mock_urlopen_fail(req, timeout=15):
+        import urllib.error
+        raise urllib.error.URLError("[Errno 11001] getaddrinfo failed")
+
+    import urllib.request
+    orig_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = _mock_urlopen_fail
+    try:
+        ok = p.refresh_token()
+        assert ok is False
+        status = p.get_provider_status()
+        assert status["error_state"] == "NETWORK_OFFLINE"
+        assert status["is_healthy"] is True  # preserved in offline cached mode
+        assert status["connection_state"] == "connected"  # never degraded to failed or expired
+
+        res = p.sync_events_delta()
+        assert res["ok"] is True  # safe offline fallback
+        assert res["error_code"] == "NETWORK_OFFLINE"
+
+        # 2. Test Google Provider offline resilience
+        gp = GoogleCalendarProvider(client_id="dummy", client_secret="dummy", auth_file_path=tmp_path / "g_test.dat")
+        gp._access_token = "g_tok"
+        gp._refresh_token = "g_refresh"
+        gp._expires_at = time.time() - 100
+
+        g_ok = gp.refresh_token()
+        assert g_ok is False
+        g_st = gp.get_provider_status()
+        assert g_st["error_state"] == "NETWORK_OFFLINE"
+        assert g_st["is_healthy"] is True
+        assert g_st["connection_state"] == "connected"
+    finally:
+        urllib.request.urlopen = orig_urlopen
+
+    # 3. Test UI state display for offline cached
+    lbl, kind = _state_display_info("offline_cached", is_healthy=True, enabled=True)
+    assert lbl == "Offline (Cached)"
+    assert kind == "muted"
+
+
+# ----------------------------------------------------------------------
+# Test 18: 2026 Day Flow Timeline, Daily Pulse & Executive Briefing
+# ----------------------------------------------------------------------
+def test_2026_day_flow_timeline_daily_pulse_and_briefing(qapp, tmp_path):
+    from voxlocal.core.controller import AppController
+    from voxlocal.ui.calendar_page import CalendarPage
+
+    cfg = AppConfig()
+    cfg.storage_dir = str(tmp_path)
+    cfg.disable_hotkeys = True
+    cfg.ensure_directories()
+    ctrl = AppController(cfg)
+
+    now_local = datetime.now().astimezone()
+    m1 = CalendarMeeting(
+        id="pulse-m1",
+        title="Engineering Standup",
+        start_time=now_local.replace(hour=9, minute=30, second=0, microsecond=0),
+        end_time=now_local.replace(hour=10, minute=0, second=0, microsecond=0),
+        join_url="https://teams.microsoft.com/l/meetup-join/pulse1",
+        platform="teams",
+        organizer="Engineering Lead",
+        attendees=["Dev 1", "Dev 2"],
+    )
+    # Consecutive meeting with 0 min gap to test back-to-back warning
+    m2 = CalendarMeeting(
+        id="pulse-m2",
+        title="Product Roadmap Review",
+        start_time=now_local.replace(hour=10, minute=0, second=0, microsecond=0),
+        end_time=now_local.replace(hour=11, minute=0, second=0, microsecond=0),
+        join_url="https://meet.google.com/xyz-uvwx-rst",
+        platform="meet",
+        organizer="Product VP",
+        attendees=["Dev 1", "Product VP", "Designer"],
+    )
+
+    ctrl.calendar_engine._cached_meetings = [m1, m2]
+
+    page = CalendarPage(controller=ctrl)
+    page.show()
+    page.refresh()
+
+    # 1. Daily Pulse metrics verified
+    assert "Scheduled" in page.lbl_flow_time.text()
+    assert "Focus:" in page.lbl_focus_time.text()
+    assert "Longest Focus:" in page.lbl_longest_chunk.text()
+    assert not page.lbl_buffer_status.isHidden()
+    assert "Back-to-back" in page.lbl_buffer_status.text()
+
+    # 2. Executive Briefing & Copy verified
+    assert "BRIEFING" in page.lbl_briefing_title.text().upper() or "FLOW" in page.lbl_briefing_title.text().upper()
+    assert "Engineering Standup" in page.lbl_briefing_content.text()
+    assert page._daily_summary_text != ""
+    page._toggle_briefing()
+    assert page._briefing_expanded is True
+    assert not page.briefing_box.isHidden()
+
+    # 3. 2026 Day Flow Timeline view switching verified
+    page.set_view_mode("timeline")
+    assert page._view_mode == "timeline"
+    assert page.btn_view_timeline.isChecked() is True
+    assert page.btn_view_agenda.isChecked() is False
+
+    # Switch back to agenda
+    page.set_view_mode("agenda")
+    assert page._view_mode == "agenda"
+    assert page.btn_view_agenda.isChecked() is True
+
+    page.close()
+
+
+

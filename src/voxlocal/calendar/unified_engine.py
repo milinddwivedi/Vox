@@ -389,6 +389,8 @@ class UnifiedCalendarEngine(QObject):
             conn_state = AccountConnectionState.ADMIN_APPROVAL_REQUIRED.value
         elif err_state == "DISCONNECTED" or (prov is not None and not is_auth and not err_state):
             conn_state = AccountConnectionState.DISCONNECTED.value
+        elif err_state == "NETWORK_OFFLINE":
+            conn_state = "offline_cached" if is_auth else AccountConnectionState.DISCONNECTED.value
         elif err_state or status.get("is_healthy") is False:
             conn_state = AccountConnectionState.FAILED.value
         elif is_auth:
@@ -422,7 +424,7 @@ class UnifiedCalendarEngine(QObject):
     def get_sync_health_summary(self) -> Dict[str, Any]:
         accounts = self.list_accounts()
         active = [a for a in accounts if a.get("enabled", True)]
-        healthy = [a for a in active if a.get("connection_state") in ("connected", "syncing")]
+        healthy = [a for a in active if a.get("connection_state") in ("connected", "syncing", "offline_cached")]
         degraded = [a for a in active if a.get("connection_state") in ("expired", "failed", "admin_approval_required")]
         sync_times = [str(a.get("last_sync_at") or "") for a in accounts if a.get("last_sync_at")]
         latest_sync = max(sync_times) if sync_times else (self._last_sync_at or "")
@@ -548,11 +550,16 @@ class UnifiedCalendarEngine(QObject):
             status = {}
 
         if not sync_ok or status.get("is_healthy") is False:
-            # Apply per-account exponential backoff (capped at 15 min) or respect HTTP 429 Retry-After
             failures = self._account_failures.get(key, 0) + 1
             self._account_failures[key] = failures
             retry_after = int(getattr(prov, "retry_after_seconds", 0) or 0)
-            backoff_sec = retry_after if retry_after > 0 else min(900, 30 * (2 ** min(failures - 1, 5)))
+            is_offline = (status.get("error_state") == "NETWORK_OFFLINE")
+            if is_offline:
+                backoff_sec = 25  # short retry window for transient network recovery
+            elif retry_after > 0:
+                backoff_sec = retry_after
+            else:
+                backoff_sec = min(900, 30 * (2 ** min(failures - 1, 5)))
             self._account_backoff_until[key] = time.monotonic() + float(backoff_sec)
             self._persist_provider_account_record(key, prov)
             # Preserve cached events offline/on rate-limit instead of vanishing schedule

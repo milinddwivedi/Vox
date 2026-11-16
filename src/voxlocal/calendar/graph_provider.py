@@ -402,12 +402,18 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
         """Return True if a valid or refreshable token is present."""
         if not self._access_token:
             if self._refresh_token:
-                return self.refresh_token()
+                ok = self.refresh_token()
+                if not ok and self._status.get("error_state") == "NETWORK_OFFLINE":
+                    return True
+                return ok
             return False
         if not self.is_token_near_expiry():
             return True
         if self._refresh_token:
-            return self.refresh_token()
+            ok = self.refresh_token()
+            if not ok and self._status.get("error_state") == "NETWORK_OFFLINE":
+                return True
+            return ok
         return False
 
     def refresh_token(self) -> bool:
@@ -470,11 +476,20 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
             )
             return False
         except Exception as exc:
-            logger.error("Failed refreshing MS Graph token: %s", exc)
+            logger.warning("Network or transient exception refreshing MS Graph token: %s", exc)
             code, friendly = sanitize_oauth_error_for_user(str(exc), "ms_graph")
-            self._status["is_healthy"] = False
-            self._status["error_state"] = "NETWORK_OFFLINE" if code == "NETWORK_OFFLINE" else "REFRESH_FAILED"
-            self._status["friendly_error"] = friendly
+            is_offline = (code == "NETWORK_OFFLINE" or "getaddrinfo" in str(exc).lower() or "timed out" in str(exc).lower() or "11001" in str(exc))
+            if is_offline:
+                self._status["is_healthy"] = True
+                self._status["error_state"] = "NETWORK_OFFLINE"
+                self._status["friendly_error"] = "Offline — using cached schedule. Will automatically sync when reconnected."
+                if not self._status.get("connection_state") or self._status.get("connection_state") == AccountConnectionState.DISCONNECTED.value:
+                    self._status["connection_state"] = AccountConnectionState.CONNECTED.value
+            else:
+                self._status["is_healthy"] = False
+                self._status["error_state"] = "REFRESH_FAILED"
+                self._status["friendly_error"] = friendly
+                self._status["connection_state"] = AccountConnectionState.EXPIRED.value
             return False
 
     # -------------------------------------------------------------------------
@@ -1144,6 +1159,8 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
             return {"meetings": [], "removed_ids": [], "is_incremental": False, "ok": False, "error_code": "AUTH_REQUIRED"}
 
         if self.is_token_near_expiry() and not self.refresh_token():
+            if self._status.get("error_state") == "NETWORK_OFFLINE":
+                return {"meetings": [], "removed_ids": [], "is_incremental": False, "ok": True, "error_code": "NETWORK_OFFLINE"}
             return {"meetings": [], "removed_ids": [], "is_incremental": False, "ok": False, "error_code": "AUTH_EXPIRED"}
 
         now_dt = datetime.now(timezone.utc)
@@ -1212,19 +1229,24 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
 
         if had_error:
             err_code, friendly = sanitize_oauth_error_for_user(had_error, "ms_graph")
-            self._status["is_healthy"] = False
-            self._status["error_state"] = had_error if had_error in ("AUTH_REQUIRED", "AUTH_EXPIRED", "HTTP_429_RATE_LIMIT", "NETWORK_OFFLINE") else err_code
-            self._status["friendly_error"] = friendly
+            is_offline = (had_error == "NETWORK_OFFLINE" or err_code == "NETWORK_OFFLINE")
+            self._status["is_healthy"] = True if is_offline else False
+            self._status["error_state"] = "NETWORK_OFFLINE" if is_offline else (had_error if had_error in ("AUTH_REQUIRED", "AUTH_EXPIRED", "HTTP_429_RATE_LIMIT") else err_code)
+            self._status["friendly_error"] = "Working offline — showing cached schedule. Will reconnect automatically." if is_offline else friendly
             self._status["connection_state"] = (
-                AccountConnectionState.EXPIRED.value
-                if self._status["error_state"] in ("AUTH_REQUIRED", "AUTH_EXPIRED")
-                else AccountConnectionState.FAILED.value
+                AccountConnectionState.CONNECTED.value
+                if is_offline
+                else (
+                    AccountConnectionState.EXPIRED.value
+                    if self._status["error_state"] in ("AUTH_REQUIRED", "AUTH_EXPIRED")
+                    else AccountConnectionState.FAILED.value
+                )
             )
             return {
                 "meetings": all_meetings,
                 "removed_ids": removed_ids,
                 "is_incremental": used_incremental,
-                "ok": False,
+                "ok": True if is_offline else False,
                 "error_code": self._status["error_state"],
             }
 
@@ -1255,7 +1277,7 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
             return []
 
         if self.is_token_near_expiry():
-            if not self.refresh_token():
+            if not self.refresh_token() and self._status.get("error_state") != "NETWORK_OFFLINE":
                 return []
 
         now_dt = datetime.now(timezone.utc)
@@ -1297,13 +1319,18 @@ class MsGraphCalendarProvider(BaseCalendarProvider):
 
         if had_error:
             err_code, friendly = sanitize_oauth_error_for_user(had_error, "ms_graph")
-            self._status["is_healthy"] = False
-            self._status["error_state"] = had_error if had_error in ("AUTH_REQUIRED", "AUTH_EXPIRED", "HTTP_429_RATE_LIMIT", "NETWORK_OFFLINE") else err_code
-            self._status["friendly_error"] = friendly
+            is_offline = (had_error == "NETWORK_OFFLINE" or err_code == "NETWORK_OFFLINE")
+            self._status["is_healthy"] = True if is_offline else False
+            self._status["error_state"] = "NETWORK_OFFLINE" if is_offline else (had_error if had_error in ("AUTH_REQUIRED", "AUTH_EXPIRED", "HTTP_429_RATE_LIMIT") else err_code)
+            self._status["friendly_error"] = "Working offline — showing cached schedule. Will reconnect automatically." if is_offline else friendly
             self._status["connection_state"] = (
-                AccountConnectionState.EXPIRED.value
-                if self._status["error_state"] in ("AUTH_REQUIRED", "AUTH_EXPIRED")
-                else AccountConnectionState.FAILED.value
+                AccountConnectionState.CONNECTED.value
+                if is_offline
+                else (
+                    AccountConnectionState.EXPIRED.value
+                    if self._status["error_state"] in ("AUTH_REQUIRED", "AUTH_EXPIRED")
+                    else AccountConnectionState.FAILED.value
+                )
             )
             return all_meetings
 

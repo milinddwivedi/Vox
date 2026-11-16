@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -26,6 +28,7 @@ from PyQt6.QtWidgets import (
 
 from voxlocal.calendar.auth_service import sanitize_oauth_error_for_user
 from voxlocal.calendar.base import CalendarMeeting
+from voxlocal.calendar.graph_provider import copy_to_clipboard_win32
 from voxlocal.core.logger import get_logger
 from voxlocal.ui.theme import get_dialog_stylesheet, get_theme_tokens, get_ui_font
 
@@ -83,12 +86,14 @@ def _state_display_info(state: str, is_healthy: bool, enabled: bool) -> Tuple[st
     st = (state or "").strip().lower()
     if st == "syncing":
         return ("Syncing...", "info")
+    if st in {"offline_cached", "network_offline"}:
+        return ("Offline (Cached)", "muted")
     if st == "expired":
         return ("Expired — Reconnect", "warn")
     if st in {"admin_approval_required", "admin_blocked"}:
         return ("Admin Approval Needed", "warn")
     if st == "failed":
-        return ("Sync Error", "err")
+        return ("Attention Needed", "warn")
     if st == "disconnected":
         return ("Disconnected", "muted")
     if st == "connected" or is_healthy:
@@ -486,6 +491,9 @@ class CalendarPage(QWidget):
         self.controller = controller
         self._theme = str(getattr(controller, "theme", "light") or "light").lower()
         self._active_filter: str = "upcoming"  # today | tomorrow | week | upcoming
+        self._view_mode: str = "agenda"  # agenda | timeline
+        self._briefing_expanded: bool = False
+        self._daily_summary_text: str = ""
         self._selected_account_filter: str = ""
         self._search_text: str = ""
         self._filter_buttons: Dict[str, QPushButton] = {}
@@ -644,7 +652,90 @@ class CalendarPage(QWidget):
             self._filter_buttons[fid] = btn
 
         filter_bar.addStretch(1)
+
+        # View Mode Switcher: Agenda (Chronological List) vs Day Flow (Hourly Timeline)
+        self.btn_view_agenda = QPushButton("Agenda")
+        self.btn_view_agenda.setCheckable(True)
+        self.btn_view_agenda.setChecked(True)
+        self.btn_view_agenda.setObjectName("calFilterBtnActive")
+        self.btn_view_agenda.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_view_agenda.clicked.connect(lambda: self.set_view_mode("agenda"))
+        filter_bar.addWidget(self.btn_view_agenda)
+
+        self.btn_view_timeline = QPushButton("Day Flow")
+        self.btn_view_timeline.setCheckable(True)
+        self.btn_view_timeline.setChecked(False)
+        self.btn_view_timeline.setObjectName("calFilterBtn")
+        self.btn_view_timeline.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_view_timeline.clicked.connect(lambda: self.set_view_mode("timeline"))
+        filter_bar.addWidget(self.btn_view_timeline)
+
+        self.btn_toggle_briefing = QPushButton("✦ Daily Pulse")
+        self.btn_toggle_briefing.setCheckable(True)
+        self.btn_toggle_briefing.setChecked(False)
+        self.btn_toggle_briefing.setObjectName("calMiniBtn")
+        self.btn_toggle_briefing.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_briefing.clicked.connect(self._toggle_briefing)
+        filter_bar.addWidget(self.btn_toggle_briefing)
+
         left_col.addLayout(filter_bar)
+
+        # ---- Daily Pulse & Executive Intelligence Strip ----
+        self.pulse_container = QFrame()
+        self.pulse_container.setObjectName("calCard")
+        self.pulse_lay = QVBoxLayout(self.pulse_container)
+        self.pulse_lay.setContentsMargins(14, 10, 14, 10)
+        self.pulse_lay.setSpacing(8)
+
+        self.pulse_metrics_row = QHBoxLayout()
+        self.pulse_metrics_row.setSpacing(12)
+
+        self.lbl_flow_time = QLabel("0h 0m Scheduled Today")
+        self.lbl_flow_time.setFont(get_ui_font(12, 600))
+        self.pulse_metrics_row.addWidget(self.lbl_flow_time)
+
+        self.lbl_focus_time = QLabel("Focus: All Day")
+        self.lbl_focus_time.setObjectName("calMutedText")
+        self.pulse_metrics_row.addWidget(self.lbl_focus_time)
+
+        self.lbl_longest_chunk = QLabel("Uninterrupted Deep Work")
+        self.lbl_longest_chunk.setObjectName("calMutedText")
+        self.pulse_metrics_row.addWidget(self.lbl_longest_chunk)
+
+        self.lbl_buffer_status = QLabel("")
+        self.lbl_buffer_status.setVisible(False)
+        self.pulse_metrics_row.addWidget(self.lbl_buffer_status)
+
+        self.pulse_metrics_row.addStretch(1)
+        self.pulse_lay.addLayout(self.pulse_metrics_row)
+
+        # Expandable Executive Daily Briefing & Recap Panel
+        self.briefing_box = QWidget()
+        self.briefing_box.setVisible(False)
+        b_lay = QVBoxLayout(self.briefing_box)
+        b_lay.setContentsMargins(0, 6, 0, 2)
+        b_lay.setSpacing(8)
+
+        b_hdr = QHBoxLayout()
+        self.lbl_briefing_title = QLabel("DAILY EXECUTIVE BRIEFING & RECAP")
+        self.lbl_briefing_title.setObjectName("calKpiLabel")
+        b_hdr.addWidget(self.lbl_briefing_title)
+        b_hdr.addStretch(1)
+
+        self.btn_copy_briefing = QPushButton("Copy Summary")
+        self.btn_copy_briefing.setObjectName("calMiniBtn")
+        self.btn_copy_briefing.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy_briefing.clicked.connect(self._copy_daily_summary)
+        b_hdr.addWidget(self.btn_copy_briefing)
+        b_lay.addLayout(b_hdr)
+
+        self.lbl_briefing_content = QLabel("Analyzing your daily flow...")
+        self.lbl_briefing_content.setObjectName("calMutedText")
+        self.lbl_briefing_content.setWordWrap(True)
+        b_lay.addWidget(self.lbl_briefing_content)
+
+        self.pulse_lay.addWidget(self.briefing_box)
+        left_col.addWidget(self.pulse_container)
 
         search_row = QHBoxLayout()
         search_row.setSpacing(8)
@@ -750,6 +841,45 @@ class CalendarPage(QWidget):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
+    def set_view_mode(self, mode: str) -> None:
+        if mode not in ("agenda", "timeline"):
+            mode = "agenda"
+        self._view_mode = mode
+        if hasattr(self, "btn_view_agenda") and hasattr(self, "btn_view_timeline"):
+            self.btn_view_agenda.setChecked(mode == "agenda")
+            self.btn_view_agenda.setObjectName("calFilterBtnActive" if mode == "agenda" else "calFilterBtn")
+            self.btn_view_agenda.style().unpolish(self.btn_view_agenda)
+            self.btn_view_agenda.style().polish(self.btn_view_agenda)
+
+            self.btn_view_timeline.setChecked(mode == "timeline")
+            self.btn_view_timeline.setObjectName("calFilterBtnActive" if mode == "timeline" else "calFilterBtn")
+            self.btn_view_timeline.style().unpolish(self.btn_view_timeline)
+            self.btn_view_timeline.style().polish(self.btn_view_timeline)
+        self.refresh()
+
+    def _toggle_briefing(self) -> None:
+        self._briefing_expanded = not self._briefing_expanded
+        if hasattr(self, "briefing_box"):
+            self.briefing_box.setVisible(self._briefing_expanded)
+        if hasattr(self, "btn_toggle_briefing"):
+            self.btn_toggle_briefing.setChecked(self._briefing_expanded)
+            self.btn_toggle_briefing.setObjectName("calFilterBtnActive" if self._briefing_expanded else "calMiniBtn")
+            self.btn_toggle_briefing.style().unpolish(self.btn_toggle_briefing)
+            self.btn_toggle_briefing.style().polish(self.btn_toggle_briefing)
+
+    def _copy_daily_summary(self) -> None:
+        txt = self._daily_summary_text or getattr(self.lbl_briefing_content, "text", lambda: "")()
+        ok = False
+        try:
+            QGuiApplication.clipboard().setText(txt)
+            ok = True
+        except Exception:
+            ok = copy_to_clipboard_win32(txt)
+        if ok:
+            self.status_toast.emit("Copied Daily Executive Briefing to clipboard!", "success")
+        else:
+            self.status_toast.emit("Failed copying briefing to clipboard.", "error")
+
     def _on_account_filter_changed(self, _idx: int) -> None:
         self._selected_account_filter = str(self.cmb_account_filter.currentData() or "")
         self.refresh()
@@ -801,9 +931,130 @@ class CalendarPage(QWidget):
         recording_map = self._get_recording_map()
 
         self._render_kpis_and_spotlight(accounts, health, meetings)
+        self._render_daily_pulse(meetings)
         self._sync_account_dropdown(accounts)
         self._render_accounts_panel(accounts)
         self._render_meetings_panel(accounts, meetings, recording_map)
+
+    def _render_daily_pulse(self, meetings: List[CalendarMeeting]) -> None:
+        if not hasattr(self, "pulse_container"):
+            return
+        today_m = [m for m in meetings if m.is_today and not m.is_cancelled]
+        today_m.sort(key=lambda m: m.local_start_time)
+        now_local = datetime.now().astimezone()
+        cur_hour = now_local.hour
+
+        if not today_m:
+            self.lbl_flow_time.setText("0h 0m Scheduled Today")
+            self.lbl_focus_time.setText("Focus: Entire Day (Deep Work)")
+            self.lbl_longest_chunk.setText("No meeting interruptions")
+            self.lbl_buffer_status.setVisible(False)
+            self.lbl_briefing_title.setText("DAILY EXECUTIVE BRIEFING")
+            self.lbl_briefing_content.setText(
+                "Your schedule is completely clear today! Great opportunity for uninterrupted deep focus, "
+                "writing, strategy, or catching up on offline tasks."
+            )
+            self._daily_summary_text = (
+                f"Daily Executive Briefing ({now_local.strftime('%A, %B %d, %Y')}):\n"
+                "- Schedule: Clear day. No meetings scheduled.\n"
+                "- Focus Time: Full workday available for deep work."
+            )
+            return
+
+        total_mins = sum(max(5, int((m.local_end_time - m.local_start_time).total_seconds() // 60)) for m in today_m)
+        hrs = total_mins // 60
+        mins = total_mins % 60
+        dur_str = f"{hrs}h {mins}m" if hrs else f"{mins}m"
+        self.lbl_flow_time.setText(f"{dur_str} Scheduled ({len(today_m)} call{'s' if len(today_m) != 1 else ''})")
+
+        # Focus time in 8-hour workday (480 mins)
+        focus_mins = max(0, 480 - total_mins)
+        f_hrs = focus_mins // 60
+        f_mins = focus_mins % 60
+        self.lbl_focus_time.setText(f"Focus: {f_hrs}h {f_mins}m Available")
+
+        # Longest focus block between 9 AM and 6 PM
+        day_start = now_local.replace(hour=9, minute=0, second=0, microsecond=0)
+        day_end = now_local.replace(hour=18, minute=0, second=0, microsecond=0)
+        free_intervals: List[Tuple[datetime, datetime]] = []
+        cur_marker = day_start
+
+        for m in today_m:
+            ms = max(day_start, m.local_start_time)
+            me = min(day_end, m.local_end_time)
+            if ms > cur_marker:
+                free_intervals.append((cur_marker, ms))
+            cur_marker = max(cur_marker, me)
+        if cur_marker < day_end:
+            free_intervals.append((cur_marker, day_end))
+
+        if free_intervals:
+            longest_span = max(free_intervals, key=lambda iv: (iv[1] - iv[0]).total_seconds())
+            span_mins = int((longest_span[1] - longest_span[0]).total_seconds() // 60)
+            s_h = span_mins // 60
+            s_m = span_mins % 60
+            span_str = f"{s_h}h {s_m}m" if s_h else f"{s_m}m"
+            self.lbl_longest_chunk.setText(f"Longest Focus: {span_str} ({longest_span[0].strftime('%I:%M %p').lstrip('0')} – {longest_span[1].strftime('%I:%M %p').lstrip('0')})")
+        else:
+            self.lbl_longest_chunk.setText("Dense meeting schedule across today")
+
+        # Back-to-back detection (< 5 min buffer)
+        b2b_alerts = []
+        for i in range(len(today_m) - 1):
+            m1 = today_m[i]
+            m2 = today_m[i + 1]
+            gap = (m2.local_start_time - m1.local_end_time).total_seconds() / 60.0
+            if 0 <= gap < 5:
+                b2b_alerts.append(f"'{m1.title[:16]}' & '{m2.title[:16]}' ({int(gap)}m gap)")
+
+        if b2b_alerts:
+            self.lbl_buffer_status.setText(f"⚠️ Back-to-back: {', '.join(b2b_alerts[:2])}")
+            self.lbl_buffer_status.setStyleSheet("color: #E06C75; font-size: 11px; font-weight: 600;")
+            self.lbl_buffer_status.setVisible(True)
+        else:
+            self.lbl_buffer_status.setVisible(False)
+
+        # Executive Briefing & Recap text
+        if cur_hour < 12:
+            phase_title = "☀️ MORNING EXECUTIVE BRIEFING"
+            phase_intro = f"You have {len(today_m)} meeting{'s' if len(today_m) != 1 else ''} scheduled today totaling {dur_str}."
+        elif cur_hour < 17:
+            phase_title = "⚡ MIDDAY FLOW & PRIORITIES"
+            completed = sum(1 for m in today_m if m.local_end_time < now_local)
+            phase_intro = f"Midday update: {completed} of {len(today_m)} meetings completed. Total meeting load is {dur_str}."
+        else:
+            phase_title = "🌙 EVENING RECAP & WRAP-UP"
+            phase_intro = f"Daily wrap-up: {len(today_m)} meeting{'s' if len(today_m) != 1 else ''} on today's calendar."
+
+        self.lbl_briefing_title.setText(phase_title)
+
+        brief_lines = [phase_intro, ""]
+        summary_markdown_lines = [
+            f"# {phase_title.title()} — {now_local.strftime('%A, %B %d, %Y')}",
+            f"{phase_intro}\n",
+            "### Scheduled Meetings:",
+        ]
+
+        all_attendees: List[str] = []
+        for idx, m in enumerate(today_m, 1):
+            t_str, r_str = _format_time_window(m)
+            p_label = m.meeting_platform_label
+            org = m.organizer_name or m.organizer or "Host"
+            line = f"{idx}. {t_str} — {m.title} ({p_label}, Host: {org})"
+            brief_lines.append(f"• {m.local_start_time.strftime('%I:%M %p').lstrip('0')} — {m.title} ({p_label})")
+            summary_markdown_lines.append(f"- **{t_str}**: {m.title} [{p_label}]")
+            for att in (m.attendees or []):
+                if att not in all_attendees:
+                    all_attendees.append(att)
+
+        if all_attendees:
+            brief_lines.append(f"\nKey Attendees ({len(all_attendees)}): {', '.join(all_attendees[:8])}{'...' if len(all_attendees) > 8 else ''}")
+            brief_lines.append("VOX Notetaker has pre-primed acoustic vocabulary for these participants.")
+            summary_markdown_lines.append(f"\n**Key Attendees**: {', '.join(all_attendees[:10])}")
+
+        brief_lines.append("\n💡 1-click Join and Notetaker capture are ready for your upcoming calls.")
+        self.lbl_briefing_content.setText("\n".join(brief_lines))
+        self._daily_summary_text = "\n".join(summary_markdown_lines)
 
     def _render_kpis_and_spotlight(
         self,
@@ -825,7 +1076,7 @@ class CalendarPage(QWidget):
         active_accounts = [
             a for a in accounts
             if a.get("enabled", True)
-            and (a.get("is_authenticated") or str(a.get("connection_state") or "").lower() in {"connected", "syncing"})
+            and (a.get("is_authenticated") or str(a.get("connection_state") or "").lower() in {"connected", "syncing", "offline_cached"})
         ]
         self.lbl_kpi_accounts.setText(str(len(active_accounts)))
         if accounts:
@@ -842,12 +1093,13 @@ class CalendarPage(QWidget):
         health_map = {
             "connected": "Healthy",
             "healthy": "Healthy",
+            "offline_cached": "Cached (Offline)",
             "syncing": "Syncing...",
             "partial": "Partial Issue",
             "degraded": "Partial Issue",
             "attention_needed": "Reconnect Needed",
             "expired": "Reconnect Needed",
-            "failed": "Sync Error",
+            "failed": "Attention Needed",
             "disconnected": "Not Connected",
             "not_connected": "Not Connected",
         }
@@ -1027,13 +1279,24 @@ class CalendarPage(QWidget):
         lbl_meta.setObjectName("calMutedText")
         lay.addWidget(lbl_meta)
 
+        is_offline_msg = (
+            "offline" in friendly_err.lower()
+            or "internet" in friendly_err.lower()
+            or state in {"offline_cached", "network_offline"}
+        )
         if friendly_err and enabled:
             err_box = QLabel(friendly_err)
             err_box.setWordWrap(True)
-            err_box.setStyleSheet(
-                f"background: {t['accent_coral_tint']}; color: {t['text_primary']}; "
-                f"border-radius: 6px; padding: 6px 8px; font-size: 11px;"
-            )
+            if is_offline_msg:
+                err_box.setStyleSheet(
+                    f"background: {t['chip_bg']}; color: {t['text_secondary']}; "
+                    f"border: 1px solid {t['border']}; border-radius: 6px; padding: 6px 8px; font-size: 11px;"
+                )
+            else:
+                err_box.setStyleSheet(
+                    f"background: {t['accent_coral_tint']}; color: {t['text_primary']}; "
+                    f"border-radius: 6px; padding: 6px 8px; font-size: 11px;"
+                )
             lay.addWidget(err_box)
 
         # Two-row compact action bar so controls never clip inside the side panel
@@ -1047,15 +1310,16 @@ class CalendarPage(QWidget):
             btn_cals.clicked.connect(lambda _=False, a=acc: self._open_calendar_picker(a))
             act_row1.addWidget(btn_cals)
 
-        btn_sync = QPushButton("Sync")
+        sync_btn_txt = "Retry Sync" if is_offline_msg else "Sync"
+        btn_sync = QPushButton(sync_btn_txt)
         btn_sync.setObjectName("calMiniBtn")
         btn_sync.setEnabled(enabled)
         btn_sync.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_sync.clicked.connect(lambda _=False, account_id=aid: self._on_sync_account(account_id))
         act_row1.addWidget(btn_sync)
 
-        needs_reauth = state in {"expired", "failed", "admin_approval_required", "disconnected"} or (
-            not acc.get("is_authenticated") and state not in {"connected", "syncing", "disabled"}
+        needs_reauth = state in {"expired", "admin_approval_required"} or (
+            not acc.get("is_authenticated") and state not in {"connected", "syncing", "disabled", "offline_cached", "failed"}
         )
         btn_reconn = QPushButton("Reconnect")
         btn_reconn.setObjectName("calDawnBtn" if needs_reauth else "calMiniBtn")
@@ -1130,6 +1394,10 @@ class CalendarPage(QWidget):
         t = get_theme_tokens(self._theme)
         filtered = self._filter_meetings(meetings)
 
+        if self._view_mode == "timeline":
+            self._render_timeline_panel(accounts, filtered, recording_map, t)
+            return
+
         if not filtered:
             empty = QFrame()
             empty.setObjectName("calCard")
@@ -1186,6 +1454,222 @@ class CalendarPage(QWidget):
             self.meetings_lay.addWidget(self._build_meeting_card(m, rec_id, t))
 
         self.meetings_lay.addStretch(1)
+
+    def _render_timeline_panel(
+        self,
+        accounts: List[Dict[str, Any]],
+        filtered: List[CalendarMeeting],
+        recording_map: Dict[str, int],
+        t: Dict[str, Any],
+    ) -> None:
+        now_local = datetime.now().astimezone()
+        if self._active_filter == "tomorrow":
+            target_date = (now_local + timedelta(days=1)).date()
+            date_title = f"TOMORROW'S FLOW — {(now_local + timedelta(days=1)).strftime('%A, %b %d')}"
+        elif self._active_filter == "week":
+            target_date = now_local.date()
+            date_title = f"THIS WEEK'S FLOW — TODAY ({now_local.strftime('%A, %b %d')})"
+        else:
+            target_date = now_local.date()
+            date_title = f"TODAY'S FLOW — {now_local.strftime('%A, %b %d, %Y')}"
+
+        is_today = (target_date == now_local.date())
+
+        tl_hdr = QHBoxLayout()
+        lbl_tl_title = QLabel(date_title.upper())
+        lbl_tl_title.setObjectName("calSectionHeader")
+        tl_hdr.addWidget(lbl_tl_title)
+        tl_hdr.addStretch(1)
+
+        lbl_tl_sub = QLabel("Hourly interactive timeline & live current time indicator")
+        lbl_tl_sub.setObjectName("calMutedText")
+        tl_hdr.addWidget(lbl_tl_sub)
+        self.meetings_lay.addLayout(tl_hdr)
+
+        day_meetings = [m for m in filtered if m.local_start_time.date() == target_date and not m.is_cancelled]
+        day_meetings.sort(key=lambda m: m.local_start_time)
+
+        if not day_meetings and not accounts:
+            empty = QFrame()
+            empty.setObjectName("calCard")
+            e_lay = QVBoxLayout(empty)
+            e_lay.setContentsMargins(24, 28, 24, 28)
+            e_lay.setSpacing(10)
+            lbl = QLabel("No Calendars Connected")
+            lbl.setFont(get_ui_font(16, 600))
+            e_lay.addWidget(lbl)
+            sub = QLabel("Connect Microsoft Outlook, Google Calendar, or Zoom to visualize your Day Flow timeline.")
+            sub.setObjectName("calMutedText")
+            e_lay.addWidget(sub)
+            cta = QPushButton("Connect Your First Calendar")
+            cta.setObjectName("calFathomBtn")
+            cta.setCursor(Qt.CursorShape.PointingHandCursor)
+            cta.clicked.connect(lambda: self._open_connect_dialog())
+            e_lay.addWidget(cta, 0, Qt.AlignmentFlag.AlignLeft)
+            self.meetings_lay.addWidget(empty)
+            self.meetings_lay.addStretch(1)
+            return
+
+        pre_8am = [m for m in day_meetings if m.local_start_time.hour < 8]
+        if pre_8am:
+            early_box = QFrame()
+            early_box.setObjectName("calCard")
+            e_lay = QVBoxLayout(early_box)
+            e_lay.setContentsMargins(12, 8, 12, 8)
+            lbl_early = QLabel("EARLY MORNING (BEFORE 8:00 AM)")
+            lbl_early.setObjectName("calKpiLabel")
+            e_lay.addWidget(lbl_early)
+            for m in pre_8am:
+                rec_id = recording_map.get(m.id)
+                e_lay.addWidget(self._build_meeting_card(m, rec_id, t))
+            self.meetings_lay.addWidget(early_box)
+
+        grid_frame = QFrame()
+        grid_frame.setObjectName("calCard")
+        grid_lay = QVBoxLayout(grid_frame)
+        grid_lay.setContentsMargins(14, 14, 14, 14)
+        grid_lay.setSpacing(8)
+
+        for h in range(8, 21):
+            h_time = f"{h % 12 or 12:02d}:00 {'AM' if h < 12 else 'PM'}"
+            h_row = QHBoxLayout()
+            h_row.setSpacing(12)
+
+            lbl_h = QLabel(h_time)
+            lbl_h.setFixedWidth(68)
+            lbl_h.setObjectName("calMutedText")
+            lbl_h.setFont(get_ui_font(11, 700))
+            h_row.addWidget(lbl_h, 0, Qt.AlignmentFlag.AlignTop)
+
+            slot_col = QVBoxLayout()
+            slot_col.setSpacing(6)
+
+            # Live NOW indicator
+            if is_today and now_local.hour == h:
+                now_bar = QHBoxLayout()
+                now_bar.setSpacing(6)
+                now_pill = QLabel(f"● NOW · {now_local.strftime('%I:%M %p')}")
+                now_pill.setStyleSheet(
+                    f"background: {t['accent_coral_tint']}; color: {t['accent_crimson']}; "
+                    f"border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: 700;"
+                )
+                now_bar.addWidget(now_pill)
+                now_line = QFrame()
+                now_line.setFixedHeight(2)
+                now_line.setStyleSheet(f"background: {t['accent_crimson']};")
+                now_bar.addWidget(now_line, 1)
+                slot_col.addLayout(now_bar)
+
+            h_mtgs = [m for m in day_meetings if m.local_start_time.hour == h]
+            if h_mtgs:
+                for m in h_mtgs:
+                    slot_col.addWidget(self._build_timeline_meeting_block(m, recording_map.get(m.id), t))
+            else:
+                empty_slot = QFrame()
+                empty_slot.setFixedHeight(20)
+                empty_slot.setStyleSheet(f"border-top: 1px dashed {t['border']};")
+                slot_col.addWidget(empty_slot)
+
+            h_row.addLayout(slot_col, 1)
+            grid_lay.addLayout(h_row)
+
+        self.meetings_lay.addWidget(grid_frame)
+
+        post_8pm = [m for m in day_meetings if m.local_start_time.hour >= 21]
+        if post_8pm:
+            late_box = QFrame()
+            late_box.setObjectName("calCard")
+            l_lay = QVBoxLayout(late_box)
+            l_lay.setContentsMargins(12, 8, 12, 8)
+            lbl_late = QLabel("EVENING / LATE (AFTER 8:00 PM)")
+            lbl_late.setObjectName("calKpiLabel")
+            l_lay.addWidget(lbl_late)
+            for m in post_8pm:
+                rec_id = recording_map.get(m.id)
+                l_lay.addWidget(self._build_meeting_card(m, rec_id, t))
+            self.meetings_lay.addWidget(late_box)
+
+        self.meetings_lay.addStretch(1)
+
+    def _build_timeline_meeting_block(
+        self,
+        m: CalendarMeeting,
+        recording_id: Optional[int],
+        t: Dict[str, Any],
+    ) -> QFrame:
+        block = QFrame()
+        block.setObjectName("calTimelineBlock")
+        plat_label, plat_color = _platform_display_info(m.platform, t)
+        is_live = m.is_happening_now
+
+        bg_col = t['surface_secondary']
+        border_col = plat_color if is_live else t['border']
+        glow = f"border: 2px solid {plat_color};" if is_live else f"border: 1px solid {border_col}; border-left: 4px solid {plat_color};"
+
+        block.setStyleSheet(f"background: {bg_col}; {glow} border-radius: 8px;")
+        b_lay = QHBoxLayout(block)
+        b_lay.setContentsMargins(12, 8, 12, 8)
+        b_lay.setSpacing(10)
+
+        info_col = QVBoxLayout()
+        info_col.setSpacing(2)
+
+        time_str, rel_str = _format_time_window(m)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
+        lbl_t = QLabel(time_str)
+        lbl_t.setFont(get_ui_font(12, 600))
+        top_row.addWidget(lbl_t)
+
+        if rel_str:
+            lbl_rel = QLabel(rel_str)
+            r_bg = t['accent_emerald_tint'] if is_live else t['chip_bg']
+            r_fg = t['accent_emerald'] if is_live else t['text_muted']
+            lbl_rel.setStyleSheet(f"background: {r_bg}; color: {r_fg}; border-radius: 4px; padding: 1px 5px; font-size: 10px; font-weight: 600;")
+            top_row.addWidget(lbl_rel)
+
+        top_row.addStretch(1)
+        info_col.addLayout(top_row)
+
+        lbl_tit = QLabel(m.title or "Untitled Meeting")
+        lbl_tit.setFont(get_ui_font(14, 600))
+        lbl_tit.setWordWrap(True)
+        info_col.addWidget(lbl_tit)
+
+        sub_parts = [plat_label]
+        org = m.organizer_name or m.organizer
+        if org:
+            sub_parts.append(f"Host: {org}")
+        if m.attendees:
+            sub_parts.append(f"{len(m.attendees)} attendee{'s' if len(m.attendees) != 1 else ''}")
+        lbl_sub = QLabel(" · ".join(sub_parts))
+        lbl_sub.setObjectName("calMutedText")
+        info_col.addWidget(lbl_sub)
+        b_lay.addLayout(info_col, 1)
+
+        act_col = QHBoxLayout()
+        act_col.setSpacing(6)
+        if m.join_url:
+            btn_join = QPushButton("Join")
+            btn_join.setObjectName("calFathomBtn")
+            btn_join.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_join.clicked.connect(lambda _=False, mt=m: self._on_join_meeting(mt))
+            act_col.addWidget(btn_join)
+
+        btn_prep = QPushButton("Prepare")
+        btn_prep.setObjectName("calDawnBtn")
+        btn_prep.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_prep.clicked.connect(lambda _=False, mt=m: self._on_prepare_notetaker(mt))
+        act_col.addWidget(btn_prep)
+
+        btn_det = QPushButton("Details")
+        btn_det.setObjectName("calMiniBtn")
+        btn_det.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_det.clicked.connect(lambda _=False, mt=m, rid=recording_id: self._open_meeting_details(mt, rid))
+        act_col.addWidget(btn_det)
+
+        b_lay.addLayout(act_col)
+        return block
 
     def _build_meeting_card(
         self,
@@ -1412,7 +1896,7 @@ class CalendarPage(QWidget):
                 font-weight: 700;
                 letter-spacing: 0.6px;
             }}
-            QFrame#calCard, QFrame#calMeetingCard, QFrame#calSidePanel {{
+            QFrame#calCard, QFrame#calMeetingCard, QFrame#calSidePanel, QFrame#calTimelineBlock {{
                 background: {t['surface']};
                 border: 1px solid {t['border']};
                 border-radius: 12px;
