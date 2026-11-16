@@ -401,6 +401,11 @@ class UnifiedCalendarEngine(QObject):
             last_err = db_meta.get("last_error") or ""
             conn_state = db_meta.get("connection_state")
             is_healthy = (not err_state or err_state == "NETWORK_OFFLINE") and bool(db_meta.get("is_healthy", True))
+            is_auth = (
+                conn_state in ("connected", "syncing", "offline_cached", "disabled")
+                or bool(db_meta.get("last_sync_at"))
+                or bool(self._auth_broker and self._auth_broker.load_credentials(self.user_id, key))
+            )
 
         if not enabled:
             conn_state = "disabled"

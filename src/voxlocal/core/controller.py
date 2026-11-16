@@ -3418,6 +3418,8 @@ class AppController(QObject):
                 mic_slice, sys_slice, actual_start_sec = self.meeting_recorder.get_audio_window(start_sec, end_sec)
                 vocab = self.db.list_vocabulary(active_only=True)
                 prompt = DictationProcessor.build_whisper_prompt(vocab)
+                if self.config.language in ("en+hi", "hinglish", "hi_latn"):
+                    prompt = f"{prompt} {DictationProcessor.DEFAULT_HINGLISH_PROMPT}".strip()
 
                 new_segments: List[Dict[str, Any]] = []
                 sys_segs: List[Dict[str, Any]] = []
@@ -3676,6 +3678,8 @@ class AppController(QObject):
                         prompt_parts.append("Participants: " + ", ".join(clean_cal_names) + ".")
                 if vocab_prompt:
                     prompt_parts.append(vocab_prompt)
+                if self.config.language in ("en+hi", "hinglish", "hi_latn"):
+                    prompt_parts.append(DictationProcessor.DEFAULT_HINGLISH_PROMPT)
                 eff_prompt = " ".join(prompt_parts).strip()
 
                 self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing speech with local Whisper...")
@@ -3947,19 +3951,36 @@ class AppController(QObject):
         if not meeting:
             return
         audio_path = meeting.get("audio_path", "")
+        vid_path = meeting.get("video_path", "")
+        parent_dir = Path(vid_path).parent if vid_path else None
+
         if not audio_path or not Path(audio_path).exists():
-            vid_path = meeting.get("video_path", "")
-            if vid_path and (Path(vid_path).parent / "mixed.wav").exists():
-                audio_path = str(Path(vid_path).parent / "mixed.wav")
+            if parent_dir and (parent_dir / "meeting_mixed.wav").exists():
+                audio_path = str(parent_dir / "meeting_mixed.wav")
+                self.db.update_meeting(meeting_id, audio_path=audio_path)
+            elif parent_dir and (parent_dir / "mixed.wav").exists():
+                audio_path = str(parent_dir / "mixed.wav")
                 self.db.update_meeting(meeting_id, audio_path=audio_path)
             else:
                 created_slug = str(meeting.get("created_at", "")).replace("-", "").replace(":", "").replace(" ", "_")
                 for folder in self.config.recordings_dir.glob("meeting_*"):
-                    if folder.is_dir() and (folder / "mixed.wav").exists():
-                        if created_slug and created_slug[:13] in folder.name:
-                            audio_path = str(folder / "mixed.wav")
+                    if folder.is_dir():
+                        target_wav = folder / "meeting_mixed.wav" if (folder / "meeting_mixed.wav").exists() else folder / "mixed.wav"
+                        if target_wav.exists() and created_slug and created_slug[:13] in folder.name:
+                            audio_path = str(target_wav)
+                            parent_dir = folder
                             self.db.update_meeting(meeting_id, audio_path=audio_path)
                             break
+
+        if parent_dir and parent_dir.exists():
+            mic_p = parent_dir / "mic_track.wav"
+            sys_p = parent_dir / "system_track.wav"
+            if mic_p.exists() and (not meeting.get("mic_audio_path") or not Path(str(meeting.get("mic_audio_path"))).exists()):
+                self.db.update_meeting(meeting_id, mic_audio_path=str(mic_p))
+                meeting["mic_audio_path"] = str(mic_p)
+            if sys_p.exists() and (not meeting.get("sys_audio_path") or not Path(str(meeting.get("sys_audio_path"))).exists()):
+                self.db.update_meeting(meeting_id, sys_audio_path=str(sys_p))
+                meeting["sys_audio_path"] = str(sys_p)
 
         if not audio_path or not Path(audio_path).exists():
             self.notification_requested.emit(

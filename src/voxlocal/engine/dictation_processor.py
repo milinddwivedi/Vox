@@ -83,9 +83,19 @@ class DictationProcessor:
         (r"\b(?:scrum|kram)\s+call\b", "Scrum call"),
         (r"\b(?:daily|dailyes|dailies)\s+(?:scrum|kram)\b", "Daily Scrum"),
         (r"\bamerican\s+(?:tall|towels?|doll)\b", "American Tall"),
+        (r"\bamerican\s+top\s*guns?\b", "American Tall"),
         (r"\btroy\s+le+a?\b", "Troy Lee"),
         (r"\b(?:heman|hemant|hemanth)\s+kumar\b", "Hemanth Kumar"),
         (r"\brum\s*j+h?u+m\b", "Rumjhum"),
+        (r"\bunnegade\b", "Aniket"),
+        (r"\b(?:bad\s+man|bad\s+men)\b", "baad mein"),
+        (r"\bbat\s+ye\b", "par yeh"),
+        (r"\byou\s+sabka\b", "yeh sabka"),
+        (r"\bpeace\s+peace\b", "please, please"),
+        (r"\b(?:tiket\s+aaeedi|veeticket\s+id|vticket\s+id|v\s+ticket\s+id)\b", "ticket ID"),
+        (r"\bvi\s+tiket\b", "bhi ticket"),
+        (r"\bhelp\s+to\s+join\b", "her to join"),
+        (r"\boh\s+doodle\b", "hold on"),
         (r"\bprep\s+one\b", "prepone"),
         (r"\bdo the need\s*ful\b", "do the needful"),
         (r"\brevert\s+back\b", "revert"),
@@ -269,6 +279,13 @@ class DictationProcessor:
         (r"\bएपीआई\s+एंडपॉइंट\b", "API endpoint"),
         (r"\bपीआर\s+मर्ज\b", "PR merge"),
         (r"\bपीआर\s+रिव्यू\b", "PR review"),
+        (r"\bटिकट\s+आईडी\b|\bतिकीट\s+आयडी\b|\bटिकट\s+आई\s*डी\b|\bतिकीट\s+आईडी\b|\bतिकिट\s+आयडी\b", "ticket ID"),
+        (r"\bपुल\s+रिक्वेस्ट\b", "pull request"),
+        (r"\bमास्टर\s+ब्रांच\b", "master branch"),
+        (r"\bमेन\s+ब्रांच\b", "main branch"),
+        (r"\bडेली\s+स्टैंडअप\b|\bडेली\s+स्क्रम\b", "Daily Scrum"),
+        (r"\bस्प्रिंट\s+प्लानिंग\b", "sprint planning"),
+        (r"\bस्प्रिंट\s+बैकलॉग\b", "sprint backlog"),
         (r"\bथैंक\s+यू\b", "thank you"),
         (r"\bवॉइस\s+टाइपिंग\b|\bवाइस\s+टाइपिंग\b", "voice typing"),
         (r"\bपरचेज\s+आर्डर\b|\bपरचेज\s+ऑर्डर\b|\bपर्चेज\s+ऑर्डर\b", "purchase order"),
@@ -471,7 +488,27 @@ class DictationProcessor:
         (r"\bरिजॉल्व्ड\b|\bरिज़ॉल्व्ड\b", "resolved"),
         (r"\bइंप्लीमेंट\b|\bइम्प्लीमेंट\b", "implement"),
         (r"\bकॉन्फ़िगरेशन\b|\bकॉन्फिगरेशन\b", "configuration"),
+        (r"\bरेप्लिकेट\b|\bरेप्लिका\b", "replicate"),
+        (r"\bडेवलपमेंट\b", "development"),
+        (r"\bरीओपन\b|\bरी\s*ओपन\b|\bरिओपन\b", "reopen"),
+        (r"\bक्लोज\b|\bख्लोज\b", "close"),
+        (r"\bऑडिबल\b", "audible"),
+        (r"\bबैकलॉग\b", "backlog"),
+        (r"\bहॉटफिक्स\b", "hotfix"),
+        (r"\bपाइपलाइन\b", "pipeline"),
+        (r"\bजेनकिंस\b", "Jenkins"),
+        (r"\bक्यूए\b", "QA"),
+        (r"\bअसाइन\b", "assign"),
+        (r"\bडिपेंडेंसी\b", "dependency"),
+        (r"\bडिलीवर\b", "deliver"),
+        (r"\bकनेक्टेड\b", "connected"),
     ]
+
+    DEFAULT_HINGLISH_PROMPT = (
+        "Daily standup and scrum meeting with natural Hindi and English code-switching. "
+        "Aaj ka update, sprint tasks, ticket ID, PR review, bug fix, deployment, baad mein check kar lenge. "
+        "We discuss sprint backlog, replicate issues, and deploy to production."
+    )
 
     # Conversational dictionary + phonetic mapping for Romanized Hinglish ('hi_latn') mode
     HINGLISH_WORD_MAP = {

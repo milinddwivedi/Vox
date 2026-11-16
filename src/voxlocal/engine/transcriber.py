@@ -1385,10 +1385,11 @@ class LocalWhisperTranscriber:
             lang_arg = None
             init_prompt = None
         elif language in bilingual_modes:
-            # Avoid injecting static bilingual phrases into Whisper prompts, as Whisper can hallucinate
-            # them during silent/quiet moments (e.g. echoing 'We speak in English and Hindi.').
             lang_arg = None
-            init_prompt = None
+            if language in ("en+hi", "hinglish", "hi_latn"):
+                init_prompt = DictationProcessor.DEFAULT_HINGLISH_PROMPT
+            else:
+                init_prompt = None
         else:
             lang_arg = language
             init_prompt = "नमस्ते।" if (lang_arg in ("hi", "mr") and self.model_name == "base") else None
@@ -1468,20 +1469,19 @@ class LocalWhisperTranscriber:
             detected = getattr(info, "language", "en")
             prob = float(getattr(info, "language_probability", 1.0))
             if language in ("en+hi", "hinglish", "hi_latn"):
-                target_lang = self._resolve_bilingual_lang(info)
+                if detected == "ur":
+                    # Avoid Arabic script tokens by re-decoding with Hinglish prompt
+                    segments_gen, info = _call_transcribe(None, effective_prompt)
             else:
                 target_lang = (
                     self._resolve_bilingual_lang(info)
                     if (detected in ("hi", "ur") or prob < 0.50)
                     else detected
                 )
-
-            # If auto-detected language differs from resolved target (e.g. 'ur' -> 'hi'),
-            # re-invoke with target_lang BEFORE consuming the lazy generator!
-            if detected != target_lang or (target_lang == "hi" and self.model_name == "base"):
-                re_prompt = "नमस्ते।" if (target_lang == "hi" and self.model_name == "base") else effective_prompt
-                segments_gen, info = _call_transcribe(target_lang, re_prompt)
-            lang_arg = target_lang
+                if detected != target_lang or (target_lang == "hi" and self.model_name == "base"):
+                    re_prompt = "नमस्ते।" if (target_lang == "hi" and self.model_name == "base") else effective_prompt
+                    segments_gen, info = _call_transcribe(target_lang, re_prompt)
+                lang_arg = target_lang
 
         segs_list = list(segments_gen)
 
@@ -2016,6 +2016,13 @@ class LocalWhisperTranscriber:
                 continue
             if output_script == "roman":
                 txt = DictationProcessor.devanagari_to_roman_hinglish(txt).strip()
+            txt = DictationProcessor.process(
+                txt,
+                cleanup_enabled=True,
+                spoken_punctuation=False,
+                output_script=output_script,
+                mode="cleaned",
+            ).strip()
             if not txt:
                 continue
 
