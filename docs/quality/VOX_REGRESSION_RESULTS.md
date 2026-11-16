@@ -23,8 +23,13 @@ tests/e2e/test_adversarial_stress_tier4.py      15      15        0      1.78s
 tests/e2e/test_speech_benchmarks.py             20      20        0     20.00s
 tests/test_handsfree_and_calls.py               14      14        0      3.20s
 tests/test_e2e_calendar_and_meeting.py          12      12        0      2.85s
+tests/stateful/test_stateful_calendar_accounts   1       1        0      2.30s
+tests/stateful/test_stateful_dictation_engine    4       4        0      1.20s
+tests/stateful/test_stateful_meeting_lifecycle   1       1        0      5.40s
+tests/stateful/test_stateful_metering_licensing  5       5        0      2.46s
+tests/e2e/test_playwright_web_portal.py          5       5        0      1.95s
 ---------------------------------------------------------------------------------
-TOTAL CORE VERIFICATION SUITE                  118     118        0     43.87s
+TOTAL CORE VERIFICATION SUITE                  139     139        0     57.18s
 =================================================================================
 ```
 

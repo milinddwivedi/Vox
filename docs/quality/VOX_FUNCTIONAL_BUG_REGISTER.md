@@ -17,6 +17,9 @@ During the comprehensive product behavior and business logic stress test, six ma
 | **BUG-004** | High | Pro Upgrade Dialog | Clicking "Upgrade Monthly" opens 2 identical Chrome tabs | **RESOLVED & VERIFIED** |
 | **BUG-005** | High | Desktop Sidebar | Google account profile visible on web but missing in desktop app | **RESOLVED & VERIFIED** |
 | **BUG-006** | Medium | Win32 Text Inserter | Clipboard paste failure in headless/decoupled test runner | **RESOLVED & VERIFIED** |
+| **BUG-007** | High | Meeting Controller | Meeting left in status='recording' in SQLite when engine stops | **RESOLVED & VERIFIED** |
+| **BUG-008** | High | Usage Metering | Local SQLite usage can be altered; DPAPI seal was never verified | **RESOLVED & VERIFIED** |
+| **BUG-009** | Medium | Local Database | In-memory SQLite connections dropped schema tables on close | **RESOLVED & VERIFIED** |
 
 ---
 
@@ -128,3 +131,49 @@ During the comprehensive product behavior and business logic stress test, six ma
   In `_paste_via_clipboard()`, when `target is None` and setting clipboard succeeded, recognized that hotkey sequence dispatch succeeded.
 - **Regression Verification:**
   - `tests/e2e/test_adversarial_stress_tier4.py::test_stress_clipboard_restoration_fast_sequential` (PASSED)
+
+---
+
+### BUG-007: Orphaned Meeting status='recording' in SQLite on Stop Action
+
+- **Module:** `voxlocal.core.controller`
+- **Severity:** High (Data & State Consistency)
+- **User Symptom:**
+  Discovered by Hypothesis state machine during rapid start/stop sequences. If an active meeting recording is stopped, `_capture_state` resets immediately to `idle`, but the meeting row in SQLite remained with `status='recording'` until background audio muxing and speech transcription completed (or indefinitely if the app is closed). If the user views Meeting History or restarts VOX immediately after clicking Stop, the meeting is erroneously shown as actively recording.
+- **Root Cause Analysis:**
+  In `stop_meeting_recording()`, the status transition to `'transcribing'` was deferred into the background thread `_finalize_meeting_worker`.
+- **Fix Implementation:**
+  Synchronously update SQLite row to `status='transcribing'`, set `ended_at`, and record estimated duration before spawning the background worker thread.
+- **Regression Verification:**
+  - `tests/stateful/test_stateful_meeting_lifecycle.py::test_meeting_lifecycle_hypothesis_state_machine` (PASSED across 500 transitions)
+
+---
+
+### BUG-008: Missing DPAPI Anti-Tamper Verification & Self-Healing in Usage Ledger
+
+- **Module:** `voxlocal.core.metering`
+- **Severity:** High (Commercial Ledger Integrity)
+- **User Symptom:**
+  Although `dpapi_seal` was calculated and stored when writing rows, `dpapi_decrypt` was never invoked when reading the row back in `_get_or_create_period_row()`. Any user manually altering the SQLite file could bypass weekly limits undetected.
+- **Root Cause Analysis:**
+  `dpapi_decrypt` was imported but unused in `_get_or_create_period_row()`.
+- **Fix Implementation:**
+  Invoked `dpapi_decrypt(seal)` on reading the period row. If raw stored metrics are lower than the cryptographically sealed metrics, VOX detects local cache tampering and self-heals the metrics to the sealed maximums.
+- **Regression Verification:**
+  - `tests/stateful/test_stateful_metering_and_licensing.py::test_metering_and_licensing_hypothesis_state_machine` (PASSED with intentional row tampering test rule)
+
+---
+
+### BUG-009: In-Memory SQLite Connections Vanishing Across Context Managers
+
+- **Module:** `voxlocal.storage.database`
+- **Severity:** Medium (Test Harness Invariant)
+- **User Symptom:**
+  Calling `LocalDatabase(":memory:")` resulted in `sqlite3.OperationalError: no such table: meetings` during migrations.
+- **Root Cause Analysis:**
+  SQLite `:memory:` databases are destroyed as soon as their connection closes. `_connect()` was creating and closing separate connections on every operation.
+- **Fix Implementation:**
+  Added persistent `_mem_conn` for in-memory databases with an explicit `close()` method.
+- **Regression Verification:**
+  - `tests/stateful/test_stateful_meeting_lifecycle.py` (PASSED)
+

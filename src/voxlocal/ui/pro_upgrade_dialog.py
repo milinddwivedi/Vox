@@ -303,25 +303,21 @@ class VoxProUpgradeDialog(QDialog):
     def _open_checkout_url(self, url: str) -> None:
         """Safely open checkout link in the default browser without opening duplicate tabs."""
         now = time.monotonic()
-        if now - getattr(self, "_last_checkout_open_time", 0.0) < 1.2:
-            logger.info("Ignoring duplicate rapid checkout click within 1.2s")
+        if now - getattr(self, "_last_checkout_open_time", 0.0) < 2.0:
+            logger.info("Ignoring duplicate rapid checkout click within 2.0s")
             return
         self._last_checkout_open_time = now
 
         logger.info("Opening Razorpay checkout link: %s", url)
-        opened = False
         try:
-            res = QDesktopServices.openUrl(QUrl(url))
-            opened = (res is True)
+            # Open URL directly in default browser once
+            webbrowser.open(url, new=2)
         except Exception as exc:
-            logger.warning("QDesktopServices.openUrl failed: %s", exc)
-            opened = False
-
-        if not opened:
+            logger.warning("webbrowser.open failed: %s, falling back to QDesktopServices", exc)
             try:
-                webbrowser.open(url)
-            except Exception as exc:
-                logger.warning("webbrowser.open failed: %s", exc)
+                QDesktopServices.openUrl(QUrl(url))
+            except Exception as q_exc:
+                logger.error("Failed to open checkout url: %s", q_exc)
 
     def _open_monthly_checkout(self) -> None:
         self._open_checkout_url(RAZORPAY_MONTHLY_LINK)

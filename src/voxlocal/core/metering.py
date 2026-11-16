@@ -268,15 +268,51 @@ class UsageMeteringEngine:
         )
         row = cur.fetchone()
         if row:
+            d_words = int(row[4] or 0)
+            m_sec = float(row[5] or 0.0)
+            m_cnt = int(row[6] or 0)
+            ask_cnt = int(row[7] or 0)
+            seal = row[8]
+
+            # Cryptographic anti-tamper check & self-healing via Windows DPAPI:
+            if seal:
+                try:
+                    decrypted_raw = dpapi_decrypt(seal)
+                    if decrypted_raw:
+                        sealed_data = json.loads(decrypted_raw.decode("utf-8"))
+                        sealed_words = int(sealed_data.get("words", 0))
+                        sealed_m_sec = float(sealed_data.get("m_sec", 0.0))
+                        sealed_m_cnt = int(sealed_data.get("m_cnt", 0))
+                        sealed_ask_cnt = int(sealed_data.get("ask_cnt", 0))
+
+                        # If raw columns were manually rolled back/edited, restore authoritative sealed numbers
+                        if (
+                            d_words < sealed_words
+                            or m_sec < sealed_m_sec
+                            or m_cnt < sealed_m_cnt
+                            or ask_cnt < sealed_ask_cnt
+                        ):
+                            logger.warning(
+                                "Local metering cache tampering detected for user %s (period %s). Self-healing to verified sealed metrics.",
+                                self._user_id,
+                                period_id,
+                            )
+                            d_words = max(d_words, sealed_words)
+                            m_sec = max(m_sec, sealed_m_sec)
+                            m_cnt = max(m_cnt, sealed_m_cnt)
+                            ask_cnt = max(ask_cnt, sealed_ask_cnt)
+                except Exception as exc:
+                    logger.debug("Failed verifying DPAPI seal: %s", exc)
+
             return {
                 "period_id": row[0],
                 "user_id": row[1],
                 "period_start_utc": row[2],
                 "period_end_utc": row[3],
-                "dictation_words": int(row[4] or 0),
-                "meeting_seconds": float(row[5] or 0.0),
-                "meeting_count": int(row[6] or 0),
-                "ask_vox_count": int(row[7] or 0),
+                "dictation_words": d_words,
+                "meeting_seconds": m_sec,
+                "meeting_count": m_cnt,
+                "ask_vox_count": ask_cnt,
             }
 
         new_period = {

@@ -27,13 +27,35 @@ class LocalDatabase:
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
-        os.makedirs(self.db_path.parent, exist_ok=True)
+        self._is_memory = (str(self.db_path) == ":memory:")
+        if self._is_memory:
+            self._mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._mem_conn.row_factory = sqlite3.Row
+            self._mem_conn.execute("PRAGMA foreign_keys=ON;")
+        else:
+            self._mem_conn = None
+            os.makedirs(self.db_path.parent, exist_ok=True)
         self._lock = threading.RLock()
         self._init_schema()
         self._seed_default_vocabulary()
 
+    def close(self) -> None:
+        """Close database connection (especially important for in-memory databases)."""
+        with self._lock:
+            if self._mem_conn is not None:
+                try:
+                    self._mem_conn.close()
+                except Exception:
+                    pass
+                self._mem_conn = None
+
     @contextlib.contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        if self._is_memory and self._mem_conn is not None:
+            with self._lock:
+                yield self._mem_conn
+            return
+
         conn = sqlite3.connect(str(self.db_path), timeout=15.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")

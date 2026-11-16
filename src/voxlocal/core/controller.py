@@ -452,6 +452,8 @@ class AppController(QObject):
                         self.metering.set_user_context(user_id, plan_code)
                     if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
                         self.entitlement.set_user_context(user_id)
+                    # Non-blocking cloud entitlement sync to immediately pull website plan updates on launch
+                    threading.Thread(target=self._sync_commercial_worker, name="StartupEntitlementSync", daemon=True).start()
                     return
             if hasattr(self, "metering") and self.metering is not None:
                 self.metering.set_user_context(None, "free")
@@ -3253,6 +3255,16 @@ class AppController(QObject):
             logger.warning("Error stopping MeetingRecorder: %s", exc)
             result = None
         if not result:
+            if meeting_id is not None:
+                try:
+                    self.db.update_meeting(
+                        meeting_id,
+                        status="empty",
+                        ended_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        duration_sec=0.0,
+                    )
+                except Exception as exc_upd:
+                    logger.debug("Failed updating aborted meeting #%s in db: %s", meeting_id, exc_upd)
             self.meeting_state_changed.emit("idle", "Meeting stopped")
             return
 
@@ -3274,6 +3286,23 @@ class AppController(QObject):
         if meeting_id is None:
             self.meeting_state_changed.emit("idle", "Meeting stopped")
             return
+
+        # Synchronously update meeting status to 'transcribing' immediately upon stopping
+        # so SQLite never retains an orphaned 'recording' status while the engine is idle.
+        try:
+            dur = getattr(result, "duration_sec", 0.0)
+            try:
+                dur_val = round(float(dur), 2)
+            except (TypeError, ValueError):
+                dur_val = 0.0
+            self.db.update_meeting(
+                meeting_id,
+                status="transcribing",
+                ended_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                duration_sec=dur_val,
+            )
+        except Exception as exc_upd:
+            logger.debug("Failed updating meeting status to transcribing in db: %s", exc_upd)
 
         session_cancel_event = threading.Event()
         with self._state_lock:
@@ -4905,6 +4934,12 @@ class AppController(QObject):
                             self.entitlement.save_token_to_vault(raw_jwt)
                             self.entitlement_changed.emit(self.entitlement.get_effective_entitlement())
                             self.auth_state_changed.emit(self.get_account_status())
+                        elif ent_data.get("is_pro") or ent_data.get("plan"):
+                            plan_code = ent_data.get("plan", "free")
+                            user_id = session.get("user_id") if session else "default"
+                            if hasattr(self, "metering") and self.metering is not None:
+                                self.metering.set_user_context(user_id, plan_code)
+                            self.auth_state_changed.emit(self.get_account_status())
         except Exception as exc:
             logger.debug("Cloud commercial sync warning (offline or warming): %s", exc)
 
@@ -4977,6 +5012,11 @@ class AppController(QObject):
             self.stop_screen_recording()
         if hasattr(self, "screen_recorder") and self.screen_recorder.is_recording:
             self.screen_recorder.stop()
-        if self.meeting_recorder.state != "idle":
+        if self._capture_state in ("recording", "paused"):
+            try:
+                self.stop_meeting_recording()
+            except Exception as exc:
+                logger.warning("Error stopping meeting on controller shutdown: %s", exc)
+        elif self.meeting_recorder.state != "idle":
             self.meeting_recorder.stop(preserve_separate_tracks=self.config.preserve_separate_tracks)
         self.config.save()
