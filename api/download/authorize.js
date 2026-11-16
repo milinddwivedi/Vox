@@ -7,6 +7,12 @@ const RELEASE_CATALOG = {
     sha256: '300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7',
     size_bytes: 10067409,
   },
+  'releases/1.0.3/VoxLocal-Setup.exe': {
+    version: '1.0.3',
+    filename: 'VoxLocal-Setup.exe',
+    sha256: 'f09eed2da71c02effdeb136249d8de7c012b76e0874a6d600155afc749f7501b',
+    size_bytes: 10160267,
+  },
   'releases/1.0.2/VoxLocal-Setup.exe': {
     version: '1.0.2',
     filename: 'VoxLocal-Setup.exe',
@@ -20,10 +26,10 @@ const RELEASE_CATALOG = {
     size_bytes: 10148603,
   },
   'VoxLocal-Setup.exe': {
-    version: '1.0.2',
+    version: '1.0.3',
     filename: 'VoxLocal-Setup.exe',
-    sha256: '1e5dfa31afda87a9f2574966499c6971a94f2a0378dd06e1dd44f912d789213f',
-    size_bytes: 10157669,
+    sha256: 'f09eed2da71c02effdeb136249d8de7c012b76e0874a6d600155afc749f7501b',
+    size_bytes: 10160267,
   },
 };
 
@@ -41,18 +47,17 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    // 1. Authenticate user via Supabase Bearer token
-    const user = await authenticateUser(req);
-    if (!user) {
-      return res.status(401).json({
-        ok: false,
-        error: 'Authentication required. Please sign in with Google to download VOX.',
-      });
+    // 1. Authenticate user via Supabase Bearer token (optional for download)
+    let user = null;
+    try {
+      user = await authenticateUser(req);
+    } catch (authErr) {
+      user = null;
     }
 
     // 2. Validate requested artifact
-    const requestedArtifact = (req.body && req.body.artifact) || 'releases/1.0.1/VoxLocal-Setup.exe';
-    const metadata = RELEASE_CATALOG[requestedArtifact];
+    const requestedArtifact = (req.body && req.body.artifact) || 'releases/1.0.2/VoxLocal-Setup.exe';
+    const metadata = RELEASE_CATALOG[requestedArtifact] || RELEASE_CATALOG['VoxLocal-Setup.exe'];
     if (!metadata) {
       return res.status(404).json({
         ok: false,
@@ -87,10 +92,10 @@ module.exports = async function handler(req, res) {
       sha256: metadata.sha256,
       size_bytes: metadata.size_bytes,
       expires_in_sec: expiresInSec,
-      user: {
+      user: user ? {
         id: user.id,
         email: user.email || '',
-      },
+      } : null,
     });
   } catch (err) {
     console.error('Download authorization error:', err);

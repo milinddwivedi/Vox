@@ -369,65 +369,72 @@
     </p>
 
     <div class="download-card">
-      <!-- Unauthenticated State -->
-      <div id="unauthBox" class="auth-gate-box">
-        <h2>Sign in to Download VOX</h2>
-        <p>
-          Connect with your Google account to authorize your free installer download, activate your local desktop sync, and start voice typing instantly.
-        </p>
-        <button class="btn-google" id="btnGoogleAuth" onclick="handleGoogleSignIn()">
-          <svg viewBox="0 0 24 24">
-            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
-            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
+      <!-- Main Download Action Row (Always available to every user) -->
+      <div class="download-action-row">
+        <div>
+          <div style="font-weight:700; font-size:20px; margin-bottom:4px; display:flex; align-items:center; gap:8px;">
+            <span>VoxLocal-Setup.exe</span>
+            <span style="font-size:12px; background:rgba(16,185,129,0.15); color:#10B981; border:1px solid rgba(16,185,129,0.3); border-radius:999px; padding:2px 8px; font-weight:700;">Latest v1.0.3</span>
+          </div>
+          <div style="font-size:13px; color:var(--text-muted);">Windows 10/11 (64-bit) · 9.7 MB · Cryptographically Verified</div>
+        </div>
+        <button class="btn-download-primary" id="btnDownload" onclick="triggerAuthorizedDownload()">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
           </svg>
-          Continue with Google to Download
+          <span id="btnDownloadText">Download Installer (.exe)</span>
         </button>
       </div>
 
-      <!-- Authenticated State -->
-      <div id="authBox" class="authenticated-box">
-        <div class="user-greeting">
-          <div class="user-profile-row">
-            <div class="user-avatar" id="userAvatar">U</div>
-            <div>
-              <div class="user-meta-name" id="userName">User</div>
-              <div class="user-meta-email" id="userEmail">user@example.com</div>
-            </div>
-          </div>
-          <span class="tier-pill free" id="userTierBadge">VOX Free</span>
-        </div>
+      <div class="checksum-bar" style="margin-top:16px;">
+        <span>SHA-256 Digest:</span>f09eed2da71c02effdeb136249d8de7c012b76e0874a6d600155afc749f7501b
+      </div>
 
-        <div class="download-action-row">
+      <!-- Account & Desktop Sync Section -->
+      <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--card-border);">
+        <!-- Unauthenticated Prompt -->
+        <div id="unauthBox" style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; background:rgba(255,255,255,0.03); border:1px solid var(--card-border); border-radius:14px; padding:16px 20px;">
           <div>
-            <div style="font-weight:700; font-size:18px; margin-bottom:4px;">VoxLocal-Setup.exe</div>
-            <div style="font-size:13px; color:var(--text-muted);">Version 1.0.2 · Windows 10/11 (64-bit) · 9.7 MB</div>
+            <div style="font-weight:700; font-size:14px; color:#F8FAFC;">Connect Google Account</div>
+            <div style="font-size:12px; color:var(--text-muted);">Link your World Fashion Exchange (WFX) or Google account to sync your Pro subscription and desktop quota.</div>
           </div>
-          <button class="btn-download-primary" id="btnDownload" onclick="triggerAuthorizedDownload()">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="7 10 12 15 17 10"/>
-              <line x1="12" y1="15" x2="12" y2="3"/>
+          <button class="btn-google" id="btnGoogleAuth" onclick="handleGoogleSignIn()" style="padding:10px 20px; font-size:13px;">
+            <svg viewBox="0 0 24 24" style="width:16px; height:16px;">
+              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
+              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
             </svg>
-            <span id="btnDownloadText">Download Installer (.exe)</span>
+            Sign in with Google
           </button>
         </div>
 
-        <div class="checksum-bar">
-          <span>SHA-256 Digest:</span>77daaf410b3413dd39a3787182d43a79ac7ba109cf305b8ba50db19ace784f48
-        </div>
-
-        <!-- Seamless Web-to-Desktop SSO Sync Card -->
-        <div id="desktopSyncCard" style="margin-top: 16px; padding: 14px 18px; border-radius: 12px; background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); display: flex; align-items: center; justify-content: space-between; gap: 12px;">
-          <div style="display:flex; align-items:center; gap:10px;">
-            <span style="font-size: 20px;">⚡</span>
-            <div>
-              <div id="syncStatusTitle" style="font-weight: 600; font-size: 13px; color: #10B981;">Desktop App Single Sign-On (SSO)</div>
-              <div id="syncStatusDesc" style="font-size: 12px; color: var(--text-muted);">Signed in on web. VOX Desktop automatically syncs your profile on this PC.</div>
+        <!-- Authenticated Profile & Sync Status -->
+        <div id="authBox" style="display:none;">
+          <div class="user-greeting" style="padding-bottom:16px; margin-bottom:16px;">
+            <div class="user-profile-row">
+              <div class="user-avatar" id="userAvatar">U</div>
+              <div>
+                <div class="user-meta-name" id="userName">User</div>
+                <div class="user-meta-email" id="userEmail">user@example.com</div>
+              </div>
             </div>
+            <span class="tier-pill pro" id="userTierBadge">👑 VOX Pro</span>
           </div>
-          <button class="btn btn-secondary" id="btnSyncDesktop" onclick="handleManualSyncDesktop()" style="padding: 8px 16px; font-size: 12px; font-weight:600; white-space: nowrap; border-radius:8px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); color:#fff; cursor:pointer;">⚡ Launch &amp; Sync Desktop</button>
+
+          <!-- Seamless Web-to-Desktop SSO Sync Card -->
+          <div id="desktopSyncCard" style="padding: 14px 18px; border-radius: 12px; background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); display: flex; align-items: center; justify-content: space-between; gap: 12px;">
+            <div style="display:flex; align-items:center; gap:10px;">
+              <span style="font-size: 20px;">⚡</span>
+              <div>
+                <div id="syncStatusTitle" style="font-weight: 600; font-size: 13px; color: #10B981;">Desktop App Single Sign-On (SSO)</div>
+                <div id="syncStatusDesc" style="font-size: 12px; color: var(--text-muted);">Signed in on web. VOX Desktop automatically syncs your profile on this PC.</div>
+              </div>
+            </div>
+            <button class="btn btn-secondary" id="btnSyncDesktop" onclick="handleManualSyncDesktop()" style="padding: 8px 16px; font-size: 12px; font-weight:600; white-space: nowrap; border-radius:8px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); color:#fff; cursor:pointer;">⚡ Launch &amp; Sync Desktop</button>
+          </div>
         </div>
       </div>
     </div>
@@ -519,48 +526,31 @@
     async function triggerAuthorizedDownload() {
       const btn = document.getElementById('btnDownload');
       const btnText = document.getElementById('btnDownloadText');
-      if (!btn || !_currentUserSession || !_currentUserSession.access_token) {
-        handleGoogleSignIn();
-        return;
-      }
+      if (btn) btn.disabled = true;
+      if (btnText) btnText.textContent = 'Starting Download... ⚡';
 
-      btn.disabled = true;
-      btnText.textContent = 'Authorizing ticket...';
+      // Direct, unblocked native browser download in Chrome, Edge, Firefox
+      const downloadPath = '/api/download/file';
+      
+      // Navigate to trigger browser attachment download directly
+      window.location.href = downloadPath;
 
-      try {
-        const resp = await fetch('/api/download/authorize', {
+      // In background, log authorized ticket if authenticated
+      if (_currentUserSession && _currentUserSession.access_token) {
+        fetch('/api/download/authorize', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + _currentUserSession.access_token,
           },
-          body: JSON.stringify({ artifact: 'releases/1.0.2/VoxLocal-Setup.exe' })
-        });
-
-        const data = await resp.json();
-        if (!resp.ok || !data.ok || !data.download_url) {
-          throw new Error(data.error || 'Failed to authorize download ticket');
-        }
-
-        btnText.textContent = 'Starting download...';
-
-        // Trigger browser download via ephemeral link
-        const a = document.createElement('a');
-        a.href = data.download_url;
-        a.download = data.filename || 'VoxLocal-Setup.exe';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-
-        setTimeout(() => {
-          btn.disabled = false;
-          btnText.textContent = 'Download Installer (.exe)';
-        }, 3000);
-      } catch (err) {
-        alert('Download authorization failed: ' + err.message);
-        btn.disabled = false;
-        btnText.textContent = 'Download Installer (.exe)';
+          body: JSON.stringify({ artifact: 'releases/1.0.3/VoxLocal-Setup.exe' })
+        }).catch(() => {});
       }
+
+      setTimeout(() => {
+        if (btn) btn.disabled = false;
+        if (btnText) btnText.textContent = 'Download Installer (.exe)';
+      }, 3000);
     }
 
     // Connect to Supabase Auth State listener

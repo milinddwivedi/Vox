@@ -1011,7 +1011,7 @@ class MainWindow(QMainWindow):
                 def _apply_and_restart():
                     self.show_toast("Installing Update", "Restarting VOX to complete installation...")
                     import subprocess
-                    subprocess.Popen([str(installer_dest), "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"])
+                    subprocess.Popen([str(installer_dest), "--silent"])
                     import sys
                     from PyQt6.QtWidgets import QApplication
                     QApplication.instance().quit()

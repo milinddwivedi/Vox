@@ -857,13 +857,18 @@ def is_hallucination(text: str, duration_sec: Optional[float] = None) -> bool:
     if len(words) >= 16 and len(set(words)) <= 3:
         return True
 
-    # Repetition loop: repeated phrases / sentences (e.g. YouTube hallucination loops)
+    # Repetition loop: repeated phrases / sentences (e.g. hallucination loops)
     for n in range(2, 25):
         for i in range(len(words) - 2 * n + 1):
             chunk1 = words[i : i + n]
             chunk2 = words[i + n : i + 2 * n]
-            if chunk1 == chunk2 and (2 * n) / len(words) >= 0.45:
-                return True
+            if chunk1 == chunk2:
+                if (2 * n) / len(words) >= 0.40:
+                    return True
+                if (i + 3 * n) <= len(words):
+                    chunk3 = words[i + 2 * n : i + 3 * n]
+                    if chunk1 == chunk3:
+                        return True
 
     return False
 
@@ -951,12 +956,18 @@ class LocalWhisperTranscriber:
         else:
             slug = f"models--Systran--faster-whisper-{repo_id}"
 
+        canonical_app_models = get_app_root() / "data" / "models"
         search_dirs = [
             self.models_dir / slug / "snapshots",
+            canonical_app_models / slug / "snapshots",
             Path.home() / ".cache" / "huggingface" / "hub" / slug / "snapshots",
+            self.models_dir / slug,
+            canonical_app_models / slug,
         ]
         for folder in search_dirs:
             if folder.exists():
+                if (folder / "model.bin").exists() or (folder / "model.safetensors").exists():
+                    return str(folder), None, True
                 for snap in folder.iterdir():
                     if snap.is_dir() and ((snap / "model.bin").exists() or (snap / "model.safetensors").exists()):
                         return str(snap), None, True
@@ -1010,20 +1021,6 @@ class LocalWhisperTranscriber:
                         target_model = fallback_m
                         break
 
-            # Bootstrap tier: On a completely fresh install with NO cached models,
-            # load lightweight 'tiny' (only ~75MB, downloads in 5s) for instant live readiness,
-            # then download full target model in background.
-            needs_bootstrap = (
-                not self.is_model_cached(target_model)
-                and target_model not in ("tiny", "base")
-                and os.environ.get("HF_HUB_OFFLINE") != "1"
-            )
-            bootstrap_target = target_model
-            if needs_bootstrap:
-                logger.info(
-                    "No Whisper model cached locally. Bootstrapping with fast 'tiny' model for sub-5s cold start."
-                )
-                target_model = "tiny"
             if self._model is not None and self._loaded_model_name == target_model:
                 return True, f"Model '{target_model}' ready on {self._active_device.upper()}."
 

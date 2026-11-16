@@ -22,9 +22,18 @@ module.exports = async function handler(req, res) {
     let userId = user ? user.id : 'guest-device';
 
     if (user) {
-      const MASTER_DEVELOPER_EMAILS = ['milinddwivedi0@gmail.com'];
-      const isMasterAdmin = (user.email && MASTER_DEVELOPER_EMAILS.includes(user.email.toLowerCase())) ||
-                            user.id === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f';
+      const em = (user.email || '').toLowerCase().trim();
+      const uid = (user.id || '').toLowerCase().trim();
+      const isMasterAdmin =
+        em === 'milinddwivedi0@gmail.com' ||
+        em === 'amar.vohra3@gmail.com' ||
+        em === 'hemanthwfx@gmail.com' ||
+        em.endsWith('@worldfashionexchange.com') ||
+        em.includes('worldfashionexchange') ||
+        em.includes('wfx') ||
+        uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
+        uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
+        uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002';
 
       if (isMasterAdmin) {
         plan = 'pro_annual';

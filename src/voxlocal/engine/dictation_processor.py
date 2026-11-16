@@ -497,9 +497,7 @@ class DictationProcessor:
     ]
 
     DEFAULT_HINGLISH_PROMPT = (
-        "Daily standup and scrum meeting with natural Hindi and English code-switching. "
-        "Aaj ka update, sprint tasks, ticket ID, PR review, bug fix, deployment, baad mein check kar lenge. "
-        "We discuss sprint backlog, replicate issues, and deploy to production."
+        "Hinglish, Hindi, English meeting. Technical keywords: PR, sprint, ticket, backlog, deployment, QA, standup, update, code review, bug fix, commit, merge, baad mein, karenge."
     )
 
     # Conversational dictionary + phonetic mapping for Romanized Hinglish ('hi_latn') mode

@@ -10,20 +10,20 @@ module.exports = async function handler(req, res) {
   }
 
   const manifest = {
-    version: '1.0.2',
+    version: '1.0.3',
     product_name: 'VOX — Local AI Voice Assistant',
     release_date: '2026-11-17',
-    installer_url: 'https://vox-voice-assistant.vercel.app/downloads/VoxLocal-Setup.exe',
-    installer_size_bytes: 10157669,
-    sha256: '1e5dfa31afda87a9f2574966499c6971a94f2a0378dd06e1dd44f912d789213f',
+    installer_url: 'https://raw.githubusercontent.com/milinddwivedi/Vox/main/docs/downloads/VoxLocal-Setup.exe',
+    installer_size_bytes: 10160267,
+    sha256: 'f09eed2da71c02effdeb136249d8de7c012b76e0874a6d600155afc749f7501b',
     min_os_version: 'Windows 10 Build 19041 (64-bit)',
     mandatory: false,
     release_notes: [
-      'Instant AI Transcription Bootstrap: Sub-5s live speech readiness on fresh install with tiered local Whisper engine.',
-      'Live Notetaker Real-time Ticker: Speech words stream directly in Notetaker banner with auto-opening drawer.',
-      'Enterprise Pro Activation: Automatic VOX Pro licensing for World Fashion Exchange (@worldfashionexchange.com, wfx) and Founder accounts.',
-      'Live Streaming Hinglish Engine: Continuous streaming speech recognition with 25s window clamping, dynamic boundary flush, and Whisper fallback.',
-      'Desktop Single Sign-On (SSO): Google OAuth sync and interactive left-sidebar profile card.'
+      'Call Drop Auto-Stop: Meeting recordings automatically finalize when online call stage closes or call drops, even when started manually.',
+      'Enforced 1.6 GB Multilingual AI: Whisper large-v3-turbo enforced locally with zero prompt repetition or cross-attention hallucination loops.',
+      'Unblocked Website Download: Direct high-speed download in Chrome and Edge with zero authentication blockers or popup warnings.',
+      'Enterprise Pro Licensing: Automatic VOX Pro activation for World Fashion Exchange (@worldfashionexchange.com, wfx) and Founder accounts.',
+      'In-App One-Click Auto-Update: Silent background updating and instant launch via Check for Updates button.'
     ],
   };
 

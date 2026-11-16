@@ -710,6 +710,9 @@ class AppController(QObject):
         elif reason == "healthy":
             badge = "Audio + Video" if rec_mode == "audio_video" else "Audio Only"
             self.meeting_state_changed.emit("recording", f"Recording ({badge}): {title}")
+        elif reason == "non_meeting_view_active" and bool(getattr(self.config, "notetaker_auto_end", True)):
+            logger.info("Meeting call stage transitioned to non-meeting view -> Auto-stopping recording")
+            self.stop_meeting_recording()
 
     def _on_audio_device_warning(self, warning_msg: str) -> None:
         logger.warning("Meeting audio device warning: %s", warning_msg)
@@ -4711,7 +4714,6 @@ class AppController(QObject):
                 self.call_ended.emit(app_name)
                 if (
                     self._capture_state in ("recording", "paused")
-                    and not getattr(self, "_is_manual_meeting", False)
                     and bool(getattr(self.config, "notetaker_auto_end", True))
                 ):
                     # CRITICAL: Verify meeting target liveness against genuine Call Stage windows or presentation sessions
@@ -4764,7 +4766,6 @@ class AppController(QObject):
             elif (
                 self._capture_state in ("recording", "paused")
                 and self._active_meeting_target_hwnd
-                and not getattr(self, "_is_manual_meeting", False)
                 and bool(self.config.notetaker_auto_end)
             ):
                 # Monitor verified auto-detected online meeting window (Teams/Meet/Zoom)
