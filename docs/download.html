@@ -4,12 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Download VOX — Local-First AI Voice Assistant for Windows</title>
-  <link rel="icon" href="assets/favicon.ico" type="image/x-icon" />
+  <link rel="icon" href="/assets/favicon.ico" type="image/x-icon" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500;1,600&family=Figtree:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="assets/vox-auth.js" defer></script>
+  <script src="/assets/vox-auth.js" defer></script>
   <style>
     :root {
       --bg: #090B10;
@@ -439,8 +439,24 @@
     let _currentUserSession = null;
 
     function handleGoogleSignIn() {
-      if (typeof window.VoxAuth !== 'undefined' && typeof window.VoxAuth.signInWithGoogle === 'function') {
-        window.VoxAuth.signInWithGoogle({ redirectTo: window.location.href });
+      const auth = window.voxAuth || window.VoxAuth;
+      if (auth && typeof auth.signInWithGoogle === 'function') {
+        auth.signInWithGoogle({ redirectTo: window.location.href });
+      } else if (typeof window.triggerGoogleSignIn === 'function') {
+        window.triggerGoogleSignIn();
+      } else if (typeof window.supabase !== 'undefined' && typeof window.supabase.createClient === 'function') {
+        try {
+          const client = window.supabase.createClient(
+            'https://qiigoipgoedexmdowtvj.supabase.co',
+            'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFpaWdvaXBnb2VkZXhtZG93dHZqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ3NTM2NjQsImV4cCI6MjExMDMyOTY2NH0.C9Bz6OYqxB5uBUa0kEBJpiMvwW6SbKYWhAEcVZoFvYM'
+          );
+          client.auth.signInWithOAuth({
+            provider: 'google',
+            options: { redirectTo: window.location.href }
+          });
+        } catch (e) {
+          alert('Sign-in service is initializing. Please try again in a second.');
+        }
       } else {
         alert('Authentication service initializing. Please try again in a moment.');
       }
@@ -495,14 +511,19 @@
 
     // Connect to Supabase Auth State listener
     window.addEventListener('DOMContentLoaded', () => {
+      let attempts = 0;
       const checkAuthLoop = setInterval(() => {
-        if (typeof window.VoxAuth !== 'undefined' && typeof window.VoxAuth.getCurrentUser === 'function') {
+        attempts++;
+        const auth = window.voxAuth || window.VoxAuth;
+        if (auth && typeof auth.getCurrentUser === 'function') {
           clearInterval(checkAuthLoop);
-          window.VoxAuth.getCurrentUser().then(user => {
+          auth.getCurrentUser().then(user => {
             renderUserState(user);
           });
+        } else if (attempts > 30) {
+          clearInterval(checkAuthLoop);
         }
-      }, 200);
+      }, 150);
 
       window.onVoxAuthChanged = function(user) {
         renderUserState(user);

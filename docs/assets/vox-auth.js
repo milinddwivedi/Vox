@@ -784,8 +784,8 @@
     init();
   }
 
-  // Export globally
-  window.voxAuth = {
+  // Export globally under both voxAuth and VoxAuth aliases
+  const authApi = {
     initAuth: initAuth,
     signInWithGoogle: signInWithGoogle,
     signOut: signOut,
@@ -797,4 +797,6 @@
     checkout: window.handleDirectRazorpayCheckout,
     links: RAZORPAY_LINKS
   };
+  window.voxAuth = authApi;
+  window.VoxAuth = authApi;
 })();

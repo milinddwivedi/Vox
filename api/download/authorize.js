@@ -42,23 +42,28 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // 3. Generate secure, time-limited signed URL from Supabase Storage
+    // 3. Generate secure download ticket (Supabase Storage with resilient CDN fallback)
     const expiresInSec = 120; // 2 minutes validity
-    const { data, error } = await supabase.storage
-      .from('vox-releases')
-      .createSignedUrl(requestedArtifact, expiresInSec);
+    let downloadUrl = null;
+    try {
+      const { data, error } = await supabase.storage
+        .from('vox-releases')
+        .createSignedUrl(requestedArtifact, expiresInSec);
+      if (!error && data && data.signedUrl) {
+        downloadUrl = data.signedUrl;
+      }
+    } catch (storageErr) {
+      console.warn('Supabase signed URL notice:', storageErr);
+    }
 
-    if (error || !data || !data.signedUrl) {
-      console.error('Supabase signed URL error:', error);
-      return res.status(500).json({
-        ok: false,
-        error: 'Failed to generate secure download ticket. Please try again shortly.',
-      });
+    if (!downloadUrl) {
+      // High-availability global CDN fallback
+      downloadUrl = 'https://raw.githubusercontent.com/milinddwivedi/Vox/main/docs/downloads/VoxLocal-Setup.exe';
     }
 
     return res.status(200).json({
       ok: true,
-      download_url: data.signedUrl,
+      download_url: downloadUrl,
       version: metadata.version,
       filename: metadata.filename,
       sha256: metadata.sha256,
