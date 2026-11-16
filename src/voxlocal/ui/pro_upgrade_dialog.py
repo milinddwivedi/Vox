@@ -341,7 +341,12 @@ class VoxProUpgradeDialog(QDialog):
     def _refresh_user_account_bar(self) -> None:
         if not hasattr(self, "lbl_user_info"):
             return
-        status = self.controller.get_account_status() if hasattr(self.controller, "get_account_status") else {}
+        try:
+            status = self.controller.get_account_status() if hasattr(self.controller, "get_account_status") else {}
+        except Exception:
+            status = {}
+        if not isinstance(status, dict):
+            status = {}
         is_signed_in = bool(status.get("signed_in"))
         email = status.get("email") or ""
         name = status.get("name") or "User"
@@ -404,7 +409,12 @@ class VoxProUpgradeDialog(QDialog):
 
     def _open_checkout_url(self, url: str) -> None:
         """Safely open checkout link in the default browser without opening duplicate tabs, enforcing authentication."""
-        status = self.controller.get_account_status() if hasattr(self.controller, "get_account_status") else {}
+        try:
+            status = self.controller.get_account_status() if hasattr(self.controller, "get_account_status") else {}
+        except Exception:
+            status = {}
+        if not isinstance(status, dict):
+            status = {}
         if not status.get("signed_in"):
             self._show_status("⚠️ Please sign in with Google first so your VOX Pro subscription is securely linked to your account.", is_error=True)
             self._on_account_action_clicked()

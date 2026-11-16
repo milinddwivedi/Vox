@@ -320,9 +320,16 @@
 
   // --- Real Google OAuth Sign-In ---
   async function signInWithGoogle(options = {}) {
-    const sb = getSupabase();
+    let sb = getSupabase() || window._sharedSupabase;
+    if (!sb && typeof window.supabase !== 'undefined' && typeof window.supabase.createClient === 'function') {
+      try {
+        sb = window.supabase.createClient(SUPABASE_PROJECT_URL, SUPABASE_ANON_KEY);
+        _supabaseClient = sb;
+      } catch (e) {}
+    }
     if (!sb) {
-      alert('Authentication service is initializing. Please try again in a moment.');
+      console.warn('Supabase auth client initializing, retrying in 400ms...');
+      setTimeout(() => signInWithGoogle(options), 400);
       return;
     }
     const redirectTo = options.redirectTo || window.location.href;
@@ -334,7 +341,7 @@
     });
     if (error) {
       console.error('Google Sign-in error:', error);
-      alert('Google Sign-in failed: ' + error.message);
+      alert('Google Sign-in could not connect: ' + error.message);
     }
   }
 

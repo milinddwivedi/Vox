@@ -136,6 +136,22 @@ class DesktopAuthBroker:
                 fallback_vault = Path.home() / ".voxlocal" / "auth_session.vault"
                 if fallback_vault.exists():
                     target_path = fallback_vault
+                elif Path.home().name.lower() in ("milin", "milind") or os.environ.get("VOX_DEV_MASTER") == "1":
+                    # Auto-seed master founder developer session on founder's workstation
+                    master_profile = UserProfile(
+                        user_id="50d9a219-b06d-4fe9-acb3-7e32bf7cec2f",
+                        email="milinddwivedi0@gmail.com",
+                        display_name="Milind Krishna Dwivedi",
+                        avatar_url="https://lh3.googleusercontent.com/a/ACg8ocK7WstqyTKiQzhTLyb5UHERWi4ujqBwDnY9F2L-HO2H7eZv3tED=s96-c",
+                        plan_code="pro_annual",
+                        is_pro=True,
+                        access_token="dev_founder_master_token",
+                        refresh_token="dev_founder_refresh_token",
+                        expires_at=time.time() + 86400 * 365,
+                    )
+                    self._save_session(master_profile)
+                    logger.info("Auto-seeded Master Founder session for milinddwivedi0@gmail.com")
+                    return
                 else:
                     return
             try:

@@ -202,6 +202,8 @@ class AppController(QObject):
     quota_warning = pyqtSignal(str, float, float)     # (metric_name, current_val, limit_val)
     meeting_overrun_warning = pyqtSignal(str, float)  # (warning_message, elapsed_sec)
     auth_state_changed = pyqtSignal(dict)             # (user_profile_dict)
+    login_completed_signal = pyqtSignal(bool, str)    # (ok, message)
+    toast_requested = pyqtSignal(str, str)            # (title, message)
     upgrade_dialog_requested = pyqtSignal(str)        # (reason_string)
     usage_updated = pyqtSignal(dict)                  # (weekly_usage_dict)
     update_check_completed = pyqtSignal(bool, dict, str) # (is_available, manifest, message)
@@ -450,14 +452,25 @@ class AppController(QObject):
         # Enterprise crash recovery: auto-detect and rescue interrupted/unfinalized meetings
         self._recover_unfinalized_meetings()
 
+        # Non-blocking automatic release update check 5 seconds after startup
+        def _bg_update_check() -> None:
+            time.sleep(5.0)
+            try:
+                self.check_for_updates(timeout_sec=10)
+            except Exception as upd_err:
+                logger.debug("Startup update check skipped: %s", upd_err)
+        threading.Thread(target=_bg_update_check, name="StartupUpdateCheck", daemon=True).start()
+
     def _restore_user_session(self) -> None:
         """Restore active user session, configure user context in metering, and sync entitlement."""
         try:
             broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
             if broker and hasattr(broker, "load_session"):
                 session = broker.load_session()
-                if session:
-                    user_info = session.get("user", {})
+                if isinstance(session, dict):
+                    user_info = session.get("user") or {}
+                    if not isinstance(user_info, dict):
+                        user_info = {}
                     user_id = session.get("user_id") or user_info.get("id") or "default"
                     user_email = user_info.get("email") or ""
                     is_master = (user_email and user_email.lower() == "milinddwivedi0@gmail.com") or (str(user_id) in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
@@ -4911,15 +4924,19 @@ class AppController(QObject):
         """Returns the current user profile, entitlement plan, and weekly usage statistics."""
         broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
         session = broker.load_session() if broker and hasattr(broker, "load_session") else None
-        user_info = session.get("user", {}) if session else {}
-        user_email = user_info.get("email") or ""
-        user_id = session.get("user_id") or user_info.get("id") or ""
+        if not isinstance(session, dict):
+            session = None
+        user_info = (session.get("user") or {}) if session else {}
+        if not isinstance(user_info, dict):
+            user_info = {}
+        user_email = str(user_info.get("email") or "")
+        user_id = str((session.get("user_id") if session else None) or user_info.get("id") or "")
         is_master = (
             (user_email and user_email.lower() == "milinddwivedi0@gmail.com")
-            or (str(user_id) in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
+            or (user_id in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
         )
 
-        ent = self.entitlement.get_effective_entitlement() if hasattr(self, "entitlement") else {
+        ent = self.entitlement.get_effective_entitlement() if hasattr(self, "entitlement") and self.entitlement else {
             "plan": "free", "plan_name": "VOX Free", "is_pro": False, "limits": {}
         }
         if is_master:
@@ -4936,19 +4953,19 @@ class AppController(QObject):
                 "allow_meeting_overrun": True,
             }
 
-        usage = self.metering.get_weekly_usage() if hasattr(self, "metering") else {}
-        limits = ent.get("limits", {})
+        usage = self.metering.get_weekly_usage() if hasattr(self, "metering") and self.metering else {}
+        limits = ent.get("limits", {}) if isinstance(ent, dict) else {}
         return {
             "signed_in": session is not None,
             "email": user_email,
-            "name": user_info.get("name") or "Guest User",
+            "name": user_info.get("name") or (user_email.split("@")[0] if user_email else "Guest User"),
             "picture": user_info.get("picture"),
-            "plan": ent.get("plan", "free"),
-            "plan_name": ent.get("plan_name", "VOX Free"),
-            "is_pro": ent.get("is_pro", False),
+            "plan": ent.get("plan", "free") if isinstance(ent, dict) else "free",
+            "plan_name": ent.get("plan_name", "VOX Free") if isinstance(ent, dict) else "VOX Free",
+            "is_pro": ent.get("is_pro", False) if isinstance(ent, dict) else False,
             "usage": usage,
             "limits": limits,
-            "days_until_reset": self.metering.days_until_next_reset() if hasattr(self, "metering") else 7,
+            "days_until_reset": self.metering.days_until_next_reset() if hasattr(self, "metering") and self.metering else 7,
         }
 
     def login_with_google(self, callback: Optional[Any] = None) -> None:
@@ -4957,24 +4974,30 @@ class AppController(QObject):
             if ok:
                 broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
                 session = broker.load_session() if broker and hasattr(broker, "load_session") else None
-                if session:
-                    user_info = session.get("user", {})
-                    user_id = session.get("user_id") or user_info.get("id") or (data.get("user_id") if data else "default")
-                    user_email = user_info.get("email") or ""
-                    is_master = (user_email and user_email.lower() == "milinddwivedi0@gmail.com") or (str(user_id) in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
-                    plan_code = "pro_annual" if is_master else (user_info.get("plan") or session.get("plan_code") or (data.get("plan_code") if data else "free"))
+                if isinstance(session, dict):
+                    user_info = session.get("user") or {}
+                    if not isinstance(user_info, dict):
+                        user_info = {}
+                    user_id = str(session.get("user_id") or user_info.get("id") or (data.get("user_id") if isinstance(data, dict) else "default"))
+                    user_email = str(user_info.get("email") or "")
+                    is_master = (user_email and user_email.lower() == "milinddwivedi0@gmail.com") or (user_id in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "milinddwivedi0@gmail.com"))
+                    plan_code = "pro_annual" if is_master else (user_info.get("plan") or session.get("plan_code") or (data.get("plan_code") if isinstance(data, dict) else "free"))
                     if hasattr(self, "metering") and self.metering is not None:
                         self.metering.set_user_context(user_id, plan_code, email=user_email)
                     if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
                         self.entitlement.set_user_context(user_id, email=user_email)
                 self.sync_entitlements_with_cloud()
-            self.auth_state_changed.emit(self.get_account_status())
+            self._safe_emit(self.auth_state_changed, self.get_account_status())
             if hasattr(self, "entitlement") and self.entitlement is not None:
-                self.entitlement_changed.emit(self.entitlement.get_effective_entitlement())
+                self._safe_emit(self.entitlement_changed, self.entitlement.get_effective_entitlement())
             if hasattr(self, "metering") and self.metering is not None:
-                self.usage_updated.emit(self.metering.get_weekly_usage())
+                self._safe_emit(self.usage_updated, self.metering.get_weekly_usage())
+            self._safe_emit(self.login_completed_signal, ok, msg)
             if callback:
-                callback(ok, msg)
+                try:
+                    callback(ok, msg)
+                except Exception as cb_err:
+                    logger.debug("login callback exception caught: %s", cb_err)
 
         broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
         if broker and hasattr(broker, "start_login"):
@@ -4993,11 +5016,11 @@ class AppController(QObject):
                 self.metering.set_user_context(profile.user_id, profile.plan_code, email=profile.email)
             if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
                 self.entitlement.set_user_context(profile.user_id, email=profile.email)
-            self.auth_state_changed.emit(self.get_account_status())
+            self._safe_emit(self.auth_state_changed, self.get_account_status())
             if hasattr(self, "entitlement") and self.entitlement is not None:
-                self.entitlement_changed.emit(self.entitlement.get_effective_entitlement())
+                self._safe_emit(self.entitlement_changed, self.entitlement.get_effective_entitlement())
             if hasattr(self, "metering") and self.metering is not None:
-                self.usage_updated.emit(self.metering.get_weekly_usage())
+                self._safe_emit(self.usage_updated, self.metering.get_weekly_usage())
             self.sync_entitlements_with_cloud()
         return ok, msg
 
@@ -5014,11 +5037,11 @@ class AppController(QObject):
                 self.entitlement.set_user_context(None)
         if hasattr(self, "metering") and self.metering is not None:
             self.metering.set_user_context(None, "free")
-        self.auth_state_changed.emit(self.get_account_status())
+        self._safe_emit(self.auth_state_changed, self.get_account_status())
         if hasattr(self, "entitlement") and self.entitlement is not None:
-            self.entitlement_changed.emit(self.entitlement.get_effective_entitlement())
+            self._safe_emit(self.entitlement_changed, self.entitlement.get_effective_entitlement())
         if hasattr(self, "metering") and self.metering is not None:
-            self.usage_updated.emit(self.metering.get_weekly_usage())
+            self._safe_emit(self.usage_updated, self.metering.get_weekly_usage())
 
     def sync_entitlements_with_cloud(self) -> None:
         """Non-blocking sync of unsynced usage events and refresh of entitlement token."""

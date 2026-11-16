@@ -257,6 +257,12 @@ class MainWindow(QMainWindow):
             self.controller.usage_updated.connect(lambda usg: self._update_plan_card(usage_data=usg))
         if hasattr(self.controller, "auth_state_changed"):
             self.controller.auth_state_changed.connect(lambda *_: self._update_plan_card())
+        if hasattr(self.controller, "login_completed_signal"):
+            self.controller.login_completed_signal.connect(self._on_login_completed)
+        if hasattr(self.controller, "toast_requested"):
+            self.controller.toast_requested.connect(self.show_toast)
+        if hasattr(self.controller, "update_check_completed"):
+            self.controller.update_check_completed.connect(self._on_update_available)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -885,8 +891,11 @@ class MainWindow(QMainWindow):
             self._toasts.remove(toast)
 
     def _on_plan_button_clicked(self) -> None:
-        account = self.controller.get_account_status() if hasattr(self.controller, "get_account_status") else {}
-        if not account.get("signed_in"):
+        try:
+            account = self.controller.get_account_status() if hasattr(self.controller, "get_account_status") else {}
+        except Exception:
+            account = {}
+        if not isinstance(account, dict) or not account.get("signed_in"):
             from PyQt6.QtWidgets import QMessageBox
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("Sign in to VOX")
@@ -915,12 +924,70 @@ class MainWindow(QMainWindow):
         """Launches the Google OAuth flow in the user's browser."""
         self.show_toast("Connecting...", "Opening browser for Google Authentication...")
         if hasattr(self.controller, "login_with_google"):
-            def _cb(ok: bool, msg: str) -> None:
-                if ok:
-                    self.show_toast("Signed In", "Welcome to VOX! Account synchronized.")
-                else:
-                    self.show_toast("Sign-In", msg)
-            self.controller.login_with_google(callback=_cb)
+            self.controller.login_with_google()
+
+    def _on_login_completed(self, ok: bool, msg: str) -> None:
+        """Handled on the Qt GUI thread via queued signal connection."""
+        if ok:
+            self.show_toast("Signed In", "Welcome to VOX! Account synchronized.")
+        else:
+            self.show_toast("Sign-In", msg)
+
+    def _on_update_available(self, is_avail: bool, manifest: Dict[str, Any], msg: str) -> None:
+        """Display an in-app update notification when a new version is detected."""
+        if not is_avail or not manifest:
+            return
+        version = str(manifest.get("version", "Latest"))
+        notes = str(manifest.get("release_notes") or "New performance improvements and features.")
+        from PyQt6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setWindowTitle(f"VOX Update Available (v{version})")
+        box.setText(f"A new version of VOX (v{version}) is ready to install!")
+        box.setInformativeText(f"{notes}\n\nWould you like to update VOX now?")
+        btn_update = box.addButton("⚡ Update Now", QMessageBox.ButtonRole.AcceptRole)
+        btn_later = box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_update)
+        box.exec()
+        if box.clickedButton() == btn_update:
+            self._start_in_app_update(manifest)
+
+    def _start_in_app_update(self, manifest: Dict[str, Any]) -> None:
+        """Downloads the cryptographically verified installer in background and restarts."""
+        ver = str(manifest.get("version", "1.0.1"))
+        self.show_toast("Downloading Update...", f"Fetching VOX v{ver} in background...")
+
+        def _bg_downloader():
+            import tempfile
+            dest_dir = Path(tempfile.gettempdir()) / "vox_updater"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            installer_dest = dest_dir / f"VoxLocal-Setup-{ver}.exe"
+            
+            mgr = getattr(self.controller, "update_manager", None)
+            if not mgr:
+                from voxlocal.core.updater import UpdateManager
+                mgr = UpdateManager()
+
+            ok, dl_msg = mgr.download_and_verify(manifest, installer_dest)
+            if ok and installer_dest.exists():
+                logger.info("Update downloaded and verified: %s", installer_dest)
+                from PyQt6.QtCore import QTimer
+
+                def _apply_and_restart():
+                    self.show_toast("Installing Update", "Restarting VOX to complete installation...")
+                    import subprocess
+                    subprocess.Popen([str(installer_dest), "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"])
+                    import sys
+                    from PyQt6.QtWidgets import QApplication
+                    QApplication.instance().quit()
+
+                QTimer.singleShot(400, _apply_and_restart)
+            else:
+                logger.warning("Auto-update failed: %s", dl_msg)
+                if hasattr(self.controller, "toast_requested"):
+                    self.controller.toast_requested.emit("Update Notice", f"Auto-update could not complete: {dl_msg}")
+
+        import threading
+        threading.Thread(target=_bg_downloader, daemon=True, name="InAppAutoUpdater").start()
 
     def _on_sign_out_clicked(self) -> None:
         """Logs out the active user and reverts to Guest Free mode."""
