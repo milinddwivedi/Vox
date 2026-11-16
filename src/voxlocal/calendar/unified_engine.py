@@ -313,7 +313,13 @@ class UnifiedCalendarEngine(QObject):
                 logger.warning("Failed updating account enabled state in DB: %s", exc)
         if enabled:
             self._account_backoff_until[account_id] = 0.0
-            self.sync_account_now(account_id)
+            # Dispatch background sync in a daemon thread so the UI thread never blocks
+            threading.Thread(
+                target=self.sync_account_now,
+                args=(account_id,),
+                daemon=True,
+                name=f"vox-sync-enable-{account_id}",
+            ).start()
         else:
             self._rebuild_cache_from_db_or_memory()
         self.emit_providers_status()
@@ -379,8 +385,23 @@ class UnifiedCalendarEngine(QObject):
             or classify_account_kind(ptype, email=email, tenant_id=tenant_id, hosted_domain=hosted_dom)
         )
         enabled = bool(self._account_enabled.get(key, db_meta.get("enabled", True)))
-        err_state = status.get("error_state") or db_meta.get("error_code")
-        conn_state = status.get("connection_state") or db_meta.get("connection_state")
+        if prov is not None:
+            # Active provider in memory is the authoritative source of runtime health.
+            # Do NOT resurrect old database errors if the live provider is currently authenticated and error-free.
+            err_state = status.get("error_state")
+            last_err = status.get("friendly_error") or status.get("error_detail") or ""
+            conn_state = status.get("connection_state")
+            is_healthy = bool(status.get("is_healthy", True)) and not err_state
+            if is_auth and not err_state:
+                conn_state = AccountConnectionState.CONNECTED.value
+                last_err = ""
+        else:
+            # Provider object not loaded in memory; use persisted metadata from SQLite
+            err_state = db_meta.get("error_code")
+            last_err = db_meta.get("last_error") or ""
+            conn_state = db_meta.get("connection_state")
+            is_healthy = not err_state and bool(db_meta.get("is_healthy", True))
+
         if not enabled:
             conn_state = "disabled"
         elif err_state in ("AUTH_REQUIRED", "AUTH_EXPIRED", "REFRESH_FAILED", "NO_REFRESH_TOKEN"):
@@ -391,7 +412,7 @@ class UnifiedCalendarEngine(QObject):
             conn_state = AccountConnectionState.DISCONNECTED.value
         elif err_state == "NETWORK_OFFLINE":
             conn_state = "offline_cached" if is_auth else AccountConnectionState.DISCONNECTED.value
-        elif err_state or status.get("is_healthy") is False:
+        elif err_state or is_healthy is False:
             conn_state = AccountConnectionState.FAILED.value
         elif is_auth:
             conn_state = AccountConnectionState.CONNECTED.value
@@ -406,10 +427,10 @@ class UnifiedCalendarEngine(QObject):
             "tenant_id": tenant_id,
             "enabled": enabled,
             "is_authenticated": is_auth,
-            "is_healthy": bool(status.get("is_healthy", True)) and not err_state,
+            "is_healthy": is_healthy and enabled,
             "connection_state": conn_state or AccountConnectionState.DISCONNECTED.value,
             "last_sync_at": status.get("last_sync_at") or status.get("last_poll_time") or db_meta.get("last_sync_at") or "",
-            "last_error": status.get("friendly_error") or status.get("error_detail") or db_meta.get("last_error") or "",
+            "last_error": last_err,
             "error_code": err_state or "",
             "selected_calendars": list(status.get("selected_calendars") or db_meta.get("selected_calendars") or []),
             "available_calendars": list(status.get("available_calendars") or db_meta.get("available_calendars") or []),
@@ -423,14 +444,18 @@ class UnifiedCalendarEngine(QObject):
 
     def get_sync_health_summary(self) -> Dict[str, Any]:
         accounts = self.list_accounts()
+        total_cnt = len(accounts)
         active = [a for a in accounts if a.get("enabled", True)]
+        paused = [a for a in accounts if not a.get("enabled", True)]
         healthy = [a for a in active if a.get("connection_state") in ("connected", "syncing", "offline_cached")]
         degraded = [a for a in active if a.get("connection_state") in ("expired", "failed", "admin_approval_required")]
         sync_times = [str(a.get("last_sync_at") or "") for a in accounts if a.get("last_sync_at")]
         latest_sync = max(sync_times) if sync_times else (self._last_sync_at or "")
 
-        if not active:
+        if not accounts:
             state = "not_connected"
+        elif not active:
+            state = "paused"
         elif degraded and not healthy:
             state = "attention_needed"
         elif degraded:
@@ -443,7 +468,9 @@ class UnifiedCalendarEngine(QObject):
         return {
             "state": state,
             "connected_accounts": len(active),
-            "total_accounts": len(accounts),
+            "total_accounts": total_cnt,
+            "active_accounts": len(active),
+            "paused_accounts": len(paused),
             "healthy_accounts": len(healthy),
             "degraded_accounts": len(degraded),
             "last_sync_at": latest_sync,

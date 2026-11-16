@@ -81,7 +81,7 @@ def _account_kind_label(kind: str) -> str:
 
 
 def _state_display_info(state: str, is_healthy: bool, enabled: bool) -> Tuple[str, str]:
-    if not enabled:
+    if not enabled or (state or "").lower() in {"disabled", "paused"}:
         return ("Paused", "muted")
     st = (state or "").strip().lower()
     if st == "syncing":
@@ -92,13 +92,13 @@ def _state_display_info(state: str, is_healthy: bool, enabled: bool) -> Tuple[st
         return ("Expired — Reconnect", "warn")
     if st in {"admin_approval_required", "admin_blocked"}:
         return ("Admin Approval Needed", "warn")
-    if st == "failed":
-        return ("Attention Needed", "warn")
+    if st in {"failed", "sync_error"}:
+        return ("Sync Error", "warn")
     if st == "disconnected":
         return ("Disconnected", "muted")
     if st == "connected" or is_healthy:
         return ("Connected", "ok")
-    return ("Attention Needed", "warn")
+    return ("Connected", "ok") if is_healthy else ("Attention Needed", "warn")
 
 
 def _format_last_sync(raw_ts: Any) -> str:
@@ -1073,28 +1073,39 @@ class CalendarPage(QWidget):
         else:
             self.lbl_kpi_today_sub.setText("Clear schedule for today")
 
+        total_accounts = len(accounts)
         active_accounts = [
             a for a in accounts
             if a.get("enabled", True)
             and (a.get("is_authenticated") or str(a.get("connection_state") or "").lower() in {"connected", "syncing", "offline_cached"})
         ]
-        self.lbl_kpi_accounts.setText(str(len(active_accounts)))
-        if accounts:
+        paused_accounts = [a for a in accounts if not a.get("enabled", True)]
+
+        if total_accounts == 0:
+            self.lbl_kpi_accounts.setText("0")
+            self.lbl_kpi_accounts_sub.setText("Connect Outlook, Google, or Zoom")
+        elif paused_accounts and not active_accounts:
+            self.lbl_kpi_accounts.setText(f"{total_accounts} Paused")
+            self.lbl_kpi_accounts_sub.setText("Sync paused by user")
+        elif paused_accounts:
+            self.lbl_kpi_accounts.setText(f"{len(active_accounts)} Active")
+            self.lbl_kpi_accounts_sub.setText(f"{len(paused_accounts)} paused · {total_accounts} total")
+        else:
+            self.lbl_kpi_accounts.setText(str(len(active_accounts)))
             providers = []
             for a in accounts:
                 _, p_name = _provider_display_info(str(a.get("provider_type", "")))
                 if p_name not in providers:
                     providers.append(p_name)
             self.lbl_kpi_accounts_sub.setText(", ".join(providers[:3]))
-        else:
-            self.lbl_kpi_accounts_sub.setText("Connect Outlook, Google, or Zoom")
 
-        state = str(health.get("state") or ("connected" if active_accounts else "not_connected")).lower()
+        state = str(health.get("state") or ("connected" if active_accounts else ("paused" if paused_accounts else "not_connected"))).lower()
         health_map = {
             "connected": "Healthy",
             "healthy": "Healthy",
             "offline_cached": "Cached (Offline)",
             "syncing": "Syncing...",
+            "paused": "Paused",
             "partial": "Partial Issue",
             "degraded": "Partial Issue",
             "attention_needed": "Reconnect Needed",
@@ -1104,7 +1115,12 @@ class CalendarPage(QWidget):
             "not_connected": "Not Connected",
         }
         self.lbl_kpi_health.setText(health_map.get(state, state.replace("_", " ").title()))
-        self.lbl_kpi_health_sub.setText(_format_last_sync(health.get("last_sync_at")))
+        if state == "paused":
+            self.lbl_kpi_health_sub.setText("Sync paused by user")
+        elif state == "offline_cached":
+            self.lbl_kpi_health_sub.setText("Working offline with local cache")
+        else:
+            self.lbl_kpi_health_sub.setText(_format_last_sync(health.get("last_sync_at")))
 
         # Spotlight next upcoming or currently live meeting
         now_local = datetime.now().astimezone()
@@ -1284,7 +1300,12 @@ class CalendarPage(QWidget):
             or "internet" in friendly_err.lower()
             or state in {"offline_cached", "network_offline"}
         )
-        if friendly_err and enabled:
+        has_active_error = (
+            bool(friendly_err)
+            and enabled
+            and (not is_healthy or state in {"expired", "failed", "admin_approval_required", "network_offline", "offline_cached"})
+        )
+        if has_active_error:
             err_box = QLabel(friendly_err)
             err_box.setWordWrap(True)
             if is_offline_msg:
@@ -1318,14 +1339,22 @@ class CalendarPage(QWidget):
         btn_sync.clicked.connect(lambda _=False, account_id=aid: self._on_sync_account(account_id))
         act_row1.addWidget(btn_sync)
 
-        needs_reauth = state in {"expired", "admin_approval_required"} or (
-            not acc.get("is_authenticated") and state not in {"connected", "syncing", "disabled", "offline_cached", "failed"}
+        needs_reauth = enabled and (
+            state in {"expired", "admin_approval_required"}
+            or (not acc.get("is_authenticated") and state not in {"connected", "syncing", "disabled", "offline_cached"})
         )
-        btn_reconn = QPushButton("Reconnect")
-        btn_reconn.setObjectName("calDawnBtn" if needs_reauth else "calMiniBtn")
-        btn_reconn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_reconn.clicked.connect(lambda _=False, account_id=aid, pt=ptype: self._on_reconnect_account(account_id, pt))
-        act_row1.addWidget(btn_reconn)
+        if needs_reauth:
+            btn_reconn = QPushButton("Reconnect")
+            btn_reconn.setObjectName("calDawnBtn")
+            btn_reconn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_reconn.clicked.connect(lambda _=False, account_id=aid, pt=ptype: self._on_reconnect_account(account_id, pt))
+            act_row1.addWidget(btn_reconn)
+        elif enabled and not is_healthy and state == "failed":
+            btn_reconn = QPushButton("Reconnect")
+            btn_reconn.setObjectName("calMiniBtn")
+            btn_reconn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_reconn.clicked.connect(lambda _=False, account_id=aid, pt=ptype: self._on_reconnect_account(account_id, pt))
+            act_row1.addWidget(btn_reconn)
         act_row1.addStretch(1)
         lay.addLayout(act_row1)
 

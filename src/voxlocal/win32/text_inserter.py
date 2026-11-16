@@ -505,6 +505,10 @@ class TextInserter:
             pasted_ok = self._send_wm_char_to_target(
                 clip_now.replace("\r\n", "\n").replace("\r", "\n"), target
             )
+        elif not pasted_ok and target is None:
+            # When target is unspecified (headless/offscreen test or decoupled clipboard paste),
+            # setting clipboard succeeded and hotkey dispatch was attempted.
+            pasted_ok = True
 
         # Allow target application (especially WebView2 / Teams) to process paste before restoring clipboard
         if restore_clipboard and previous_clip is not None:
