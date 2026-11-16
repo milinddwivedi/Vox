@@ -48,7 +48,7 @@ Desktop login implements standard **RFC 7636 Proof Key for Code Exchange (PKCE)*
 - **Project Name:** Vox Local
 - **Project ID:** `vox-local-514822`
 - **OAuth 2.0 Web Application Client:**
-  - **Client ID:** `541845334167-k9sa1dem22flsddu5721tsr173snbppo.apps.googleusercontent.com`
+  - **Client ID:** `290945439058-kipvted3lsi25t8fjts2mpdm1addciop.apps.googleusercontent.com`
   - **Authorized JavaScript Origins:**
     - `https://vox-voice-assistant.vercel.app`
     - `https://qiigoipgoedexmdowtvj.supabase.co`
@@ -63,7 +63,7 @@ Desktop login implements standard **RFC 7636 Proof Key for Code Exchange (PKCE)*
 - **Project Name:** Vox
 - **Region:** `ap-southeast-1`
 - **URL:** `https://qiigoipgoedexmdowtvj.supabase.co`
-- **Google Provider:** Configured and active with Web Client ID `541845334167-k9sa1dem22flsddu5721tsr173snbppo.apps.googleusercontent.com`
+- **Google Provider:** Configured and active with Web Client ID `290945439058-kipvted3lsi25t8fjts2mpdm1addciop.apps.googleusercontent.com`
 - **Site URL:** `https://vox-voice-assistant.vercel.app`
 - **Redirect Allowlist:**
   - `https://vox-voice-assistant.vercel.app/**`

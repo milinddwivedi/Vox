@@ -176,12 +176,12 @@ def main():
         assert e.code in (302, 303), f"Expected HTTP 302/303 redirect, got {e.code}"
         loc = e.headers.get("Location", "")
         assert loc.startswith("https://accounts.google.com/o/oauth2/v2/auth"), f"Unexpected redirect destination: {loc}"
-        assert "541845334167-k9sa1dem22flsddu5721tsr173snbppo.apps.googleusercontent.com" in loc, "Missing client_id in OAuth URL!"
+        assert "290945439058-kipvted3lsi25t8fjts2mpdm1addciop.apps.googleusercontent.com" in loc, "Missing client_id in OAuth URL!"
         assert "response_type=code" in loc, "Missing response_type in OAuth URL!"
         assert "qiigoipgoedexmdowtvj.supabase.co" in loc, "Missing callback redirect_uri in OAuth URL!"
         print(f"  [+] Status: HTTP {e.code} Found (OAuth Redirection)")
         print(f"  [+] Redirect Target: https://accounts.google.com/o/oauth2/v2/auth")
-        print(f"  [+] Google Client ID present in query: 541845334167-k9sa1dem22flsddu5721tsr173snbppo.apps.googleusercontent.com")
+        print(f"  [+] Google Client ID present in query: 290945439058-kipvted3lsi25t8fjts2mpdm1addciop.apps.googleusercontent.com")
         print(f"  [+] Callback URI present in query: https://qiigoipgoedexmdowtvj.supabase.co/auth/v1/callback")
         print("  -> CHECK 7 PASSED.\n")
 
