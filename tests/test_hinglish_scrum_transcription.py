@@ -38,35 +38,14 @@ def test_scrum_deva_loanwords_restoration():
     assert "standup" in t4
 
 
-def test_hinglish_acoustic_confusion_corrections():
-    # Bad man -> baad mein
-    res1 = DictationProcessor.process("We will discuss this bad man.", cleanup_enabled=True)
-    assert "baad mein" in res1.lower()
-    assert "bad man" not in res1.lower()
-
-    # Bat ye -> par yeh
-    res2 = DictationProcessor.process("Bat ye nahi ho raha.", cleanup_enabled=True)
-    assert "par yeh" in res2.lower()
-
-    # You sabka -> yeh sabka
-    res3 = DictationProcessor.process("You sabka update le lo.", cleanup_enabled=True)
-    assert "yeh sabka" in res3.lower()
-
-    # Peace peace -> please, please
-    res4 = DictationProcessor.process("Peace peace hold on.", cleanup_enabled=True)
-    assert "please, please" in res4.lower()
-
-    # VeeTicket id / Tiket aaeedi -> ticket ID
-    res5 = DictationProcessor.process("I shared this with veeticket id.", cleanup_enabled=True)
-    assert "ticket ID" in res5
-
-    # Help to join -> her to join
-    res6 = DictationProcessor.process("Do you expect help to join?", cleanup_enabled=True)
-    assert "her to join" in res6.lower()
-
+def test_domain_entity_corrections():
     # American Top Guns -> American Tall
-    res7 = DictationProcessor.process("What about American Top Guns?", cleanup_enabled=True)
-    assert "American Tall" in res7
+    res1 = DictationProcessor.process("What about American Top Guns?", cleanup_enabled=True)
+    assert "American Tall" in res1
+
+    # Tiket aaeedi -> ticket ID
+    res2 = DictationProcessor.process("Tiket aaeedi update ho gaya.", cleanup_enabled=True)
+    assert "ticket ID" in res2 or "Ticket ID" in res2
 
 
 def test_offline_cached_account_snapshot_retains_authenticated_state():

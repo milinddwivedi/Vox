@@ -71,6 +71,7 @@ a = Analysis(
         'voxlocal.audio.call_detector',
         'voxlocal.engine.transcriber',
         'voxlocal.engine.dictation_processor',
+        'voxlocal.engine.streaming_transcriber',
         'voxlocal.engine.meeting_intelligence',
         'voxlocal.engine.llm_engine',
         'tokenizers',

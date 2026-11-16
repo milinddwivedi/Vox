@@ -158,6 +158,8 @@ class AppController(QObject):
     meeting_lifecycle_changed = pyqtSignal(str, str)  # (lifecycle_state, status_message)
     meeting_tick = pyqtSignal(float, float, float, bool, bool)  # (elapsed, mic_lvl, sys_lvl, mic_ok, sys_ok)
     meeting_progressive_segment = pyqtSignal(int, dict)         # (meeting_id, segment_dict)
+    meeting_live_partial = pyqtSignal(int, dict)                # (meeting_id, partial_dict)
+    meeting_live_confirmed = pyqtSignal(int, dict)              # (meeting_id, confirmed_dict)
     meeting_about_to_mux = pyqtSignal(int)                      # meeting_id (releases UI media player handle)
     meeting_saved_and_transcribed = pyqtSignal(int)             # meeting_id
     call_detected = pyqtSignal(str, str)                        # (app_name, suggested_title) - for explicit user consent popup
@@ -297,6 +299,15 @@ class AppController(QObject):
             compute_type=self.config.compute_type,
             cpu_threads=self.config.cpu_threads,
             profile=getattr(self.config, "transcribe_profile", "balanced"),
+        )
+
+        # Live Streaming Transcriber for Real-Time Incremental Meeting Recognition (SimulStreaming LocalAgreement)
+        from voxlocal.engine.streaming_transcriber import LiveMeetingStreamingTranscriber
+        self.streaming_transcriber = LiveMeetingStreamingTranscriber(
+            transcriber=self.transcriber,
+            db=self.db,
+            on_partial=self._on_streaming_partial,
+            on_confirmed=self._on_streaming_confirmed,
         )
 
         # Independent State Variables
@@ -3109,6 +3120,12 @@ class AppController(QObject):
                 self._progressive_worker_busy = False
                 self._capture_state = "recording"
                 self._recent_emitted_segments = []
+                if hasattr(self, "streaming_transcriber") and self.config.progressive_transcription:
+                    self.streaming_transcriber.start(
+                        meeting_id=self._active_meeting_id,
+                        recorder=self.meeting_recorder,
+                        language=self.config.language,
+                    )
 
             if self._meeting_prompt_popup and self._meeting_prompt_popup.isVisible():
                 try:
@@ -3144,6 +3161,8 @@ class AppController(QObject):
     def pause_meeting_recording(self) -> bool:
         with self._state_lock:
             if self._capture_state == "recording" and self.meeting_recorder.pause():
+                if hasattr(self, "streaming_transcriber"):
+                    self.streaming_transcriber.pause()
                 if getattr(self, "_meeting_video_recorder", None) and self._meeting_video_recorder.is_recording:
                     self._meeting_video_recorder.pause()
                 self._capture_state = "paused"
@@ -3158,6 +3177,8 @@ class AppController(QObject):
     def resume_meeting_recording(self) -> bool:
         with self._state_lock:
             if self._capture_state == "paused" and self.meeting_recorder.resume():
+                if hasattr(self, "streaming_transcriber"):
+                    self.streaming_transcriber.resume()
                 if getattr(self, "_meeting_video_recorder", None) and self._meeting_video_recorder.is_paused:
                     self._meeting_video_recorder.resume()
                 self._capture_state = "recording"
@@ -3171,6 +3192,11 @@ class AppController(QObject):
 
     def stop_meeting_recording(self) -> None:
         with self._state_lock:
+            if hasattr(self, "streaming_transcriber"):
+                try:
+                    self.streaming_transcriber.stop()
+                except Exception as st_exc:
+                    logger.debug("Error stopping streaming transcriber: %s", st_exc)
             if self._capture_state not in ("recording", "paused"):
                 # Safety net: force stop if audio recorder is actively running on disk
                 if getattr(self, "meeting_recorder", None) and getattr(self.meeting_recorder, "is_recording", False):
@@ -3391,9 +3417,10 @@ class AppController(QObject):
             if status.get("warning"):
                 self.meeting_overrun_warning.emit(status.get("message", ""), elapsed)
 
-        # Trigger progressive live transcription every `progressive_interval_sec`
+        # Trigger progressive live transcription (fallback only if streaming transcriber is inactive)
         if (
             self.config.progressive_transcription
+            and (not getattr(self, "streaming_transcriber", None) or not self.streaming_transcriber.is_active)
             and self._capture_state == "recording"
             and self._active_meeting_id is not None
             and not self._progressive_worker_busy
@@ -3536,6 +3563,13 @@ class AppController(QObject):
                 logger.debug("Progressive transcription chunk warning: %s", exc)
             finally:
                 self._progressive_worker_busy = False
+
+    def _on_streaming_partial(self, meeting_id: int, partial_dict: dict) -> None:
+        self.meeting_live_partial.emit(meeting_id, partial_dict)
+
+    def _on_streaming_confirmed(self, meeting_id: int, confirmed_dict: dict) -> None:
+        self.meeting_live_confirmed.emit(meeting_id, confirmed_dict)
+        self.meeting_progressive_segment.emit(meeting_id, confirmed_dict)
 
     def _finalize_meeting_worker(
         self, meeting_id: int, result, video_path: str = "", cancel_event: Optional[threading.Event] = None
@@ -3682,23 +3716,29 @@ class AppController(QObject):
                     prompt_parts.append(DictationProcessor.DEFAULT_HINGLISH_PROMPT)
                 eff_prompt = " ".join(prompt_parts).strip()
 
-                self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing speech with local Whisper...")
-                segments = self.transcriber.transcribe_meeting_dual_track(
-                    mixed_wav_path=getattr(result, "mixed_wav_path", None),
-                    mic_wav_path=getattr(result, "mic_wav_path", None),
-                    sys_wav_path=getattr(result, "sys_wav_path", None),
-                    initial_prompt=eff_prompt,
-                    language=self.config.language,
-                    progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: Transcribing speech ({s})"),
-                    cancel_check=is_cancelled,
-                    output_script="roman",
-                    remote_speaker_label=remote_name,
-                )
+                existing_segs = self.db.get_transcript_segments(meeting_id) if hasattr(self.db, "get_transcript_segments") else self.db.get_meeting_segments(meeting_id)
+                if existing_segs and len(existing_segs) > 0:
+                    logger.info("Preserving %d live streaming segments for meeting #%d; skipping duplicate offline Whisper pass", len(existing_segs), meeting_id)
+                    segments = list(existing_segs)
+                else:
+                    self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing speech with local Whisper...")
+                    segments = self.transcriber.transcribe_meeting_dual_track(
+                        mixed_wav_path=getattr(result, "mixed_wav_path", None),
+                        mic_wav_path=getattr(result, "mic_wav_path", None),
+                        sys_wav_path=getattr(result, "sys_wav_path", None),
+                        initial_prompt=eff_prompt,
+                        language=self.config.language,
+                        progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: Transcribing speech ({s})"),
+                        cancel_check=is_cancelled,
+                        output_script="roman",
+                        remote_speaker_label=remote_name,
+                    )
 
                 # Early Stage 2 transcript persistence: Call self.db.replace_meeting_segments
                 # immediately following Stage 2 Whisper transcription completion so intermediate
                 # segments are safely saved to SQLite before Stage 3 diarization begins.
                 if segments:
+                    self.db.replace_meeting_segments(meeting_id, segments)
                     self.db.replace_meeting_segments(meeting_id, segments)
                 else:
                     # Fallback: preserve live progressive transcript segments if offline pass yielded no segments

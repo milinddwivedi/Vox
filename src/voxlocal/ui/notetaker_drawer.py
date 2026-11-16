@@ -152,6 +152,16 @@ class VoxNotetakerDrawer(QWidget):
         self.list_transcript = QListWidget()
         self.list_transcript.setWordWrap(True)
         tx_lay.addWidget(self.list_transcript, 1)
+
+        self.lbl_live_partial = QLabel("")
+        self.lbl_live_partial.setWordWrap(True)
+        self.lbl_live_partial.setStyleSheet(
+            "color: #00D084; font-style: italic; font-size: 12px; padding: 4px 8px; "
+            "background: rgba(0, 208, 132, 0.08); border-radius: 4px;"
+        )
+        self.lbl_live_partial.setVisible(False)
+        tx_lay.addWidget(self.lbl_live_partial)
+
         self.stack.addWidget(tx_page)
 
         # 2: Summary
@@ -295,6 +305,10 @@ class VoxNotetakerDrawer(QWidget):
         self.controller.meeting_state_changed.connect(self._on_meeting_state_changed)
         self.controller.meeting_tick.connect(self._on_meeting_tick)
         self.controller.meeting_progressive_segment.connect(self._on_progressive_segment)
+        if hasattr(self.controller, "meeting_live_partial"):
+            self.controller.meeting_live_partial.connect(self._on_live_partial)
+        if hasattr(self.controller, "meeting_live_confirmed"):
+            self.controller.meeting_live_confirmed.connect(self._on_live_confirmed)
         self.controller.meeting_saved_and_transcribed.connect(self._on_meeting_finalized)
 
     def _switch_section(self, idx: int) -> None:
@@ -328,6 +342,9 @@ class VoxNotetakerDrawer(QWidget):
         self._live_segments = []
         self._active_displayed_meeting_id = meeting_id
         self.list_transcript.clear()
+        if hasattr(self, "lbl_live_partial"):
+            self.lbl_live_partial.setText("")
+            self.lbl_live_partial.setVisible(False)
 
     def _render_live_segments(self) -> None:
         """Render deduplicated live segments sorted strictly chronologically."""
@@ -411,6 +428,26 @@ class VoxNotetakerDrawer(QWidget):
         self.lbl_timer.setText(f"{mins:02d}:{secs:02d}")
         self.lbl_mic_badge.setText(f"Mic: {'Live' if mic_ok else 'Off'} ({int(mic_lvl * 100)}%)")
         self.lbl_sys_badge.setText(f"Call Audio: {'Live' if sys_ok else 'Off'} ({int(sys_lvl * 100)}%)")
+
+    def _on_live_partial(self, meeting_id: int, partial_dict: dict) -> None:
+        if self.controller and self.controller.active_meeting_id != meeting_id:
+            return
+        txt = partial_dict.get("text", "").strip()
+        spk = partial_dict.get("speaker", "Speaker")
+        if hasattr(self, "lbl_live_partial"):
+            if txt:
+                self.lbl_live_partial.setText(f"● {spk}: {txt}")
+                self.lbl_live_partial.setVisible(True)
+            else:
+                self.lbl_live_partial.setVisible(False)
+
+    def _on_live_confirmed(self, meeting_id: int, seg_dict: dict) -> None:
+        if self.controller and self.controller.active_meeting_id != meeting_id:
+            return
+        if hasattr(self, "lbl_live_partial"):
+            self.lbl_live_partial.setText("")
+            self.lbl_live_partial.setVisible(False)
+        self._on_progressive_segment(meeting_id, seg_dict)
 
     def _on_progressive_segment(self, meeting_id: int, seg: dict) -> None:
         if self.controller.active_meeting_id != meeting_id:
