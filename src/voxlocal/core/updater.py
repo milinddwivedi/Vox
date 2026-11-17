@@ -15,9 +15,10 @@ import hmac
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 import urllib.request
 
+from voxlocal import __version__
 from voxlocal.core.ed25519_rfc8032 import ed25519_verify
 from voxlocal.core.entitlement import DEFAULT_ENTITLEMENT_PUBLIC_KEY
 from voxlocal.core.logger import get_logger
@@ -25,6 +26,30 @@ from voxlocal.core.logger import get_logger
 logger = get_logger("updater")
 
 DEFAULT_RELEASE_MANIFEST_URL = "https://vox-voice-assistant.vercel.app/api/releases/latest"
+
+
+def parse_version_tuple(ver_str: str) -> Tuple[int, ...]:
+    """
+    Parses a semantic version string (e.g. '1.0.3' or 'v1.0.3-beta') into an integer tuple.
+    """
+    if not ver_str or not isinstance(ver_str, str):
+        return (0, 0, 0)
+    cleaned = ver_str.strip().lstrip("vV")
+    core = cleaned.split("-")[0].split("+")[0]
+    parts = []
+    for part in core.split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def is_newer_version(latest: str, current: str) -> bool:
+    """
+    Returns True strictly when the latest semantic version is greater than current.
+    """
+    return parse_version_tuple(latest) > parse_version_tuple(current)
 
 
 def canonicalize_manifest(manifest: Dict[str, Any]) -> bytes:
@@ -220,11 +245,11 @@ class UpdateManager:
 
     def __init__(
         self,
-        current_version: str = "1.0.0",
+        current_version: Optional[str] = None,
         manifest_url: str = DEFAULT_RELEASE_MANIFEST_URL,
         public_key_hex: str = DEFAULT_ENTITLEMENT_PUBLIC_KEY,
     ) -> None:
-        self.current_version = current_version
+        self.current_version = current_version or __version__
         self.manifest_url = manifest_url
         self.public_key_hex = public_key_hex
 
@@ -259,7 +284,7 @@ class UpdateManager:
             return False, None, "Untrusted release manifest: cryptographic verification failed"
 
         latest_version = str(manifest.get("version", "0.0.0")).strip()
-        if latest_version != self.current_version:
+        if is_newer_version(latest_version, self.current_version):
             return True, manifest, f"New version {latest_version} available"
 
         return False, manifest, f"Up to date (version {self.current_version})"
@@ -279,7 +304,7 @@ class UpdateManager:
         """
         if auth_token:
             try:
-                ver = manifest.get("version", "1.0.1")
+                ver = manifest.get("version", self.current_version)
                 payload = json.dumps({"artifact": f"releases/{ver}/VoxLocal-Setup.exe"}).encode("utf-8")
                 req = urllib.request.Request(
                     auth_api_url,
@@ -310,6 +335,7 @@ class UpdateManager:
         dest_path: Union[str, Path],
         auth_token: Optional[str] = None,
         timeout_sec: int = 120,
+        progress_callback: Optional[Callable[[int, int, int], None]] = None,
     ) -> Tuple[bool, str]:
         """
         Downloads the installer binary from an authorized or manifest URL,
@@ -330,9 +356,30 @@ class UpdateManager:
             with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
                 if resp.status != 200:
                     return False, f"Download failed with HTTP {resp.status}"
+                total_bytes = 0
+                try:
+                    cl = resp.headers.get("Content-Length") if hasattr(resp, "headers") and resp.headers else None
+                    if cl:
+                        total_bytes = int(cl)
+                except (ValueError, TypeError, AttributeError):
+                    total_bytes = 0
+                if total_bytes <= 0:
+                    try:
+                        total_bytes = int(manifest.get("installer_size_bytes") or 0)
+                    except (ValueError, TypeError):
+                        total_bytes = 0
+
+                downloaded_bytes = 0
                 with dest.open("wb") as out_f:
                     while chunk := resp.read(64 * 1024):
                         out_f.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        if progress_callback is not None:
+                            pct = int(min(100, (downloaded_bytes * 100) // total_bytes)) if total_bytes > 0 else 0
+                            try:
+                                progress_callback(downloaded_bytes, total_bytes, pct)
+                            except Exception:
+                                pass
         except Exception as exc:
             return False, f"Download error: {exc}"
 

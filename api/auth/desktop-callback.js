@@ -68,9 +68,25 @@ module.exports = async function handler(req, res) {
           avatar_url: data.user.user_metadata?.avatar_url || data.user.user_metadata?.picture || '',
         };
 
-        // Query active subscription tier or apply master developer bypass
-        const isMaster = (data.user.email && data.user.email.toLowerCase() === 'milinddwivedi0@gmail.com') ||
-                         data.user.id === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f';
+        // Query active subscription tier or apply master developer / WFX company allowlist
+        const em = (data.user.email || '').toLowerCase().trim();
+        const uid = (data.user.id || '').toLowerCase().trim();
+        let isMaster =
+          em === 'milinddwivedi0@gmail.com' ||
+          em === 'amar.vohra3@gmail.com' ||
+          em === 'hemanthwfx@gmail.com' ||
+          (em.endsWith('@worldfashionexchange.com') && em.split('@')[1] === 'worldfashionexchange.com') ||
+          uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
+          uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
+          uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002';
+
+        if (!isMaster && em && typeof serverClient.rpc === 'function') {
+          try {
+            const { data: rpcPro } = await serverClient.rpc('is_company_pro_email', { check_email: em });
+            if (rpcPro) isMaster = true;
+          } catch (_) {}
+        }
+
         if (isMaster) {
           serverIsPro = true;
           serverPlanCode = 'pro_annual';
@@ -282,6 +298,27 @@ module.exports = async function handler(req, res) {
       const searchParams = new URLSearchParams(window.location.search);
       const hashParams = new URLSearchParams(window.location.hash.startsWith('#') ? window.location.hash.substring(1) : window.location.hash);
 
+      let resolvedTarget = TARGET;
+      let resolvedState = STATE;
+      try {
+        const savedRaw = localStorage.getItem('vox_desktop_oauth_ctx');
+        if (savedRaw) {
+          const savedCtx = JSON.parse(savedRaw);
+          if (savedCtx && (!savedCtx.ts || Date.now() - savedCtx.ts < 30 * 60 * 1000)) {
+            if (!searchParams.get('target') && savedCtx.target) {
+              const parsedSaved = new URL(savedCtx.target);
+              if (parsedSaved.hostname === '127.0.0.1' || parsedSaved.hostname === 'localhost') {
+                resolvedTarget = savedCtx.target;
+              }
+            }
+            if (!resolvedState && savedCtx.state) {
+              resolvedState = savedCtx.state;
+            }
+          }
+          localStorage.removeItem('vox_desktop_oauth_ctx');
+        }
+      } catch (e) {}
+
       const error = searchParams.get('error') || hashParams.get('error');
       const errorDesc = searchParams.get('error_description') || hashParams.get('error_description') || error;
 
@@ -289,8 +326,8 @@ module.exports = async function handler(req, res) {
         showError(errorDesc);
         // Relay error to loopback server so desktop does not hang
         try {
-          const errUrl = new URL(TARGET);
-          errUrl.searchParams.set('state', STATE);
+          const errUrl = new URL(resolvedTarget);
+          errUrl.searchParams.set('state', resolvedState);
           errUrl.searchParams.set('error', error);
           errUrl.searchParams.set('error_description', errorDesc);
           window.location.replace(errUrl.toString());
@@ -381,7 +418,17 @@ module.exports = async function handler(req, res) {
         return;
       }
 
-      if ((email && email.toLowerCase() === 'milinddwivedi0@gmail.com') || userId === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f') {
+      const em = (email || '').toLowerCase().trim();
+      const uid = (userId || '').toLowerCase().trim();
+      if (
+        em === 'milinddwivedi0@gmail.com' ||
+        em === 'amar.vohra3@gmail.com' ||
+        em === 'hemanthwfx@gmail.com' ||
+        (em.endsWith('@worldfashionexchange.com') && em.split('@')[1] === 'worldfashionexchange.com') ||
+        uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
+        uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
+        uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002'
+      ) {
         planCode = 'pro_annual';
         isPro = true;
       }
@@ -389,11 +436,11 @@ module.exports = async function handler(req, res) {
       // Construct loopback forwarding URL
       let loopbackUrl;
       try {
-        loopbackUrl = new URL(TARGET);
+        loopbackUrl = new URL(resolvedTarget);
       } catch (e) {
         loopbackUrl = new URL('http://127.0.0.1:8400/callback');
       }
-      loopbackUrl.searchParams.set('state', STATE);
+      loopbackUrl.searchParams.set('state', resolvedState);
       loopbackUrl.searchParams.set('user_id', userId);
       loopbackUrl.searchParams.set('email', email);
       loopbackUrl.searchParams.set('name', name);

@@ -409,15 +409,17 @@ class LiveMeetingStreamingTranscriber:
                 logger.debug("Streaming transcriber fallback pass warning: %s", fb_err)
                 res = None
 
+        rms = float(np.sqrt(np.mean(np.square(audio_slice)))) if audio_slice.size else 0.0
+
         if not res or not res[0]:
-            # Always advance cursor if window has grown excessively to prevent permanent stall
-            if (end_sec - self._audio_cursor_sec) >= 12.0:
+            # Only advance cursor on empty output if audio slice RMS energy is below the silence floor
+            if rms < 0.008 and (end_sec - self._audio_cursor_sec) >= 12.0:
                 self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec - 4.0)
             return
 
         raw_text = " ".join(s.text.strip() for s in res[0] if s.text.strip())
         if not raw_text or is_hallucination(raw_text):
-            if (end_sec - self._audio_cursor_sec) >= 12.0:
+            if rms < 0.008 and (end_sec - self._audio_cursor_sec) >= 12.0:
                 self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec - 4.0)
             return
 
@@ -425,6 +427,19 @@ class LiveMeetingStreamingTranscriber:
         confirmed, partial = self._agreement_engine.process_step(
             raw_text, speech_boundary=speech_boundary, vocabulary=vocab
         )
+
+        # If the window grows >= 18.0s and raw_text is non-empty without a 2-pass prefix match yet,
+        # force-confirm the stable first half of raw_text and advance _audio_cursor_sec proportionally
+        # so speech is never dropped or lost.
+        if not confirmed and (end_sec - self._audio_cursor_sec) >= 18.0:
+            raw_words = raw_text.split()
+            if raw_words:
+                half_len = max(1, len(raw_words) // 2)
+                first_half_raw = " ".join(raw_words[:half_len])
+                rem_half_raw = " ".join(raw_words[half_len:])
+                confirmed = self._agreement_engine._clean_and_normalize(first_half_raw, vocab)
+                partial = self._agreement_engine._clean_and_normalize(rem_half_raw, vocab)
+                self._agreement_engine.prev_words = raw_words[half_len:]
 
         # Emit Live Partial
         if partial and self.on_partial and self._meeting_id is not None:
@@ -439,7 +454,7 @@ class LiveMeetingStreamingTranscriber:
             )
 
         # Emit and commit Confirmed Text
-        if confirmed and self._meeting_id is not None:
+        if confirmed:
             # Check for duplicate emission against recent segments
             norm_conf = confirmed.lower()
             is_dup = False
@@ -456,7 +471,8 @@ class LiveMeetingStreamingTranscriber:
             if not is_dup:
                 self._segment_index += 1
                 seg_id = None
-                if self.db:
+                m_id = self._meeting_id if self._meeting_id is not None else 0
+                if self.db and self._meeting_id is not None:
                     try:
                         seg_id = self.db.add_transcript_segment(
                             meeting_id=self._meeting_id,
@@ -473,7 +489,7 @@ class LiveMeetingStreamingTranscriber:
 
                 seg_dict = {
                     "id": seg_id or self._segment_index,
-                    "meeting_id": self._meeting_id,
+                    "meeting_id": m_id,
                     "segment_index": self._segment_index,
                     "speaker": speaker,
                     "text": confirmed,
@@ -487,7 +503,7 @@ class LiveMeetingStreamingTranscriber:
                     self._recent_emitted = self._recent_emitted[-50:]
 
                 if self.on_confirmed:
-                    self.on_confirmed(self._meeting_id, seg_dict)
+                    self.on_confirmed(m_id, seg_dict)
 
                 # Advance cursor past confirmed audio
                 if speech_boundary:
@@ -495,7 +511,3 @@ class LiveMeetingStreamingTranscriber:
                 else:
                     dur = max(0.2, (len(confirmed.split()) / max(1, len(raw_text.split()))) * (end_sec - start_sec))
                     self._audio_cursor_sec = min(end_sec, start_sec + dur)
-        else:
-            # If no confirmed text was emitted on this pass and cursor is falling far behind, advance cursor safely
-            if (end_sec - self._audio_cursor_sec) >= 12.0:
-                self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec - 3.0)

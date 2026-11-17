@@ -136,6 +136,65 @@ MODEL_REPO_MAP: Dict[str, str] = {
     "tiny": "Systran/faster-whisper-tiny",
 }
 
+MODEL_MANIFEST: Dict[str, Dict[str, Any]] = {
+    "large-v3-turbo": {
+        "model_id": "large-v3-turbo",
+        "repo_id": "deepdml/faster-whisper-large-v3-turbo-ct2",
+        "version": "1.0.0",
+        "expected_size_mb": 1543,
+        "min_disk_space_mb": 2000,
+        "required_files": ["model.bin", "config.json", "tokenizer.json", "vocabulary.json"],
+        "supported_languages": ["en", "hi", "en+hi", "hinglish", "hi_latn", "auto"],
+    },
+    "large-v3": {
+        "model_id": "large-v3",
+        "repo_id": "Systran/faster-whisper-large-v3",
+        "version": "1.0.0",
+        "expected_size_mb": 3090,
+        "min_disk_space_mb": 4000,
+        "required_files": ["model.bin", "config.json", "tokenizer.json", "vocabulary.json"],
+        "supported_languages": ["en", "hi", "en+hi", "hinglish", "hi_latn", "auto"],
+    },
+    "small": {
+        "model_id": "small",
+        "repo_id": "Systran/faster-whisper-small",
+        "version": "1.0.0",
+        "expected_size_mb": 465,
+        "min_disk_space_mb": 700,
+        "required_files": ["model.bin", "config.json", "tokenizer.json", "vocabulary.json"],
+        "supported_languages": ["en", "hi", "en+hi", "hinglish", "hi_latn", "auto"],
+    },
+    "base": {
+        "model_id": "base",
+        "repo_id": "Systran/faster-whisper-base",
+        "version": "1.0.0",
+        "expected_size_mb": 145,
+        "min_disk_space_mb": 250,
+        "required_files": ["model.bin", "config.json", "tokenizer.json", "vocabulary.json"],
+        "supported_languages": ["en", "hi", "en+hi", "hinglish", "hi_latn", "auto"],
+    },
+    "tiny": {
+        "model_id": "tiny",
+        "repo_id": "Systran/faster-whisper-tiny",
+        "version": "1.0.0",
+        "expected_size_mb": 75,
+        "min_disk_space_mb": 150,
+        "required_files": ["model.bin", "config.json", "tokenizer.json", "vocabulary.json"],
+        "supported_languages": ["en", "hi", "en+hi", "hinglish", "hi_latn", "auto"],
+    },
+}
+
+
+class ModelReadinessState:
+    """Lifecycle readiness states for local Whisper speech models."""
+    NOT_INSTALLED = "not_installed"
+    DOWNLOADING = "downloading"
+    VERIFYING = "verifying"
+    LOADING = "loading"
+    READY = "ready"
+    FAILED = "failed"
+
+
 DEFAULT_DOMAIN_HOTWORDS: str = (
     "Microsoft Teams, Google Meet, Zoom, Slack, Jira, GitHub, GitLab, VS Code, "
     "Python, SQLite, SQL, PostgreSQL, MongoDB, Redis, API, endpoint, frontend, backend, staging, production, "
@@ -910,6 +969,8 @@ class LocalWhisperTranscriber:
         self._interim_model: Optional[WhisperModel] = None
         self._loaded_model_name: str = ""
         self._active_device: str = "cpu"
+        self._readiness_state: Optional[str] = None
+        self._readiness_message: str = ""
         self.speaker_profile_store = LocalSpeakerProfileStore()
 
     def _get_fast_interim_model(self) -> Optional[WhisperModel]:
@@ -942,10 +1003,31 @@ class LocalWhisperTranscriber:
     def active_device_description(self) -> str:
         return f"{self._active_device.upper()} ({self.compute_type}, {self.model_name})"
 
+    @staticmethod
+    def _is_valid_snapshot_dir(folder: Path) -> bool:
+        """
+        Verify that a snapshot folder contains both `model.bin` (or `model.safetensors`, non-empty)
+        AND `config.json` so incomplete/corrupted downloads are never treated as valid cached models.
+        """
+        if not folder.exists() or not folder.is_dir():
+            return False
+        cfg = folder / "config.json"
+        if not cfg.exists() or not cfg.is_file():
+            return False
+        for weight_name in ("model.bin", "model.safetensors"):
+            weight_file = folder / weight_name
+            if weight_file.exists() and weight_file.is_file():
+                try:
+                    if weight_file.stat().st_size > 0:
+                        return True
+                except OSError:
+                    pass
+        return False
+
     def resolve_model_path(self, model_name: Optional[str] = None) -> Tuple[str, Optional[str], bool]:
         """
         Resolve model identifier, download_root, and whether it is cached locally.
-        If a local snapshot exists (in self.models_dir or ~/.cache/huggingface/hub),
+        If a valid local snapshot exists (in self.models_dir or ~/.cache/huggingface/hub),
         returns (str(snapshot_dir), None, True) so WhisperModel loads it directly.
         """
         target = model_name or self.model_name
@@ -965,14 +1047,53 @@ class LocalWhisperTranscriber:
             canonical_app_models / slug,
         ]
         for folder in search_dirs:
-            if folder.exists():
-                if (folder / "model.bin").exists() or (folder / "model.safetensors").exists():
+            if folder.exists() and folder.is_dir():
+                if self._is_valid_snapshot_dir(folder):
                     return str(folder), None, True
                 for snap in folder.iterdir():
-                    if snap.is_dir() and ((snap / "model.bin").exists() or (snap / "model.safetensors").exists()):
+                    if self._is_valid_snapshot_dir(snap):
                         return str(snap), None, True
 
         return repo_id, str(self.models_dir), False
+
+    def get_model_readiness(self, model_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Return structured readiness status for the requested (or active) Whisper model.
+        """
+        target = model_name or self.model_name
+        meta = MODEL_MANIFEST.get(target, {})
+        expected_size_mb = int(meta.get("expected_size_mb", 150))
+        resolved_path, _, cached = self.resolve_model_path(target)
+        loaded = bool(self._model is not None and (self._loaded_model_name == target or (model_name is None and self._loaded_model_name)))
+
+        transient_states = (
+            ModelReadinessState.DOWNLOADING,
+            ModelReadinessState.VERIFYING,
+            ModelReadinessState.LOADING,
+            ModelReadinessState.FAILED,
+        )
+        if self._readiness_state in transient_states and (model_name is None or model_name == self.model_name):
+            state = self._readiness_state
+            message = self._readiness_message or f"Model '{target}' is {state}."
+        elif loaded:
+            state = ModelReadinessState.READY
+            message = f"Model '{target}' is loaded and ready on {self._active_device.upper()}."
+        elif cached:
+            state = ModelReadinessState.READY
+            message = f"Model '{target}' is verified and cached locally."
+        else:
+            state = ModelReadinessState.NOT_INSTALLED
+            message = f"Model '{target}' is not installed locally (~{expected_size_mb} MB download)."
+
+        return {
+            "state": state,
+            "model_name": target,
+            "cached": cached,
+            "loaded": loaded,
+            "path": resolved_path if cached else None,
+            "expected_size_mb": expected_size_mb,
+            "message": message,
+        }
 
     def is_model_cached(self, model_name: Optional[str] = None) -> bool:
         """Check whether the requested Whisper model already exists in local storage or HF cache."""
@@ -997,6 +1118,8 @@ class LocalWhisperTranscriber:
         setup_nvidia_dll_paths()
         with self._lock:
             target_model = model_name or self.model_name
+            needs_bootstrap = False
+            bootstrap_target = target_model
             if self._model is None and callable(getattr(self, "is_model_loaded", None)):
                 try:
                     if self.is_model_loaded() and self._model is None:
@@ -1005,6 +1128,8 @@ class LocalWhisperTranscriber:
                         mock_model.transcribe = MagicMock(return_value=([], None))
                         self._model = mock_model
                         self._loaded_model_name = target_model
+                        self._readiness_state = ModelReadinessState.READY
+                        self._readiness_message = "Mock model ready"
                         return True, "Mock model ready"
                 except Exception:
                     pass
@@ -1022,7 +1147,10 @@ class LocalWhisperTranscriber:
                         break
 
             if self._model is not None and self._loaded_model_name == target_model:
-                return True, f"Model '{target_model}' ready on {self._active_device.upper()}."
+                self._readiness_state = ModelReadinessState.READY
+                msg = f"Model '{target_model}' ready on {self._active_device.upper()}."
+                self._readiness_message = msg
+                return True, msg
 
             model_identifier, dl_root, cached = self.resolve_model_path(target_model)
             if not cached and os.environ.get("HF_HUB_OFFLINE") == "1":
@@ -1030,14 +1158,21 @@ class LocalWhisperTranscriber:
                     f"Model '{target_model}' is not cached locally and Offline-Only mode is enabled. "
                     "Disable Offline-Only mode temporarily in Settings to download it."
                 )
+                self._readiness_state = ModelReadinessState.FAILED
+                self._readiness_message = msg
                 logger.warning(msg)
                 return False, msg
 
-            if status_callback:
-                if cached:
-                    status_callback(f"Loading local model '{target_model}'...")
-                else:
-                    status_callback(f"Downloading model '{target_model}' to local storage...")
+            if cached:
+                self._readiness_state = ModelReadinessState.LOADING
+                self._readiness_message = f"Loading local model '{target_model}'..."
+                if status_callback:
+                    status_callback(self._readiness_message)
+            else:
+                self._readiness_state = ModelReadinessState.DOWNLOADING
+                self._readiness_message = f"Downloading model '{target_model}' to local storage..."
+                if status_callback:
+                    status_callback(self._readiness_message)
 
             t0 = time.perf_counter()
             preferred_dev = self.compute_device.lower()
@@ -1046,6 +1181,9 @@ class LocalWhisperTranscriber:
                     preferred_dev = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
                 except Exception:
                     preferred_dev = "cpu"
+
+            import gc
+            gc.collect()
 
             if preferred_dev == "cuda":
                 try:
@@ -1064,6 +1202,7 @@ class LocalWhisperTranscriber:
                     self.model_name = target_model
                     self._active_device = "cuda"
                     elapsed = time.perf_counter() - t0
+                    self._readiness_state = ModelReadinessState.READY
                     logger.info("Loaded Whisper '%s' on CUDA (%s) in %.2fs", target_model, cuda_compute, elapsed)
                     if needs_bootstrap:
                         threading.Thread(
@@ -1072,9 +1211,15 @@ class LocalWhisperTranscriber:
                             name="WhisperBackgroundUpgrade",
                             daemon=True,
                         ).start()
-                        return True, f"Loaded fast '{target_model}' on GPU. Downloading '{bootstrap_target}' in background."
-                    return True, f"Loaded '{target_model}' on GPU (CUDA {cuda_compute}) in {elapsed:.1f}s"
+                        msg = f"Loaded fast '{target_model}' on GPU. Downloading '{bootstrap_target}' in background."
+                        self._readiness_message = msg
+                        return True, msg
+                    msg = f"Loaded '{target_model}' on GPU (CUDA {cuda_compute}) in {elapsed:.1f}s"
+                    self._readiness_message = msg
+                    return True, msg
                 except Exception as cuda_exc:
+                    model = None
+                    gc.collect()
                     logger.info(
                         "CUDA runtime libraries not active (%s); using optimized multi-core CPU int8.",
                         cuda_exc,
@@ -1085,12 +1230,23 @@ class LocalWhisperTranscriber:
                 if dl_root:
                     kw_cpu["download_root"] = dl_root
                     kw_cpu["local_files_only"] = cached
-                model = WhisperModel(model_identifier, **kw_cpu)
+                try:
+                    model = WhisperModel(model_identifier, **kw_cpu)
+                except Exception as cpu_alloc_err:
+                    err_str = str(cpu_alloc_err).lower()
+                    if ("mkl_malloc" in err_str or "allocate" in err_str or "memory" in err_str) and self.cpu_threads > 2:
+                        gc.collect()
+                        logger.warning("Low virtual memory commit headroom (%s); retrying '%s' with cpu_threads=2", cpu_alloc_err, target_model)
+                        kw_cpu["cpu_threads"] = 2
+                        model = WhisperModel(model_identifier, **kw_cpu)
+                    else:
+                        raise
                 self._model = model
                 self._loaded_model_name = target_model
                 self.model_name = target_model
                 self._active_device = "cpu"
                 elapsed = time.perf_counter() - t0
+                self._readiness_state = ModelReadinessState.READY
                 logger.info(
                     "Loaded Whisper '%s' on CPU (int8, %d threads) in %.2fs",
                     target_model,
@@ -1104,10 +1260,16 @@ class LocalWhisperTranscriber:
                         name="WhisperBackgroundUpgrade",
                         daemon=True,
                     ).start()
-                    return True, f"Loaded fast '{target_model}' on CPU. Downloading '{bootstrap_target}' in background."
-                return True, f"Loaded '{target_model}' on CPU (int8) in {elapsed:.1f}s"
+                    msg = f"Loaded fast '{target_model}' on CPU. Downloading '{bootstrap_target}' in background."
+                    self._readiness_message = msg
+                    return True, msg
+                msg = f"Loaded '{target_model}' on CPU (int8) in {elapsed:.1f}s"
+                self._readiness_message = msg
+                return True, msg
             except Exception as exc:
                 msg = f"Failed to load Whisper model '{target_model}': {exc}"
+                self._readiness_state = ModelReadinessState.FAILED
+                self._readiness_message = msg
                 logger.error(msg)
                 return False, msg
 

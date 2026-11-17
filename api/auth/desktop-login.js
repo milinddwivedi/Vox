@@ -131,10 +131,19 @@ module.exports = async function handler(req, res) {
     const supabaseUrl = "${supabaseUrl}";
 
     function initiateOAuth() {
+      try {
+        localStorage.setItem('vox_desktop_oauth_ctx', JSON.stringify({
+          target: redirectUri,
+          state: state,
+          codeChallenge: codeChallenge,
+          ts: Date.now()
+        }));
+      } catch (e) {}
+
       // In production with Supabase configured:
       if (supabaseUrl && !supabaseUrl.includes('placeholder')) {
         const callbackUrl = window.location.origin + '/api/auth/desktop-callback?target=' + encodeURIComponent(redirectUri) + '&state=' + encodeURIComponent(state);
-        const authUrl = supabaseUrl + '/auth/v1/authorize?provider=custom:google&redirect_to=' + encodeURIComponent(callbackUrl);
+        const authUrl = supabaseUrl + '/auth/v1/authorize?provider=google&redirect_to=' + encodeURIComponent(callbackUrl);
         window.location.href = authUrl;
       } else {
         // Direct loopback simulation for dev/test verification

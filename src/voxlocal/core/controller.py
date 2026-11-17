@@ -214,9 +214,10 @@ class AppController(QObject):
         self.db = LocalDatabase(self.config.db_path)
 
         # Initialize Commercial Ledger & Entitlements (100% Local DPAPI Vault)
+        storage_root = Path(self.config.storage_dir)
         self.metering = UsageMeteringEngine(self.db.db_path)
-        self.entitlement = EntitlementManager()
-        self.desktop_auth_broker = DesktopAuthBroker()
+        self.entitlement = EntitlementManager(cache_file=storage_root / "entitlement.vault")
+        self.desktop_auth_broker = DesktopAuthBroker(vault_path=storage_root / "auth_session.vault")
         self.auth_broker = self.desktop_auth_broker  # Backward compatibility alias
         self.desktop_auth_broker.on_session_synced = self._on_desktop_auth_synced
         self._restore_user_session()
@@ -479,7 +480,7 @@ class AppController(QObject):
                     if hasattr(self, "metering") and self.metering is not None:
                         self.metering.set_user_context(user_id, plan_code, email=user_email)
                     if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
-                        self.entitlement.set_user_context(user_id, email=user_email)
+                        self.entitlement.set_user_context(user_id, email=user_email, plan_code=plan_code)
                     # Non-blocking cloud entitlement sync to immediately pull website plan updates on launch
                     threading.Thread(target=self._sync_commercial_worker, name="StartupEntitlementSync", daemon=True).start()
                     return
@@ -500,7 +501,7 @@ class AppController(QObject):
             if hasattr(self, "metering") and self.metering is not None:
                 self.metering.set_user_context(user_id, plan_code, email=user_email)
             if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
-                self.entitlement.set_user_context(user_id, email=user_email)
+                self.entitlement.set_user_context(user_id, email=user_email, plan_code=plan_code)
             self._safe_emit(self.auth_state_changed, self.get_account_status())
             if hasattr(self, "entitlement") and self.entitlement is not None:
                 self._safe_emit(self.entitlement_changed, self.entitlement.get_effective_entitlement())
@@ -5010,7 +5011,7 @@ class AppController(QObject):
                     if hasattr(self, "metering") and self.metering is not None:
                         self.metering.set_user_context(user_id, plan_code, email=user_email)
                     if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
-                        self.entitlement.set_user_context(user_id, email=user_email)
+                        self.entitlement.set_user_context(user_id, email=user_email, plan_code=plan_code)
                 self.sync_entitlements_with_cloud()
             self._safe_emit(self.auth_state_changed, self.get_account_status())
             if hasattr(self, "entitlement") and self.entitlement is not None:
@@ -5040,7 +5041,7 @@ class AppController(QObject):
             if hasattr(self, "metering") and self.metering is not None:
                 self.metering.set_user_context(profile.user_id, profile.plan_code, email=profile.email)
             if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
-                self.entitlement.set_user_context(profile.user_id, email=profile.email)
+                self.entitlement.set_user_context(profile.user_id, email=profile.email, plan_code=profile.plan_code)
             self._safe_emit(self.auth_state_changed, self.get_account_status())
             if hasattr(self, "entitlement") and self.entitlement is not None:
                 self._safe_emit(self.entitlement_changed, self.entitlement.get_effective_entitlement())
@@ -5085,6 +5086,13 @@ class AppController(QObject):
             headers = {"Content-Type": "application/json"}
             if token:
                 headers["Authorization"] = f"Bearer {token}"
+            if isinstance(session, dict):
+                uid_hdr = str(session.get("user_id") or (session.get("user") or {}).get("id") or "").strip()
+                em_hdr = str((session.get("user") or {}).get("email") or "").strip()
+                if uid_hdr:
+                    headers["X-Vox-User-Id"] = uid_hdr
+                if em_hdr:
+                    headers["X-Vox-User-Email"] = em_hdr
 
             # 1. Sync unsynced usage events (idempotent UUIDs, aggregate counters only)
             unsynced = self.metering.get_unsynced_events(limit=50)

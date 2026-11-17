@@ -7,32 +7,42 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib.machinery
 import os
 from pathlib import Path
 import sys
 
-# Ensure 'src' is on sys.path
-ROOT_DIR = Path(__file__).resolve().parent
+# Ensure 'src' is on sys.path (and prioritized ahead of PyiFrozenImporter when frozen)
+ROOT_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
 SRC_DIR = ROOT_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+if str(SRC_DIR) in sys.path:
+    sys.path.remove(str(SRC_DIR))
+sys.path.insert(0, str(SRC_DIR))
+if getattr(sys, "frozen", False) and (SRC_DIR / "voxlocal").exists():
+    if not sys.meta_path or sys.meta_path[0] is not importlib.machinery.PathFinder:
+        sys.meta_path.insert(0, importlib.machinery.PathFinder)
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-from PyQt6.QtCore import QtMsgType, qInstallMessageHandler
-from PyQt6.QtWidgets import QApplication, QMessageBox
+if "--print-version" not in sys.argv:
+    from PyQt6.QtCore import QtMsgType, qInstallMessageHandler
+    from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from voxlocal.core.config import AppConfig
-from voxlocal.core.controller import AppController
-from voxlocal.core.logger import get_logger, setup_logging
-from voxlocal.ui.calendar_prompt import VoxMeetingPromptPopup
-from voxlocal.ui.floating_pill import DualTierFloatingPill, PillState
-from voxlocal.ui.main_window import MainWindow
-from voxlocal.ui.notetaker_drawer import VoxNotetakerDrawer
-from voxlocal.ui.onboarding_wizard import VoxOnboardingWizard
-from voxlocal.ui.scratchpad_window import VoxScratchpadWindow
-from voxlocal.ui.theme import create_app_icon
-from voxlocal.ui.tray_manager import SystemTrayManager
+    from voxlocal.core.config import AppConfig
+    from voxlocal.core.controller import AppController
+    from voxlocal.core.logger import get_logger, setup_logging
+    from voxlocal.ui.calendar_prompt import VoxMeetingPromptPopup
+    from voxlocal.ui.floating_pill import DualTierFloatingPill, PillState
+    from voxlocal.ui.main_window import MainWindow
+    from voxlocal.ui.notetaker_drawer import VoxNotetakerDrawer
+    from voxlocal.ui.onboarding_wizard import VoxOnboardingWizard
+    from voxlocal.ui.scratchpad_window import VoxScratchpadWindow
+    from voxlocal.ui.theme import create_app_icon
+    from voxlocal.ui.tray_manager import SystemTrayManager
 
 ERROR_ALREADY_EXISTS = 183
 
@@ -82,7 +92,18 @@ def main() -> int:
         default="",
         help="Deep link authorization payload or redirect URL (from voxlocal:// protocol)",
     )
+    parser.add_argument(
+        "--print-version",
+        action="store_true",
+        help="Print the application version and exit immediately",
+    )
     args = parser.parse_args()
+
+    if getattr(args, "print_version", False):
+        from voxlocal import __version__
+
+        print(__version__)
+        return 0
 
     setup_logging()
     logger = get_logger("main")

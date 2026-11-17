@@ -4,7 +4,7 @@
 a = Analysis(
     ['packaging/vox_setup_installer.py'],
     pathex=[],
-    binaries=[],
+    binaries=[('dist/VoxLocal/VoxLocal.exe', 'bundled_bin')],
     datas=[('src', 'src'), ('assets', 'assets')],
     hiddenimports=[],
     hookspath=[],

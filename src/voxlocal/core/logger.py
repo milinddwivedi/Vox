@@ -256,6 +256,9 @@ _initialized = False
 
 def get_app_root() -> Path:
     """Return the root directory of the application (handles frozen PyInstaller builds too)."""
+    env_root = os.environ.get("VOXLOCAL_APP_ROOT", "").strip()
+    if env_root:
+        return Path(env_root).resolve()
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).resolve().parent
         if (

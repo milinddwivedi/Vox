@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -23,6 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from voxlocal import __version__
 from voxlocal.core.logger import get_logger
 from voxlocal.storage.exporter import format_seconds_hms
 from voxlocal.ui.animations import ThemeToggleCapsule, ToastNotification
@@ -275,6 +277,7 @@ class MainWindow(QMainWindow):
 
         # ---- Left Sidebar (Warm Cream / Obsidian Dark) ----
         self.sidebar = QFrame()
+        self.sidebar.setObjectName("leftSidebar")
         self.sidebar.setFixedWidth(228)
         sb_lay = QVBoxLayout(self.sidebar)
         sb_lay.setContentsMargins(14, 18, 14, 16)
@@ -415,7 +418,7 @@ class MainWindow(QMainWindow):
         plan_card_lay.setContentsMargins(12, 10, 12, 12)
         plan_card_lay.setSpacing(6)
 
-        # 1. User Profile Row
+        # 1. User Profile Row (Full width for avatar + name/email — never squeezed horizontally)
         profile_row = QHBoxLayout()
         profile_row.setSpacing(8)
 
@@ -444,13 +447,6 @@ class MainWindow(QMainWindow):
         profile_text_lay.addWidget(self.lbl_user_email)
         profile_row.addLayout(profile_text_lay, 1)
 
-        self.btn_user_sign_out = QPushButton("Sign Out")
-        self.btn_user_sign_out.setObjectName("btnUserSignOut")
-        self.btn_user_sign_out.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_user_sign_out.clicked.connect(self._on_sign_out_clicked)
-        self.btn_user_sign_out.setVisible(False)
-        profile_row.addWidget(self.btn_user_sign_out)
-
         plan_card_lay.addLayout(profile_row)
 
         # 2. Google Sign-In Action (shown when not logged in)
@@ -464,6 +460,7 @@ class MainWindow(QMainWindow):
 
         # 3. Divider
         self.profile_divider = QFrame()
+        self.profile_divider.setObjectName("profileDivider")
         self.profile_divider.setFrameShape(QFrame.Shape.HLine)
         self.profile_divider.setFrameShadow(QFrame.Shadow.Sunken)
         self.profile_divider.setFixedHeight(1)
@@ -504,10 +501,19 @@ class MainWindow(QMainWindow):
         self.btn_plan_upgrade.clicked.connect(self._on_plan_button_clicked)
         plan_card_lay.addWidget(self.btn_plan_upgrade)
 
+        self.btn_user_sign_out = QPushButton("Sign Out")
+        self.btn_user_sign_out.setObjectName("btnUserSignOut")
+        self.btn_user_sign_out.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_user_sign_out.setFixedHeight(24)
+        self.btn_user_sign_out.setAccessibleName("Sign out of VOX account")
+        self.btn_user_sign_out.clicked.connect(self._on_sign_out_clicked)
+        self.btn_user_sign_out.setVisible(False)
+        plan_card_lay.addWidget(self.btn_user_sign_out)
+
         sb_lay.addWidget(self.plan_card)
         sb_lay.addSpacing(4)
 
-        self.lbl_privacy_badge = QLabel("100% Local AI · Offline")
+        self.lbl_privacy_badge = QLabel(f"v{__version__} · 100% Local AI · Offline")
         self.lbl_privacy_badge.setObjectName("sbMutedLabel")
         self.lbl_privacy_badge.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.lbl_privacy_badge.setAccessibleName("Privacy status indicator")
@@ -780,10 +786,10 @@ class MainWindow(QMainWindow):
         )
         self.sidebar.setStyleSheet(
             f"""
-            QFrame {{ background-color: {t['sidebar_bg']}; border-right: 1px solid {t['line']}; }}
+            QFrame#leftSidebar {{ background-color: {t['sidebar_bg']}; border-right: 1px solid {t['line']}; }}
             QLabel {{ color: {t['text']}; border: none; background: transparent; }}
             QLabel#sbMutedLabel {{ color: {t['text_dim']}; font-size: 11px; padding: 6px 8px 0 8px; }}
-            QFrame#sbDivider {{ background-color: {t['line']}; border: none; }}
+            QFrame#sbDivider, QFrame#profileDivider {{ background-color: {t['line']}; border: none; max-height: 1px; }}
             QPushButton {{
                 text-align: left;
                 padding: 7px 12px;
@@ -814,7 +820,7 @@ class MainWindow(QMainWindow):
             }}
             QFrame#planStatusCard {{
                 background-color: {t['surface']};
-                border: 1px solid {t['line']};
+                border: 1px solid {t['border']};
                 border-radius: 10px;
             }}
             QLabel#planSectionHeader {{
@@ -839,6 +845,7 @@ class MainWindow(QMainWindow):
                 font-weight: 400;
             }}
             QPushButton#btnGoogleSignIn {{
+                text-align: center;
                 background-color: {t['surface_well']};
                 color: {t['text_primary']};
                 border: 1px solid {t['border']};
@@ -852,15 +859,19 @@ class MainWindow(QMainWindow):
                 border-color: {t['accent']};
             }}
             QPushButton#btnUserSignOut {{
-                background-color: transparent;
-                color: {t['text_dim']};
-                border: none;
-                font-size: 10px;
-                font-weight: 500;
-                padding: 2px 4px;
+                text-align: center;
+                background-color: {t['surface_well']};
+                color: {t['text_secondary']};
+                border: 1px solid {t['border']};
+                border-radius: 6px;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 3px 8px;
             }}
             QPushButton#btnUserSignOut:hover {{
+                background-color: {t['surface_secondary']};
                 color: #EF4444;
+                border-color: #EF4444;
             }}
             """
         )
@@ -882,6 +893,7 @@ class MainWindow(QMainWindow):
         self._update_plan_card()
 
     set_theme = apply_theme
+    _apply_theme = apply_theme
 
     def show_toast(self, title: str, message: str) -> None:
         if not self.isVisible():
@@ -951,12 +963,19 @@ class MainWindow(QMainWindow):
 
     def _on_manual_check_updates(self) -> None:
         """User clicked 'Check for Updates' in sidebar."""
+        from voxlocal import __version__
         self.show_toast("Checking for Updates", "Connecting to VOX update server...")
         def _bg():
             is_avail, manifest, msg = self.controller.check_for_updates(timeout_sec=10)
             if not is_avail:
                 from PyQt6.QtCore import QTimer
-                QTimer.singleShot(0, lambda: self.show_toast("VOX Up to Date", msg or "You are using the latest version of VOX (v1.0.1)."))
+                QTimer.singleShot(
+                    0,
+                    lambda: self.show_toast(
+                        "VOX Up to Date",
+                        msg or f"You are using the latest version of VOX (v{__version__}).",
+                    ),
+                )
         import threading
         threading.Thread(target=_bg, daemon=True, name="ManualUpdateCheck").start()
 
@@ -989,7 +1008,18 @@ class MainWindow(QMainWindow):
 
     def _start_in_app_update(self, manifest: Dict[str, Any]) -> None:
         """Downloads the cryptographically verified installer in background and restarts."""
-        ver = str(manifest.get("version", "1.0.1"))
+        from voxlocal import __version__
+        if getattr(self.controller, "capture_state", "idle") in ("recording", "paused"):
+            defer_msg = (
+                "An active meeting recording is currently in progress. "
+                "VOX will defer installing this update until your meeting finishes."
+            )
+            self.show_toast("Update Deferred", defer_msg)
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Meeting Recording in Progress", defer_msg)
+            return
+
+        ver = str(manifest.get("version", __version__))
         self.show_toast("Downloading Update...", f"Fetching VOX v{ver} in background...")
 
         def _bg_downloader():
@@ -1042,6 +1072,32 @@ class MainWindow(QMainWindow):
         try:
             t = get_theme_tokens(self._theme)
 
+            self.plan_card.setStyleSheet(
+                f"QFrame#planStatusCard {{ "
+                f"background-color: {t['surface']}; "
+                f"border: 1px solid {t['border']}; "
+                f"border-radius: 10px; "
+                f"}}"
+            )
+            if hasattr(self, "btn_user_sign_out"):
+                self.btn_user_sign_out.setStyleSheet(
+                    f"QPushButton#btnUserSignOut {{ "
+                    f"text-align: center; "
+                    f"background-color: {t['surface_well']}; "
+                    f"color: {t['text_secondary']}; "
+                    f"border: 1px solid {t['border']}; "
+                    f"border-radius: 6px; "
+                    f"font-size: 11px; "
+                    f"font-weight: 600; "
+                    f"padding: 3px 8px; "
+                    f"}} "
+                    f"QPushButton#btnUserSignOut:hover {{ "
+                    f"background-color: {t['surface_secondary']}; "
+                    f"color: #EF4444; "
+                    f"border-color: #EF4444; "
+                    f"}}"
+                )
+
             # 1. Update User Profile Section
             account_status = (
                 self.controller.get_account_status()
@@ -1055,14 +1111,14 @@ class MainWindow(QMainWindow):
             if hasattr(self, "lbl_user_name"):
                 if signed_in and user_email:
                     display_name = user_name if user_name != "Guest User" else user_email.split("@")[0]
-                    # Format display text cleanly with ellipsis so letters never get sliced into vertical lines
+                    # Format display text cleanly with ellipsis across full card width (145 px)
                     fm = self.lbl_user_name.fontMetrics()
-                    elided_name = fm.elidedText(display_name, Qt.TextElideMode.ElideRight, 108)
+                    elided_name = fm.elidedText(display_name, Qt.TextElideMode.ElideRight, 145)
                     self.lbl_user_name.setText(elided_name)
                     self.lbl_user_name.setToolTip(f"{user_name}\n{user_email}\n(Click to view Account & Subscription)")
 
                     fm_email = self.lbl_user_email.fontMetrics()
-                    elided_email = fm_email.elidedText(user_email, Qt.TextElideMode.ElideRight, 108)
+                    elided_email = fm_email.elidedText(user_email, Qt.TextElideMode.ElideRight, 145)
                     self.lbl_user_email.setText(elided_email)
                     self.lbl_user_email.setToolTip(user_email)
                     self.lbl_user_email.setVisible(True)
@@ -1107,8 +1163,9 @@ class MainWindow(QMainWindow):
             is_pro = is_master or bool(ent.get("is_pro", False)) or bool(account_status.get("is_pro", False))
             words_used = int(usage.get("dictation_words", 0))
 
-            limits = ent.get("limits", {})
-            word_limit = int(limits.get("dictation_words_weekly", 3000))
+            limits = ent.get("limits") or {}
+            raw_word_limit = limits.get("dictation_words_weekly")
+            word_limit = int(raw_word_limit) if raw_word_limit is not None else 3000
 
             t = get_theme_tokens(self._theme)
 
@@ -1129,6 +1186,7 @@ class MainWindow(QMainWindow):
                 self.btn_plan_upgrade.setText("👑 Manage Plan")
                 self.btn_plan_upgrade.setStyleSheet(
                     f"QPushButton#planUpgradeBtn {{ "
+                    f"text-align: center; "
                     f"background: transparent; color: {t['accent_emerald']}; "
                     f"border: 1px solid {t['accent_emerald']}; border-radius: 6px; "
                     f"font-size: 11.5px; font-weight: 600; padding: 4px 8px; "
@@ -1162,6 +1220,7 @@ class MainWindow(QMainWindow):
                 self.btn_plan_upgrade.setText("⚡ Upgrade to Pro")
                 self.btn_plan_upgrade.setStyleSheet(
                     f"QPushButton#planUpgradeBtn {{ "
+                    f"text-align: center; "
                     f"background: {t['accent']}; color: #FFFFFF; "
                     f"border: none; border-radius: 6px; "
                     f"font-size: 11.5px; font-weight: 700; padding: 4px 8px; "
@@ -1172,6 +1231,8 @@ class MainWindow(QMainWindow):
                 )
         except Exception as exc:
             logger.debug("Failed updating Plan Status Card: %s", exc)
+
+    _update_plan_status_card = _update_plan_card
 
     def _show_pro_upgrade_dialog(self, reason: str = "") -> None:
         """Show the modern 2026 VOX Pro upgrade modal."""

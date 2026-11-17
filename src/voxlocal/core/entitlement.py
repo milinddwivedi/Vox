@@ -49,6 +49,15 @@ FREE_DEFAULT_LIMITS = {
     "ask_vox_queries_weekly": 10,
 }
 
+PRO_DEFAULT_LIMITS: Dict[str, Any] = {
+    "dictation_words_weekly": None,
+    "meeting_minutes_weekly": None,
+    "meeting_sessions_weekly": None,
+    "meeting_session_cap_min": None,
+    "ask_vox_queries_weekly": None,
+    "allow_meeting_overrun": True,
+}
+
 FREE_DEFAULT_FEATURES = [
     "dictation",
     "dual_track_recording",
@@ -218,7 +227,7 @@ MASTER_DEVELOPER_USER_IDS = {
 def is_master_developer(user_id: Optional[str] = None, email: Optional[str] = None) -> bool:
     """
     Check if the given user ID or email belongs to Founder (Milind) or any
-    employee / stakeholder of World Fashion Exchange (worldfashionexchange.com, WFX).
+    employee / stakeholder of World Fashion Exchange (worldfashionexchange.com).
     All these users receive permanent, full Pro access by default.
     """
     if user_id and str(user_id).strip().lower() in MASTER_DEVELOPER_USER_IDS:
@@ -228,7 +237,7 @@ def is_master_developer(user_id: Optional[str] = None, email: Optional[str] = No
     em = str(email).strip().lower()
     if em in MASTER_DEVELOPER_EMAILS:
         return True
-    if em.endswith("@worldfashionexchange.com") or "worldfashionexchange" in em or "wfx" in em:
+    if em.endswith("@worldfashionexchange.com") and em.split("@")[-1] == "worldfashionexchange.com":
         return True
     return False
 
@@ -404,13 +413,30 @@ class EntitlementManager:
             except Exception:
                 return False
 
-    def set_user_context(self, user_id: Optional[str], email: Optional[str] = None) -> None:
+    def set_user_context(
+        self,
+        user_id: Optional[str],
+        email: Optional[str] = None,
+        plan_code: Optional[str] = None,
+    ) -> None:
         """Sets the active user ID and email context and validates current entitlement against it."""
         with self.lock:
             self._active_user_id = str(user_id) if user_id else "default"
             self._active_email = str(email).strip().lower() if email else ""
-            if is_master_developer(self._active_user_id, self._active_email):
-                logger.info("Master Developer context verified for %s / %s — full Pro access enabled", self._active_email, self._active_user_id)
+            norm_plan = str(plan_code).strip().lower() if plan_code else ""
+            if is_master_developer(self._active_user_id, self._active_email) or norm_plan in ("pro", "pro_monthly", "pro_annual"):
+                self._current_state = EntitlementState(
+                    user_id=self._active_user_id,
+                    plan_code="pro_annual",
+                    status="active",
+                    is_pro=True,
+                    enabled_features=list(PRO_DEFAULT_FEATURES),
+                    usage_limits=dict(PRO_DEFAULT_LIMITS),
+                    last_verified_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    offline_hours_remaining=MAX_OFFLINE_GRACE_HOURS,
+                    is_offline_expired=False,
+                )
+                logger.info("Master Developer / Pro context verified for %s / %s — full Pro access enabled", self._active_email, self._active_user_id)
                 return
             # If current state belongs to another specific user, clear cached token / fall back to free
             if self._active_user_id != "default" and self._current_state.user_id != "default":
@@ -522,6 +548,10 @@ class EntitlementManager:
     def save_entitlement_token(self, token: str, expected_user_id: Optional[str] = None) -> Tuple[bool, str]:
         """Validate, apply, and securely persist an entitlement token received from the backend."""
         with self.lock:
+            valid_raw, payload_raw, _ = verify_and_decode_entitlement_token(token, self.verify_key, expected_user_id=None)
+            if valid_raw and payload_raw and self._active_user_id != "default" and payload_raw.get("user_id") == "guest-device":
+                return False, "Cannot overwrite authenticated user entitlement with guest-device token"
+
             target_user_id = expected_user_id or (self._active_user_id if self._active_user_id != "default" else None)
             valid, payload, err = verify_and_decode_entitlement_token(token, self.verify_key, expected_user_id=target_user_id)
             if not valid or not payload:

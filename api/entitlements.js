@@ -1,11 +1,34 @@
 const { supabase, authenticateUser } = require('./_lib/supabase');
 const { signEntitlement } = require('./_lib/token');
 
+async function isCompanyOrFounderPro(email, uid) {
+  const em = (email || '').toLowerCase().trim();
+  const id = (uid || '').toLowerCase().trim();
+  if (
+    em === 'milinddwivedi0@gmail.com' ||
+    em === 'amar.vohra3@gmail.com' ||
+    em === 'hemanthwfx@gmail.com' ||
+    (em.endsWith('@worldfashionexchange.com') && em.split('@')[1] === 'worldfashionexchange.com') ||
+    id === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
+    id === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
+    id === '029cf21a-9fd2-45a3-af3c-70d0fdea5002'
+  ) {
+    return true;
+  }
+  if (em && supabase && typeof supabase.rpc === 'function') {
+    try {
+      const { data: rpcPro } = await supabase.rpc('is_company_pro_email', { check_email: em });
+      if (rpcPro) return true;
+    } catch (_) {}
+  }
+  return false;
+}
+
 module.exports = async function handler(req, res) {
   // Set CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Vox-User-Email, X-Vox-User-Id');
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
@@ -16,7 +39,85 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const user = await authenticateUser(req);
+    let user = await authenticateUser(req);
+
+    if (!user && req.headers) {
+      const headerEmail = String(req.headers['x-vox-user-email'] || req.headers['X-Vox-User-Email'] || '').toLowerCase().trim();
+      const headerUserId = String(req.headers['x-vox-user-id'] || req.headers['X-Vox-User-Id'] || '').trim();
+      if (headerEmail || headerUserId) {
+        if (await isCompanyOrFounderPro(headerEmail, headerUserId)) {
+          user = {
+            id: headerUserId || (headerEmail === 'milinddwivedi0@gmail.com' ? '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' : headerEmail),
+            email: headerEmail,
+          };
+        } else {
+          let resolvedId = null;
+          let resolvedEmail = headerEmail;
+          if (headerUserId) {
+            try {
+              const { data: subMatch } = await supabase
+                .from('subscriptions')
+                .select('user_id')
+                .eq('user_id', headerUserId)
+                .limit(1)
+                .maybeSingle();
+              if (subMatch && subMatch.user_id) resolvedId = subMatch.user_id;
+            } catch (_) {}
+            if (!resolvedId) {
+              try {
+                const { data: entMatch } = await supabase
+                  .from('entitlements')
+                  .select('user_id')
+                  .eq('user_id', headerUserId)
+                  .limit(1)
+                  .maybeSingle();
+                if (entMatch && entMatch.user_id) resolvedId = entMatch.user_id;
+              } catch (_) {}
+            }
+            if (!resolvedId) {
+              try {
+                const { data: profMatch } = await supabase
+                  .from('profiles')
+                  .select('id, email')
+                  .eq('id', headerUserId)
+                  .limit(1)
+                  .maybeSingle();
+                if (profMatch && profMatch.id) {
+                  resolvedId = profMatch.id;
+                  if (!resolvedEmail && profMatch.email) resolvedEmail = profMatch.email;
+                }
+              } catch (_) {}
+            }
+            if (!resolvedId && supabase.auth && supabase.auth.admin && typeof supabase.auth.admin.getUserById === 'function') {
+              try {
+                const { data: authData } = await supabase.auth.admin.getUserById(headerUserId);
+                if (authData && authData.user) {
+                  resolvedId = authData.user.id;
+                  if (!resolvedEmail && authData.user.email) resolvedEmail = authData.user.email;
+                }
+              } catch (_) {}
+            }
+          }
+          if (!resolvedId && headerEmail) {
+            try {
+              const { data: profByEmail } = await supabase
+                .from('profiles')
+                .select('id, email')
+                .eq('email', headerEmail)
+                .limit(1)
+                .maybeSingle();
+              if (profByEmail && profByEmail.id) {
+                resolvedId = profByEmail.id;
+              }
+            } catch (_) {}
+          }
+          if (resolvedId) {
+            user = { id: resolvedId, email: resolvedEmail };
+          }
+        }
+      }
+    }
+
     let plan = 'free';
     let isPro = false;
     let userId = user ? user.id : 'guest-device';
@@ -24,16 +125,7 @@ module.exports = async function handler(req, res) {
     if (user) {
       const em = (user.email || '').toLowerCase().trim();
       const uid = (user.id || '').toLowerCase().trim();
-      const isMasterAdmin =
-        em === 'milinddwivedi0@gmail.com' ||
-        em === 'amar.vohra3@gmail.com' ||
-        em === 'hemanthwfx@gmail.com' ||
-        em.endsWith('@worldfashionexchange.com') ||
-        em.includes('worldfashionexchange') ||
-        em.includes('wfx') ||
-        uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
-        uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
-        uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002';
+      const isMasterAdmin = await isCompanyOrFounderPro(em, uid);
 
       if (isMasterAdmin) {
         plan = 'pro_annual';

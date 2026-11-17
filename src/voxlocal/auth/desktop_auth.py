@@ -99,7 +99,7 @@ def is_privileged_wfx_user(email: str, user_id: str = "") -> bool:
         return True
     if uid in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9", "029cf21a-9fd2-45a3-af3c-70d0fdea5002"):
         return True
-    if em.endswith("@worldfashionexchange.com") or "worldfashionexchange" in em or "wfx" in em:
+    if em.endswith("@worldfashionexchange.com") and em.split("@")[-1] == "worldfashionexchange.com":
         return True
     return False
 
@@ -147,7 +147,7 @@ class DesktopAuthBroker:
             target_path = self.vault_path
             if not target_path.exists():
                 fallback_vault = Path.home() / ".voxlocal" / "auth_session.vault"
-                if fallback_vault.exists():
+                if fallback_vault.exists() and not os.environ.get("PYTEST_CURRENT_TEST"):
                     target_path = fallback_vault
                 elif (Path.home().name.lower() in ("milin", "milind") or os.environ.get("VOX_DEV_MASTER") == "1") and not os.environ.get("PYTEST_CURRENT_TEST"):
                     # Auto-seed master founder developer session on founder's workstation
@@ -209,12 +209,13 @@ class DesktopAuthBroker:
             encrypted = dpapi_encrypt(raw, description="vox_user_session")
             self.vault_path.parent.mkdir(parents=True, exist_ok=True)
             self.vault_path.write_bytes(encrypted)
-            try:
-                home_vault = Path.home() / ".voxlocal" / "auth_session.vault"
-                home_vault.parent.mkdir(parents=True, exist_ok=True)
-                home_vault.write_bytes(encrypted)
-            except Exception:
-                pass
+            if not os.environ.get("PYTEST_CURRENT_TEST"):
+                try:
+                    home_vault = Path.home() / ".voxlocal" / "auth_session.vault"
+                    home_vault.parent.mkdir(parents=True, exist_ok=True)
+                    home_vault.write_bytes(encrypted)
+                except Exception:
+                    pass
             logger.info("Saved desktop auth session for %s", profile.email)
 
     def get_current_user(self) -> Optional[UserProfile]:
@@ -249,7 +250,10 @@ class DesktopAuthBroker:
 
     def sign_out(self) -> None:
         with self.lock:
-            for p in (self.vault_path, Path.home() / ".voxlocal" / "auth_session.vault"):
+            paths = [self.vault_path]
+            if not os.environ.get("PYTEST_CURRENT_TEST"):
+                paths.append(Path.home() / ".voxlocal" / "auth_session.vault")
+            for p in paths:
                 if p.exists():
                     try:
                         p.unlink()
