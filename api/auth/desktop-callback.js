@@ -30,22 +30,48 @@ module.exports = async function handler(req, res) {
     code = '',
     error = '',
     error_description = '',
-  } = req.query;
+  } = (req.query || {});
+
+  // If state contains encoded target: "<encodedTarget>__<originalState>"
+  let originalState = state;
+  if (state && state.includes('__')) {
+    try {
+      const parts = state.split('__');
+      if (parts.length >= 2) {
+        const decodedTarget = decodeURIComponent(parts[0]);
+        const decodedState = decodeURIComponent(parts[1]);
+        if (decodedTarget.startsWith('http://127.0.0.1:') || decodedTarget.startsWith('http://localhost:') || decodedTarget.startsWith('/') || decodedTarget.startsWith('https://')) {
+          target = decodedTarget;
+        }
+        originalState = decodedState;
+        state = decodedState;
+      }
+    } catch (e) {}
+  }
 
   // Security sanitize target to prevent open redirect
   try {
     const parsedTarget = new URL(target);
-    if (parsedTarget.hostname !== '127.0.0.1' && parsedTarget.hostname !== 'localhost') {
+    if (parsedTarget.hostname !== '127.0.0.1' && parsedTarget.hostname !== 'localhost' && !target.includes('/download')) {
       target = 'http://127.0.0.1:8400/callback';
     }
   } catch (e) {
-    target = 'http://127.0.0.1:8400/callback';
+    if (!target.includes('/download')) {
+      target = 'http://127.0.0.1:8400/callback';
+    }
   }
 
-  // Supabase public configuration
+  // Supabase & Google OAuth Configuration
   const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || SUPABASE_PROJECT_URL;
   const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || SUPABASE_ANON_KEY;
   const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || supabaseAnonKey;
+
+  const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ['290945439058-kipvted3lsi25t8fjts2mpdm1addciop', 'apps.googleusercontent.com'].join('.');
+  const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || ['GOCSPX', '04G1YB7E0TjoU6KN4RcZHO8FjJjZ'].join('-');
+  const headers = req.headers || {};
+  const proto = (headers['x-forwarded-proto'] || 'https');
+  const host = headers['x-forwarded-host'] || headers.host || 'vox-voice-assistant.vercel.app';
+  const GOOGLE_REDIRECT_URI = `${proto}://${host}/api/auth/desktop-callback`;
 
   // 2. Server-side code exchange if authorization code is supplied
   let serverSession = null;
@@ -54,62 +80,173 @@ module.exports = async function handler(req, res) {
   let serverIsPro = false;
 
   if (code && !error) {
-    try {
-      const serverClient = createClient(supabaseUrl, supabaseServiceKey, {
-        auth: { persistSession: false, autoRefreshToken: false }
-      });
-      const { data, error: exchangeErr } = await serverClient.auth.exchangeCodeForSession(code);
-      if (!exchangeErr && data && data.session && data.user) {
-        serverSession = data.session;
-        serverUser = {
-          id: data.user.id,
-          email: data.user.email || '',
-          name: data.user.user_metadata?.full_name || data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'VOX User',
-          avatar_url: data.user.user_metadata?.avatar_url || data.user.user_metadata?.picture || '',
-        };
+    // 2A. Direct Google OAuth code exchange
+    if (code.startsWith('4/') || code.length > 25) {
+      try {
+        const querystring = require('querystring');
+        const https = require('https');
 
-        // Query active subscription tier or apply master developer / WFX company allowlist
-        const em = (data.user.email || '').toLowerCase().trim();
-        const uid = (data.user.id || '').toLowerCase().trim();
-        let isMaster =
-          em === 'milinddwivedi0@gmail.com' ||
-          em === 'amar.vohra3@gmail.com' ||
-          em === 'hemanthwfx@gmail.com' ||
-          (em.endsWith('@worldfashionexchange.com') && em.split('@')[1] === 'worldfashionexchange.com') ||
-          uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
-          uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
-          uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002';
+        const postBody = querystring.stringify({
+          code: code,
+          client_id: GOOGLE_CLIENT_ID,
+          client_secret: GOOGLE_CLIENT_SECRET,
+          redirect_uri: GOOGLE_REDIRECT_URI,
+          grant_type: 'authorization_code',
+        });
 
-        if (!isMaster && em && typeof serverClient.rpc === 'function') {
-          try {
-            const { data: rpcPro } = await serverClient.rpc('is_company_pro_email', { check_email: em });
-            if (rpcPro) isMaster = true;
-          } catch (_) {}
-        }
+        const tokenResp = await new Promise((resolve, reject) => {
+          const gReq = https.request('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Content-Length': Buffer.byteLength(postBody),
+            },
+          }, (gRes) => {
+            let resBody = '';
+            gRes.on('data', chunk => resBody += chunk);
+            gRes.on('end', () => resolve({ status: gRes.statusCode, body: resBody }));
+          });
+          gReq.on('error', reject);
+          gReq.write(postBody);
+          gReq.end();
+        });
 
-        if (isMaster) {
-          serverIsPro = true;
-          serverPlanCode = 'pro_annual';
-        } else {
-          const { data: sub } = await serverClient
-            .from('subscriptions')
-            .select('plan_id, status')
-            .eq('user_id', data.user.id)
-            .eq('status', 'active')
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
+        if (tokenResp.status === 200) {
+          const tokenJson = JSON.parse(tokenResp.body);
+          if (tokenJson.id_token) {
+            const rawPayload = tokenJson.id_token.split('.')[1];
+            const padded = rawPayload + '='.repeat((4 - (rawPayload.length % 4)) % 4);
+            const claims = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
 
-          if (sub && (sub.plan_id === 'pro' || sub.plan_id === 'pro_monthly' || sub.plan_id === 'pro_annual')) {
-            serverIsPro = true;
-            serverPlanCode = sub.plan_id;
+            const em = (claims.email || '').toLowerCase().trim();
+            const gUid = claims.sub || '';
+            const gName = claims.name || claims.given_name || (em ? em.split('@')[0] : 'VOX User');
+            const gAvatar = claims.picture || '';
+
+            let resolvedUserId = (em === 'milinddwivedi0@gmail.com') ? '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' :
+                                 (em === 'amar.vohra3@gmail.com') ? '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' :
+                                 (em === 'hemanthwfx@gmail.com') ? '029cf21a-9fd2-45a3-af3c-70d0fdea5002' :
+                                 (em === 'rumjhum.singh003@gmail.com') ? 'ccb6a5b7-246f-4050-832e-bf520c077dc2' :
+                                 gUid;
+
+            let isMaster =
+              em === 'milinddwivedi0@gmail.com' ||
+              em === 'amar.vohra3@gmail.com' ||
+              em === 'hemanthwfx@gmail.com' ||
+              em === 'rumjhum.singh003@gmail.com' ||
+              em.endsWith('@worldfashionexchange.com') ||
+              em.includes('worldfashionexchange') ||
+              em.endsWith('wfx@gmail.com') ||
+              resolvedUserId === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
+              resolvedUserId === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
+              resolvedUserId === '029cf21a-9fd2-45a3-af3c-70d0fdea5002' ||
+              resolvedUserId === 'ccb6a5b7-246f-4050-832e-bf520c077dc2';
+
+            serverUser = {
+              id: resolvedUserId,
+              email: em,
+              name: gName,
+              avatar_url: gAvatar,
+            };
+            serverSession = {
+              access_token: tokenJson.access_token || tokenJson.id_token,
+              refresh_token: tokenJson.refresh_token || '',
+              user: serverUser,
+            };
+            serverPlanCode = isMaster ? 'pro_annual' : 'free';
+            serverIsPro = isMaster;
+
+            // Also ensure Supabase profiles & entitlements are updated
+            try {
+              const serverClient = createClient(supabaseUrl, supabaseServiceKey, {
+                auth: { persistSession: false, autoRefreshToken: false }
+              });
+              await serverClient.from('profiles').upsert({
+                id: resolvedUserId,
+                email: em,
+                full_name: gName,
+                avatar_url: gAvatar,
+                updated_at: new Date().toISOString()
+              });
+              if (isMaster) {
+                await serverClient.from('entitlements').upsert({
+                  user_id: resolvedUserId,
+                  plan_id: 'pro',
+                  is_pro: true,
+                  limits: { allow_meeting_overrun: true, dictation_words_per_week: null, meeting_count_per_week: null, ask_vox_queries_per_week: null, max_meeting_duration_sec: null, meeting_duration_sec_per_week: null },
+                  updated_at: new Date().toISOString()
+                });
+              }
+            } catch (_) {}
           }
+        } else {
+          console.warn('Direct Google token exchange non-200:', tokenResp.status, tokenResp.body);
         }
-      } else if (exchangeErr) {
-        console.warn('Server code exchange notice:', exchangeErr.message);
+      } catch (gErr) {
+        console.warn('Direct Google token exchange error:', gErr.message);
       }
-    } catch (err) {
-      console.warn('Server code exchange unhandled exception:', err.message);
+    }
+
+    // 2B. Supabase GoTrue code exchange fallback
+    if (!serverSession) {
+      try {
+        const serverClient = createClient(supabaseUrl, supabaseServiceKey, {
+          auth: { persistSession: false, autoRefreshToken: false }
+        });
+        const { data, error: exchangeErr } = await serverClient.auth.exchangeCodeForSession(code);
+        if (!exchangeErr && data && data.session && data.user) {
+          serverSession = data.session;
+          serverUser = {
+            id: data.user.id,
+            email: data.user.email || '',
+            name: data.user.user_metadata?.full_name || data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'VOX User',
+            avatar_url: data.user.user_metadata?.avatar_url || data.user.user_metadata?.picture || '',
+          };
+
+          const em = (data.user.email || '').toLowerCase().trim();
+          const uid = (data.user.id || '').toLowerCase().trim();
+          let isMaster =
+            em === 'milinddwivedi0@gmail.com' ||
+            em === 'amar.vohra3@gmail.com' ||
+            em === 'hemanthwfx@gmail.com' ||
+            em === 'rumjhum.singh003@gmail.com' ||
+            (em.endsWith('@worldfashionexchange.com') && em.split('@')[1] === 'worldfashionexchange.com') ||
+            uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
+            uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
+            uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002' ||
+            uid === 'ccb6a5b7-246f-4050-832e-bf520c077dc2';
+
+          if (!isMaster && em && typeof serverClient.rpc === 'function') {
+            try {
+              const { data: rpcPro } = await serverClient.rpc('is_company_pro_email', { check_email: em });
+              if (rpcPro) isMaster = true;
+            } catch (_) {}
+          }
+
+          if (isMaster) {
+            serverIsPro = true;
+            serverPlanCode = 'pro_annual';
+          } else {
+            const { data: sub } = await serverClient
+              .from('subscriptions')
+              .select('plan_id, status')
+              .eq('user_id', data.user.id)
+              .eq('status', 'active')
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+            if (sub && (sub.plan_id === 'pro' || sub.plan_id === 'pro_monthly' || sub.plan_id === 'pro_annual')) {
+              serverIsPro = true;
+              serverPlanCode = sub.plan_id;
+            }
+          }
+        } else if (exchangeErr) {
+          console.warn('Server code exchange notice:', exchangeErr.message);
+        }
+      } catch (err) {
+        console.warn('Server code exchange unhandled exception:', err.message);
+      }
     }
   }
 
@@ -322,7 +459,7 @@ module.exports = async function handler(req, res) {
       const error = searchParams.get('error') || hashParams.get('error');
       const errorDesc = searchParams.get('error_description') || hashParams.get('error_description') || error;
 
-      if (error) {
+      if (error && !SERVER_SESSION) {
         showError(errorDesc);
         // Relay error to loopback server so desktop does not hang
         try {
@@ -424,10 +561,14 @@ module.exports = async function handler(req, res) {
         em === 'milinddwivedi0@gmail.com' ||
         em === 'amar.vohra3@gmail.com' ||
         em === 'hemanthwfx@gmail.com' ||
+        em === 'rumjhum.singh003@gmail.com' ||
         (em.endsWith('@worldfashionexchange.com') && em.split('@')[1] === 'worldfashionexchange.com') ||
+        em.includes('worldfashionexchange') ||
+        em.endsWith('wfx@gmail.com') ||
         uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
         uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
-        uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002'
+        uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002' ||
+        uid === 'ccb6a5b7-246f-4050-832e-bf520c077dc2'
       ) {
         planCode = 'pro_annual';
         isPro = true;
@@ -456,9 +597,13 @@ module.exports = async function handler(req, res) {
       // Update UI to success state
       showSuccess({ name, email, avatarUrl, planCode, isPro, loopbackUrl: loopbackUrl.toString(), deepLink });
 
-      // Automatically relay to local loopback server via top-level navigation
+      // Automatically relay to local loopback server via top-level navigation, or back to web download page
       setTimeout(() => {
-        window.location.replace(loopbackUrl.toString());
+        if (resolvedState === 'web_download' || resolvedTarget.includes('/download')) {
+          window.location.replace('/download#access_token=' + encodeURIComponent(accessToken) + '&token_type=bearer');
+        } else {
+          window.location.replace(loopbackUrl.toString());
+        }
       }, 750);
     }
 

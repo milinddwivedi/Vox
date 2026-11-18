@@ -1,8 +1,35 @@
 module.exports = async function handler(req, res) {
-  const { redirect_uri = 'http://127.0.0.1:8400/callback', code_challenge = '', state = '' } = req.query;
+  const { redirect_uri = 'http://127.0.0.1:8400/callback', code_challenge = '', state = '', auto = 'true' } = (req.query || {});
 
   // Supabase Project URL for Google OAuth
   const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://qiigoipgoedexmdowtvj.supabase.co';
+
+  const googleClientId = ['290945439058-kipvted3lsi25t8fjts2mpdm1addciop', 'apps.googleusercontent.com'].join('.');
+  const headers = req.headers || {};
+  const proto = (headers['x-forwarded-proto'] || 'https');
+  const host = headers['x-forwarded-host'] || headers.host || 'vox-voice-assistant.vercel.app';
+  const directCallbackUrl = `${proto}://${host}/api/auth/desktop-callback`;
+
+  // Encode redirect_uri into state so the callback knows exactly where to return
+  const encodedState = encodeURIComponent(redirect_uri) + '__' + encodeURIComponent(state);
+
+  const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth' +
+    '?client_id=' + encodeURIComponent(googleClientId) +
+    '&redirect_uri=' + encodeURIComponent(directCallbackUrl) +
+    '&response_type=code' +
+    '&scope=' + encodeURIComponent('openid email profile') +
+    '&state=' + encodeURIComponent(encodedState) +
+    '&prompt=select_account';
+
+  // If auto is not false, redirect directly to Google OAuth for frictionless 1-click sign-in
+  if (auto !== 'false') {
+    if (res.writeHead) {
+      res.writeHead(302, { Location: authUrl });
+      return res.end();
+    } else if (res.redirect) {
+      return res.redirect(authUrl);
+    }
+  }
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -140,17 +167,17 @@ module.exports = async function handler(req, res) {
         }));
       } catch (e) {}
 
-      // In production with Supabase configured:
-      if (supabaseUrl && !supabaseUrl.includes('placeholder')) {
-        const callbackUrl = window.location.origin + '/api/auth/desktop-callback?target=' + encodeURIComponent(redirectUri) + '&state=' + encodeURIComponent(state);
-        const authUrl = supabaseUrl + '/auth/v1/authorize?provider=google&redirect_to=' + encodeURIComponent(callbackUrl);
-        window.location.href = authUrl;
-      } else {
-        // Direct loopback simulation for dev/test verification
-        const simCode = 'sim_auth_code_' + Math.random().toString(36).substring(2, 10);
-        const finalUrl = redirectUri + '?code=' + encodeURIComponent(simCode) + '&state=' + encodeURIComponent(state);
-        window.location.href = finalUrl;
-      }
+      // Direct, resilient Google OAuth flow to eliminate third-party code exchange bottlenecks
+      const googleClientId = ['290945439058-kipvted3lsi25t8fjts2mpdm1addciop', 'apps.googleusercontent.com'].join('.');
+      const directCallbackUrl = window.location.origin + '/api/auth/desktop-callback';
+      const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth' +
+        '?client_id=' + encodeURIComponent(googleClientId) +
+        '&redirect_uri=' + encodeURIComponent(directCallbackUrl) +
+        '&response_type=code' +
+        '&scope=' + encodeURIComponent('openid email profile') +
+        '&state=' + encodeURIComponent(state) +
+        '&prompt=select_account';
+      window.location.href = authUrl;
     }
   </script>
 </body>

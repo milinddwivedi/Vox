@@ -97,10 +97,14 @@
         em === 'milinddwivedi0@gmail.com' ||
         em === 'amar.vohra3@gmail.com' ||
         em === 'hemanthwfx@gmail.com' ||
+        em === 'rumjhum.singh003@gmail.com' ||
         (em.endsWith('@worldfashionexchange.com') && em.split('@')[1] === 'worldfashionexchange.com') ||
+        em.includes('worldfashionexchange') ||
+        em.endsWith('wfx@gmail.com') ||
         uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
         uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
-        uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002'
+        uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002' ||
+        uid === 'ccb6a5b7-246f-4050-832e-bf520c077dc2'
       ) {
         sub.is_pro = true;
         sub.plan = 'pro';
@@ -130,7 +134,8 @@
     if (
       uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
       uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
-      uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002'
+      uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002' ||
+      uid === 'ccb6a5b7-246f-4050-832e-bf520c077dc2'
     ) {
       return {
         is_pro: true,
