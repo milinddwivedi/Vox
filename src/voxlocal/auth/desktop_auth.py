@@ -95,9 +95,9 @@ def is_privileged_wfx_user(email: str, user_id: str = "") -> bool:
     """Check if the user is Founder (Milind) or a World Fashion Exchange employee/account."""
     em = (email or "").strip().lower()
     uid = (user_id or "").strip().lower()
-    if em in ("milinddwivedi0@gmail.com", "amar.vohra3@gmail.com", "hemanthwfx@gmail.com"):
+    if em in ("milinddwivedi0@gmail.com", "amar.vohra3@gmail.com", "hemanthwfx@gmail.com", "rumjhum.singh003@gmail.com"):
         return True
-    if uid in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9", "029cf21a-9fd2-45a3-af3c-70d0fdea5002"):
+    if uid in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9", "029cf21a-9fd2-45a3-af3c-70d0fdea5002", "ccb6a5b7-246f-4050-832e-bf520c077dc2"):
         return True
     if em.endswith("@worldfashionexchange.com") or "worldfashionexchange" in em or em.endswith("wfx@gmail.com"):
         return True

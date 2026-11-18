@@ -1176,7 +1176,7 @@ class MainWindow(QMainWindow):
                 else {}
             )
             from voxlocal.core.entitlement import is_master_developer
-            is_master = is_master_developer(email=user_email or account_status.get("email"))
+            is_master = is_master_developer(user_id=account_status.get("user_id"), email=user_email or account_status.get("email"))
             is_pro = is_master or bool(ent.get("is_pro", False)) or bool(account_status.get("is_pro", False))
             if not signed_in or not user_email:
                 if (

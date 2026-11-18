@@ -474,7 +474,7 @@ class AppController(QObject):
                     if not isinstance(user_info, dict):
                         user_info = {}
                     user_id = session.get("user_id") or user_info.get("id") or "default"
-                    user_email = user_info.get("email") or ""
+                    user_email = user_info.get("email") or session.get("email") or ""
                     from voxlocal.core.entitlement import is_master_developer
                     is_master = is_master_developer(user_id=user_id, email=user_email)
                     plan_code = "pro_annual" if is_master else (user_info.get("plan") or session.get("plan_code") or "free")
@@ -5006,7 +5006,7 @@ class AppController(QObject):
         user_info = (session.get("user") or {}) if session else {}
         if not isinstance(user_info, dict):
             user_info = {}
-        user_email = str(user_info.get("email") or "")
+        user_email = str(user_info.get("email") or (session.get("email") if session else "") or "")
         user_id = str((session.get("user_id") if session else None) or user_info.get("id") or "")
         from voxlocal.core.entitlement import is_master_developer
         is_master = is_master_developer(user_id=user_id, email=user_email)
@@ -5031,6 +5031,7 @@ class AppController(QObject):
         limits = ent.get("limits", {}) if isinstance(ent, dict) else {}
         return {
             "signed_in": True,
+            "user_id": user_id,
             "email": user_email,
             "name": user_info.get("name") or (user_email.split("@")[0] if user_email else "Guest User"),
             "picture": user_info.get("picture"),
