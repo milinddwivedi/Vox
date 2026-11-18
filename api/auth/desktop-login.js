@@ -10,10 +10,15 @@ module.exports = async function handler(req, res) {
   const host = headers['x-forwarded-host'] || headers.host || 'vox-voice-assistant.vercel.app';
   const directCallbackUrl = `${proto}://${host}/api/auth/desktop-callback`;
 
-  // Encode redirect_uri into state so the callback knows exactly where to return
-  const encodedState = encodeURIComponent(redirect_uri) + '__' + encodeURIComponent(state);
+  // Callback URL for Supabase to return to (including target loopback and state)
+  const callbackUrl = `${proto}://${host}/api/auth/desktop-callback?target=${encodeURIComponent(redirect_uri)}&state=${encodeURIComponent(state)}`;
 
-  const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth' +
+  // Canonical Supabase GoTrue Google OAuth authorize URL
+  const supabaseAuthUrl = `${supabaseUrl}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(callbackUrl)}`;
+
+  // Direct Google fallback URL (in case caller explicitly requests direct flow via flow=direct)
+  const encodedState = encodeURIComponent(redirect_uri) + '__' + encodeURIComponent(state);
+  const directAuthUrl = 'https://accounts.google.com/o/oauth2/v2/auth' +
     '?client_id=' + encodeURIComponent(googleClientId) +
     '&redirect_uri=' + encodeURIComponent(directCallbackUrl) +
     '&response_type=code' +
@@ -21,13 +26,16 @@ module.exports = async function handler(req, res) {
     '&state=' + encodeURIComponent(encodedState) +
     '&prompt=select_account';
 
-  // If auto is not false, redirect directly to Google OAuth for frictionless 1-click sign-in
+  // Use Supabase GoTrue by default to ensure proper Supabase user sessions and RLS tokens
+  const targetAuthUrl = (req.query && req.query.flow === 'direct') ? directAuthUrl : supabaseAuthUrl;
+
+  // If auto is not false, redirect to OAuth for frictionless 1-click sign-in
   if (auto !== 'false') {
     if (res.writeHead) {
-      res.writeHead(302, { Location: authUrl });
+      res.writeHead(302, { Location: targetAuthUrl });
       return res.end();
     } else if (res.redirect) {
-      return res.redirect(authUrl);
+      return res.redirect(targetAuthUrl);
     }
   }
 
@@ -167,17 +175,24 @@ module.exports = async function handler(req, res) {
         }));
       } catch (e) {}
 
-      // Direct, resilient Google OAuth flow to eliminate third-party code exchange bottlenecks
-      const googleClientId = ['290945439058-kipvted3lsi25t8fjts2mpdm1addciop', 'apps.googleusercontent.com'].join('.');
-      const directCallbackUrl = window.location.origin + '/api/auth/desktop-callback';
-      const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth' +
-        '?client_id=' + encodeURIComponent(googleClientId) +
-        '&redirect_uri=' + encodeURIComponent(directCallbackUrl) +
-        '&response_type=code' +
-        '&scope=' + encodeURIComponent('openid email profile') +
-        '&state=' + encodeURIComponent(state) +
-        '&prompt=select_account';
-      window.location.href = authUrl;
+      // Use Supabase GoTrue by default to ensure proper Supabase user sessions and RLS tokens
+      if (supabaseUrl && !supabaseUrl.includes('placeholder')) {
+        const callbackUrl = window.location.origin + '/api/auth/desktop-callback?target=' + encodeURIComponent(redirectUri) + '&state=' + encodeURIComponent(state);
+        const authUrl = supabaseUrl + '/auth/v1/authorize?provider=google&redirect_to=' + encodeURIComponent(callbackUrl);
+        window.location.href = authUrl;
+      } else {
+        // Direct, resilient Google OAuth flow fallback
+        const googleClientId = ['290945439058-kipvted3lsi25t8fjts2mpdm1addciop', 'apps.googleusercontent.com'].join('.');
+        const directCallbackUrl = window.location.origin + '/api/auth/desktop-callback';
+        const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth' +
+          '?client_id=' + encodeURIComponent(googleClientId) +
+          '&redirect_uri=' + encodeURIComponent(directCallbackUrl) +
+          '&response_type=code' +
+          '&scope=' + encodeURIComponent('openid email profile') +
+          '&state=' + encodeURIComponent(state) +
+          '&prompt=select_account';
+        window.location.href = authUrl;
+      }
     }
   </script>
 </body>
