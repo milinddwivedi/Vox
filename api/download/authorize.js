@@ -1,6 +1,12 @@
 const { supabase, authenticateUser } = require('../_lib/supabase');
 
 const RELEASE_CATALOG = {
+  'releases/1.0.6/VoxLocal-Setup.exe': {
+    version: '1.0.6',
+    filename: 'VoxLocal-Setup.exe',
+    sha256: '7bfc7f0e0604ff322e3228569ce6f2f453a3f87b14b40764404e2dc2c4a0c8d5',
+    size_bytes: 29609520,
+  },
   'releases/1.0.5/VoxLocal-Setup.exe': {
     version: '1.0.5',
     filename: 'VoxLocal-Setup.exe',
@@ -38,10 +44,10 @@ const RELEASE_CATALOG = {
     size_bytes: 10148603,
   },
   'VoxLocal-Setup.exe': {
-    version: '1.0.5',
+    version: '1.0.6',
     filename: 'VoxLocal-Setup.exe',
-    sha256: 'e2128ecec30c6d23517cc2bb3e99b01ed9defb3ed14447f7b04d43abf8c42292',
-    size_bytes: 29606855,
+    sha256: '7bfc7f0e0604ff322e3228569ce6f2f453a3f87b14b40764404e2dc2c4a0c8d5',
+    size_bytes: 29609520,
   },
 };
 
