@@ -701,6 +701,7 @@ class VoxRestrainedTooltip(QWidget):
 
     def _on_anim_val(self, val: Any) -> None:
         self._opacity = float(val)
+        self.setWindowOpacity(max(0.0, min(1.0, self._opacity)))
         self.update()
 
     def show_for_rect(self, text: str, target_rect: QRect, dock_edge: str = "right") -> None:
@@ -1070,6 +1071,7 @@ class VoxSatelliteChevronButton(QWidget):
 
     def _on_anim_val(self, val: Any) -> None:
         self._opacity = float(val)
+        self.setWindowOpacity(max(0.0, min(1.0, self._opacity)))
         self.update()
 
     def enterEvent(self, event) -> None:
@@ -2094,6 +2096,7 @@ class VoxContextualMeetingPanel(QWidget):
 
     def _on_anim_val(self, val: Any) -> None:
         self._opacity = float(val)
+        self.setWindowOpacity(max(0.0, min(1.0, self._opacity)))
         self.update()
 
     def _build_ui(self) -> None:
@@ -2377,20 +2380,23 @@ class VoxContextualMeetingPanel(QWidget):
 
         def _on_done() -> None:
             self.hide()
+            self.setWindowOpacity(0.0)
             try:
                 self._anim.finished.disconnect(_on_done)
             except Exception:
                 pass
 
+        try:
+            self._anim.finished.disconnect()
+        except Exception:
+            pass
         self._anim.finished.connect(_on_done)
         self._anim.start()
 
     def paintEvent(self, event) -> None:
-        if self._opacity <= 0.01:
-            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setOpacity(self._opacity)
+        painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
 
 
 class VoxVerticalCapsule(QFrame):

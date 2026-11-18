@@ -183,14 +183,6 @@ class DesktopAuthBroker:
                 encrypted = target_path.read_bytes()
                 decrypted = dpapi_decrypt(encrypted)
                 data = json.loads(decrypted.decode("utf-8"))
-                if data.get("access_token") == "dev_founder_master_token":
-                    logger.info("Purging legacy auto-seeded fake token from %s", target_path)
-                    try:
-                        target_path.unlink()
-                    except Exception:
-                        pass
-                    self._current_user = None
-                    return
                 user_id = data.get("user_id", "default")
                 email = data.get("email", "")
                 is_master = is_privileged_wfx_user(email, user_id)

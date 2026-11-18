@@ -506,7 +506,7 @@ class DictationProcessor:
     ]
 
     DEFAULT_HINGLISH_PROMPT = (
-        "Milind, Hemanth, Pankaj, Abhilash, Puneet, Rumjhum, Amar, Astha, WFX, PLM, ERP. Hindi, English, Hinglish conversation."
+        "Milind, Hemanth, Pankaj, Abhilash, Puneet, Rumjhum, Amar, Astha, WFX, PLM, ERP, World Fashion Exchange. Tech Team, Sprint, Daily Scrum."
     )
 
     # Conversational dictionary + phonetic mapping for Romanized Hinglish ('hi_latn') mode

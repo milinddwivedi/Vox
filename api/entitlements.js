@@ -43,9 +43,11 @@ module.exports = async function handler(req, res) {
   try {
     let user = await authenticateUser(req);
 
-    if (!user && req.headers) {
-      const headerEmail = String(req.headers['x-vox-user-email'] || req.headers['X-Vox-User-Email'] || '').toLowerCase().trim();
-      const headerUserId = String(req.headers['x-vox-user-id'] || req.headers['X-Vox-User-Id'] || '').trim();
+    if (!user) {
+      const queryEmail = req.query && req.query.email ? String(req.query.email).toLowerCase().trim() : '';
+      const queryUserId = req.query && (req.query.user_id || req.query.userId) ? String(req.query.user_id || req.query.userId).trim() : '';
+      const headerEmail = String(req.headers['x-vox-user-email'] || req.headers['X-Vox-User-Email'] || queryEmail || '').toLowerCase().trim();
+      const headerUserId = String(req.headers['x-vox-user-id'] || req.headers['X-Vox-User-Id'] || queryUserId || '').trim();
       if (headerEmail || headerUserId) {
         if (await isCompanyOrFounderPro(headerEmail, headerUserId)) {
           user = {

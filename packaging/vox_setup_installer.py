@@ -324,7 +324,7 @@ def main() -> int:
     while i < len(argv):
         arg = argv[i]
         arg_low = arg.lower()
-        if arg_low in ("--silent", "-s", "/s", "/silent"):
+        if arg_low in ("--silent", "-s", "/s", "/silent", "/verysilent", "/suppressmsgboxes", "/norestart", "/sp-"):
             silent = True
         elif arg_low == "--no-launch":
             no_launch = True

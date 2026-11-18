@@ -1039,12 +1039,18 @@ class LocalWhisperTranscriber:
             slug = f"models--Systran--faster-whisper-{repo_id}"
 
         canonical_app_models = get_app_root() / "data" / "models"
+        local_app_data_models = Path(os.path.expandvars(r"%LOCALAPPDATA%\Programs\VOX\data\models"))
+        dev_ws_models = Path(r"D:\Milind\Voice Assistant\data\models")
         search_dirs = [
             self.models_dir / slug / "snapshots",
             canonical_app_models / slug / "snapshots",
+            local_app_data_models / slug / "snapshots",
+            dev_ws_models / slug / "snapshots",
             Path.home() / ".cache" / "huggingface" / "hub" / slug / "snapshots",
             self.models_dir / slug,
             canonical_app_models / slug,
+            local_app_data_models / slug,
+            dev_ws_models / slug,
         ]
         for folder in search_dirs:
             if folder.exists() and folder.is_dir():
@@ -1144,6 +1150,8 @@ class LocalWhisperTranscriber:
                             fallback_m,
                         )
                         target_model = fallback_m
+                        if target_model != bootstrap_target:
+                            needs_bootstrap = True
                         break
 
             if self._model is not None and self._loaded_model_name == target_model:
@@ -1555,11 +1563,11 @@ class LocalWhisperTranscriber:
                     best_of=beam_size,
                     patience=1,
                     length_penalty=1,
-                    repetition_penalty=1,
-                    no_repeat_ngram_size=0,
-                    log_prob_threshold=None,
-                    no_speech_threshold=0.85,
-                    compression_ratio_threshold=2.8,
+                    repetition_penalty=1.15,
+                    no_repeat_ngram_size=3,
+                    log_prob_threshold=-1.0,
+                    no_speech_threshold=0.6,
+                    compression_ratio_threshold=2.4,
                     condition_on_previous_text=False,
                     prompt_reset_on_temperature=0.5,
                     temperatures=temp_tuple,
@@ -1689,9 +1697,11 @@ class LocalWhisperTranscriber:
                     beam_size=beam_size,
                     best_of=beam_size,
                     temperature=temperatures,
-                    no_speech_threshold=0.85,
-                    log_prob_threshold=None,
-                    compression_ratio_threshold=2.8,
+                    repetition_penalty=1.15,
+                    no_repeat_ngram_size=3,
+                    no_speech_threshold=0.6,
+                    log_prob_threshold=-1.0,
+                    compression_ratio_threshold=2.4,
                     initial_prompt=prompt_v,
                     hotwords=hotwords,
                     vad_filter=vad_filter,
@@ -1706,9 +1716,11 @@ class LocalWhisperTranscriber:
                     beam_size=beam_size,
                     best_of=beam_size,
                     temperature=temperatures,
-                    no_speech_threshold=0.85,
-                    log_prob_threshold=None,
-                    compression_ratio_threshold=2.8,
+                    repetition_penalty=1.15,
+                    no_repeat_ngram_size=3,
+                    no_speech_threshold=0.6,
+                    log_prob_threshold=-1.0,
+                    compression_ratio_threshold=2.4,
                     initial_prompt=prompt_v,
                     hotwords=hotwords,
                     vad_filter=vad_filter,

@@ -784,7 +784,7 @@ class VoxNotetakerDrawer(QWidget):
                 font-size: 13px;
             }}
             QPushButton#drawerBackBtn:hover, QPushButton#drawerIconBtn:hover, QPushButton#drawerMiniIconBtn:hover {{
-                background: {t['surface_hover']};
+                background: {t.get('surface_hover', t.get('surface_secondary', '#F5F5F4'))};
                 color: {t['text']};
             }}
             QPushButton#drawerShareBtn {{

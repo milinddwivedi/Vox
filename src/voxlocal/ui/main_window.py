@@ -1050,10 +1050,17 @@ class MainWindow(QMainWindow):
 
                 def _apply_and_restart():
                     self.show_toast("Installing Update", "Restarting VOX to complete installation...")
-                    import subprocess
-                    subprocess.Popen([str(installer_dest), "--silent"])
-                    import sys
+                    import subprocess, sys
+                    from pathlib import Path
                     from PyQt6.QtWidgets import QApplication
+
+                    app_exe = Path(sys.executable)
+                    cmd = (
+                        f'Start-Sleep -Milliseconds 600; '
+                        f'Start-Process -FilePath "{installer_dest}" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" -Wait; '
+                        f'if (Test-Path "{app_exe}") {{ Start-Process -FilePath "{app_exe}" }}'
+                    )
+                    subprocess.Popen(["powershell", "-WindowStyle", "Hidden", "-Command", cmd])
                     QApplication.instance().quit()
 
                 QTimer.singleShot(400, _apply_and_restart)
