@@ -87,6 +87,12 @@ class MeetingPromptPopup(QWidget):
             self.lbl_title.setText(self.session_info.clean_title)
         if hasattr(self, "lbl_badge"):
             self._update_badge_style()
+        if hasattr(self, "btn_record"):
+            is_rec = bool(
+                hasattr(self.controller, "_capture_state")
+                and getattr(self.controller, "_capture_state", "") in ("recording", "paused")
+            )
+            self.btn_record.setText("⚡ Switch Call" if is_rec else "Start Notetaker")
         self._update_countdown_label()
         self.reposition_smart()
 
@@ -383,7 +389,11 @@ class MeetingPromptPopup(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
 
-        self.btn_record = QPushButton("Start Notetaker")
+        is_already_rec = bool(
+            hasattr(self.controller, "_capture_state")
+            and getattr(self.controller, "_capture_state", "") in ("recording", "paused")
+        )
+        self.btn_record = QPushButton("⚡ Switch Call" if is_already_rec else "Start Notetaker")
         self.btn_record.setMinimumWidth(0)
         self.btn_record.setStyleSheet(
             f"""
@@ -511,6 +521,22 @@ class MeetingPromptPopup(QWidget):
                 self.controller.config.save()
             except Exception:
                 pass
+
+        # If meeting is already recording, execute seamless call switch
+        if (
+            hasattr(self.controller, "_capture_state")
+            and getattr(self.controller, "_capture_state", "") in ("recording", "paused")
+            and hasattr(self.controller, "switch_to_meeting")
+        ):
+            self.controller.switch_to_meeting(
+                new_title=sess.clean_title,
+                new_platform=sess.platform,
+                new_target_hwnd=sess.window_hwnd,
+                new_pid=sess.pid,
+                recording_mode=rec_mode,
+            )
+            self.close()
+            return
 
         # Start Call-Only Recording bound directly to the meeting surface in the user's chosen mode
         self.controller.start_meeting_recording(

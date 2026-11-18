@@ -565,6 +565,73 @@ class CallDetector:
         elif self.active_session:
             self.state = MeetingDetectorState.MEETING_CONFIRMED
 
+    def bind_active_meeting(
+        self,
+        hwnd: Optional[int] = None,
+        platform: Optional[str] = None,
+        title: Optional[str] = None,
+        pid: Optional[int] = None,
+    ) -> MeetingSessionInfo:
+        """
+        Manually or programmatically bind an active meeting session to the detector.
+        Used when recording starts from UI toggle bar, drawer, shortcut, or calendar auto-start,
+        ensuring the detector actively tracks call lifecycle, detects call endings, and enables auto-stop.
+        """
+        now = time.monotonic()
+        # Discover window info if not provided
+        if hwnd is None:
+            all_wins = list_all_meeting_windows(include_non_call_hubs=False)
+            if all_wins:
+                hwnd, win_plat, win_title, bounds = all_wins[0]
+                platform = platform or win_plat
+                title = title or win_title
+
+        plat = platform or "Meeting"
+        raw_title = title or "Active Call"
+        clean_title_str = clean_meeting_title(raw_title, plat)
+        title_slug = re.sub(r"[^a-zA-Z0-9]", "", clean_title_str.lower())[:32]
+        h_val = hwnd or 0
+        epoch = self._hwnd_first_seen.setdefault(h_val, int(time.time()))
+        plat_slug = plat.lower().replace(" ", "_")
+        sess_id = f"{plat_slug}_{title_slug or 'call'}_{h_val}_{epoch}"
+
+        if pid is None and hwnd:
+            try:
+                from voxlocal.video.meeting_capture import get_window_pid_and_process_name
+                pid, _ = get_window_pid_and_process_name(hwnd)
+            except Exception:
+                pid = None
+
+        sess = MeetingSessionInfo(
+            session_id=sess_id,
+            platform=plat,
+            window_hwnd=hwnd,
+            window_title=raw_title,
+            clean_title=clean_title_str,
+            bounds=(0, 0, 1280, 720),
+            is_call_stage=bool(hwnd is not None),
+            mic_active=True,
+            pid=pid,
+            first_detected_at=now,
+            confirmed_at=now,
+            decision="approved",
+        )
+        self.active_session = sess
+        self.active = ActiveCall(
+            app_name=plat,
+            key=f"manual_{sess_id}",
+            since=now,
+            window_hwnd=hwnd,
+            window_title=clean_title_str,
+            session_id=sess_id,
+        )
+        self.prompted_session_ids.add(sess_id)
+        self.state = MeetingDetectorState.RECORDING
+        self._is_recording = True
+        self._released_at = None
+        logger.info("Bound active meeting to CallDetector: %s (HWND=%s, PID=%s, title='%s')", plat, hwnd, pid, clean_title_str)
+        return sess
+
     def mark_decision(self, session_id: str, decision: str) -> None:
         """Record user decision ('approved', 'dismissed', 'ignored') for this session ID."""
         now = time.monotonic()

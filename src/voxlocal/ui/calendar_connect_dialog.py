@@ -607,7 +607,10 @@ class VoxCalendarConnectDialog(QDialog):
             self.connected.emit(msg)
             QTimer.singleShot(1100, self._maybe_auto_accept)
         else:
-            _code, friendly = sanitize_oauth_error_for_user(msg)
+            current_tab = self.stack.currentIndex() if hasattr(self, "stack") else 0
+            provider_keys = ["ms_graph", "google", "zoom", "ics", "local_ics", "mapi"]
+            pkey = provider_keys[current_tab] if current_tab < len(provider_keys) else "generic"
+            _code, friendly = sanitize_oauth_error_for_user(msg, provider=pkey)
             self._show_status(friendly, kind="err")
 
     def _maybe_auto_accept(self) -> None:

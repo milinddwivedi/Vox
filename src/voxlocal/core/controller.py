@@ -2975,6 +2975,26 @@ class AppController(QObject):
                 logger.debug("resolve_meeting_source check: %s", exc)
                 source_desc = None
 
+            if source_desc is None and effective_target_hwnd is None:
+                try:
+                    from voxlocal.audio.call_detector import list_all_meeting_windows
+                    all_stages = list_all_meeting_windows(include_non_call_hubs=False)
+                    if all_stages:
+                        w_hwnd, w_plat, w_title, w_bounds = all_stages[0]
+                        from voxlocal.video.meeting_capture import MeetingSourceDescriptor, get_window_pid_and_process_name
+                        w_pid, _ = get_window_pid_and_process_name(w_hwnd)
+                        source_desc = MeetingSourceDescriptor(
+                            source_type="window",
+                            hwnd=w_hwnd,
+                            pid=w_pid,
+                            platform_name=w_plat,
+                            window_title=w_title,
+                            bounds=w_bounds,
+                            is_call_stage=True,
+                        )
+                except Exception as exc:
+                    logger.debug("Fallback call stage discovery: %s", exc)
+
             active_sess = getattr(self.call_detector, "active_session", None)
             if require_active_meeting and source_desc is None and active_sess is None and effective_target_hwnd is None:
                 msg_no_mtg = "No active meeting detected."
@@ -3021,7 +3041,7 @@ class AppController(QObject):
 
             # Bind target HWND / PID / platform for lifecycle auto-stop in both Audio Only and Audio + Video modes
             self._active_meeting_target_hwnd = (
-                source_desc.hwnd if source_desc else (active_sess.window_hwnd if active_sess else effective_target_hwnd)
+                effective_target_hwnd if effective_target_hwnd is not None else (source_desc.hwnd if source_desc else (active_sess.window_hwnd if active_sess else None))
             )
             self._active_meeting_pid = (
                 source_desc.pid if source_desc else (active_sess.pid if active_sess else None)
@@ -3031,6 +3051,24 @@ class AppController(QObject):
             )
             self._active_meeting_session_id = active_sess.session_id if active_sess else ""
             self._manual_target_lost_since = None
+
+            # Ensure CallDetector actively tracks this meeting session for reliable auto-stop
+            if getattr(self, "call_detector", None) is not None:
+                try:
+                    bound_sess = self.call_detector.bind_active_meeting(
+                        hwnd=self._active_meeting_target_hwnd,
+                        platform=self._active_meeting_platform or "Meeting",
+                        title=meeting_title,
+                        pid=self._active_meeting_pid,
+                    )
+                    if bound_sess:
+                        self._active_meeting_session_id = bound_sess.session_id
+                        if not self._active_meeting_target_hwnd and bound_sess.window_hwnd:
+                            self._active_meeting_target_hwnd = bound_sess.window_hwnd
+                            self._active_meeting_platform = bound_sess.platform
+                            self._active_meeting_pid = bound_sess.pid
+                except Exception as exc:
+                    logger.debug("CallDetector bind error: %s", exc)
 
             self._meeting_video_recorder = None
             if should_rec_screen:
@@ -3460,6 +3498,78 @@ class AppController(QObject):
             "resource_snapshot": get_system_resource_snapshot(),
             "hardware_compatibility": compat,
         }
+
+    def switch_to_meeting(
+        self,
+        new_title: str = "",
+        new_platform: Optional[str] = None,
+        new_target_hwnd: Optional[int] = None,
+        new_pid: Optional[int] = None,
+        recording_mode: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Seamlessly transition from current active meeting recording to a new meeting call.
+        Finalizes Call A (flushes audio, launches async intelligence, preserves separate notes/ID)
+        and immediately starts fresh recording for Call B without dropping audio or state leakage.
+        """
+        logger.info(
+            "switch_to_meeting requested: current_state=%s, new_title='%s', new_platform=%s, new_hwnd=%s",
+            self._capture_state,
+            new_title,
+            new_platform,
+            new_target_hwnd,
+        )
+        old_title = getattr(self, "_active_meeting_title", "Previous Meeting")
+
+        # 1. If currently recording, safely finalize previous meeting
+        if self._capture_state in ("recording", "paused"):
+            self.set_meeting_lifecycle_state(
+                MeetingLifecycleState.MEETING_ENDING,
+                f"Transitioning from '{old_title}' to '{new_title or 'Next Call'}'...",
+            )
+            try:
+                self.stop_meeting_recording()
+            except Exception as exc:
+                logger.error("Error stopping previous meeting during call switch: %s", exc)
+
+            # Wait briefly for previous audio recorder to release its writer lock
+            if getattr(self, "meeting_recorder", None):
+                t_end = time.monotonic() + 1.5
+                while getattr(self.meeting_recorder, "is_recording", False) and time.monotonic() < t_end:
+                    time.sleep(0.04)
+
+        # 2. Reset diarizer and live streaming transcriber state to prevent speech spillover into new meeting
+        if hasattr(self, "_active_meeting_diarizer"):
+            self._active_meeting_diarizer = PersistentSpeakerDiarizer(
+                speaker_prefix="Speaker",
+                new_speaker_threshold=0.085,
+                profile_store=getattr(self.transcriber, "speaker_profile_store", None),
+            )
+        if hasattr(self, "streaming_transcriber") and self.streaming_transcriber:
+            try:
+                if hasattr(self.streaming_transcriber, "reset_streaming_session"):
+                    self.streaming_transcriber.reset_streaming_session()
+            except Exception:
+                pass
+
+        # 3. Start fresh recording for Call B
+        clean_new_title = (new_title or "").strip() or f"{new_platform or 'Meeting'} Call"
+        ok, msg = self.start_meeting_recording(
+            title=clean_new_title,
+            target_hwnd=new_target_hwnd,
+            recording_mode=recording_mode,
+            is_auto_detected=True,
+        )
+        if ok:
+            logger.info("Successfully switched to meeting: %s (new_id=%s)", clean_new_title, self._active_meeting_id)
+            self.notification_requested.emit(
+                "Switched Meeting",
+                f"Previous meeting saved. Now recording '{clean_new_title}'.",
+            )
+            return True, f"Switched to {clean_new_title}"
+        else:
+            logger.error("Failed starting new meeting during call switch: %s", msg)
+            return False, f"Could not start new meeting: {msg}"
 
     def _on_meeting_recorder_tick(
         self,
@@ -4708,6 +4818,14 @@ class AppController(QObject):
                                 f"Detected {app_name} call. Recording & transcribing meeting notes.",
                             )
                         self.call_detected.emit(app_name, title)
+                elif self._capture_state in ("recording", "paused"):
+                    # Call Switch / consecutive meeting detected while recording
+                    if (sess_id and sess_id in self._dismissed_call_keys) or (call_key and call_key in self._dismissed_call_keys):
+                        return
+                    logger.info("Consecutive call detected while recording: %s - %s", app_name, title)
+                    if sess:
+                        self.show_meeting_prompt_popup(sess)
+                    self.call_detected.emit(app_name, title)
             elif event == "ended":
                 if self._meeting_prompt_popup and self._meeting_prompt_popup.isVisible():
                     self._meeting_prompt_popup.close()
@@ -4797,8 +4915,7 @@ class AppController(QObject):
                     self.set_meeting_lifecycle_state(MeetingLifecycleState.NO_MEETING_DETECTED, "No active meeting detected.")
             elif (
                 self._capture_state in ("recording", "paused")
-                and self._active_meeting_target_hwnd
-                and bool(self.config.notetaker_auto_end)
+                and bool(getattr(self.config, "notetaker_auto_end", True))
             ):
                 # Monitor verified auto-detected online meeting window (Teams/Meet/Zoom)
                 from voxlocal.audio.call_detector import is_leaving_title, is_non_call_hub
@@ -4806,44 +4923,79 @@ class AppController(QObject):
 
                 plat = getattr(self, "_active_meeting_platform", "") or "Call"
                 target_alive = False
-                if user32.IsWindow(self._active_meeting_target_hwnd):
-                    t = get_window_title(self._active_meeting_target_hwnd)
-                    if not is_leaving_title(t) and not is_non_call_hub(plat, t):
-                        target_alive = True
 
-                if not target_alive:
+                # Dynamic binding: if manual/toggle recording started with no target HWND, discover it now
+                if not self._active_meeting_target_hwnd:
                     sources = discover_meeting_sources(include_non_call_hubs=False)
-                    for src in sources:
-                        if (plat == "Call" or src.platform_name.lower() == plat.lower()) and src.is_call_stage:
-                            if not is_leaving_title(src.window_title):
-                                target_alive = True
-                                self._active_meeting_target_hwnd = src.hwnd
-                                break
-
-                if not target_alive:
-                    if "teams" in plat.lower() and find_teams_sharing_session(self._active_meeting_pid) is not None:
+                    if sources:
+                        top_src = sources[0]
+                        self._active_meeting_target_hwnd = top_src.hwnd
+                        self._active_meeting_pid = top_src.pid
+                        self._active_meeting_platform = top_src.platform_name
+                        plat = top_src.platform_name
                         target_alive = True
-                    elif "zoom" in plat.lower() and find_zoom_sharing_session(self._active_meeting_pid) is not None:
-                        target_alive = True
+                        if getattr(self, "call_detector", None):
+                            try:
+                                self.call_detector.bind_active_meeting(
+                                    hwnd=top_src.hwnd,
+                                    platform=top_src.platform_name,
+                                    title=top_src.window_title,
+                                    pid=top_src.pid,
+                                )
+                            except Exception as e_b:
+                                logger.debug("Error binding active meeting dynamically: %s", e_b)
 
-                if target_alive:
-                    self._manual_target_lost_since = None
-                else:
-                    now_m = time.monotonic()
-                    if self._manual_target_lost_since is None:
-                        self._manual_target_lost_since = now_m
-                    elif (now_m - self._manual_target_lost_since) >= 2.0:
+                if self._active_meeting_target_hwnd:
+                    if user32.IsWindow(self._active_meeting_target_hwnd):
+                        t = get_window_title(self._active_meeting_target_hwnd)
+                        if not is_leaving_title(t) and not is_non_call_hub(plat, t):
+                            target_alive = True
+
+                    if not target_alive:
+                        sources = discover_meeting_sources(include_non_call_hubs=False)
+                        for src in sources:
+                            if (plat == "Call" or src.platform_name.lower() == plat.lower()) and src.is_call_stage:
+                                if not is_leaving_title(src.window_title):
+                                    target_alive = True
+                                    self._active_meeting_target_hwnd = src.hwnd
+                                    break
+
+                    if not target_alive:
+                        if "teams" in plat.lower() and find_teams_sharing_session(self._active_meeting_pid) is not None:
+                            target_alive = True
+                        elif "zoom" in plat.lower() and find_zoom_sharing_session(self._active_meeting_pid) is not None:
+                            target_alive = True
+
+                    if target_alive:
                         self._manual_target_lost_since = None
-                        logger.info("Bound meeting window (HWND=%s) closed/ended -> Auto-stopping meeting recording", self._active_meeting_target_hwnd)
-                        self.set_meeting_lifecycle_state(
-                            MeetingLifecycleState.MEETING_ENDING,
-                            f"{plat} call ended — finalizing recording...",
-                        )
-                        self.stop_meeting_recording()
-                        self.notification_requested.emit(
-                            "Meeting Ended",
-                            f"{plat} call ended. Finalizing meeting notes and transcription...",
-                        )
+                        # Check for call switch: another call stage window opened while this one is leaving
+                        other_sources = [s for s in discover_meeting_sources(include_non_call_hubs=False) if s.hwnd != self._active_meeting_target_hwnd and s.is_call_stage]
+                        if other_sources:
+                            new_call = other_sources[0]
+                            if user32.IsWindow(self._active_meeting_target_hwnd) and is_leaving_title(get_window_title(self._active_meeting_target_hwnd)):
+                                logger.info("Auto-switching from leaving call (HWND=%s) to new call (HWND=%s): %s", self._active_meeting_target_hwnd, new_call.hwnd, new_call.window_title)
+                                self.switch_to_meeting(
+                                    new_title=new_call.window_title,
+                                    new_platform=new_call.platform_name,
+                                    new_target_hwnd=new_call.hwnd,
+                                    new_pid=new_call.pid,
+                                )
+                    else:
+                        now_m = time.monotonic()
+                        if self._manual_target_lost_since is None:
+                            self._manual_target_lost_since = now_m
+                        elif (now_m - self._manual_target_lost_since) >= 2.0:
+                            self._manual_target_lost_since = None
+                            logger.info("Bound meeting window (HWND=%s) closed/ended -> Auto-stopping meeting recording", self._active_meeting_target_hwnd)
+                            self.set_meeting_lifecycle_state(
+                                MeetingLifecycleState.MEETING_ENDING,
+                                f"{plat} call ended — finalizing recording...",
+                            )
+                            self.stop_meeting_recording()
+                            self.notification_requested.emit(
+                                "Meeting Ended",
+                                f"{plat} call ended. Finalizing meeting notes and transcription...",
+                            )
         except Exception as exc:
             logger.debug("Error in _poll_call_detector: %s", exc)
 

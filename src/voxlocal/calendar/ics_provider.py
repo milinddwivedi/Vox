@@ -572,6 +572,13 @@ class IcsCalendarProvider(BaseCalendarProvider):
             logger.warning("ICS calendar validation failed: %s", exc)
             return False
 
+    @property
+    def is_local_file(self) -> bool:
+        """Return True if this ICS provider is backed by a local .ics file rather than a remote HTTP/webcal feed."""
+        if not self._feed_url:
+            return False
+        return not (self._feed_url.startswith("http://") or self._feed_url.startswith("https://") or self._feed_url.startswith("webcal://"))
+
     def is_authenticated(self) -> bool:
         return bool(self._authenticated and self._feed_url)
 

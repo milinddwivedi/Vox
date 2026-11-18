@@ -3136,11 +3136,18 @@ class VoxFlowBar(QWidget):
         self._auto_start_timer.stop()
         self.auto_start_progress = 0.0
         self.meeting_toggle_requested.emit()
-        if self.controller and hasattr(self.controller, "start_meeting_recording"):
+        if self.controller:
             try:
-                self.controller.start_meeting_recording(title=self._meeting_title)
+                is_rec = bool(
+                    hasattr(self.controller, "_capture_state")
+                    and getattr(self.controller, "_capture_state", "") in ("recording", "paused")
+                )
+                if is_rec and hasattr(self.controller, "switch_to_meeting"):
+                    self.controller.switch_to_meeting(new_title=self._meeting_title)
+                elif hasattr(self.controller, "start_meeting_recording"):
+                    self.controller.start_meeting_recording(title=self._meeting_title)
             except Exception as exc:
-                logger.debug("start_meeting_recording trigger: %s", exc)
+                logger.debug("start_meeting_recording/switch trigger: %s", exc)
         self.set_pill_state(PillState.ACTIVE_RECORDING)
 
     def _on_join_without_notetaker(self) -> None:

@@ -662,8 +662,9 @@ class TestE2ECalendarAndMeeting(unittest.TestCase):
 
             def _hit() -> None:
                 time.sleep(0.08)
+                target_url = f"{r_uri.replace('localhost', '127.0.0.1')}{callback_path}"
                 try:
-                    urllib.request.urlopen(f"{r_uri}{callback_path}", timeout=5).read()
+                    urllib.request.urlopen(target_url, timeout=5).read()
                 except (PermissionError, OSError):
                     # Catch PermissionError / WinError 10013 during test HTTP callback delivery
                     # and simulate redirect request directly against the provider callback handler

@@ -181,11 +181,13 @@ def sanitize_oauth_error_for_user(raw_error: str, provider: str = "") -> Tuple[s
     raw = (raw_error or "").strip()
     low = raw.lower()
     provider_label = {
-        "ms_graph": "Microsoft",
-        "google": "Google",
-        "zoom": "Zoom",
-        "ics": "ICS Calendar",
-        "local_mapi": "Outlook Desktop",
+        "ms_graph": "Microsoft 365 / Outlook",
+        "google": "Google Calendar",
+        "zoom": "Zoom Meetings",
+        "ics": "Calendar Feed (.ics)",
+        "local_ics": "Local Calendar (.ics)",
+        "local_mapi": "Classic Outlook Desktop",
+        "mapi": "Classic Outlook Desktop",
     }.get((provider or "").lower(), "your calendar provider")
 
     if any(tok in low for tok in ("aadsts65001", "aadsts65002", "admin_approval", "consent_required", "admin approval", "admin_consent")):
@@ -199,6 +201,36 @@ def sanitize_oauth_error_for_user(raw_error: str, provider: str = "") -> Tuple[s
         return (
             "AUTH_EXPIRED",
             f"{provider_label} requires another sign-in verification check. Click Reconnect to complete sign-in.",
+        )
+
+    if any(tok in low for tok in ("outlook is not installed", "mapi unavailable", "pywintypes", "win32com", "com error")):
+        return (
+            "MAPI_UNAVAILABLE",
+            "Classic Outlook Desktop (MAPI) is not installed or unavailable on this system. If you use Microsoft 365 or Outlook for Web, please connect using the Microsoft tab.",
+        )
+
+    if "file not found" in low or "does not exist" in low or "no such file" in low:
+        return (
+            "FILE_NOT_FOUND",
+            f"The specified local calendar file does not exist. Please choose an existing .ics file on disk.",
+        )
+
+    if "404" in low or "not found" in low:
+        return (
+            "ICS_NOT_FOUND",
+            f"Calendar feed URL was not found (HTTP 404). Please verify that the .ics URL is correct and publicly published.",
+        )
+
+    if "403" in low or "forbidden" in low:
+        return (
+            "ICS_FORBIDDEN",
+            f"Access to the calendar feed was forbidden (HTTP 403). Ensure the feed URL does not require organization intranet or VPN login.",
+        )
+
+    if "no valid calendar events" in low or "vevent" in low or "malformed" in low:
+        return (
+            "ICS_PARSE_ERROR",
+            "The calendar file or URL does not contain valid iCalendar events (VEVENT). Please check the file formatting.",
         )
 
     if any(tok in low for tok in ("access_denied", "user_cancelled", "cancelled by user", "declined")):
@@ -255,9 +287,15 @@ def sanitize_oauth_error_for_user(raw_error: str, provider: str = "") -> Tuple[s
             f"Could not reach {provider_label} right now (network offline). Previously synced meetings remain available.",
         )
 
+    if raw and len(raw) < 200 and "\n" not in raw and "Traceback" not in raw:
+        return (
+            "AUTH_FAILED",
+            f"Could not connect to {provider_label}: {raw}",
+        )
+
     return (
         "AUTH_FAILED",
-        f"VOX could not finish connecting to {provider_label}. Please try reconnecting in a moment.",
+        f"VOX could not finish connecting to {provider_label}. Please check your connection or credentials and try again.",
     )
 
 

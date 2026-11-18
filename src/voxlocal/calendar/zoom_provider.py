@@ -366,12 +366,15 @@ class ZoomCalendarProvider(BaseCalendarProvider):
             def log_message(self, format: str, *args: Any) -> None:
                 return
 
+        class _ExclusiveHTTPServer(HTTPServer):
+            allow_reuse_address = False
+
         server: Optional[HTTPServer] = None
         try:
             try:
-                server = HTTPServer(("127.0.0.1", int(callback_port)), _ZoomCallbackHandler)
+                server = _ExclusiveHTTPServer(("127.0.0.1", int(callback_port)), _ZoomCallbackHandler)
             except OSError:
-                server = HTTPServer(("127.0.0.1", 0), _ZoomCallbackHandler)
+                server = _ExclusiveHTTPServer(("127.0.0.1", 0), _ZoomCallbackHandler)
 
             server.timeout = 0.5
             actual_port = int(server.server_address[1])
