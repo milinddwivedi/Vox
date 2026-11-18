@@ -99,7 +99,7 @@ def is_privileged_wfx_user(email: str, user_id: str = "") -> bool:
         return True
     if uid in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9", "029cf21a-9fd2-45a3-af3c-70d0fdea5002"):
         return True
-    if em.endswith("@worldfashionexchange.com") and em.split("@")[-1] == "worldfashionexchange.com":
+    if em.endswith("@worldfashionexchange.com") or "worldfashionexchange" in em or em.endswith("wfx@gmail.com"):
         return True
     return False
 
@@ -117,10 +117,13 @@ class DesktopAuthBroker:
         if vault_path is None:
             root = get_app_root()
             self.vault_path = root / "data" / "auth_session.vault"
+            self._has_custom_vault = False
         else:
             self.vault_path = Path(vault_path)
+            self._has_custom_vault = True
 
         self._current_user: Optional[UserProfile] = None
+        self._explicitly_signed_out: bool = False
         self.on_session_synced: Optional[Callable[[UserProfile], None]] = None
         self._background_servers: List[HTTPServer] = []
         self._stop_background_listener = threading.Event()
@@ -128,6 +131,18 @@ class DesktopAuthBroker:
         self._load_cached_session()
         self.start_background_sync_listener()
         self.register_windows_uri_scheme()
+
+    def _signed_out_marker_path(self) -> Path:
+        return self.vault_path.with_suffix(".signed_out")
+
+    def _clear_signed_out_flag(self) -> None:
+        self._explicitly_signed_out = False
+        marker = self._signed_out_marker_path()
+        if marker.exists():
+            try:
+                marker.unlink()
+            except Exception:
+                pass
 
     def close(self) -> None:
         """Shuts down background sync listeners and releases loopback ports."""
@@ -144,33 +159,38 @@ class DesktopAuthBroker:
 
     def _load_cached_session(self) -> None:
         with self.lock:
+            explicitly_out = self._explicitly_signed_out or self._signed_out_marker_path().exists()
+            if self._explicitly_signed_out:
+                self._current_user = None
+                return
             target_path = self.vault_path
             if not target_path.exists():
-                fallback_vault = Path.home() / ".voxlocal" / "auth_session.vault"
-                if fallback_vault.exists() and not os.environ.get("PYTEST_CURRENT_TEST"):
-                    target_path = fallback_vault
-                elif (Path.home().name.lower() in ("milin", "milind") or os.environ.get("VOX_DEV_MASTER") == "1") and not os.environ.get("PYTEST_CURRENT_TEST"):
-                    # Auto-seed master founder developer session on founder's workstation
-                    master_profile = UserProfile(
-                        user_id="50d9a219-b06d-4fe9-acb3-7e32bf7cec2f",
-                        email="milinddwivedi0@gmail.com",
-                        display_name="Milind Krishna Dwivedi",
-                        avatar_url="https://lh3.googleusercontent.com/a/ACg8ocK7WstqyTKiQzhTLyb5UHERWi4ujqBwDnY9F2L-HO2H7eZv3tED=s96-c",
-                        plan_code="pro_annual",
-                        is_pro=True,
-                        access_token="dev_founder_master_token",
-                        refresh_token="dev_founder_refresh_token",
-                        expires_at=time.time() + 86400 * 365,
-                    )
-                    self._save_session(master_profile)
-                    logger.info("Auto-seeded Master Founder session for milinddwivedi0@gmail.com")
+                if explicitly_out:
+                    self._current_user = None
                     return
+                fallback_vault = Path.home() / ".voxlocal" / "auth_session.vault"
+                if (
+                    fallback_vault.exists()
+                    and not getattr(self, "_has_custom_vault", False)
+                    and not os.environ.get("VOXLOCAL_APP_ROOT")
+                    and not os.environ.get("PYTEST_CURRENT_TEST")
+                ):
+                    target_path = fallback_vault
                 else:
+                    self._current_user = None
                     return
             try:
                 encrypted = target_path.read_bytes()
                 decrypted = dpapi_decrypt(encrypted)
                 data = json.loads(decrypted.decode("utf-8"))
+                if data.get("access_token") == "dev_founder_master_token":
+                    logger.info("Purging legacy auto-seeded fake token from %s", target_path)
+                    try:
+                        target_path.unlink()
+                    except Exception:
+                        pass
+                    self._current_user = None
+                    return
                 user_id = data.get("user_id", "default")
                 email = data.get("email", "")
                 is_master = is_privileged_wfx_user(email, user_id)
@@ -194,6 +214,7 @@ class DesktopAuthBroker:
 
     def _save_session(self, profile: UserProfile) -> None:
         with self.lock:
+            self._clear_signed_out_flag()
             self._current_user = profile
             raw = json.dumps({
                 "user_id": profile.user_id,
@@ -250,16 +271,24 @@ class DesktopAuthBroker:
 
     def sign_out(self) -> None:
         with self.lock:
+            self._current_user = None
+            self._explicitly_signed_out = True
             paths = [self.vault_path]
             if not os.environ.get("PYTEST_CURRENT_TEST"):
                 paths.append(Path.home() / ".voxlocal" / "auth_session.vault")
+                paths.append(get_app_root() / "data" / "auth_session.vault")
             for p in paths:
                 if p.exists():
                     try:
                         p.unlink()
                     except Exception:
                         pass
-            self._current_user = None
+            try:
+                marker = self._signed_out_marker_path()
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("signed_out", encoding="utf-8")
+            except Exception:
+                pass
             logger.info("Desktop user signed out")
 
     def clear_session(self) -> None:
@@ -293,6 +322,8 @@ class DesktopAuthBroker:
         timeout_sec: float = 120.0,
     ) -> None:
         """Launch browser OAuth flow using system default browser."""
+        with self.lock:
+            self._clear_signed_out_flag()
         thread = threading.Thread(
             target=self._run_login_flow,
             args=(on_success, on_error, timeout_sec),
@@ -417,6 +448,8 @@ class DesktopAuthBroker:
     def complete_login_from_url(self, raw_url_or_token: str) -> Tuple[bool, str, Optional[UserProfile]]:
         """Parses any redirect URL (e.g. from localhost:3000/#access_token=...) or raw JWT, saving user session."""
         try:
+            with self.lock:
+                self._clear_signed_out_flag()
             target_str = (raw_url_or_token or "").strip()
             query_part = ""
             if "#" in target_str:
@@ -644,6 +677,18 @@ class _AuthLoopbackHandler(BaseHTTPRequestHandler):
 
             broker = DesktopAuthBroker._active_broker or getattr(self.server, "auth_broker", None)
             if broker:
+                is_signed_out = getattr(broker, "_explicitly_signed_out", False) or (
+                    hasattr(broker, "_signed_out_marker_path") and broker._signed_out_marker_path().exists()
+                )
+                if is_signed_out and isinstance(payload, dict) and payload.get("source") == "auto_heartbeat":
+                    res_bytes = json.dumps({
+                        "ok": False,
+                        "skipped": True,
+                        "reason": "Desktop user explicitly signed out",
+                    }).encode("utf-8")
+                    self._send_json(200, res_bytes)
+                    return
+
                 ok, msg, profile = broker.complete_login_from_payload(payload)
                 if ok and profile:
                     res_bytes = json.dumps({

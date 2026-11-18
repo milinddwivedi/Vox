@@ -494,10 +494,19 @@ class DictationProcessor:
         (r"\bडिपेंडेंसी\b", "dependency"),
         (r"\bडिलीवर\b", "deliver"),
         (r"\bकनेक्टेड\b", "connected"),
+        # Domain name and team entity phonetic corrections
+        (r"\b(?:Achilles|Achillesha|achillesha|A\s+village)\b", "Abhilash"),
+        (r"\b(?:Hey\s+man|Hey\s+manth|K-month|Hiemont|k-month)\b", "Hemanth"),
+        (r"\b(?:punkers|Punkers)\b", "Pankaj"),
+        (r"\b(?:Rungjom|rungjom)\b", "Rumjhum"),
+        (r"\bWFS\b", "WFX"),
+        (r"\bAazitit\b", "as it is"),
+        (r"\bVoonone\b", "Unhone"),
+        (r"\b(?:two\s+PU|to\s+a\s+few)\b", "2 PU"),
     ]
 
     DEFAULT_HINGLISH_PROMPT = (
-        "Hinglish, Hindi, English meeting. Technical keywords: PR, sprint, ticket, backlog, deployment, QA, standup, update, code review, bug fix, commit, merge, baad mein, karenge."
+        "Milind, Hemanth, Pankaj, Abhilash, Puneet, Rumjhum, Amar, Astha, WFX, PLM, ERP. Hindi, English, Hinglish conversation."
     )
 
     # Conversational dictionary + phonetic mapping for Romanized Hinglish ('hi_latn') mode

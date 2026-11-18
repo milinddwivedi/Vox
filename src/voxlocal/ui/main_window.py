@@ -639,6 +639,8 @@ class MainWindow(QMainWindow):
             self.insights_page.refresh()
         elif idx == 7:
             self.settings_page.load_from_config()
+            if hasattr(self.settings_page, "_update_account_ui"):
+                self.settings_page._update_account_ui()
         elif idx == 8:
             self.calendar_page.refresh()
 
@@ -941,8 +943,16 @@ class MainWindow(QMainWindow):
             return
 
         effective_ent = self.controller.entitlement.get_effective_entitlement() if hasattr(self.controller, "entitlement") else {}
-        is_pro = bool(effective_ent.get("is_pro", False))
-        reason = "Manage VOX Pro Plan" if is_pro else "Upgrade to VOX Pro"
+        is_pro = bool(account.get("is_pro", False)) or bool(effective_ent.get("is_pro", False))
+        if is_pro:
+            self.show_settings_dialog(4)
+            self.show_toast(
+                "Account & Subscription",
+                "Account & Subscription — Manage your VOX Pro plan and connected accounts.",
+            )
+            return
+
+        reason = "Upgrade to VOX Pro"
         if hasattr(self.controller, "request_upgrade_dialog"):
             self.controller.request_upgrade_dialog(reason=reason)
         else:
@@ -1161,6 +1171,15 @@ class MainWindow(QMainWindow):
             from voxlocal.core.entitlement import is_master_developer
             is_master = is_master_developer(email=user_email or account_status.get("email"))
             is_pro = is_master or bool(ent.get("is_pro", False)) or bool(account_status.get("is_pro", False))
+            if not signed_in or not user_email:
+                if (
+                    entitlement_data is not None
+                    and bool(entitlement_data.get("is_pro", False))
+                    and entitlement_data.get("user_id") not in ("default", "guest-device")
+                ):
+                    is_pro = True
+                else:
+                    is_pro = False
             words_used = int(usage.get("dictation_words", 0))
 
             limits = ent.get("limits") or {}

@@ -149,6 +149,7 @@ class LiveMeetingStreamingTranscriber:
         self._silence_start_sec: float = 0.0
         self._turn_start_sec: float = 0.0
         self._current_speaker: str = "Speaker 1"
+        self._remote_speaker_label: str = "Speaker 1"
         self._current_track: str = "system"
         self._step_accumulated_sec: float = 0.0
 
@@ -161,6 +162,7 @@ class LiveMeetingStreamingTranscriber:
         meeting_id: int,
         recorder: Any,
         language: str = "en+hi",
+        remote_speaker: str = "Speaker 1",
     ) -> None:
         """Start live streaming transcription for the given meeting."""
         with self._lock:
@@ -170,6 +172,7 @@ class LiveMeetingStreamingTranscriber:
             self._meeting_id = meeting_id
             self._recorder = recorder
             self._language = language
+            self._remote_speaker_label = (remote_speaker or "Speaker 1").strip() or "Speaker 1"
             self._active = True
             self._paused = False
             self._stop_event.clear()
@@ -181,7 +184,7 @@ class LiveMeetingStreamingTranscriber:
             self._speech_active = False
             self._silence_start_sec = 0.0
             self._turn_start_sec = 0.0
-            self._current_speaker = "Speaker 1"
+            self._current_speaker = self._remote_speaker_label
             self._current_track = "system"
             self._step_accumulated_sec = 0.0
 
@@ -265,43 +268,47 @@ class LiveMeetingStreamingTranscriber:
         if window_dur < 0.4:
             return
 
-        # Dual-track VAD energy assessment
-        mic_rms = float(np.sqrt(np.mean(mic_slice**2))) if mic_slice.size else 0.0
-        sys_rms = float(np.sqrt(np.mean(sys_slice**2))) if sys_slice.size else 0.0
+        # Dual-track VAD energy assessment on the latest 0.45s tail so ambient mic noise
+        # or earlier speech in the window never masks silence or remote participant speech.
+        tail_samples = max(1, int(TARGET_SAMPLE_RATE * 0.45))
+        mic_tail = mic_slice[-tail_samples:] if mic_slice.size > tail_samples else mic_slice
+        sys_tail = sys_slice[-tail_samples:] if sys_slice.size > tail_samples else sys_slice
 
-        speech_thresh = 0.0006
-        is_mic_speech = mic_rms >= speech_thresh
-        is_sys_speech = sys_rms >= speech_thresh
+        mic_rms = float(np.sqrt(np.mean(mic_tail**2))) if mic_tail.size else 0.0
+        sys_rms = float(np.sqrt(np.mean(sys_tail**2))) if sys_tail.size else 0.0
 
+        # Separate thresholds: physical microphones have ambient room noise (~0.001-0.0025),
+        # whereas digital WASAPI loopback is near-zero when silent.
+        mic_speech_thresh = 0.0035
+        sys_speech_thresh = 0.0012
+        is_mic_speech = mic_rms >= mic_speech_thresh
+        is_sys_speech = sys_rms >= sys_speech_thresh
+
+        remote_label = getattr(self, "_remote_speaker_label", "Speaker 1") or "Speaker 1"
         active_track = "system"
-        active_slice = sys_slice
-        active_speaker = "Speaker 1"
+        active_speaker = remote_label
 
         if is_mic_speech and not is_sys_speech:
             active_track = "mic"
-            active_slice = mic_slice
             active_speaker = "You (Mic)"
         elif is_sys_speech and not is_mic_speech:
             active_track = "system"
-            active_slice = sys_slice
-            active_speaker = "Speaker 1"
+            active_speaker = remote_label
         elif is_mic_speech and is_sys_speech:
-            # Both active: select dominant energy track
-            if mic_rms > sys_rms * 1.5:
+            # Both active: select dominant energy track relative to threshold
+            if (mic_rms / mic_speech_thresh) > (sys_rms / sys_speech_thresh) * 1.25:
                 active_track = "mic"
-                active_slice = mic_slice
                 active_speaker = "You (Mic)"
             else:
                 active_track = "system"
-                active_slice = sys_slice
-                active_speaker = "Speaker 1"
+                active_speaker = remote_label
         else:
-            # Silence / background noise
+            # Silence / background noise in the latest 0.45s tail
             if self._speech_active:
                 if self._silence_start_sec == 0.0:
                     self._silence_start_sec = now_sec
-                elif (now_sec - self._silence_start_sec) >= 0.4:
-                    # Speech turn boundary detected! Flush current utterance
+                elif (now_sec - self._silence_start_sec) >= 0.45:
+                    # Speech turn boundary detected! Flush current utterance cleanly
                     self._execute_transcribe_pass(
                         actual_start, now_sec, self._current_track, self._current_speaker, speech_boundary=True
                     )
@@ -309,6 +316,7 @@ class LiveMeetingStreamingTranscriber:
                     self._silence_start_sec = 0.0
                     self._step_accumulated_sec = 0.0
                     self._audio_cursor_sec = now_sec
+                    self._agreement_engine.reset()
             else:
                 # Still silent: advance cursor to keep window short and prevent memory accumulation
                 if window_dur >= 2.0:
@@ -323,13 +331,28 @@ class LiveMeetingStreamingTranscriber:
             self._current_track = active_track
             self._silence_start_sec = 0.0
             self._step_accumulated_sec = 0.0
+        elif active_track != self._current_track and window_dur >= 1.2:
+            # Active speaker switched between Mic and System mid-window!
+            # Flush previous speaker's turn cleanly before switching tracks so neither speaker is lost.
+            boundary_sec = max(actual_start + 0.4, now_sec - 0.35)
+            self._execute_transcribe_pass(
+                actual_start, boundary_sec, self._current_track, self._current_speaker, speech_boundary=True
+            )
+            self._audio_cursor_sec = boundary_sec
+            self._agreement_engine.reset()
+            self._turn_start_sec = boundary_sec
+            self._current_track = active_track
+            self._current_speaker = active_speaker
+            self._silence_start_sec = 0.0
+            self._step_accumulated_sec = 0.0
+            return
 
         self._silence_start_sec = 0.0
         self._step_accumulated_sec += 0.15
 
-        # Trigger partial inference if continuous speech has accumulated >= 2.0s
-        # If continuous speech exceeds 10s without a natural pause, force turn boundary flush to prevent runaway buffer
-        if window_dur >= 10.0:
+        # Trigger partial inference if continuous speech has accumulated >= 1.8s
+        # If continuous speech exceeds 8.5s without a natural pause, force turn boundary flush
+        if window_dur >= 8.5:
             self._execute_transcribe_pass(
                 actual_start, now_sec, self._current_track, self._current_speaker, speech_boundary=True
             )
@@ -337,7 +360,8 @@ class LiveMeetingStreamingTranscriber:
             self._silence_start_sec = 0.0
             self._step_accumulated_sec = 0.0
             self._audio_cursor_sec = now_sec
-        elif self._step_accumulated_sec >= 2.0:
+            self._agreement_engine.reset()
+        elif self._step_accumulated_sec >= 1.8:
             self._execute_transcribe_pass(
                 actual_start, now_sec, self._current_track, self._current_speaker, speech_boundary=False
             )
@@ -423,91 +447,151 @@ class LiveMeetingStreamingTranscriber:
                 self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec - 4.0)
             return
 
-        # Process with LocalAgreement
-        confirmed, partial = self._agreement_engine.process_step(
-            raw_text, speech_boundary=speech_boundary, vocabulary=vocab
+        if not speech_boundary:
+            # Intermediate streaming pass: emit the full normalized utterance-in-progress as a
+            # live partial preview without slicing the audio cursor mid-word or fragmenting DB rows.
+            partial = self._agreement_engine._clean_and_normalize(raw_text, vocab)
+            if partial and self.on_partial and self._meeting_id is not None:
+                self.on_partial(
+                    self._meeting_id,
+                    {
+                        "speaker": speaker,
+                        "text": partial,
+                        "start_time": start_sec,
+                        "source_track": track,
+                    },
+                )
+            return
+
+        # Speech boundary (pause >= 0.45s, speaker switch, or 8.5s turn cap):
+        # Commit complete, clean utterance for the primary track.
+        confirmed, _ = self._agreement_engine.process_step(
+            raw_text, speech_boundary=True, vocabulary=vocab
         )
+        self._commit_confirmed_segment(start_sec, end_sec, track, speaker, confirmed)
+        self._audio_cursor_sec = end_sec
 
-        # If the window grows >= 18.0s and raw_text is non-empty without a 2-pass prefix match yet,
-        # force-confirm the stable first half of raw_text and advance _audio_cursor_sec proportionally
-        # so speech is never dropped or lost.
-        if not confirmed and (end_sec - self._audio_cursor_sec) >= 18.0:
-            raw_words = raw_text.split()
-            if raw_words:
-                half_len = max(1, len(raw_words) // 2)
-                first_half_raw = " ".join(raw_words[:half_len])
-                rem_half_raw = " ".join(raw_words[half_len:])
-                confirmed = self._agreement_engine._clean_and_normalize(first_half_raw, vocab)
-                partial = self._agreement_engine._clean_and_normalize(rem_half_raw, vocab)
-                self._agreement_engine.prev_words = raw_words[half_len:]
-
-        # Emit Live Partial
-        if partial and self.on_partial and self._meeting_id is not None:
-            self.on_partial(
-                self._meeting_id,
-                {
-                    "speaker": speaker,
-                    "text": partial,
-                    "start_time": start_sec,
-                    "source_track": track,
-                },
+        # Also check if the secondary track had simultaneous speech during [start_sec, end_sec]
+        # so remote participant audio (system) is never starved by microphone activity (or vice-versa).
+        other_track = "system" if track == "mic" else "mic"
+        other_slice = sys_slice if other_track == "system" else mic_slice
+        other_thresh = 0.0015 if other_track == "system" else 0.0040
+        other_rms = float(np.sqrt(np.mean(np.square(other_slice)))) if other_slice.size else 0.0
+        if other_rms >= other_thresh and other_slice.size >= int(TARGET_SAMPLE_RATE * 0.5):
+            if other_slice.size > max_samples:
+                other_slice = other_slice[-max_samples:]
+            other_res = self.transcriber._transcribe_single_encode(
+                norm_audio=other_slice,
+                language=self._language,
+                lang_arg=None,
+                is_en_only=False,
+                bilingual_modes=("", "en+hi", "hinglish", "hi_latn"),
+                beam_size=1,
+                vad_filter=False,
+                vad_params={},
+                hotwords=None,
+                temperatures=0.0,
+                effective_prompt=prompt,
+                word_timestamps=False,
             )
+            if other_res and other_res[0]:
+                other_raw = " ".join(s.text.strip() for s in other_res[0] if s.text.strip())
+                if other_raw and not is_hallucination(other_raw):
+                    other_conf = self._agreement_engine._clean_and_normalize(other_raw, vocab)
+                    other_speaker = (
+                        (getattr(self, "_remote_speaker_label", "Speaker 1") or "Speaker 1")
+                        if other_track == "system"
+                        else "You (Mic)"
+                    )
+                    self._commit_confirmed_segment(start_sec, end_sec, other_track, other_speaker, other_conf)
 
-        # Emit and commit Confirmed Text
-        if confirmed:
-            # Check for duplicate emission against recent segments
-            norm_conf = confirmed.lower()
-            is_dup = False
-            for ex in self._recent_emitted:
-                if (
-                    ex.get("source_track") == track
-                    and abs(start_sec - float(ex.get("start_time", 0.0))) <= 1.5
-                ):
-                    ex_txt = ex.get("text", "").strip().lower()
-                    if ex_txt == norm_conf or norm_conf in ex_txt:
-                        is_dup = True
-                        break
+    def _commit_confirmed_segment(
+        self,
+        start_sec: float,
+        end_sec: float,
+        track: str,
+        speaker: str,
+        confirmed: str,
+    ) -> None:
+        if not confirmed:
+            return
+        cleaned = confirmed.strip(" .,?!;:-—")
+        if not cleaned or cleaned.lower() in ("technical keywords", "hinglish conversation"):
+            return
 
-            if not is_dup:
-                self._segment_index += 1
-                seg_id = None
-                m_id = self._meeting_id if self._meeting_id is not None else 0
-                if self.db and self._meeting_id is not None:
-                    try:
-                        seg_id = self.db.add_transcript_segment(
-                            meeting_id=self._meeting_id,
-                            segment_index=self._segment_index,
-                            start_time=start_sec,
-                            end_time=end_sec,
-                            speaker=speaker,
-                            text=confirmed,
-                            source_track=track,
-                            confidence=0.95,
-                        )
-                    except Exception as db_exc:
-                        logger.debug("Failed saving confirmed segment to DB: %s", db_exc)
+        # Ensure start_sec does not overlap backwards with previous emitted segments on this track
+        last_track_end = 0.0
+        last_track_text = ""
+        for ex in reversed(self._recent_emitted):
+            if ex.get("source_track") == track:
+                last_track_end = float(ex.get("end_time", 0.0))
+                last_track_text = ex.get("text", "").strip()
+                break
 
-                seg_dict = {
-                    "id": seg_id or self._segment_index,
-                    "meeting_id": m_id,
-                    "segment_index": self._segment_index,
-                    "speaker": speaker,
-                    "text": confirmed,
-                    "start_time": start_sec,
-                    "end_time": end_sec,
-                    "source_track": track,
-                }
+        if last_track_end > 0.0 and start_sec < last_track_end:
+            start_sec = max(start_sec, last_track_end)
+        if end_sec <= start_sec:
+            end_sec = start_sec + 0.3
 
-                self._recent_emitted.append(seg_dict)
-                if len(self._recent_emitted) > 50:
-                    self._recent_emitted = self._recent_emitted[-50:]
+        # Strip repeated prefix words from the end of the previous segment
+        if last_track_text:
+            prev_words = last_track_text.split()
+            cur_words = confirmed.split()
+            for k in range(min(5, len(prev_words), len(cur_words)), 0, -1):
+                if [w.lower().strip(".,?!") for w in prev_words[-k:]] == [w.lower().strip(".,?!") for w in cur_words[:k]]:
+                    cur_words = cur_words[k:]
+                    confirmed = " ".join(cur_words)
+                    break
+        if not confirmed.strip():
+            return
 
-                if self.on_confirmed:
-                    self.on_confirmed(m_id, seg_dict)
+        norm_conf = confirmed.strip().lower()
+        is_dup = False
+        for ex in self._recent_emitted:
+            if ex.get("source_track") == track:
+                ex_txt = ex.get("text", "").strip().lower()
+                if ex_txt == norm_conf:
+                    is_dup = True
+                    break
+                if abs(start_sec - float(ex.get("start_time", 0.0))) <= 1.0 and (norm_conf in ex_txt or ex_txt in norm_conf):
+                    is_dup = True
+                    break
 
-                # Advance cursor past confirmed audio
-                if speech_boundary:
-                    self._audio_cursor_sec = end_sec
-                else:
-                    dur = max(0.2, (len(confirmed.split()) / max(1, len(raw_text.split()))) * (end_sec - start_sec))
-                    self._audio_cursor_sec = min(end_sec, start_sec + dur)
+        if not is_dup:
+            self._segment_index += 1
+            seg_id = None
+            m_id = self._meeting_id if self._meeting_id is not None else 0
+            if self.db and self._meeting_id is not None:
+                try:
+                    seg_id = self.db.add_transcript_segment(
+                        meeting_id=self._meeting_id,
+                        segment_index=self._segment_index,
+                        start_time=start_sec,
+                        end_time=end_sec,
+                        speaker=speaker,
+                        text=confirmed,
+                        source_track=track,
+                        confidence=0.95,
+                    )
+                except Exception as db_exc:
+                    logger.debug("Failed saving confirmed segment to DB: %s", db_exc)
+
+            seg_dict = {
+                "id": seg_id or self._segment_index,
+                "meeting_id": m_id,
+                "segment_index": self._segment_index,
+                "speaker": speaker,
+                "text": confirmed,
+                "start_time": start_sec,
+                "end_time": end_sec,
+                "source_track": track,
+            }
+
+            self._recent_emitted.append(seg_dict)
+            if len(self._recent_emitted) > 50:
+                self._recent_emitted = self._recent_emitted[-50:]
+
+            self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec)
+
+            if self.on_confirmed:
+                self.on_confirmed(m_id, seg_dict)

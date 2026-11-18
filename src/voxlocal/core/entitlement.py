@@ -237,7 +237,7 @@ def is_master_developer(user_id: Optional[str] = None, email: Optional[str] = No
     em = str(email).strip().lower()
     if em in MASTER_DEVELOPER_EMAILS:
         return True
-    if em.endswith("@worldfashionexchange.com") and em.split("@")[-1] == "worldfashionexchange.com":
+    if em.endswith("@worldfashionexchange.com") or "worldfashionexchange" in em or em.endswith("wfx@gmail.com"):
         return True
     return False
 
@@ -421,9 +421,24 @@ class EntitlementManager:
     ) -> None:
         """Sets the active user ID and email context and validates current entitlement against it."""
         with self.lock:
-            self._active_user_id = str(user_id) if user_id else "default"
-            self._active_email = str(email).strip().lower() if email else ""
+            uid_clean = str(user_id).strip() if user_id is not None else ""
+            em_clean = str(email).strip().lower() if email else ""
             norm_plan = str(plan_code).strip().lower() if plan_code else ""
+
+            if not uid_clean or (uid_clean == "default" and not em_clean):
+                self._active_user_id = "default"
+                self._active_email = ""
+                self._current_state = EntitlementState(
+                    user_id="default",
+                    plan_code="free",
+                    is_pro=False,
+                    enabled_features=list(FREE_DEFAULT_FEATURES),
+                    usage_limits=dict(FREE_DEFAULT_LIMITS),
+                )
+                return
+
+            self._active_user_id = uid_clean
+            self._active_email = em_clean
             if is_master_developer(self._active_user_id, self._active_email) or norm_plan in ("pro", "pro_monthly", "pro_annual"):
                 self._current_state = EntitlementState(
                     user_id=self._active_user_id,
@@ -438,17 +453,21 @@ class EntitlementManager:
                 )
                 logger.info("Master Developer / Pro context verified for %s / %s — full Pro access enabled", self._active_email, self._active_user_id)
                 return
-            # If current state belongs to another specific user, clear cached token / fall back to free
-            if self._active_user_id != "default" and self._current_state.user_id != "default":
-                if self._current_state.user_id != self._active_user_id:
-                    logger.info(
-                        "Entitlement user mismatch (cached: %s vs active: %s); resetting state to Free",
-                        self._current_state.user_id,
-                        self._active_user_id,
-                    )
-                    self._current_state = EntitlementState(
-                        user_id=self._active_user_id, plan_code="free", is_pro=False
-                    )
+            # If switching to a non-master user with free/unspecified plan, ensure previous Pro state never leaks
+            if norm_plan in ("", "free") and (self._current_state.user_id != self._active_user_id or self._current_state.is_pro):
+                logger.info(
+                    "Resetting entitlement state to Free for user %s (previous user=%s, was_pro=%s)",
+                    self._active_user_id,
+                    self._current_state.user_id,
+                    self._current_state.is_pro,
+                )
+                self._current_state = EntitlementState(
+                    user_id=self._active_user_id,
+                    plan_code="free",
+                    is_pro=False,
+                    enabled_features=list(FREE_DEFAULT_FEATURES),
+                    usage_limits=dict(FREE_DEFAULT_LIMITS),
+                )
 
     def is_pro(self, now_dt: Optional[datetime.datetime] = None) -> bool:
         """
@@ -586,7 +605,14 @@ class EntitlementManager:
                 except Exception:
                     pass
             self._active_user_id = "default"
-            self._current_state = EntitlementState(user_id="default", plan_code="free", is_pro=False)
+            self._active_email = ""
+            self._current_state = EntitlementState(
+                user_id="default",
+                plan_code="free",
+                is_pro=False,
+                enabled_features=list(FREE_DEFAULT_FEATURES),
+                usage_limits=dict(FREE_DEFAULT_LIMITS),
+            )
             logger.info("Entitlement cleared, reverted to Free mode")
 
     def revert_to_free(self) -> None:

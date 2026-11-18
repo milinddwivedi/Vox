@@ -276,7 +276,7 @@
   }
 
   // --- Seamless Web-to-Desktop SSO Sync ---
-  async function syncToDesktopApp(session, user) {
+  async function syncToDesktopApp(session, user, isExplicit = false) {
     const activeSession = session || (user && user.session);
     if (!activeSession || !activeSession.access_token) return false;
     const ports = [8400, 8401, 8402, 3000];
@@ -290,7 +290,8 @@
       name: u.name || '',
       avatar_url: u.avatar_url || u.avatar || '',
       plan_code: u.is_pro ? 'pro_annual' : 'free',
-      is_pro: Boolean(u.is_pro)
+      is_pro: Boolean(u.is_pro),
+      source: isExplicit ? 'explicit_button' : 'auto_heartbeat'
     });
 
     for (const port of ports) {
@@ -306,6 +307,10 @@
         });
         clearTimeout(timeoutId);
         if (resp.ok) {
+          const data = await resp.json().catch(() => ({}));
+          if (data && data.skipped) {
+            return true;
+          }
           console.log(`[VOX SSO] Synced authenticated session with VOX Desktop on 127.0.0.1:${port}`);
           if (typeof window.onVoxDesktopSyncSuccess === 'function') {
             window.onVoxDesktopSyncSuccess(port);

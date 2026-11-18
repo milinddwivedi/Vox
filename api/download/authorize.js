@@ -1,6 +1,12 @@
 const { supabase, authenticateUser } = require('../_lib/supabase');
 
 const RELEASE_CATALOG = {
+  'releases/1.0.5/VoxLocal-Setup.exe': {
+    version: '1.0.5',
+    filename: 'VoxLocal-Setup.exe',
+    sha256: 'e2128ecec30c6d23517cc2bb3e99b01ed9defb3ed14447f7b04d43abf8c42292',
+    size_bytes: 29606855,
+  },
   'releases/1.0.0/VoxLocal-Setup.exe': {
     version: '1.0.0',
     filename: 'VoxLocal-Setup.exe',
@@ -32,10 +38,10 @@ const RELEASE_CATALOG = {
     size_bytes: 10148603,
   },
   'VoxLocal-Setup.exe': {
-    version: '1.0.4',
+    version: '1.0.5',
     filename: 'VoxLocal-Setup.exe',
-    sha256: '66fa320f5d8a6d8d6de3cfe5f77b22999820a94aa998c2cd1a2f3be2f5d52b83',
-    size_bytes: 29578973,
+    sha256: 'e2128ecec30c6d23517cc2bb3e99b01ed9defb3ed14447f7b04d43abf8c42292',
+    size_bytes: 29606855,
   },
 };
 
@@ -86,8 +92,8 @@ module.exports = async function handler(req, res) {
     }
 
     if (!downloadUrl) {
-      // High-availability global CDN fallback
-      downloadUrl = 'https://raw.githubusercontent.com/milinddwivedi/Vox/main/docs/downloads/VoxLocal-Setup.exe';
+      // High-availability Supabase Storage CDN global delivery
+      downloadUrl = 'https://qiigoipgoedexmdowtvj.supabase.co/storage/v1/object/public/vox-releases/releases/1.0.5/VoxLocal-Setup.exe';
     }
 
     return res.status(200).json({

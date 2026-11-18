@@ -251,7 +251,10 @@ class AppConfig:
         custom_env = os.environ.get("VOXLOCAL_CONFIG_PATH")
         if custom_env:
             return Path(custom_env)
-        if self.storage_dir and ("temp" in str(self.storage_dir).lower() or "tmp" in str(self.storage_dir).lower()):
+        if self.storage_dir and any(
+            tok in str(self.storage_dir).lower()
+            for tok in ("temp", "tmp", "test_", "pytest", "scratch")
+        ):
             return Path(self.storage_dir) / "config.json"
         return get_app_root() / "data" / "config.json"
 
@@ -277,6 +280,12 @@ class AppConfig:
                 data: Dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
                 valid = set(cls.__dataclass_fields__)
                 cfg = cls(**{k: v for k, v in data.items() if k in valid})
+                # Self-heal if primary data/config.json was previously polluted by a test_mtg_* storage_dir
+                if not os.environ.get("VOXLOCAL_CONFIG_PATH") and cfg.storage_dir:
+                    s_low = str(cfg.storage_dir).lower()
+                    if any(tok in s_low for tok in ("temp", "tmp", "test_", "pytest", "scratch")):
+                        cfg.storage_dir = str(get_app_root() / "data")
+                        cfg.save()
                 return cfg
             except Exception as exc:
                 logger.warning("config.json unreadable, using defaults: %s", exc)

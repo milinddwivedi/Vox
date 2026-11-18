@@ -378,6 +378,7 @@ class SettingsWorkspaceWidget(QWidget):
         for i, btn in enumerate(self._nav_buttons):
             btn.setChecked(i == idx)
         if idx == 4:
+            self._update_account_ui()
             self._refresh_calendar_status()
 
     # ------------------------------------------------------------------
@@ -877,6 +878,25 @@ class SettingsWorkspaceWidget(QWidget):
         hdr_row.addWidget(self.lbl_plan_badge)
         s_lay.addLayout(hdr_row)
 
+        # Editable Profile Display Name Row
+        prof_row = QHBoxLayout()
+        prof_row.setSpacing(8)
+        lbl_disp_name = QLabel("Display Name:")
+        lbl_disp_name.setStyleSheet("font-size: 12px; font-weight: 600;")
+        prof_row.addWidget(lbl_disp_name)
+
+        self.edit_display_name = QLineEdit()
+        self.edit_display_name.setPlaceholderText("Sign in with Google to customize display name")
+        self.edit_display_name.setAccessibleName("Profile display name")
+        prof_row.addWidget(self.edit_display_name, 1)
+
+        self.btn_save_display_name = QPushButton("Save Profile")
+        self.btn_save_display_name.setObjectName("secondaryBtn")
+        self.btn_save_display_name.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_save_display_name.clicked.connect(self._on_save_display_name_clicked)
+        prof_row.addWidget(self.btn_save_display_name)
+        s_lay.addLayout(prof_row)
+
         s_lay.addSpacing(6)
 
         # Quota Meters
@@ -949,6 +969,13 @@ class SettingsWorkspaceWidget(QWidget):
         self.btn_auth_action.clicked.connect(self._on_login_clicked)
         sub_btns.addWidget(self.btn_auth_action)
 
+        self.btn_switch_account = QPushButton("Switch Account")
+        self.btn_switch_account.setObjectName("secondaryBtn")
+        self.btn_switch_account.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_switch_account.clicked.connect(self._on_login_clicked)
+        self.btn_switch_account.setVisible(False)
+        sub_btns.addWidget(self.btn_switch_account)
+
         self.btn_manual_auth = QPushButton("Paste Sign-in URL...")
         self.btn_manual_auth.setObjectName("secondaryBtn")
         self.btn_manual_auth.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -967,6 +994,12 @@ class SettingsWorkspaceWidget(QWidget):
         self.btn_sync_sub.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_sync_sub.clicked.connect(self._on_sync_subscription_clicked)
         sub_btns.addWidget(self.btn_sync_sub)
+
+        self.btn_manage_web = QPushButton("Web Account Dashboard ↗")
+        self.btn_manage_web.setObjectName("secondaryBtn")
+        self.btn_manage_web.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_manage_web.clicked.connect(self._on_manage_web_clicked)
+        sub_btns.addWidget(self.btn_manage_web)
 
         sub_btns.addStretch(1)
         s_lay.addLayout(sub_btns)
@@ -1070,12 +1103,22 @@ class SettingsWorkspaceWidget(QWidget):
         if not hasattr(self, "lbl_user_email") or not hasattr(self.controller, "get_account_status"):
             return
         status = self.controller.get_account_status()
-        is_pro = status.get("is_pro", False)
-        signed_in = status.get("signed_in", False)
+        signed_in = bool(status.get("signed_in", False))
         email = status.get("email")
         name = status.get("name") or "Guest User"
-        usage = status.get("usage", {})
-        limits = status.get("limits", {})
+        is_pro = bool(status.get("is_pro", False)) if signed_in else False
+        usage = status.get("usage") or {}
+        limits = status.get("limits") or {}
+
+        if hasattr(self, "edit_display_name"):
+            self.edit_display_name.setText(name if signed_in else "")
+            self.edit_display_name.setPlaceholderText(
+                "Sign in with Google to customize display name" if not signed_in else "Your display name"
+            )
+        if hasattr(self, "btn_save_display_name"):
+            self.btn_save_display_name.setEnabled(bool(signed_in))
+        if hasattr(self, "btn_switch_account"):
+            self.btn_switch_account.setVisible(bool(signed_in))
 
         if signed_in and email:
             self.lbl_user_email.setText(f"Signed in as: <b>{name}</b> ({email})")
@@ -1099,19 +1142,19 @@ class SettingsWorkspaceWidget(QWidget):
             self.btn_auth_action.clicked.connect(self._on_login_clicked)
 
         if is_pro:
-            self.lbl_plan_badge.setText("VOX PRO (Active) · ₹199/mo")
+            self.lbl_plan_badge.setText("👑 VOX PRO (Active) · Unlimited")
             self.lbl_plan_badge.setStyleSheet("color: #10b981; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(16, 185, 129, 0.12);")
             self.btn_upgrade_pro.setVisible(False)
-            self.lbl_usage_words.setText(f"Voice Typing: {usage.get('dictation_words', 0):,} words this week (Unlimited)")
+            self.lbl_usage_words.setText(f"Voice Typing: {int(usage.get('dictation_words') or 0):,} words this week (Unlimited)")
             self.bar_words.setMaximum(100)
             self.bar_words.setValue(100)
-            self.lbl_usage_minutes.setText(f"Meeting Audio: {int(usage.get('meeting_duration_sec', 0) / 60)} mins this week (Unlimited)")
+            self.lbl_usage_minutes.setText(f"Meeting Audio: {int(float(usage.get('meeting_duration_sec') or 0) / 60)} mins this week (Unlimited)")
             self.bar_minutes.setMaximum(100)
             self.bar_minutes.setValue(100)
-            self.lbl_usage_meetings.setText(f"Meetings Recorded: {usage.get('meeting_count', 0)} sessions this week (Unlimited)")
+            self.lbl_usage_meetings.setText(f"Meetings Recorded: {int(usage.get('meeting_count') or 0)} sessions this week (Unlimited)")
             self.bar_meetings.setMaximum(100)
             self.bar_meetings.setValue(100)
-            self.lbl_usage_ask_vox.setText(f"Ask VOX Queries: {usage.get('ask_vox_count', 0)} queries this week (Unlimited)")
+            self.lbl_usage_ask_vox.setText(f"Ask VOX Queries: {int(usage.get('ask_vox_count') or 0)} queries this week (Unlimited)")
             self.bar_ask_vox.setMaximum(100)
             self.bar_ask_vox.setValue(100)
         else:
@@ -1119,30 +1162,60 @@ class SettingsWorkspaceWidget(QWidget):
             self.lbl_plan_badge.setStyleSheet("color: #f59e0b; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(245, 158, 11, 0.12);")
             self.btn_upgrade_pro.setVisible(True)
 
-            w_used = usage.get("dictation_words", 0)
-            w_lim = limits.get("dictation_words_per_week", 3000)
+            w_used = int(usage.get("dictation_words") or 0)
+            w_lim = int(limits.get("dictation_words_weekly") or limits.get("dictation_words_per_week") or 3000)
             self.lbl_usage_words.setText(f"Voice Typing: {w_used:,} / {w_lim:,} words this week")
             self.bar_words.setMaximum(w_lim)
             self.bar_words.setValue(min(w_used, w_lim))
 
-            m_sec = usage.get("meeting_duration_sec", 0.0)
+            m_sec = float(usage.get("meeting_duration_sec") or 0.0)
             m_min = int(m_sec / 60)
-            m_lim = int(limits.get("meeting_duration_sec_per_week", 10800) / 60)
+            raw_m_sec = limits.get("meeting_duration_sec_per_week")
+            raw_m_min = limits.get("meeting_minutes_weekly")
+            m_lim = int(raw_m_min) if raw_m_min is not None else (int(raw_m_sec / 60) if raw_m_sec is not None else 180)
             self.lbl_usage_minutes.setText(f"Meeting Audio: {m_min} / {m_lim} mins this week")
             self.bar_minutes.setMaximum(m_lim)
             self.bar_minutes.setValue(min(m_min, m_lim))
 
-            c_used = usage.get("meeting_count", 0)
-            c_lim = limits.get("meeting_count_per_week", 5)
+            c_used = int(usage.get("meeting_count") or 0)
+            c_lim = int(limits.get("meeting_sessions_weekly") or limits.get("meeting_count_per_week") or 5)
             self.lbl_usage_meetings.setText(f"Meetings Recorded: {c_used} / {c_lim} sessions this week")
             self.bar_meetings.setMaximum(c_lim)
             self.bar_meetings.setValue(min(c_used, c_lim))
 
-            q_used = usage.get("ask_vox_count", 0)
-            q_lim = limits.get("ask_vox_queries_per_week", 10)
+            q_used = int(usage.get("ask_vox_count") or 0)
+            q_lim = int(limits.get("ask_vox_queries_weekly") or limits.get("ask_vox_queries_per_week") or 10)
             self.lbl_usage_ask_vox.setText(f"Ask VOX Queries: {q_used} / {q_lim} queries this week")
             self.bar_ask_vox.setMaximum(q_lim)
             self.bar_ask_vox.setValue(min(q_used, q_lim))
+
+    _update_subscription_display = _update_account_ui
+
+    def _on_save_display_name_clicked(self) -> None:
+        if not hasattr(self, "edit_display_name"):
+            return
+        new_name = self.edit_display_name.text().strip()
+        if not new_name:
+            self.status_toast.emit("Profile", "Display name cannot be empty.")
+            return
+        broker = getattr(self.controller, "desktop_auth_broker", None) or getattr(self.controller, "auth_broker", None)
+        if broker is not None:
+            user = getattr(broker, "_current_user", None)
+            if user is None and hasattr(broker, "get_current_user"):
+                user = broker.get_current_user()
+            if user is not None:
+                user.display_name = new_name
+                if hasattr(broker, "_save_session"):
+                    broker._save_session(user)
+        if hasattr(self.controller, "auth_state_changed") and hasattr(self.controller, "get_account_status"):
+            self.controller.auth_state_changed.emit(self.controller.get_account_status())
+        self._update_account_ui()
+        self.status_toast.emit("Profile Saved", f"Display name updated to '{new_name}'.")
+
+    def _on_manage_web_clicked(self) -> None:
+        import webbrowser
+        webbrowser.open("https://vox-voice-assistant.vercel.app/account")
+        self.status_toast.emit("Account Dashboard", "Opening Web Account Dashboard in your browser...")
 
     def _on_login_clicked(self) -> None:
         self.status_toast.emit("Signing In", "Opening browser for Google Authentication...")

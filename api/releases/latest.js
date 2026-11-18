@@ -10,20 +10,20 @@ module.exports = async function handler(req, res) {
   }
 
   const manifest = {
-    version: '1.0.4',
+    version: '1.0.5',
     min_supported_version: '1.0.0',
     channel: 'stable',
     platform: 'win32',
     arch: 'x64',
     product_name: 'VOX — Local AI Voice Assistant',
     release_date: '2026-11-17',
-    installer_url: 'https://raw.githubusercontent.com/milinddwivedi/Vox/main/docs/downloads/VoxLocal-Setup.exe',
-    installer_size_bytes: 29578973,
-    sha256: '66fa320f5d8a6d8d6de3cfe5f77b22999820a94aa998c2cd1a2f3be2f5d52b83',
+    installer_url: 'https://qiigoipgoedexmdowtvj.supabase.co/storage/v1/object/public/vox-releases/releases/1.0.5/VoxLocal-Setup.exe',
+    installer_size_bytes: 29606855,
+    sha256: 'e2128ecec30c6d23517cc2bb3e99b01ed9defb3ed14447f7b04d43abf8c42292',
     min_os_version: 'Windows 10 Build 19041 (64-bit)',
     mandatory: false,
     release_notes: [
-      'Bundled Compiled Desktop Binary: VoxLocal-Setup.exe now packages the freshly compiled v1.0.4 VoxLocal.exe binary directly alongside hot-reloadable modules.',
+      'Bundled Compiled Desktop Binary: VoxLocal-Setup.exe now packages the freshly compiled v1.0.5 VoxLocal.exe binary directly alongside hot-reloadable modules.',
       'Account & Pro Entitlement Fix: Resolved NoneType quota limit crash in Profile Card and enforced strict @worldfashionexchange.com + Supabase RPC Pro verification.',
       'Desktop Google OAuth Fix: Fixed desktop-login provider from custom:google to standard Google OAuth with persistent state recovery.',
       'Lossless Live Transcription & Model Readiness: Added versioned MODEL_MANIFEST, explicit readiness states, OOM thread recovery, and zero-drop streaming cursor logic.',

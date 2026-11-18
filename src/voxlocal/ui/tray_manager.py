@@ -149,11 +149,15 @@ class SystemTrayManager:
         self.controller.screen_recording_state_changed.connect(lambda *_: self._refresh_state())
         self.controller.theme_changed.connect(self.apply_theme)
         if hasattr(self.controller, "entitlement_changed"):
-            self.controller.entitlement_changed.connect(lambda *_: self._refresh_state())
+            self.controller.entitlement_changed.connect(
+                lambda *args: self._refresh_state(entitlement_data=args[0] if args else None)
+            )
         if hasattr(self.controller, "usage_updated"):
             self.controller.usage_updated.connect(lambda *_: self._refresh_state())
         if hasattr(self.controller, "auth_state_changed"):
-            self.controller.auth_state_changed.connect(lambda *_: self._refresh_state())
+            self.controller.auth_state_changed.connect(
+                lambda *args: self._refresh_state(auth_data=args[0] if args else None)
+            )
         self.apply_theme(getattr(self.controller, "theme", getattr(self.controller.config, "theme", "light")))
         self._refresh_state()
 
@@ -240,7 +244,11 @@ class SystemTrayManager:
             """
         )
 
-    def _refresh_state(self) -> None:
+    def _refresh_state(
+        self,
+        entitlement_data: Optional[dict] = None,
+        auth_data: Optional[dict] = None,
+    ) -> None:
         active_labels = []
         d_state = getattr(self.controller, "dictation_state", "idle")
         m_state = getattr(self.controller, "meeting_state", "idle")
@@ -289,12 +297,16 @@ class SystemTrayManager:
 
         # Refresh plan badge & upgrade text
         ent = {}
-        if hasattr(self.controller, "entitlement") and hasattr(self.controller.entitlement, "get_effective_entitlement"):
+        if isinstance(entitlement_data, dict):
+            ent = entitlement_data
+        elif hasattr(self.controller, "entitlement") and hasattr(self.controller.entitlement, "get_effective_entitlement"):
             try:
                 ent = self.controller.entitlement.get_effective_entitlement()
             except Exception:
                 pass
         is_pro = bool(ent.get("is_pro", False))
+        if isinstance(auth_data, dict) and not auth_data.get("signed_in", True):
+            is_pro = False
         if is_pro:
             self.act_plan.setText("Plan: VOX Pro")
             self.act_upgrade.setText("⚡ Manage Pro Plan...")

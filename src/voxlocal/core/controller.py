@@ -214,6 +214,7 @@ class AppController(QObject):
         self.db = LocalDatabase(self.config.db_path)
 
         # Initialize Commercial Ledger & Entitlements (100% Local DPAPI Vault)
+        self._auth_generation: int = 0
         storage_root = Path(self.config.storage_dir)
         self.metering = UsageMeteringEngine(self.db.db_path)
         self.entitlement = EntitlementManager(cache_file=storage_root / "entitlement.vault")
@@ -494,6 +495,7 @@ class AppController(QObject):
     def _on_desktop_auth_synced(self, profile: Any) -> None:
         """Called automatically when Web-to-Desktop SSO session sync arrives via loopback."""
         try:
+            self._auth_generation = getattr(self, "_auth_generation", 0) + 1
             user_id = getattr(profile, "user_id", "default")
             user_email = getattr(profile, "email", "")
             plan_code = getattr(profile, "plan_code", "free")
@@ -711,9 +713,9 @@ class AppController(QObject):
         elif reason == "healthy":
             badge = "Audio + Video" if rec_mode == "audio_video" else "Audio Only"
             self.meeting_state_changed.emit("recording", f"Recording ({badge}): {title}")
-        elif reason == "non_meeting_view_active" and bool(getattr(self.config, "notetaker_auto_end", True)):
-            logger.info("Meeting call stage transitioned to non-meeting view -> Auto-stopping recording")
-            self.stop_meeting_recording()
+        elif reason == "non_meeting_view_active":
+            logger.info("Meeting call stage backgrounded/navigated -> Continuing audio recording without interruption")
+            self.meeting_state_changed.emit("recording", f"Recording (Audio Active - Call Stage Backgrounded): {title}")
 
     def _on_audio_device_warning(self, warning_msg: str) -> None:
         logger.warning("Meeting audio device warning: %s", warning_msg)
@@ -3167,6 +3169,13 @@ class AppController(QObject):
                         recorder=self.meeting_recorder,
                         language=self.config.language,
                     )
+                    try:
+                        inferred_remote = LocalWhisperTranscriber._infer_remote_speaker_from_title(meeting_title)
+                        if inferred_remote:
+                            self.streaming_transcriber._remote_speaker_label = inferred_remote
+                            self.streaming_transcriber._current_speaker = inferred_remote
+                    except Exception:
+                        pass
                 if hasattr(self, "open_notetaker_drawer_requested"):
                     self.open_notetaker_drawer_requested.emit()
 
@@ -3770,11 +3779,33 @@ class AppController(QObject):
                 existing_segs = self.db.get_transcript_segments(meeting_id) if hasattr(self.db, "get_transcript_segments") else self.db.get_meeting_segments(meeting_id)
                 max_seg_end = max((float(s.get("end_time") or 0.0) for s in existing_segs), default=0.0) if existing_segs else 0.0
                 meeting_dur = float(dur_val or 0.0)
+
+                # Check if system_track.wav has real speech energy that was missed by live streaming
+                sys_wav_candidate = getattr(result, "sys_wav_path", None)
+                has_sys_segments = any(
+                    str(s.get("source_track") or "").lower() in ("system", "sys")
+                    or (s.get("speaker") and s.get("speaker") not in ("You (Mic)", "You"))
+                    for s in (existing_segs or [])
+                )
+                sys_track_has_untranscribed_audio = False
+                if sys_wav_candidate and not has_sys_segments:
+                    try:
+                        import os as _os
+                        if _os.path.exists(str(sys_wav_candidate)) and _os.path.getsize(str(sys_wav_candidate)) > 32000:
+                            from voxlocal.engine.transcriber import load_wav_as_16k_f32
+                            sys_samples = load_wav_as_16k_f32(str(sys_wav_candidate))
+                            if sys_samples.size > 0 and float(np.sqrt(np.mean(sys_samples[:min(sys_samples.size, 16000 * 120)] ** 2))) >= 0.0012:
+                                sys_track_has_untranscribed_audio = True
+                    except Exception:
+                        pass
+
                 # Only bypass offline Whisper pass if live streaming segments captured at least 70% of meeting duration
+                # AND did not drop a non-silent system_track.wav
                 is_substantially_complete = bool(
                     existing_segs
                     and len(existing_segs) >= 2
                     and (meeting_dur <= 20.0 or max_seg_end >= meeting_dur * 0.70)
+                    and not sys_track_has_untranscribed_audio
                 )
 
                 if is_substantially_complete:
@@ -4953,6 +4984,25 @@ class AppController(QObject):
         session = broker.load_session() if broker and hasattr(broker, "load_session") else None
         if not isinstance(session, dict):
             session = None
+
+        usage = self.metering.get_weekly_usage() if hasattr(self, "metering") and self.metering else {}
+        days_until_reset = self.metering.days_until_next_reset() if hasattr(self, "metering") and self.metering else 7
+
+        if session is None:
+            from voxlocal.core.entitlement import FREE_DEFAULT_LIMITS
+            return {
+                "signed_in": False,
+                "email": "",
+                "name": "Guest User",
+                "picture": None,
+                "plan": "free",
+                "plan_name": "VOX Free",
+                "is_pro": False,
+                "usage": usage,
+                "limits": dict(FREE_DEFAULT_LIMITS),
+                "days_until_reset": days_until_reset,
+            }
+
         user_info = (session.get("user") or {}) if session else {}
         if not isinstance(user_info, dict):
             user_info = {}
@@ -4978,10 +5028,9 @@ class AppController(QObject):
                 "allow_meeting_overrun": True,
             }
 
-        usage = self.metering.get_weekly_usage() if hasattr(self, "metering") and self.metering else {}
         limits = ent.get("limits", {}) if isinstance(ent, dict) else {}
         return {
-            "signed_in": session is not None,
+            "signed_in": True,
             "email": user_email,
             "name": user_info.get("name") or (user_email.split("@")[0] if user_email else "Guest User"),
             "picture": user_info.get("picture"),
@@ -4990,13 +5039,15 @@ class AppController(QObject):
             "is_pro": ent.get("is_pro", False) if isinstance(ent, dict) else False,
             "usage": usage,
             "limits": limits,
-            "days_until_reset": self.metering.days_until_next_reset() if hasattr(self, "metering") and self.metering else 7,
+            "days_until_reset": days_until_reset,
         }
 
     def login_with_google(self, callback: Optional[Any] = None) -> None:
         """Starts loopback OAuth PKCE flow to sign in the user."""
+        self._auth_generation = getattr(self, "_auth_generation", 0) + 1
         def _on_done(ok: bool, msg: str, data: Optional[Dict[str, Any]] = None):
             if ok:
+                self._auth_generation = getattr(self, "_auth_generation", 0) + 1
                 broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
                 session = broker.load_session() if broker and hasattr(broker, "load_session") else None
                 if isinstance(session, dict):
@@ -5033,6 +5084,7 @@ class AppController(QObject):
 
     def complete_login_from_url(self, raw_url_or_token: str) -> Tuple[bool, str]:
         """Manually completes sign-in from an authorization URL or access token."""
+        self._auth_generation = getattr(self, "_auth_generation", 0) + 1
         broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
         if not broker or not hasattr(broker, "complete_login_from_url"):
             return False, "Desktop auth broker unavailable."
@@ -5052,6 +5104,7 @@ class AppController(QObject):
 
     def logout_user(self) -> None:
         """Logs out user, clears session vault, and reverts to Free tier safely."""
+        self._auth_generation = getattr(self, "_auth_generation", 0) + 1
         broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
         if broker and hasattr(broker, "clear_session"):
             broker.clear_session()
@@ -5075,6 +5128,7 @@ class AppController(QObject):
 
     def _sync_commercial_worker(self) -> None:
         try:
+            gen = getattr(self, "_auth_generation", 0)
             broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
             if not broker or not hasattr(self, "metering"):
                 return
@@ -5107,7 +5161,7 @@ class AppController(QObject):
                     if resp.status == 200:
                         sync_res = json.loads(resp.read().decode("utf-8"))
                         acked_ids = sync_res.get("acked_event_ids", [])
-                        if acked_ids:
+                        if acked_ids and getattr(self, "_auth_generation", 0) == gen:
                             self.metering.mark_events_synced(acked_ids)
 
             # 2. Refresh active entitlement token
@@ -5120,6 +5174,8 @@ class AppController(QObject):
                 with urllib.request.urlopen(req_ent, timeout=10) as resp:
                     if resp.status == 200:
                         ent_data = json.loads(resp.read().decode("utf-8"))
+                        if getattr(self, "_auth_generation", 0) != gen or (hasattr(broker, "is_authenticated") and not broker.is_authenticated()):
+                            return
                         raw_jwt = ent_data.get("token")
                         if raw_jwt:
                             self.entitlement.save_token_to_vault(raw_jwt)

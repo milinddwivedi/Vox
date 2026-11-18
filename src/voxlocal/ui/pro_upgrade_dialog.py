@@ -360,8 +360,8 @@ class VoxProUpgradeDialog(QDialog):
                     f"<b>{name}</b> ({email})<br>"
                     f"<span style='color: #10b981; font-weight: 700;'>● {plan_name} Active — Unlimited Access</span>"
                 )
-                self.btn_account_action.setText("Pro Active")
-                self.btn_account_action.setEnabled(False)
+                self.btn_account_action.setText("Switch Account")
+                self.btn_account_action.setEnabled(True)
                 if hasattr(self, "btn_paste_auth"):
                     self.btn_paste_auth.setVisible(False)
             else:

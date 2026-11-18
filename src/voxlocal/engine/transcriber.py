@@ -1371,7 +1371,7 @@ class LocalWhisperTranscriber:
             probs = dict(all_probs)
             p_hi = float(probs.get("hi", 0.0)) + float(probs.get("ur", 0.0))
             p_en = float(probs.get("en", 0.0))
-            return "hi" if p_hi >= p_en else "en"
+            return "hi" if (p_hi >= 0.18 or p_hi >= p_en * 0.65) else "en"
         detected = getattr(info, "language", "en")
         return "hi" if detected in ("hi", "ur") else "en"
 

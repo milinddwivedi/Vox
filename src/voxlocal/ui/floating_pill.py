@@ -1952,6 +1952,8 @@ class VoxActiveRecordingCapsule(QWidget):
     - Emerald `#30C382` outline + subtle outer glow when unhovered; transitions to warm translucent grey hover frame when hovered.
     """
 
+    clicked = pyqtSignal()
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._dock_edge: str = "bottom"
@@ -1959,6 +1961,7 @@ class VoxActiveRecordingCapsule(QWidget):
         self._finishing: bool = False
         self._panel_open: bool = False
         self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.equalizer = VoxEqualizerControl(self)
@@ -1971,6 +1974,13 @@ class VoxActiveRecordingCapsule(QWidget):
         self._lay.addWidget(self.equalizer)
         self._lay.addWidget(self.stop_ctrl)
         self.setFixedSize(72, 30)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def set_dock_edge(self, edge: str) -> None:
         self._dock_edge = (edge or "bottom").lower()
@@ -2737,6 +2747,7 @@ class VoxFlowBar(QWidget):
 
         # Subpage 4: Active Meeting Recording Emerald Capsule (72x30 / 30x72)
         self.active_recording_capsule = VoxActiveRecordingCapsule(self.lay_dictation_widget)
+        self.active_recording_capsule.clicked.connect(self._on_meeting_chip_clicked)
         self.active_recording_capsule.equalizer.clicked.connect(self._on_meeting_chip_clicked)
         self.active_recording_capsule.equalizer.hover_changed.connect(self._on_equalizer_hover)
         self.active_recording_capsule.stop_ctrl.clicked.connect(self._on_stop_clicked)
@@ -3754,12 +3765,10 @@ class VoxFlowBar(QWidget):
             self.btn_cancel.hide()
             self.btn_check.hide()
             self.btn_undo_toast.hide()
-            self.waveform_capsule.set_visual_mode("speech")
-            self.waveform_capsule.setFixedSize(36, 18)
-            self.waveform_capsule.show()
-            self.lbl_state_text.setText(self._meeting_elapsed_str or "00:00")
-            self.btn_stop.setEnabled(True)
-            self.btn_stop.show()
+            self.waveform_capsule.hide()
+            self.lbl_state_text.hide()
+            self.btn_stop.hide()
+            self._compat_holder.hide()
         elif effective == PillState.L4_PREVIEW:
             self.pill_stack.setCurrentIndex(3)
             self.satellite_chevron.hide()
@@ -3767,16 +3776,8 @@ class VoxFlowBar(QWidget):
                 "QFrame#flowBarPill { background-color: #080808; border: 1px solid #30302F; border-radius: 16px; }"
             )
 
-        if self._meeting_active:
-            self.meeting_chip.setText(f"● {self._meeting_elapsed_str} Notetaker")
-        if self._meeting_active and effective not in (
-            PillState.MINI_MEETING,
-            PillState.CARD_NOTIFICATION,
-            PillState.ACTIVE_RECORDING,
-        ):
-            self.meeting_chip.show()
-        else:
-            self.meeting_chip.hide()
+        self.meeting_chip.hide()
+        self._compat_holder.hide()
 
     def _sync_geometry(self) -> None:
         effective = self.pill_state
