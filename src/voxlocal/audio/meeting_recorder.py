@@ -388,17 +388,7 @@ class MeetingRecorder:
                     except Exception:
                         pass
 
-                # 2. Real-time Downward Expander (Mutes fan noise/room hiss during pauses)
-                c_rms = float(np.sqrt(np.mean(chunk**2))) if chunk.size else 0.0
-                thresh = max(0.002, self._mic_noise_floor * 2.2)
-                if c_rms < thresh:
-                    self._mic_noise_floor = min(0.012, max(0.0003, self._mic_noise_floor * 0.95 + c_rms * 0.05))
-                    expand_gain = max(0.18, (c_rms / max(1e-6, thresh)) ** 1.6)
-                    chunk = chunk * expand_gain
-                else:
-                    self._mic_noise_floor = min(0.008, self._mic_noise_floor * 0.995 + c_rms * 0.005)
-
-                # 3. Controlled gain & soft-knee peak limiting to max 0.65 (prevents shouting/clipping)
+                # 2. Controlled gain & soft-knee peak limiting to max 0.65 (preserve raw quiet endings without downward gating)
                 if self.mic_gain != 1.0:
                     scale = max(0.5, min(2.0, float(self.mic_gain)))
                     chunk = chunk * scale
@@ -525,83 +515,26 @@ def _write_mixed(mic_path: Optional[Path], sys_path: Optional[Path], out: Path, 
 
     chunk_frames = 60 * TARGET_SAMPLE_RATE  # 60s bounded DSP window
 
-    # 1. Preserve original raw mic audio and apply Studio Broadcast DSP chain in bounded 60s chunks
-    if mic_path and mic_path.exists():
+    # 1. Preserve original raw mic audio untouched on disk (and maintain *_raw.wav mirror for ASR/legacy callers)
+    if mic_path and mic_path.exists() and mic_path.stat().st_size > 44:
         try:
             raw_backup = mic_path.with_name(mic_path.stem + "_raw.wav")
             if not raw_backup.exists():
                 try:
-                    shutil.copyfile(str(mic_path), str(raw_backup))
+                    shutil.copy2(str(mic_path), str(raw_backup))
                 except Exception:
                     pass
-
-            tmp_mic = mic_path.with_name(mic_path.stem + "_dsp_tmp.wav")
-            with wave.open(str(mic_path), "rb") as r_wf:
-                total_m = r_wf.getnframes()
-                if total_m > 0:
-                    with wave.open(str(tmp_mic), "wb") as w_wf:
-                        w_wf.setnchannels(1)
-                        w_wf.setsampwidth(2)
-                        w_wf.setframerate(TARGET_SAMPLE_RATE)
-                        done_m = 0
-                        while done_m < total_m:
-                            n_m = min(chunk_frames, total_m - done_m)
-                            buf_m = np.frombuffer(r_wf.readframes(n_m), dtype=np.int16).astype(np.float32) / 32768.0
-                            if buf_m.size > 0:
-                                cleaned_m = clean_speech_microphone_audio(
-                                    buf_m,
-                                    TARGET_SAMPLE_RATE,
-                                    hp_cutoff=85.0,
-                                    target_peak=0.62,
-                                    spectral_nr_db=18.0,
-                                )
-                                w_wf.writeframes((np.clip(cleaned_m, -0.75, 0.75) * 32767).astype(np.int16).tobytes())
-                            done_m += n_m
-            if tmp_mic.exists() and tmp_mic.stat().st_size > 44:
-                os.replace(str(tmp_mic), str(mic_path))
         except Exception as exc:
-            logger.error("Error mastering mic track: %s", exc)
+            logger.debug("Error preserving raw mic track: %s", exc)
 
-    # 2. Preserve untouched system_track_raw.wav (Stage A) and apply gentle DC/level conditioning
-    if sys_path and sys_path.exists():
+    # 2. Preserve original raw system audio untouched on disk (and maintain system_track_raw.wav mirror)
+    if sys_path and sys_path.exists() and sys_path.stat().st_size > 44:
         try:
-            import shutil
-
             raw_sys_backup = sys_path.with_name("system_track_raw.wav")
-            if not raw_sys_backup.exists() and sys_path.stat().st_size > 44:
+            if not raw_sys_backup.exists():
                 shutil.copy2(str(sys_path), str(raw_sys_backup))
-
-            tmp_sys = sys_path.with_name(sys_path.stem + "_dsp_tmp.wav")
-            with wave.open(str(sys_path), "rb") as r_sf:
-                total_s = r_sf.getnframes()
-                if total_s > 0:
-                    with wave.open(str(tmp_sys), "wb") as w_sf:
-                        w_sf.setnchannels(1)
-                        w_sf.setsampwidth(2)
-                        w_sf.setframerate(TARGET_SAMPLE_RATE)
-                        done_s = 0
-                        while done_s < total_s:
-                            n_s = min(chunk_frames, total_s - done_s)
-                            buf_s = np.frombuffer(r_sf.readframes(n_s), dtype=np.int16).astype(np.float32) / 32768.0
-                            if buf_s.size > 0:
-                                buf_s = buf_s - float(np.mean(buf_s))
-                                s_peak = (
-                                    float(np.percentile(np.abs(buf_s), 99.8))
-                                    if buf_s.size > 500
-                                    else float(np.max(np.abs(buf_s)))
-                                )
-                                if s_peak > 0.85:
-                                    buf_s = buf_s * (0.85 / s_peak)
-                                elif 0.025 < s_peak < 0.65:
-                                    # Boost quiet remote speakers gently (up to +8 dB max) for ASR clarity
-                                    gain = min(2.5, 0.78 / s_peak)
-                                    buf_s = buf_s * gain
-                                w_sf.writeframes((np.clip(buf_s, -0.98, 0.98) * 32767).astype(np.int16).tobytes())
-                            done_s += n_s
-            if tmp_sys.exists() and tmp_sys.stat().st_size > 44:
-                os.replace(str(tmp_sys), str(sys_path))
         except Exception as exc:
-            logger.debug("Error cleaning system audio: %s", exc)
+            logger.debug("Error preserving raw system audio: %s", exc)
 
     readers = []
     for p in (mic_path, sys_path):
@@ -618,17 +551,38 @@ def _write_mixed(mic_path: Optional[Path], sys_path: Optional[Path], out: Path, 
         while done < total:
             n = min(block, total - done)
             mix = np.zeros(n, dtype=np.float32)
-            mic_buf = None
             if readers[0]:
                 raw_m = readers[0].readframes(n)
                 mic_buf = np.frombuffer(raw_m, dtype=np.int16).astype(np.float32) / 32768.0
-                mix[: mic_buf.size] += mic_buf * 0.70
+                if mic_buf.size > 0:
+                    try:
+                        mic_dsp = clean_speech_microphone_audio(
+                            mic_buf,
+                            TARGET_SAMPLE_RATE,
+                            hp_cutoff=85.0,
+                            target_peak=0.62,
+                            spectral_nr_db=18.0,
+                        )
+                    except Exception:
+                        mic_dsp = mic_buf
+                    mix[: mic_dsp.size] += np.clip(mic_dsp, -0.75, 0.75) * 0.70
 
             if len(readers) > 1 and readers[1]:
                 raw_s = readers[1].readframes(n)
                 sys_buf = np.frombuffer(raw_s, dtype=np.int16).astype(np.float32) / 32768.0
-                # Preserve high fidelity and intelligibility for remote meeting callers (0.85 weight)
-                mix[: sys_buf.size] += sys_buf * 0.85
+                if sys_buf.size > 0:
+                    sys_dsp = sys_buf - float(np.mean(sys_buf))
+                    s_peak = (
+                        float(np.percentile(np.abs(sys_dsp), 99.8))
+                        if sys_dsp.size > 500
+                        else float(np.max(np.abs(sys_dsp)))
+                    )
+                    if s_peak > 0.85:
+                        sys_dsp = sys_dsp * (0.85 / s_peak)
+                    elif 0.025 < s_peak < 0.65:
+                        sys_dsp = sys_dsp * min(2.5, 0.78 / s_peak)
+                    # Preserve high fidelity and intelligibility for remote meeting callers (0.85 weight)
+                    mix[: sys_dsp.size] += np.clip(sys_dsp, -0.98, 0.98) * 0.85
 
             # True-Peak soft-knee saturation: preserves linear dynamics below 0.75, soft-rounds loud combined peaks
             abs_m = np.abs(mix)

@@ -188,9 +188,9 @@ class LocalLLMEngine:
                     if cuda_count > 0:
                         if self.requested_device.lower() == "auto":
                             free_mb = self._get_free_vram_mb()
-                            if free_mb is not None and free_mb < 1400:
+                            if free_mb is not None and free_mb < 1800:
                                 logger.info(
-                                    "Low available GPU VRAM (%d MB free < 1400 MB). Selecting multi-threaded CPU for LLM to avoid CUDA out-of-memory.",
+                                    "Low available GPU VRAM (%d MB free < 1800 MB). Selecting multi-threaded CPU for LLM to avoid CUDA out-of-memory.",
                                     free_mb,
                                 )
                                 use_cuda = False

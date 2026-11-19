@@ -196,17 +196,36 @@ class ModelReadinessState:
 
 
 DEFAULT_DOMAIN_HOTWORDS: str = (
-    "Microsoft Teams, Google Meet, Zoom, Slack, Jira, GitHub, GitLab, VS Code, "
-    "Python, SQLite, SQL, PostgreSQL, MongoDB, Redis, API, endpoint, frontend, backend, staging, production, "
-    "deploy, deployment, commit, merge, PR, branch, bug fix, code review, screen share, "
-    "screenshot, client, meeting, project update, report, office, connect, sync, "
-    "status, release, sprint, standup, scrum, backlog, task, ticket, timeline, deadline, "
-    "presentation, slides, voice typing, prepone, do the needful, loop in, touch base, "
-    "Windchill, PLM, ERP, SAP, BOM, WFX, PO, HubSpot, American Tall, Troy Lee, subcategory, barcode, "
-    "Hemanth, Talathoti, Astha, Riya, Rhythm, Rumjhum, Pankaj, Vineet, Manoj, Abhilash, Amar, Yamini, Anannya, "
-    "Docker, Kubernetes, AWS, Azure, GCP, TypeScript, JavaScript, React, Next.js, FastAPI, REST, GraphQL, "
-    "microservice, repository, how I, in caps, all caps"
+    "standup, ticket, PR, Google Meet, Microsoft Teams, Zoom, Slack, Jira, GitHub, "
+    "WFX, PLM, ERP, HubSpot, Windchill, SAP, BOM, PO, Excel, costing sheet, "
+    "American Tall, Troy Lee, subcategory, barcode, Sprint, Daily Scrum, "
+    "Hemanth, Talathoti, Rumjhum, Milind, Abhilash, Pankaj, Puneet, Amar, Astha, "
+    "World Fashion Exchange, Microsoft Office, Tech Team, GitLab, VS Code, "
+    "Python, SQLite, SQL, API, endpoint, frontend, backend, staging, production, "
+    "deploy, commit, merge, branch, bug fix, code review, screen share, "
+    "screenshot, client, meeting, report, status, release, scrum, backlog, task, "
+    "timeline, deadline, presentation, slides, voice typing, prepone, do the needful, "
+    "loop in, touch base, how I, in caps, all caps"
 )
+
+
+def merge_domain_hotwords(extra_hotwords: Optional[str] = None, max_terms: int = 28) -> str:
+    """Merge caller hotwords with priority domain hotwords, bounded cleanly for CTranslate2."""
+    merged: List[str] = []
+    seen: set[str] = set()
+    for block in (extra_hotwords or "", DEFAULT_DOMAIN_HOTWORDS):
+        for raw_tok in str(block).split(","):
+            tok = re.sub(r"\s+", " ", raw_tok.strip()).strip(",.")
+            if not tok:
+                continue
+            key = tok.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(tok)
+            if len(merged) >= max_terms:
+                return ", ".join(merged)
+    return ", ".join(merged)
 
 
 def load_wav_as_16k_f32(wav_path: str | Path) -> np.ndarray:
@@ -840,13 +859,36 @@ VALID_AFFIRMATION_WORDS = {
 def clean_repetition_tail(text: str) -> str:
     """
     If Whisper enters a runaway repetition loop at the tail of an audio segment
-    (e.g. '...point ke andar theek hai theek hai theek hai theek hai'),
-    trim off the trailing runaway loop while preserving the genuine speech before it.
+    (e.g. '...point ke andar theek hai theek hai' or 'Oh my God. Oh my god. Oh my gosh.'),
+    trim off the trailing runaway loop while preserving genuine speech before it.
     """
     t = text.strip()
     words = t.split()
     if len(words) < 6:
         return t
+
+    # Strip trailing repeated 2-word clause/sentence opener loops (e.g. >= 3 trailing clauses starting with 'oh my')
+    clauses = re.split(r"(?<=[.!?।])\s+", t)
+    if len(clauses) >= 4:
+        norm_prefixes = []
+        for cl in clauses:
+            cl_words = re.sub(r"[^\w\s]", " ", cl.lower()).split()
+            norm_prefixes.append(" ".join(cl_words[:2]) if len(cl_words) >= 2 else "")
+        for pfx in set(p for p in norm_prefixes if p):
+            if norm_prefixes.count(pfx) >= 3:
+                # Find start of trailing contiguous run with same 2-word prefix
+                run_start = len(norm_prefixes)
+                for idx in range(len(norm_prefixes) - 1, -1, -1):
+                    if norm_prefixes[idx] == pfx:
+                        run_start = idx
+                    else:
+                        break
+                if (len(norm_prefixes) - run_start) >= 3:
+                    kept = clauses[:run_start]
+                    if kept:
+                        t = " ".join(kept).strip()
+                        words = t.split()
+                    break
 
     for n in (1, 2, 3, 4):
         if len(words) >= n * 3:
@@ -865,7 +907,67 @@ def clean_repetition_tail(text: str) -> str:
     return t
 
 
-def is_hallucination(text: str, duration_sec: Optional[float] = None) -> bool:
+_SEQUENTIAL_NUMBER_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+}
+
+
+def is_prompt_contamination_hallucination(
+    text: str,
+    *,
+    initial_prompt: str = "",
+    avg_logprob: Optional[float] = None,
+    no_speech_prob: Optional[float] = None,
+    duration_sec: Optional[float] = None,
+    audio_rms: Optional[float] = None,
+) -> bool:
+    """
+    Detect legacy prompt-echo strings ONLY when corroborated by active prompt
+    contamination or acoustic failure evidence (high no_speech_prob, low avg_logprob,
+    silence-floor RMS, or physiologically impossible micro-slice duration).
+    Never rejects legitimately spoken phrases like 'Tech Team, Sprint, Daily Scrum.'
+    """
+    cleaned = re.sub(
+        r"^(?:\[\d{2}:\d{2}(?::\d{2})?\]\s*)?(?:(?:you\s*\((?:mic|you)\)|speaker\s*\d+|unknown speaker)\s*:\s*)?",
+        "",
+        (text or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip().lower()
+    if not cleaned:
+        return False
+
+    norm = " ".join(re.sub(r"[^\w\s]", " ", cleaned).split())
+    legacy_norm = {
+        " ".join(re.sub(r"[^\w\s]", " ", s).split())
+        for s in DictationProcessor.KNOWN_LEGACY_PROMPT_ECHOES
+    }
+    prompt_norm = " ".join(re.sub(r"[^\w\s]", " ", (initial_prompt or "").strip().lower()).split())
+    matches_active_prompt = bool(prompt_norm and len(norm.split()) >= 3 and norm in prompt_norm)
+    matches_legacy_echo = cleaned in DictationProcessor.KNOWN_LEGACY_PROMPT_ECHOES or norm in legacy_norm
+    if not (matches_active_prompt or matches_legacy_echo):
+        return False
+
+    return bool(
+        matches_active_prompt
+        or (no_speech_prob is not None and float(no_speech_prob) >= 0.65)
+        or (avg_logprob is not None and float(avg_logprob) < -1.05)
+        or (audio_rms is not None and float(audio_rms) < 0.0025)
+        or (duration_sec is not None and duration_sec > 0.0 and duration_sec < 0.45 and len(norm.split()) >= 4)
+    )
+
+
+def is_hallucination(
+    text: str,
+    duration_sec: Optional[float] = None,
+    *,
+    initial_prompt: str = "",
+    avg_logprob: Optional[float] = None,
+    no_speech_prob: Optional[float] = None,
+    audio_rms: Optional[float] = None,
+) -> bool:
     import re
 
     raw = text.strip()
@@ -884,6 +986,15 @@ def is_hallucination(text: str, duration_sec: Optional[float] = None) -> bool:
         return True
     if cleaned in DictationProcessor.HALLUCINATION_PHRASES:
         return True
+    if is_prompt_contamination_hallucination(
+        cleaned,
+        initial_prompt=initial_prompt,
+        avg_logprob=avg_logprob,
+        no_speech_prob=no_speech_prob,
+        duration_sec=duration_sec,
+        audio_rms=audio_rms,
+    ):
+        return True
     if cleaned.startswith((
         "we speak in english and hindi",
         "we speak english and hindi",
@@ -896,6 +1007,26 @@ def is_hallucination(text: str, duration_sec: Optional[float] = None) -> bool:
     words = re.sub(r"[^\w\s]", " ", cleaned).split()
     if not words:
         return True
+
+    # Reject Whisper temperature-sampling counting hallucinations ('one, two, three, four, five, six, seven, eight, nine, ten')
+    if len(words) <= 25:
+        asc_run = 0
+        best_asc_run = 0
+        prev_num: Optional[int] = None
+        for w in words:
+            val = _SEQUENTIAL_NUMBER_WORDS.get(w)
+            if val is not None:
+                if prev_num is not None and (val == prev_num + 1 or val == prev_num):
+                    asc_run += 1
+                else:
+                    asc_run = 1
+                prev_num = val
+                best_asc_run = max(best_asc_run, asc_run)
+            else:
+                asc_run = 0
+                prev_num = None
+        if best_asc_run >= 6 and (best_asc_run / len(words)) >= 0.60:
+            return True
 
     # Speech physiology & duration rate guard:
     # Typical human speech is ~2.0 - 4.5 words/s (absolute physiological maximum ~7.5 words/s on short phrases).
@@ -1114,6 +1245,18 @@ class LocalWhisperTranscriber:
         """Load Whisper model by name, returning boolean success."""
         ok, _ = self.ensure_loaded(model_name)
         return ok
+
+    def unload_model(self) -> None:
+        """Unload the Whisper/CTranslate2 model and reclaim GPU VRAM / RAM."""
+        with self._lock:
+            self._model = None
+            self._loaded_model_name = None
+            self._readiness_state = (
+                ModelReadinessState.READY if self.is_model_cached() else ModelReadinessState.NOT_INSTALLED
+            )
+            self._readiness_message = "Model unloaded cleanly."
+        import gc
+        gc.collect()
 
     def ensure_loaded(
         self,
@@ -1369,19 +1512,23 @@ class LocalWhisperTranscriber:
     @staticmethod
     def _resolve_bilingual_lang(info: Any) -> str:
         """
-        Resolve between Hindi ('hi') and English ('en') by fusing Hindustani
-        acoustic probabilities P(hi) + P(ur) so spoken Hindi is never lost to Urdu or English.
+        Resolve strictly between Hindi ('hi') and English ('en') by fusing Hindustani
+        acoustic probabilities P(hi) + P(ur), preventing drift into Welsh/Nepali/Marathi/Urdu.
         """
         if info is None:
             return "en"
+        detected = getattr(info, "language", "en")
         all_probs = getattr(info, "all_language_probs", None)
         if all_probs:
             probs = dict(all_probs)
             p_hi = float(probs.get("hi", 0.0)) + float(probs.get("ur", 0.0))
             p_en = float(probs.get("en", 0.0))
-            return "hi" if (p_hi >= 0.18 or p_hi >= p_en * 0.65) else "en"
-        detected = getattr(info, "language", "en")
-        return "hi" if detected in ("hi", "ur") else "en"
+            if p_hi >= 0.18 or p_hi >= p_en * 0.65:
+                return "hi"
+            if detected in ("ne", "mr", "pa", "sd") and p_en < 0.35:
+                return "hi"
+            return "en"
+        return "hi" if detected in ("hi", "ur", "ne", "mr", "pa") else "en"
 
     # Markers indicating that a Devanagari single-pass transcription contains an English second clause
     DEVANAGARI_ENGLISH_CLAUSE_MARKERS = (
@@ -1540,7 +1687,7 @@ class LocalWhisperTranscriber:
                     )
                     if language in ("en+hi", "hinglish", "hi_latn"):
                         resolved_lang = self._resolve_bilingual_lang(probe_info)
-                    elif detected in ("hi", "ur") or language_probability < 0.50:
+                    elif detected in ("hi", "ur", "ne", "mr", "pa") or language_probability < 0.65:
                         resolved_lang = self._resolve_bilingual_lang(probe_info)
                     else:
                         resolved_lang = detected
@@ -1558,9 +1705,12 @@ class LocalWhisperTranscriber:
                 )
                 temp_tuple = tuple(temperatures) if isinstance(temperatures, (list, tuple)) else (temperatures,)
                 suppressed = get_suppressed_tokens(tok, [-1])
+                eff_best_of = max(1, min(int(beam_size), 2))
+                # Never pass Latin/English hotwords to Hindi decodes (prevents translation to English)
+                dec_hotwords = None if tok_lang in ("hi", "mr", "ur") else hotwords
                 opts = TranscriptionOptions(
                     beam_size=beam_size,
-                    best_of=beam_size,
+                    best_of=eff_best_of,
                     patience=1,
                     length_penalty=1,
                     repetition_penalty=1.15,
@@ -1583,8 +1733,8 @@ class LocalWhisperTranscriber:
                     multilingual=False,
                     max_new_tokens=None,
                     clip_timestamps=[0.0],
-                    hallucination_silence_threshold=None,
-                    hotwords=hotwords,
+                    hallucination_silence_threshold=1.5 if word_timestamps else None,
+                    hotwords=dec_hotwords,
                 )
                 segs_iter = m.generate_segments(features, tok, opts, False, encoder_output)
                 if speech_chunks:
@@ -1593,10 +1743,50 @@ class LocalWhisperTranscriber:
 
             segs_list, final_opts = _decode_with_encoder(resolved_lang, prompt_for_pass)
 
-            if not is_en_only and resolved_lang in ("hi", "mr"):
+            if not is_en_only and (resolved_lang in ("hi", "mr") or language in ("en+hi", "hinglish", "hi_latn")):
                 joined_txt = " ".join(s.text for s in segs_list)
                 if any("\u0600" <= ch <= "\u06FF" for ch in joined_txt):
-                    segs_list, final_opts = _decode_with_encoder(resolved_lang, "नमस्ते।")
+                    segs_list, final_opts = _decode_with_encoder("hi", "नमस्ते।")
+                    resolved_lang = "hi"
+
+            # Free encoder-reused fallback ONLY from 'en' -> 'hi' on very weak English decodes;
+            # never flip 'hi' -> 'en' so spoken Hindi is never translated into English.
+            if (
+                not is_en_only
+                and resolved_lang == "en"
+                and language in ("en+hi", "hinglish", "hi_latn")
+                and all_language_probs
+                and duration_after_vad >= 0.45
+            ):
+                def _score_segs(seg_items: List[Any]) -> float:
+                    if not seg_items:
+                        return -99.0
+                    lps = [
+                        float(getattr(s, "avg_logprob", -1.5))
+                        for s in seg_items
+                        if str(getattr(s, "text", "")).strip()
+                    ]
+                    if not lps:
+                        return -99.0
+                    joined = " ".join(str(getattr(s, "text", "")).strip() for s in seg_items)
+                    if any("\u0600" <= ch <= "\u06FF" for ch in joined) or is_hallucination(joined):
+                        return -50.0
+                    return sum(lps) / len(lps)
+
+                first_score = _score_segs(segs_list)
+                probs_map = dict(all_language_probs)
+                p_hi = float(probs_map.get("hi", 0.0)) + float(probs_map.get("ur", 0.0))
+                if first_score < -0.95 and p_hi >= 0.08:
+                    alt_prompt = "नमस्ते।" if self.model_name == "base" else effective_prompt
+                    alt_segs, alt_opts = _decode_with_encoder("hi", alt_prompt)
+                    joined_alt = " ".join(s.text for s in alt_segs)
+                    if any("\u0600" <= ch <= "\u06FF" for ch in joined_alt):
+                        alt_segs, alt_opts = _decode_with_encoder("hi", "नमस्ते।")
+                    alt_score = _score_segs(alt_segs)
+                    if alt_score > first_score + 0.08:
+                        segs_list = alt_segs
+                        final_opts = alt_opts
+                        resolved_lang = "hi"
 
             info = TranscriptionInfo(
                 language=resolved_lang,
@@ -1647,10 +1837,7 @@ class LocalWhisperTranscriber:
             init_prompt = None
         elif language in bilingual_modes:
             lang_arg = None
-            if language in ("en+hi", "hinglish", "hi_latn"):
-                init_prompt = DictationProcessor.DEFAULT_HINGLISH_PROMPT
-            else:
-                init_prompt = None
+            init_prompt = None
         else:
             lang_arg = language
             init_prompt = "नमस्ते।" if (lang_arg in ("hi", "mr") and self.model_name == "base") else None
@@ -1658,7 +1845,7 @@ class LocalWhisperTranscriber:
         effective_prompt = init_prompt
         if initial_prompt:
             p_clean = initial_prompt.strip()
-            for h in DictationProcessor.HALLUCINATION_PHRASES:
+            for h in (DictationProcessor.HALLUCINATION_PHRASES | DictationProcessor.KNOWN_LEGACY_PROMPT_ECHOES):
                 if len(h) >= 8 and h.lower() in p_clean.lower():
                     p_clean = re.sub(re.escape(h), "", p_clean, flags=re.IGNORECASE).strip()
             if p_clean:
@@ -1670,8 +1857,9 @@ class LocalWhisperTranscriber:
         extra_kw: Dict[str, Any] = {}
         if word_timestamps:
             extra_kw["word_timestamps"] = True
+            extra_kw["hallucination_silence_threshold"] = 1.5
 
-        if not word_timestamps and norm_audio.size <= 30 * TARGET_SAMPLE_RATE:
+        if norm_audio.size <= 30 * TARGET_SAMPLE_RATE:
             fast_res = self._transcribe_single_encode(
                 norm_audio=norm_audio,
                 language=language,
@@ -1689,13 +1877,17 @@ class LocalWhisperTranscriber:
             if fast_res is not None:
                 return fast_res
 
+        eff_best_of = max(1, min(int(beam_size), 2))
+
         def _call_transcribe(lang_v, prompt_v):
+            # Never pass Latin/English hotwords when decoding Hindi/Marathi/Urdu
+            dec_hotwords = None if lang_v in ("hi", "mr", "ur") else hotwords
             try:
                 return self._model.transcribe(
                     norm_audio,
                     language=lang_v,
                     beam_size=beam_size,
-                    best_of=beam_size,
+                    best_of=eff_best_of,
                     temperature=temperatures,
                     repetition_penalty=1.15,
                     no_repeat_ngram_size=3,
@@ -1703,7 +1895,7 @@ class LocalWhisperTranscriber:
                     log_prob_threshold=-1.0,
                     compression_ratio_threshold=2.4,
                     initial_prompt=prompt_v,
-                    hotwords=hotwords,
+                    hotwords=dec_hotwords,
                     vad_filter=vad_filter,
                     vad_parameters=vad_params if vad_filter else None,
                     condition_on_previous_text=False,
@@ -1714,7 +1906,7 @@ class LocalWhisperTranscriber:
                     norm_audio,
                     language=lang_v,
                     beam_size=beam_size,
-                    best_of=beam_size,
+                    best_of=eff_best_of,
                     temperature=temperatures,
                     repetition_penalty=1.15,
                     no_repeat_ngram_size=3,
@@ -1722,7 +1914,7 @@ class LocalWhisperTranscriber:
                     log_prob_threshold=-1.0,
                     compression_ratio_threshold=2.4,
                     initial_prompt=prompt_v,
-                    hotwords=hotwords,
+                    hotwords=dec_hotwords,
                     vad_filter=vad_filter,
                     vad_parameters=vad_params if vad_filter else None,
                     condition_on_previous_text=False,
@@ -1734,19 +1926,15 @@ class LocalWhisperTranscriber:
             detected = getattr(info, "language", "en")
             prob = float(getattr(info, "language_probability", 1.0))
             if language in ("en+hi", "hinglish", "hi_latn"):
-                if detected == "ur":
-                    # Avoid Arabic script tokens by re-decoding with Hinglish prompt
-                    segments_gen, info = _call_transcribe(None, effective_prompt)
+                target_lang = self._resolve_bilingual_lang(info)
+            elif detected in ("hi", "ur", "ne", "mr", "pa") or prob < 0.65:
+                target_lang = self._resolve_bilingual_lang(info)
             else:
-                target_lang = (
-                    self._resolve_bilingual_lang(info)
-                    if (detected in ("hi", "ur") or prob < 0.50)
-                    else detected
-                )
-                if detected != target_lang or (target_lang == "hi" and self.model_name == "base"):
-                    re_prompt = "नमस्ते।" if (target_lang == "hi" and self.model_name == "base") else effective_prompt
-                    segments_gen, info = _call_transcribe(target_lang, re_prompt)
-                lang_arg = target_lang
+                target_lang = detected
+            if detected != target_lang or (target_lang == "hi" and self.model_name == "base"):
+                re_prompt = "नमस्ते।" if (target_lang == "hi" and self.model_name == "base") else effective_prompt
+                segments_gen, info = _call_transcribe(target_lang, re_prompt)
+            lang_arg = target_lang
 
         segs_list = list(segments_gen)
 
@@ -1967,12 +2155,7 @@ class LocalWhisperTranscriber:
         is_bilingual = (not self.model_name.endswith(".en")) and (
             language in ("", "auto", "en+hi", "hinglish", "hi_latn", "hi")
         )
-        if is_bilingual:
-            effective_hotwords = hotwords or None
-        elif hotwords:
-            effective_hotwords = f"{DEFAULT_DOMAIN_HOTWORDS}, {hotwords}"
-        else:
-            effective_hotwords = DEFAULT_DOMAIN_HOTWORDS
+        effective_hotwords = merge_domain_hotwords(hotwords)
 
         with self._lock:
             t0 = time.perf_counter()
@@ -2117,11 +2300,14 @@ class LocalWhisperTranscriber:
         formatted_segments = []
         for s in (segments_list or []):
             if hasattr(s, "start") and hasattr(s, "end"):
+                raw_lp = getattr(s, "avg_logprob", None)
                 seg_dict = DictationSegment({
                     "start": float(s.start),
                     "end": float(s.end),
                     "text": str(getattr(s, "text", "")).strip(),
-                    "confidence": float(np.exp(getattr(s, "avg_logprob", -0.2))) if getattr(s, "avg_logprob", None) is not None else 1.0,
+                    "confidence": round(float(np.exp(float(raw_lp))), 4) if raw_lp is not None else 0.0,
+                    "raw_model_score": round(float(raw_lp), 4) if raw_lp is not None else None,
+                    "confidence_calibrated": False,
                 })
                 formatted_segments.append(seg_dict)
             elif isinstance(s, dict):
@@ -2171,6 +2357,230 @@ class LocalWhisperTranscriber:
         )
         return res.raw_text
 
+    @staticmethod
+    def _extract_vad_chunk_spans(
+        audio_16k: np.ndarray,
+        vad_params: dict,
+        max_chunk_sec: float = 22.0,
+        merge_gap_sec: float = 0.85,
+        pad_sec: float = 0.30,
+    ) -> Optional[List[Tuple[int, int]]]:
+        """
+        Detect active speech intervals with Silero VAD and group contiguous turns into
+        non-overlapping pause-aligned chunks <= `max_chunk_sec` for single-encode Whisper passes.
+        Returns None if Silero VAD is unavailable so callers fall back cleanly.
+        """
+        try:
+            from faster_whisper.vad import VadOptions, get_speech_timestamps
+        except Exception:
+            return None
+
+        n_samples = int(audio_16k.size)
+        if n_samples <= 0:
+            return []
+
+        norm_for_vad = normalize_speech_audio(audio_16k)
+        try:
+            vad_opts = VadOptions(**vad_params) if isinstance(vad_params, dict) else (vad_params or VadOptions())
+            raw_spans = get_speech_timestamps(norm_for_vad, vad_opts)
+        except Exception as vad_exc:
+            logger.debug("Silero VAD chunking fell back to whole-buffer mode: %s", vad_exc)
+            return None
+
+        if not raw_spans:
+            return []
+
+        pad_samp = int(pad_sec * TARGET_SAMPLE_RATE)
+        merge_gap_samp = int(merge_gap_sec * TARGET_SAMPLE_RATE)
+        max_chunk_samp = int(max_chunk_sec * TARGET_SAMPLE_RATE)
+        hard_cap_samp = int(24.0 * TARGET_SAMPLE_RATE)
+
+        padded: List[Tuple[int, int]] = []
+        for sp in raw_spans:
+            s = max(0, int(sp["start"]) - pad_samp)
+            e = min(n_samples, int(sp["end"]) + pad_samp)
+            if e - s >= int(0.15 * TARGET_SAMPLE_RATE):
+                padded.append((s, e))
+
+        if not padded:
+            return []
+
+        grouped: List[Tuple[int, int]] = []
+        cur_s, cur_e = padded[0]
+        for s, e in padded[1:]:
+            if e <= cur_e:
+                continue
+            s_adj = max(s, cur_e) if (s < cur_e and (e - cur_s) > max_chunk_samp) else s
+            if (s_adj - cur_e) <= merge_gap_samp and (e - cur_s) <= max_chunk_samp:
+                cur_e = max(cur_e, e)
+            else:
+                grouped.append((cur_s, cur_e))
+                cur_s, cur_e = max(s, cur_e), e
+        grouped.append((cur_s, cur_e))
+
+        final_spans: List[Tuple[int, int]] = []
+        frame_sz = int(0.05 * TARGET_SAMPLE_RATE)
+        for gs, ge in grouped:
+            pos = gs
+            while (ge - pos) > hard_cap_samp:
+                search_lo = pos + int(16.0 * TARGET_SAMPLE_RATE)
+                search_hi = min(ge, pos + hard_cap_samp)
+                cut = search_hi
+                if (search_hi - search_lo) >= frame_sz * 4:
+                    sub = audio_16k[search_lo:search_hi]
+                    n_fr = sub.size // frame_sz
+                    if n_fr >= 2:
+                        frames = sub[: n_fr * frame_sz].reshape(n_fr, frame_sz)
+                        rms = np.sqrt(np.mean(frames ** 2, axis=1))
+                        cut = search_lo + int(np.argmin(rms)) * frame_sz
+                final_spans.append((pos, cut))
+                pos = cut
+            if (ge - pos) >= int(0.15 * TARGET_SAMPLE_RATE):
+                final_spans.append((pos, ge))
+        return final_spans
+
+    @staticmethod
+    def _filter_raw_segment_objects(
+        segments_gen: Any,
+        *,
+        initial_prompt: str = "",
+        audio_rms: Optional[float] = None,
+    ) -> List[Any]:
+        """Keep valid decoded Whisper segment objects, stripping hallucination loops."""
+        raw_segs: List[Any] = []
+        for s in segments_gen:
+            t_clean = clean_repetition_tail(str(getattr(s, "text", "")).strip())
+            if not t_clean:
+                continue
+            seg_nsp = getattr(s, "no_speech_prob", None)
+            if seg_nsp is not None and float(seg_nsp) >= 0.85:
+                continue
+            cr = getattr(s, "compression_ratio", 1.0)
+            if cr >= 3.5:
+                w_chk = t_clean.split()
+                if len(w_chk) >= 8 and (len(set(w_chk)) / len(w_chk)) < 0.25:
+                    continue
+            dur = max(0.01, float(getattr(s, "end", 0.0)) - float(getattr(s, "start", 0.0)))
+            seg_lp = getattr(s, "avg_logprob", None)
+            if not is_hallucination(
+                t_clean,
+                duration_sec=dur,
+                initial_prompt=initial_prompt,
+                avg_logprob=seg_lp,
+                no_speech_prob=seg_nsp,
+                audio_rms=audio_rms,
+            ):
+                s.text = t_clean
+                raw_segs.append(s)
+        return raw_segs
+
+    @staticmethod
+    def _build_packed_vad_batches(
+        audio_16k: np.ndarray,
+        vad_params: dict,
+        max_speech_sec: float = 24.0,
+        max_gap_sec: float = 12.0,
+        pad_sec: float = 0.22,
+    ) -> Optional[List[Tuple[np.ndarray, List[Dict[str, int]]]]]:
+        """
+        Pack Silero VAD speech intervals into compact <= `max_speech_sec` concatenated audio batches
+        while splitting batches across long conversation silences (> `max_gap_sec`).
+        Returns (batch_audio, span_dicts) tuples compatible with faster-whisper's
+        `restore_speech_timestamps`, reducing Whisper encode() calls by ~5-6x with exact timestamps.
+        """
+        try:
+            from faster_whisper.vad import VadOptions, get_speech_timestamps
+        except Exception:
+            return None
+
+        n_samples = int(audio_16k.size)
+        if n_samples <= 0:
+            return []
+
+        norm_for_vad = normalize_speech_audio(audio_16k)
+        try:
+            vad_opts = VadOptions(**vad_params) if isinstance(vad_params, dict) else (vad_params or VadOptions())
+            raw_spans = get_speech_timestamps(norm_for_vad, vad_opts)
+        except Exception as vad_exc:
+            logger.debug("Silero VAD packing fell back to whole-buffer mode: %s", vad_exc)
+            return None
+
+        if not raw_spans:
+            return []
+
+        pad_samp = int(pad_sec * TARGET_SAMPLE_RATE)
+        merge_gap_samp = int(0.45 * TARGET_SAMPLE_RATE)
+        hard_cap_samp = int(max_speech_sec * TARGET_SAMPLE_RATE)
+
+        padded: List[Tuple[int, int]] = []
+        for sp in raw_spans:
+            s = max(0, int(sp["start"]) - pad_samp)
+            e = min(n_samples, int(sp["end"]) + pad_samp)
+            if e - s >= int(0.15 * TARGET_SAMPLE_RATE):
+                padded.append((s, e))
+        if not padded:
+            return []
+
+        # Merge tiny intra-phrase pauses and clamp out overlaps
+        merged: List[Tuple[int, int]] = []
+        cur_s, cur_e = padded[0]
+        for s, e in padded[1:]:
+            if e <= cur_e:
+                continue
+            s_adj = max(s, cur_e) if (s < cur_e and (e - cur_s) > hard_cap_samp) else s
+            if (s_adj - cur_e) <= merge_gap_samp and (e - cur_s) <= hard_cap_samp:
+                cur_e = max(cur_e, e)
+            else:
+                merged.append((cur_s, cur_e))
+                cur_s, cur_e = max(s, cur_e), e
+        merged.append((cur_s, cur_e))
+
+        # Split any continuous single span > max_speech_sec at quietest 50ms energy valley
+        bounded_spans: List[Dict[str, int]] = []
+        frame_sz = int(0.05 * TARGET_SAMPLE_RATE)
+        for gs, ge in merged:
+            pos = gs
+            while (ge - pos) > hard_cap_samp:
+                search_lo = pos + int(16.0 * TARGET_SAMPLE_RATE)
+                search_hi = min(ge, pos + hard_cap_samp)
+                cut = search_hi
+                if (search_hi - search_lo) >= frame_sz * 4:
+                    sub = audio_16k[search_lo:search_hi]
+                    n_fr = sub.size // frame_sz
+                    if n_fr >= 2:
+                        frames = sub[: n_fr * frame_sz].reshape(n_fr, frame_sz)
+                        rms = np.sqrt(np.mean(frames ** 2, axis=1))
+                        cut = search_lo + int(np.argmin(rms)) * frame_sz
+                bounded_spans.append({"start": pos, "end": cut})
+                pos = cut
+            if (ge - pos) >= int(0.15 * TARGET_SAMPLE_RATE):
+                bounded_spans.append({"start": pos, "end": ge})
+
+        if not bounded_spans:
+            return []
+
+        # Pack adjacent spans into single-encode batches <= max_speech_sec unless gap > max_gap_sec
+        batches: List[Tuple[np.ndarray, List[Dict[str, int]]]] = []
+        cur_batch: List[Dict[str, int]] = []
+        cur_samp = 0
+        max_gap_samp = int(max_gap_sec * TARGET_SAMPLE_RATE)
+
+        for sp in bounded_spans:
+            sp_len = sp["end"] - sp["start"]
+            gap = (sp["start"] - cur_batch[-1]["end"]) if cur_batch else 0
+            if cur_batch and ((cur_samp + sp_len > hard_cap_samp) or (gap > max_gap_samp)):
+                b_parts = [normalize_speech_audio(audio_16k[c["start"] : c["end"]]) for c in cur_batch]
+                batches.append((np.concatenate(b_parts, axis=0), cur_batch))
+                cur_batch = [sp]
+                cur_samp = sp_len
+            else:
+                cur_batch.append(sp)
+                cur_samp += sp_len
+        if cur_batch:
+            b_parts = [normalize_speech_audio(audio_16k[c["start"] : c["end"]]) for c in cur_batch]
+            batches.append((np.concatenate(b_parts, axis=0), cur_batch))
+        return batches
+
     def transcribe_audio_segments(
         self,
         audio_16k: np.ndarray,
@@ -2183,18 +2593,14 @@ class LocalWhisperTranscriber:
         hotwords: Optional[str] = None,
         diarizer: Optional[PersistentSpeakerDiarizer] = None,
         output_script: str = "roman",
-        beam_size: int = 5,
+        beam_size: int = 3,
         word_timestamps: bool = True,
+        vocabulary: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Transcribe an audio buffer into timestamped segment dictionaries.
-        Applies automatic gain normalization so low-volume system/video audio is transcribed clearly.
-        - Enforces Romanized Hinglish (`output_script='roman'`) by default for meeting transcripts
-          so Hindi/English code-switched speech is always rendered in clean Latin script.
-        - Uses `beam_size=5` and `word_timestamps=True` for high-precision boundary alignment.
-        - If `diarize_remote_turns=True`, uses `PersistentSpeakerDiarizer` to assign stable
-          multi-speaker labels (`Speaker 1`, `Speaker 2`, `Speaker 3`, `Unknown Speaker`) across
-          chunks and full-meeting passes.
+        Uses speech-packed Silero VAD batching (<= 24s active speech per encode) + per-span AGC,
+        anti-translation Hindi/English resolution, and restored original timeline timestamps.
         """
         if audio_16k.size < int(0.3 * TARGET_SAMPLE_RATE):
             return []
@@ -2203,93 +2609,95 @@ class LocalWhisperTranscriber:
         if raw_peak < 0.0004:
             return []
 
-        norm_audio = normalize_speech_audio(audio_16k)
-
         ok, msg = self.ensure_loaded()
         if not ok or self._model is None:
             raise RuntimeError(msg)
 
-        vad_params = dict(threshold=0.35, min_silence_duration_ms=800, speech_pad_ms=450)
-        is_bilingual = (not self.model_name.endswith(".en")) and (
-            language in ("", "auto", "en+hi", "hinglish", "hi_latn", "hi")
-        )
-        if is_bilingual:
-            effective_hotwords = hotwords or None
-        elif hotwords:
-            effective_hotwords = f"{DEFAULT_DOMAIN_HOTWORDS}, {hotwords}"
-        else:
-            effective_hotwords = DEFAULT_DOMAIN_HOTWORDS
+        vad_params = dict(threshold=0.35, min_silence_duration_ms=700, speech_pad_ms=300)
+        effective_hotwords = merge_domain_hotwords(hotwords)
         eff_beam = max(1, int(beam_size))
+        is_real_whisper = bool(
+            hasattr(self._model, "feature_extractor")
+            and hasattr(self._model, "encode")
+            and hasattr(self._model, "generate_segments")
+            and type(self._model).__module__.startswith("faster_whisper")
+        )
+
+        # Tuples of (segment_obj, abs_chunk_offset_sec, slice_audio_for_diarizer)
+        decoded_items: List[Tuple[Any, float, np.ndarray]] = []
+        track_rms = float(np.sqrt(np.mean(np.square(audio_16k)))) if audio_16k.size else 0.0
+        norm_full = normalize_speech_audio(audio_16k)
         with self._lock:
-            try:
-                segments_gen, _ = self._run_whisper_pass(
-                    norm_audio,
-                    language=language,
-                    beam_size=eff_beam,
-                    vad_filter=True,
-                    vad_params=vad_params,
-                    hotwords=effective_hotwords,
-                    initial_prompt=initial_prompt,
-                    word_timestamps=word_timestamps,
-                )
-                raw_segs = []
-                for s in segments_gen:
-                    t_clean = clean_repetition_tail(s.text.strip())
-                    if not t_clean:
+            batches = self._build_packed_vad_batches(audio_16k, vad_params) if is_real_whisper else None
+            if batches == []:
+                return []
+
+            if batches:
+                from faster_whisper.transcribe import restore_speech_timestamps
+                for batch_audio, batch_spans in batches:
+                    if batch_audio.size < int(0.15 * TARGET_SAMPLE_RATE) or float(np.max(np.abs(batch_audio))) < 0.0004:
                         continue
-                    if getattr(s, "no_speech_prob", 0.0) >= 0.85:
-                        continue
-                    cr = getattr(s, "compression_ratio", 1.0)
-                    if cr >= 3.5:
-                        w_chk = t_clean.split()
-                        if len(w_chk) >= 8 and (len(set(w_chk)) / len(w_chk)) < 0.25:
-                            continue
-                    dur = max(0.01, float(getattr(s, "end", 0.0)) - float(getattr(s, "start", 0.0)))
-                    if not is_hallucination(t_clean, duration_sec=dur):
-                        s.text = t_clean
-                        raw_segs.append(s)
-            except Exception as vad_err:
-                logger.warning("Meeting VAD transcribe failed (%s); retrying with vad_filter=False", vad_err)
-                segments_gen, _ = self._run_whisper_pass(
-                    norm_audio,
-                    language=language,
-                    beam_size=eff_beam,
-                    vad_filter=False,
-                    vad_params=vad_params,
-                    hotwords=effective_hotwords,
-                    initial_prompt=initial_prompt,
-                    word_timestamps=word_timestamps,
-                )
-                raw_segs = []
-                for s in segments_gen:
-                    t_clean = clean_repetition_tail(s.text.strip())
-                    if not t_clean:
-                        continue
-                    if getattr(s, "no_speech_prob", 0.0) >= 0.85:
-                        continue
-                    cr = getattr(s, "compression_ratio", 1.0)
-                    if cr >= 3.5:
-                        w_chk = t_clean.split()
-                        if len(w_chk) >= 8 and (len(set(w_chk)) / len(w_chk)) < 0.25:
-                            continue
-                    dur = max(0.01, float(getattr(s, "end", 0.0)) - float(getattr(s, "start", 0.0)))
-                    if not is_hallucination(t_clean, duration_sec=dur):
-                        s.text = t_clean
-                        raw_segs.append(s)
+                    batch_rms = float(np.sqrt(np.mean(np.square(batch_audio)))) if batch_audio.size else track_rms
+                    segments_gen, _ = self._run_whisper_pass(
+                        batch_audio,
+                        language=language,
+                        beam_size=eff_beam,
+                        vad_filter=False,
+                        vad_params=vad_params,
+                        hotwords=effective_hotwords,
+                        initial_prompt=initial_prompt,
+                        word_timestamps=word_timestamps,
+                    )
+                    restored_gen = restore_speech_timestamps(segments_gen, batch_spans, TARGET_SAMPLE_RATE)
+                    for s in self._filter_raw_segment_objects(
+                        restored_gen, initial_prompt=initial_prompt, audio_rms=batch_rms
+                    ):
+                        decoded_items.append((s, time_offset_sec, norm_full))
+            else:
+                try:
+                    segments_gen, _ = self._run_whisper_pass(
+                        norm_full,
+                        language=language,
+                        beam_size=eff_beam,
+                        vad_filter=True,
+                        vad_params=vad_params,
+                        hotwords=effective_hotwords,
+                        initial_prompt=initial_prompt,
+                        word_timestamps=word_timestamps,
+                    )
+                    for s in self._filter_raw_segment_objects(
+                        segments_gen, initial_prompt=initial_prompt, audio_rms=track_rms
+                    ):
+                        decoded_items.append((s, time_offset_sec, norm_full))
+                except Exception as vad_err:
+                    logger.warning("Meeting VAD transcribe failed (%s); retrying with vad_filter=False", vad_err)
+                    segments_gen, _ = self._run_whisper_pass(
+                        norm_full,
+                        language=language,
+                        beam_size=eff_beam,
+                        vad_filter=False,
+                        vad_params=vad_params,
+                        hotwords=effective_hotwords,
+                        initial_prompt=initial_prompt,
+                        word_timestamps=word_timestamps,
+                    )
+                    for s in self._filter_raw_segment_objects(
+                        segments_gen, initial_prompt=initial_prompt, audio_rms=track_rms
+                    ):
+                        decoded_items.append((s, time_offset_sec, norm_full))
 
         results: List[Dict[str, Any]] = []
         active_diarizer = diarizer
         if diarize_remote_turns and active_diarizer is None:
             active_diarizer = PersistentSpeakerDiarizer(speaker_prefix="Speaker")
 
-        for seg in raw_segs:
-            txt = seg.text.strip()
-            if not txt:
+        for seg, seg_offset, seg_audio in decoded_items:
+            raw_asr_txt = seg.text.strip()
+            if not raw_asr_txt:
                 continue
-            if output_script == "roman":
-                txt = DictationProcessor.devanagari_to_roman_hinglish(txt).strip()
             txt = DictationProcessor.process(
-                txt,
+                raw_asr_txt,
+                vocabulary=vocabulary,
                 cleanup_enabled=True,
                 spoken_punctuation=False,
                 output_script=output_script,
@@ -2324,33 +2732,37 @@ class LocalWhisperTranscriber:
                             word_items.append(
                                 {
                                     "word": w_txt,
-                                    "start": round(time_offset_sec + float(getattr(w_obj, "start", s_local)), 2),
-                                    "end": round(time_offset_sec + float(getattr(w_obj, "end", e_local)), 2),
+                                    "start": round(seg_offset + float(getattr(w_obj, "start", s_local)), 2),
+                                    "end": round(seg_offset + float(getattr(w_obj, "end", e_local)), 2),
                                     "probability": round(w_prob, 3),
                                 }
                             )
                 except Exception:
                     pass
 
-            abs_start = round(time_offset_sec + s_local, 2)
-            abs_end = round(time_offset_sec + e_local, 2)
+            abs_start = round(seg_offset + s_local, 2)
+            abs_end = round(seg_offset + e_local, 2)
 
             assigned_speaker = speaker_label
             spk_conf = 0.95
             overlap_flag = False
             if diarize_remote_turns and active_diarizer is not None:
                 s_idx = int(s_local * TARGET_SAMPLE_RATE)
-                e_idx = min(norm_audio.size, int(e_local * TARGET_SAMPLE_RATE))
+                e_idx = min(seg_audio.size, int(e_local * TARGET_SAMPLE_RATE))
                 assigned_speaker, spk_conf = active_diarizer.assign_segment(
-                    norm_audio[s_idx:e_idx],
+                    seg_audio[s_idx:e_idx],
                     start_sec=abs_start,
                     end_sec=abs_end,
                 )
                 overlap_flag = bool(getattr(active_diarizer, "last_segment_overlap", False))
 
-            logprob_conf = float(np.exp(getattr(seg, "avg_logprob", -0.2)))
-            if word_probs:
+            raw_lp = getattr(seg, "avg_logprob", None)
+            raw_nsp = getattr(seg, "no_speech_prob", None)
+            logprob_conf = float(np.exp(float(raw_lp))) if raw_lp is not None else 0.0
+            if word_probs and raw_lp is not None:
                 seg_conf = round(0.6 * logprob_conf + 0.4 * (sum(word_probs) / len(word_probs)), 2)
+            elif word_probs:
+                seg_conf = round(sum(word_probs) / len(word_probs), 2)
             else:
                 seg_conf = round(logprob_conf, 2)
 
@@ -2360,11 +2772,17 @@ class LocalWhisperTranscriber:
                 "speaker": assigned_speaker,
                 "speaker_confidence": spk_conf,
                 "source_track": source_track,
+                "raw_text": raw_asr_txt,
                 "text": txt,
                 "confidence": seg_conf,
-                "low_confidence": seg_conf < 0.45,
+                "raw_model_score": round(float(raw_lp), 4) if raw_lp is not None else None,
+                "no_speech_prob": round(float(raw_nsp), 4) if raw_nsp is not None else None,
+                "confidence_calibrated": False,
+                "low_confidence": (seg_conf < 0.45) if (raw_lp is not None or word_probs) else False,
                 "overlap": overlap_flag,
             }
+            if diarize_remote_turns:
+                seg_dict["speaker_cluster"] = assigned_speaker
             if word_items:
                 seg_dict["words"] = word_items
             results.append(seg_dict)
@@ -2384,6 +2802,8 @@ class LocalWhisperTranscriber:
         progress_callback: Optional[Callable[[str], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         output_script: str = "roman",
+        hotwords: Optional[str] = None,
+        vocabulary: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Transcribe a WAV file of any length using bounded memory windows (`window_sec`).
@@ -2406,8 +2826,12 @@ class LocalWhisperTranscriber:
                 initial_prompt=initial_prompt,
                 language=language,
                 diarize_remote_turns=diarize_remote_turns,
+                hotwords=hotwords,
                 diarizer=diarizer,
                 output_script=output_script,
+                beam_size=2,
+                word_timestamps=False,
+                vocabulary=vocabulary,
             )
 
         # Long recording: process in pause-aligned bounded windows
@@ -2457,14 +2881,29 @@ class LocalWhisperTranscriber:
                     initial_prompt=initial_prompt,
                     language=language,
                     diarize_remote_turns=diarize_remote_turns,
+                    hotwords=hotwords,
                     diarizer=diarizer,
                     output_script=output_script,
+                    beam_size=2,
+                    word_timestamps=False,
+                    vocabulary=vocabulary,
                 )
                 all_segments.extend(win_segs)
 
             cursor += max(1.0, actual_dur)
 
         return all_segments
+
+    @staticmethod
+    def _prefer_raw_wav_path(wav_path: str) -> str:
+        """Prefer untouched pre-DSP `*_raw.wav` when present and non-empty."""
+        if not wav_path:
+            return ""
+        p = Path(wav_path)
+        raw_cand = p.with_name(f"{p.stem}_raw.wav")
+        if raw_cand.exists() and get_wav_duration_sec(str(raw_cand)) > 0.1:
+            return str(raw_cand)
+        return wav_path
 
     def transcribe_meeting_dual_track(
         self,
@@ -2479,25 +2918,27 @@ class LocalWhisperTranscriber:
         cancel_check: Optional[Callable[[], bool]] = None,
         output_script: str = "roman",
         remote_speaker_label: str = "Speaker 1",
+        hotwords: Optional[str] = None,
+        vocabulary: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Perform complete offline transcription of a saved meeting/video recording.
-        - Uses bounded-memory windowed processing (`_transcribe_wav_windowed`) so multi-hour
-          recordings never load huge WAV files into memory all at once.
-        - Uses `PersistentSpeakerDiarizer` so remote participants are consistently attributed as
-          `Speaker 1`, `Speaker 2`, `Speaker 3`, etc., while the user's microphone is `You (Mic)`.
+        - Prefers untouched pre-DSP `*_raw.wav` tracks when present on disk.
+        - Keeps source_track (`system`/`mic`), acoustic cluster (`Speaker 1`, `Speaker 2`),
+          and calendar participant attribution separated.
         """
-        has_mic = bool(mic_wav_path and os.path.exists(mic_wav_path))
-        has_sys = bool(sys_wav_path and os.path.exists(sys_wav_path))
+        eff_mic_path = self._prefer_raw_wav_path(mic_wav_path)
+        eff_sys_path = self._prefer_raw_wav_path(sys_wav_path)
+        has_mic = bool(eff_mic_path and os.path.exists(eff_mic_path))
+        has_sys = bool(eff_sys_path and os.path.exists(eff_sys_path))
 
         segments: List[Dict[str, Any]] = []
         eff_remote_label = remote_speaker_label.strip() if remote_speaker_label else "Speaker 1"
+        has_participant_name = eff_remote_label != "Speaker 1" and is_likely_person_name(eff_remote_label)
         active_diarizer = diarizer or PersistentSpeakerDiarizer(
             speaker_prefix="Speaker",
             profile_store=getattr(self, "speaker_profile_store", None),
         )
-        if active_diarizer and eff_remote_label != "Speaker 1" and is_likely_person_name(eff_remote_label):
-            active_diarizer.custom_labels[0] = eff_remote_label
 
         if has_mic or has_sys:
             sys_segs: List[Dict[str, Any]] = []
@@ -2505,8 +2946,8 @@ class LocalWhisperTranscriber:
                 if progress_callback:
                     progress_callback(f"Transcribing system/video audio track ({eff_remote_label})...")
                 sys_segs = self._transcribe_wav_windowed(
-                    sys_wav_path,
-                    speaker_label=eff_remote_label,
+                    eff_sys_path,
+                    speaker_label="Speaker 1",
                     source_track="system",
                     initial_prompt=initial_prompt,
                     language=language,
@@ -2516,14 +2957,29 @@ class LocalWhisperTranscriber:
                     progress_callback=progress_callback,
                     cancel_check=cancel_check,
                     output_script=output_script,
+                    hotwords=hotwords,
+                    vocabulary=vocabulary,
                 )
+                remote_clusters = {
+                    s.get("speaker_cluster", s.get("speaker", "Speaker 1"))
+                    for s in sys_segs
+                    if s.get("speaker") not in ("Unknown Speaker", "")
+                }
+                for s_seg in sys_segs:
+                    cluster_id = s_seg.get("speaker_cluster", s_seg.get("speaker", "Speaker 1"))
+                    s_seg["speaker_cluster"] = cluster_id
+                    if has_participant_name:
+                        s_seg["participant_name"] = eff_remote_label
+                        # Only map Speaker 1 display label to calendar participant when single remote cluster
+                        if len(remote_clusters) <= 1 and cluster_id == "Speaker 1":
+                            s_seg["speaker"] = eff_remote_label
                 segments.extend(sys_segs)
 
             if has_mic and not (cancel_check and cancel_check()):
                 if progress_callback:
                     progress_callback("Transcribing microphone track (You)...")
                 mic_segs = self._transcribe_wav_windowed(
-                    mic_wav_path,
+                    eff_mic_path,
                     speaker_label="You (Mic)",
                     source_track="mic",
                     initial_prompt=initial_prompt,
@@ -2534,11 +2990,11 @@ class LocalWhisperTranscriber:
                     progress_callback=progress_callback,
                     cancel_check=cancel_check,
                     output_script=output_script,
+                    hotwords=hotwords,
+                    vocabulary=vocabulary,
                 )
-                # Filter out acoustic echo bleed if open speakers caused the exact same system
-                # phrase to be picked up faintly by the microphone at the exact same timestamp.
-                # Conversational affirmations (e.g. 'ok', 'haan', 'tika', 'sure') are preserved.
                 for m_seg in mic_segs:
+                    m_seg["speaker_cluster"] = "You (Mic)"
                     m_txt_clean = m_seg["text"].strip().lower()
                     is_bleed = False
                     if len(m_txt_clean) >= 12:
@@ -2571,6 +3027,8 @@ class LocalWhisperTranscriber:
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 output_script=output_script,
+                hotwords=hotwords,
+                vocabulary=vocabulary,
             )
         return segments
 
@@ -2617,10 +3075,18 @@ class LocalWhisperTranscriber:
             return []
 
         eff_remote = remote_speaker_label.strip()
+        distinct_sys_clusters = {
+            s.get("speaker_cluster", s.get("speaker", ""))
+            for s in sorted_segs
+            if s.get("source_track") == "system" and s.get("speaker") not in ("Unknown Speaker", "")
+        }
         if eff_remote and eff_remote not in ("Speaker", "Speaker 1", "Unknown Speaker") and is_likely_person_name(eff_remote):
             for s in sorted_segs:
-                if s.get("source_track") == "system" and s.get("speaker") in ("Speaker 1", "Speaker", ""):
-                    s["speaker"] = eff_remote
+                if s.get("source_track") == "system":
+                    s["participant_name"] = eff_remote
+                    if len(distinct_sys_clusters) <= 1 and s.get("speaker") in ("Speaker 1", "Speaker", ""):
+                        s.setdefault("speaker_cluster", s.get("speaker") or "Speaker 1")
+                        s["speaker"] = eff_remote
 
         # Pass 1: Eliminate only genuine micro-glitch turns (A -> uncertain micro-fragment < 0.65s -> A)
         if len(sorted_segs) >= 3:
@@ -2668,7 +3134,26 @@ class LocalWhisperTranscriber:
                     curr["text"] = f"{curr_txt} {nxt_txt}"
                 elif nxt_txt:
                     curr["text"] = nxt_txt
-                curr["confidence"] = round((float(curr.get("confidence", 0.8)) + float(nxt.get("confidence", 0.8))) / 2.0, 2)
+                curr_raw = str(curr.get("raw_text", "")).strip()
+                nxt_raw = str(nxt.get("raw_text", "")).strip()
+                if curr_raw and nxt_raw:
+                    curr["raw_text"] = f"{curr_raw} {nxt_raw}"
+                elif nxt_raw:
+                    curr["raw_text"] = nxt_raw
+                curr["confidence"] = round((float(curr.get("confidence", 0.0)) + float(nxt.get("confidence", 0.0))) / 2.0, 2)
+                c_lp = curr.get("raw_model_score")
+                n_lp = nxt.get("raw_model_score")
+                if c_lp is not None and n_lp is not None:
+                    curr["raw_model_score"] = round((float(c_lp) + float(n_lp)) / 2.0, 4)
+                elif n_lp is not None:
+                    curr["raw_model_score"] = n_lp
+                c_nsp = curr.get("no_speech_prob")
+                n_nsp = nxt.get("no_speech_prob")
+                if c_nsp is not None and n_nsp is not None:
+                    curr["no_speech_prob"] = round(max(float(c_nsp), float(n_nsp)), 4)
+                elif n_nsp is not None:
+                    curr["no_speech_prob"] = n_nsp
+                curr["confidence_calibrated"] = False
                 if curr.get("words") and nxt.get("words"):
                     curr["words"] = list(curr["words"]) + list(nxt["words"])
             else:
@@ -2696,9 +3181,12 @@ class LocalWhisperTranscriber:
 
         if has_mic_mem or has_sys_mem or has_mic_disk or has_sys_disk:
             with self._lock:
+                refinements_done = 0
                 for seg in reconciled:
+                    if refinements_done >= 6:
+                        break
                     conf = float(seg.get("confidence", 1.0))
-                    if conf >= 0.78:
+                    if conf >= 0.32:
                         continue
                     track = seg.get("source_track", "mic")
                     s_sec = max(0.0, float(seg["start_time"]) - 0.12)
@@ -2723,29 +3211,61 @@ class LocalWhisperTranscriber:
                             slice_audio = load_wav_slice_as_16k_f32(eff_sys_disk, s_sec, e_sec)
 
                     if slice_audio is not None and slice_audio.size > int(0.3 * TARGET_SAMPLE_RATE):
-                        rec_profile = (
-                            TranscribeProfile.MAX_ACCURACY
-                            if (getattr(self, "compute_device", "") == "cuda" and getattr(self, "model_name", "") not in ("large-v3-turbo", "large-v3"))
-                            else TranscribeProfile.BALANCED
-                        )
-                        refined_text = self.transcribe_dictation(
-                            slice_audio,
+                        refinements_done += 1
+                        slice_rms = float(np.sqrt(np.mean(np.square(slice_audio))))
+                        norm_slice = normalize_speech_audio(slice_audio)
+                        ref_segs, _ = self._run_whisper_pass(
+                            norm_slice,
                             language=language,
-                            hotwords=hotwords,
-                            profile=rec_profile,
+                            beam_size=3,
+                            vad_filter=False,
+                            vad_params={},
+                            hotwords=merge_domain_hotwords(hotwords),
+                            temperatures=0.0,
+                            initial_prompt=None,
+                            word_timestamps=False,
                         )
+                        ref_objs = self._filter_raw_segment_objects(
+                            ref_segs, initial_prompt="", audio_rms=slice_rms
+                        )
+                        refined_raw = " ".join(str(getattr(r, "text", "")).strip() for r in ref_objs).strip()
+                        refined_lps = [
+                            float(getattr(r, "avg_logprob"))
+                            for r in ref_objs
+                            if getattr(r, "avg_logprob", None) is not None
+                        ]
+                        refined_nsps = [
+                            float(getattr(r, "no_speech_prob"))
+                            for r in ref_objs
+                            if getattr(r, "no_speech_prob", None) is not None
+                        ]
+                        mean_ref_lp = (sum(refined_lps) / len(refined_lps)) if refined_lps else None
+                        max_ref_nsp = max(refined_nsps) if refined_nsps else None
+                        refined_conf = float(np.exp(mean_ref_lp)) if mean_ref_lp is not None else conf
                         if output_script == "roman":
-                            refined_text = DictationProcessor.devanagari_to_roman_hinglish(refined_text).strip()
+                            refined_text = DictationProcessor.devanagari_to_roman_hinglish(refined_raw).strip()
                         else:
-                            refined_text = refined_text.strip()
+                            refined_text = refined_raw
                         if (
                             refined_text
-                            and not is_hallucination(refined_text)
+                            and not is_hallucination(
+                                refined_text,
+                                duration_sec=e_sec - s_sec,
+                                initial_prompt="",
+                                avg_logprob=mean_ref_lp,
+                                no_speech_prob=max_ref_nsp,
+                                audio_rms=slice_rms,
+                            )
                             and len(refined_text.split()) >= max(1, len(seg["text"].split()) - 1)
+                            and refined_conf > conf + 0.10
                         ):
+                            seg["raw_text"] = refined_raw
                             seg["text"] = refined_text
-                            seg["confidence"] = 0.92
-                            seg["low_confidence"] = False
+                            seg["confidence"] = round(refined_conf, 2)
+                            seg["raw_model_score"] = round(mean_ref_lp, 4) if mean_ref_lp is not None else None
+                            seg["no_speech_prob"] = round(max_ref_nsp, 4) if max_ref_nsp is not None else None
+                            seg["confidence_calibrated"] = False
+                            seg["low_confidence"] = refined_conf < 0.45
 
         # Final guarantee: ensure all meeting segments are in Romanized Hinglish + Domain Normalized when output_script == 'roman',
         # remove any micro-slice hallucinations, and sort strictly chronologically.
@@ -2762,14 +3282,29 @@ class LocalWhisperTranscriber:
             if not txt:
                 continue
             dur = max(0.01, e_val - s_val)
-            if is_hallucination(txt, duration_sec=dur):
+            seg_lp = seg.get("raw_model_score")
+            seg_nsp = seg.get("no_speech_prob")
+            if is_hallucination(
+                txt,
+                duration_sec=dur,
+                initial_prompt="",
+                avg_logprob=seg_lp,
+                no_speech_prob=seg_nsp,
+            ):
                 continue
             if output_script == "roman":
                 txt = DictationProcessor.devanagari_to_roman_hinglish(txt)
             txt = dp.process(txt).strip()
-            if not txt or is_hallucination(txt, duration_sec=dur):
+            if not txt or is_hallucination(
+                txt,
+                duration_sec=dur,
+                initial_prompt="",
+                avg_logprob=seg_lp,
+                no_speech_prob=seg_nsp,
+            ):
                 continue
             seg["text"] = txt
+            seg.setdefault("confidence_calibrated", False)
             final_reconciled.append(seg)
 
         final_reconciled.sort(key=lambda s: (float(s["start_time"]), float(s["end_time"])))

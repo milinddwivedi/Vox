@@ -6,16 +6,21 @@ from unittest.mock import MagicMock
 import pytest
 
 from voxlocal.engine.dictation_processor import DictationProcessor
+from voxlocal.engine.transcriber import merge_domain_hotwords
 from voxlocal.calendar.unified_engine import UnifiedCalendarEngine
 
 
 def test_hinglish_scrum_prompt_integrity():
-    prompt = DictationProcessor.DEFAULT_HINGLISH_PROMPT
-    assert "standup" in prompt.lower()
-    assert "ticket id" in prompt.lower()
-    assert "pr" in prompt.lower()
-    assert "sprint" in prompt.lower()
-    assert "baad mein" in prompt.lower()
+    # initial_prompt must stay empty to prevent silence hallucinations
+    assert DictationProcessor.DEFAULT_HINGLISH_PROMPT == ""
+
+    hinglish_hw = DictationProcessor.build_whisper_hotwords([], language="en+hi").lower()
+    for term in ("wfx", "plm", "erp", "hemanth", "rumjhum", "sprint", "daily scrum"):
+        assert term in hinglish_hw
+
+    merged_hw = merge_domain_hotwords(hinglish_hw).lower()
+    for term in ("standup", "ticket", "pr", "sprint", "wfx", "plm", "erp", "hemanth", "rumjhum", "daily scrum"):
+        assert term in merged_hw
 
 
 def test_scrum_deva_loanwords_restoration():

@@ -3614,9 +3614,7 @@ class AppController(QObject):
             try:
                 mic_slice, sys_slice, actual_start_sec = self.meeting_recorder.get_audio_window(start_sec, end_sec)
                 vocab = self.db.list_vocabulary(active_only=True)
-                prompt = DictationProcessor.build_whisper_prompt(vocab)
-                if self.config.language in ("en+hi", "hinglish", "hi_latn"):
-                    prompt = f"{prompt} {DictationProcessor.DEFAULT_HINGLISH_PROMPT}".strip()
+                eff_hotwords = DictationProcessor.build_whisper_hotwords(vocab, language=self.config.language)
 
                 new_segments: List[Dict[str, Any]] = []
                 sys_segs: List[Dict[str, Any]] = []
@@ -3626,11 +3624,13 @@ class AppController(QObject):
                         speaker_label="Speaker 1",
                         source_track="system",
                         time_offset_sec=actual_start_sec,
-                        initial_prompt=prompt,
+                        initial_prompt="",
                         language=self.config.language,
                         diarize_remote_turns=True,
+                        hotwords=eff_hotwords,
                         diarizer=self._active_meeting_diarizer,
                         output_script="roman",
+                        vocabulary=vocab,
                     )
                     new_segments.extend(sys_segs)
 
@@ -3640,9 +3640,11 @@ class AppController(QObject):
                         speaker_label="You (Mic)",
                         source_track="mic",
                         time_offset_sec=actual_start_sec,
-                        initial_prompt=prompt,
+                        initial_prompt="",
                         language=self.config.language,
+                        hotwords=eff_hotwords,
                         output_script="roman",
+                        vocabulary=vocab,
                     )
                     # Filter acoustic bleed if open speakers caused the exact same system phrase
                     # to be faintly picked up by the microphone at the exact same timestamp.
@@ -3872,87 +3874,49 @@ class AppController(QObject):
                         remote_name = cand_name
 
                 vocab = self.db.list_vocabulary(active_only=True)
-                vocab_prompt = DictationProcessor.build_whisper_prompt(vocab)
-                prompt_parts: List[str] = []
+                participant_hints: List[str] = []
                 if remote_name != "Speaker 1":
-                    prompt_parts.append(f"{remote_name} meeting discussion.")
+                    participant_hints.append(remote_name)
                 if cal_names:
-                    clean_cal_names = [n.split("<")[0].strip() for n in cal_names[:8] if n.strip()]
-                    if clean_cal_names:
-                        prompt_parts.append("Participants: " + ", ".join(clean_cal_names) + ".")
-                if vocab_prompt:
-                    prompt_parts.append(vocab_prompt)
-                if self.config.language in ("en+hi", "hinglish", "hi_latn"):
-                    prompt_parts.append(DictationProcessor.DEFAULT_HINGLISH_PROMPT)
-                eff_prompt = " ".join(prompt_parts).strip()
-
-                existing_segs = self.db.get_transcript_segments(meeting_id) if hasattr(self.db, "get_transcript_segments") else self.db.get_meeting_segments(meeting_id)
-                max_seg_end = max((float(s.get("end_time") or 0.0) for s in existing_segs), default=0.0) if existing_segs else 0.0
-                meeting_dur = float(dur_val or 0.0)
-
-                # Check if system_track.wav has real speech energy that was missed by live streaming
-                sys_wav_candidate = getattr(result, "sys_wav_path", None)
-                has_sys_segments = any(
-                    str(s.get("source_track") or "").lower() in ("system", "sys")
-                    or (s.get("speaker") and s.get("speaker") not in ("You (Mic)", "You"))
-                    for s in (existing_segs or [])
+                    participant_hints.extend(
+                        [n.split("<")[0].strip() for n in cal_names[:8] if n.strip()]
+                    )
+                eff_hotwords = DictationProcessor.build_whisper_hotwords(
+                    vocab,
+                    language=self.config.language,
+                    participants=participant_hints,
                 )
-                sys_track_has_untranscribed_audio = False
-                if sys_wav_candidate and not has_sys_segments:
-                    try:
-                        import os as _os
-                        if _os.path.exists(str(sys_wav_candidate)) and _os.path.getsize(str(sys_wav_candidate)) > 32000:
-                            from voxlocal.engine.transcriber import load_wav_as_16k_f32
-                            sys_samples = load_wav_as_16k_f32(str(sys_wav_candidate))
-                            if sys_samples.size > 0 and float(np.sqrt(np.mean(sys_samples[:min(sys_samples.size, 16000 * 120)] ** 2))) >= 0.0012:
-                                sys_track_has_untranscribed_audio = True
-                    except Exception:
-                        pass
+                eff_prompt = ""
 
-                # Only bypass offline Whisper pass if live streaming segments captured at least 70% of meeting duration
-                # AND did not drop a non-silent system_track.wav
-                is_substantially_complete = bool(
-                    existing_segs
-                    and len(existing_segs) >= 2
-                    and (meeting_dur <= 20.0 or max_seg_end >= meeting_dur * 0.70)
-                    and not sys_track_has_untranscribed_audio
+                existing_segs = (
+                    self.db.get_transcript_segments(meeting_id)
+                    if hasattr(self.db, "get_transcript_segments")
+                    else self.db.get_meeting_segments(meeting_id)
                 )
-
-                if is_substantially_complete:
+                if existing_segs:
                     logger.info(
-                        "Preserving %d live streaming segments for meeting #%d (coverage=%.1fs/%.1fs); skipping offline Whisper pass",
+                        "Replacing %d provisional live streaming segments with full-audio Whisper finalization for meeting #%d",
                         len(existing_segs),
                         meeting_id,
-                        max_seg_end,
-                        meeting_dur,
-                    )
-                    segments = list(existing_segs)
-                else:
-                    if existing_segs:
-                        logger.info(
-                            "Live streaming segments incomplete (%d segs, end=%.1fs vs meeting=%.1fs); running offline Whisper pass on full recording",
-                            len(existing_segs),
-                            max_seg_end,
-                            meeting_dur,
-                        )
-                    self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing speech with local Whisper...")
-                    segments = self.transcriber.transcribe_meeting_dual_track(
-                        mixed_wav_path=getattr(result, "mixed_wav_path", None),
-                        mic_wav_path=getattr(result, "mic_wav_path", None),
-                        sys_wav_path=getattr(result, "sys_wav_path", None),
-                        initial_prompt=eff_prompt,
-                        language=self.config.language,
-                        progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: Transcribing speech ({s})"),
-                        cancel_check=is_cancelled,
-                        output_script="roman",
-                        remote_speaker_label=remote_name,
                     )
 
-                # Early Stage 2 transcript persistence: Call self.db.replace_meeting_segments
-                # immediately following Stage 2 Whisper transcription completion so intermediate
-                # segments are safely saved to SQLite before Stage 3 diarization begins.
+                self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing full recording with local Whisper...")
+                segments = self.transcriber.transcribe_meeting_dual_track(
+                    mixed_wav_path=getattr(result, "mixed_wav_path", None),
+                    mic_wav_path=getattr(result, "mic_wav_path", None),
+                    sys_wav_path=getattr(result, "sys_wav_path", None),
+                    initial_prompt=eff_prompt,
+                    language=self.config.language,
+                    progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: Transcribing speech ({s})"),
+                    cancel_check=is_cancelled,
+                    output_script="roman",
+                    remote_speaker_label=remote_name,
+                    hotwords=eff_hotwords,
+                    vocabulary=vocab,
+                )
+
+                # Early Stage 2 transcript persistence before Stage 3 reconciliation
                 if segments:
-                    self.db.replace_meeting_segments(meeting_id, segments)
                     self.db.replace_meeting_segments(meeting_id, segments)
                 else:
                     # Fallback: preserve live progressive transcript segments if offline pass yielded no segments
@@ -3989,6 +3953,7 @@ class AppController(QObject):
                         mic_audio_16k=None,
                         sys_audio_16k=None,
                         language=self.config.language,
+                        hotwords=eff_hotwords,
                         mic_wav_path=getattr(result, "mic_wav_path", None),
                         sys_wav_path=getattr(result, "sys_wav_path", None),
                         output_script="roman",
@@ -4011,19 +3976,8 @@ class AppController(QObject):
                     self.db.replace_meeting_segments(meeting_id, cleaned_segments)
                     segments = cleaned_segments
 
-                # Cleanup redundant Stage-A *_raw.wav backups now that Stage 3 reconciliation finished
-                for raw_attr in ("mixed_wav_path", "mic_wav_path", "sys_wav_path"):
-                    cand_p = _safe_str_field(getattr(result, raw_attr, ""))
-                    if cand_p:
-                        rec_folder = Path(cand_p).parent
-                        for raw_name in ("mic_track_raw.wav", "system_track_raw.wav"):
-                            raw_file = rec_folder / raw_name
-                            if raw_file.is_file():
-                                try:
-                                    raw_file.unlink()
-                                except Exception:
-                                    pass
-                        break
+                # Preserve untouched Stage-A *_raw.wav backups on disk so Re-Transcribe can always
+                # access pre-DSP audio without degradation.
 
                 # Cooperative cancellation check between Stage 3 and Stage 4
                 if is_cancelled():
@@ -4040,6 +3994,23 @@ class AppController(QObject):
                 smart_folder_id = meeting_obj.get("folder_id") if meeting_obj else None
 
                 if self.config.auto_summarize_meeting:
+                    # Free Whisper VRAM before Stage 4 local LLM inference when GPU headroom < 1800 MB
+                    try:
+                        if (
+                            self._capture_state == "idle"
+                            and getattr(self.transcriber, "_active_device", "") == "cuda"
+                            and getattr(self.transcriber, "_model", None) is not None
+                            and self.llm_engine is not None
+                        ):
+                            free_vram = self.llm_engine._get_free_vram_mb()
+                            if free_vram is not None and free_vram < 1800:
+                                logger.info(
+                                    "Unloading Whisper CUDA model before Stage 4 LLM summarization (free VRAM=%d MB < 1800 MB)",
+                                    free_vram,
+                                )
+                                self.transcriber.unload_model()
+                    except Exception:
+                        pass
                     m_title = meeting_obj.get("title", "") if meeting_obj else "Meeting Notes"
                     m_plat = "Microsoft Teams"
                     tl = m_title.lower()

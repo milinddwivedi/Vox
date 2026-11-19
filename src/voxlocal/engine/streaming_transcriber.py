@@ -19,10 +19,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from voxlocal.audio.devices import TARGET_SAMPLE_RATE, compute_rms_level
+from voxlocal.audio.devices import TARGET_SAMPLE_RATE, compute_rms_level, normalize_speech_audio
 from voxlocal.core.logger import get_logger
 from voxlocal.engine.dictation_processor import DictationProcessor
-from voxlocal.engine.transcriber import LocalWhisperTranscriber, is_hallucination
+from voxlocal.engine.transcriber import LocalWhisperTranscriber, is_hallucination, merge_domain_hotwords
 
 logger = get_logger("engine.streaming_transcriber")
 
@@ -223,6 +223,39 @@ class LiveMeetingStreamingTranscriber:
             self._worker_thread.join(timeout=1.5)
             self._worker_thread = None
 
+        try:
+            rec = self._recorder
+            if rec is not None and self.transcriber is not None:
+                now_sec = float(getattr(rec, "elapsed_seconds", 0.0))
+                flush_start = float(self._audio_cursor_sec)
+                if now_sec - flush_start >= 0.45:
+                    mic_s, sys_s, actual_s = rec.get_audio_window(flush_start, now_sec)
+                    m_rms = float(np.sqrt(np.mean(mic_s ** 2))) if mic_s.size else 0.0
+                    s_rms = float(np.sqrt(np.mean(sys_s ** 2))) if sys_s.size else 0.0
+                    remote_label = getattr(self, "_remote_speaker_label", "Speaker 1") or "Speaker 1"
+                    if self._speech_active and (m_rms >= 0.0025 or s_rms >= 0.0010):
+                        self._execute_transcribe_pass(
+                            actual_s,
+                            now_sec,
+                            self._current_track,
+                            self._current_speaker,
+                            speech_boundary=True,
+                            force_flush=True,
+                        )
+                    elif s_rms >= 0.0012 or m_rms >= 0.0035:
+                        tr = "mic" if (m_rms / 0.0035) > (s_rms / 0.0012) else "system"
+                        sp = "You (Mic)" if tr == "mic" else remote_label
+                        self._execute_transcribe_pass(
+                            actual_s,
+                            now_sec,
+                            tr,
+                            sp,
+                            speech_boundary=True,
+                            force_flush=True,
+                        )
+        except Exception as flush_exc:
+            logger.debug("Live streaming stop flush skipped: %s", flush_exc)
+
         logger.info("Live streaming transcriber stopped")
 
     def _warmup_model(self) -> None:
@@ -307,7 +340,7 @@ class LiveMeetingStreamingTranscriber:
             if self._speech_active:
                 if self._silence_start_sec == 0.0:
                     self._silence_start_sec = now_sec
-                elif (now_sec - self._silence_start_sec) >= 0.45:
+                elif (now_sec - self._silence_start_sec) >= 0.65:
                     # Speech turn boundary detected! Flush current utterance cleanly
                     self._execute_transcribe_pass(
                         actual_start, now_sec, self._current_track, self._current_speaker, speech_boundary=True
@@ -350,9 +383,9 @@ class LiveMeetingStreamingTranscriber:
         self._silence_start_sec = 0.0
         self._step_accumulated_sec += 0.15
 
-        # Trigger partial inference if continuous speech has accumulated >= 1.8s
-        # If continuous speech exceeds 8.5s without a natural pause, force turn boundary flush
-        if window_dur >= 8.5:
+        # Trigger partial inference if continuous speech has accumulated >= 2.4s
+        # If continuous speech exceeds 14.0s without a natural pause, force turn boundary flush
+        if window_dur >= 14.0:
             self._execute_transcribe_pass(
                 actual_start, now_sec, self._current_track, self._current_speaker, speech_boundary=True
             )
@@ -361,11 +394,51 @@ class LiveMeetingStreamingTranscriber:
             self._step_accumulated_sec = 0.0
             self._audio_cursor_sec = now_sec
             self._agreement_engine.reset()
-        elif self._step_accumulated_sec >= 1.8:
+        elif self._step_accumulated_sec >= 2.4:
             self._execute_transcribe_pass(
                 actual_start, now_sec, self._current_track, self._current_speaker, speech_boundary=False
             )
             self._step_accumulated_sec = 0.0
+
+    @staticmethod
+    def _score_whisper_segments(
+        segs: Any,
+    ) -> Tuple[str, float, Optional[float], Optional[float]]:
+        """Reject ghost/high-no-speech segments and return (text, exp_score, raw_avg_logprob, max_no_speech_prob)."""
+        texts: List[str] = []
+        lps: List[float] = []
+        nsps: List[float] = []
+        for s in (segs or []):
+            t = str(getattr(s, "text", "")).strip()
+            if not t:
+                continue
+            nsp = getattr(s, "no_speech_prob", None)
+            if nsp is not None and float(nsp) >= 0.85:
+                continue
+            lp = getattr(s, "avg_logprob", None)
+            if lp is not None and float(lp) < -1.45:
+                continue
+            texts.append(t)
+            if lp is not None:
+                lps.append(float(lp))
+            if nsp is not None:
+                nsps.append(float(nsp))
+        if not texts:
+            return "", 0.0, None, None
+        joined = " ".join(texts)
+        raw_avg_lp: Optional[float] = round(sum(lps) / len(lps), 4) if lps else None
+        max_nsp: Optional[float] = round(max(nsps), 4) if nsps else None
+        if raw_avg_lp is not None:
+            conf = round(max(0.05, min(0.99, float(np.exp(raw_avg_lp)))), 2)
+        else:
+            conf = 0.0
+        return joined, conf, raw_avg_lp, max_nsp
+
+    @classmethod
+    def _filter_and_score_segments(cls, segs: Any) -> Tuple[str, float]:
+        """Reject ghost/high-no-speech segments and compute uncalibrated exp(avg_logprob) score."""
+        joined, conf, _, _ = cls._score_whisper_segments(segs)
+        return joined, conf
 
     def _execute_transcribe_pass(
         self,
@@ -374,9 +447,10 @@ class LiveMeetingStreamingTranscriber:
         track: str,
         speaker: str,
         speech_boundary: bool,
+        force_flush: bool = False,
     ) -> None:
-        """Run Whisper inference and apply LocalAgreement policy."""
-        if self._stop_event.is_set():
+        """Run Whisper inference with AGC, Silero VAD gating, clean hotwords, and real confidence scoring."""
+        if self._stop_event.is_set() and not force_flush:
             return
         mic_slice, sys_slice, actual_start = self._recorder.get_audio_window(start_sec, end_sec)
         audio_slice = mic_slice if track == "mic" else sys_slice
@@ -396,23 +470,49 @@ class LiveMeetingStreamingTranscriber:
             audio_slice = audio_slice[-max_samples:]
 
         vocab = self.db.list_vocabulary(active_only=True) if self.db else []
-        prompt = DictationProcessor.build_whisper_prompt(vocab)
-        if self._language in ("en+hi", "hinglish", "hi_latn"):
-            prompt = f"{prompt} {DictationProcessor.DEFAULT_HINGLISH_PROMPT}".strip()
+        remote_label = getattr(self, "_remote_speaker_label", "Speaker 1") or "Speaker 1"
+        hotwords = merge_domain_hotwords(
+            DictationProcessor.build_whisper_hotwords(
+                vocab,
+                language=self._language,
+                participants=[remote_label] if remote_label != "Speaker 1" else None,
+            )
+        )
 
-        # Run fast single-pass inference (beam_size=1)
+        # Gate non-speech noise with Silero VAD only on boundary commits >= 4.0s (saves ONNX overhead on partials/short turns)
+        model_obj = getattr(self.transcriber, "_model", None)
+        is_real_whisper = bool(
+            model_obj is not None
+            and hasattr(self.transcriber, "_extract_vad_chunk_spans")
+            and type(model_obj).__module__.startswith("faster_whisper")
+        )
+        if is_real_whisper and speech_boundary and audio_slice.size >= int(4.0 * TARGET_SAMPLE_RATE):
+            vad_spans = self.transcriber._extract_vad_chunk_spans(
+                audio_slice,
+                dict(threshold=0.35, min_silence_duration_ms=400, speech_pad_ms=200),
+            )
+            if vad_spans == []:
+                rms_empty = float(np.sqrt(np.mean(np.square(audio_slice)))) if audio_slice.size else 0.0
+                if rms_empty < 0.008 and (end_sec - self._audio_cursor_sec) >= 12.0:
+                    self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec - 4.0)
+                return
+
+        proc_slice = normalize_speech_audio(audio_slice)
+        pass_beam = 2 if speech_boundary else 1
+
+        # Run single-encode inference (beam_size=2 on boundary commit, beam_size=1 on live partials)
         res = self.transcriber._transcribe_single_encode(
-            norm_audio=audio_slice,
+            norm_audio=proc_slice,
             language=self._language,
             lang_arg=None,
             is_en_only=False,
-            bilingual_modes=("", "en+hi", "hinglish", "hi_latn"),
-            beam_size=1,
+            bilingual_modes=("", "auto", "en+hi", "hinglish", "hi_latn"),
+            beam_size=pass_beam,
             vad_filter=False,
             vad_params={},
-            hotwords=None,
+            hotwords=hotwords,
             temperatures=0.0,
-            effective_prompt=prompt,
+            effective_prompt=None,
             word_timestamps=False,
         )
 
@@ -420,14 +520,14 @@ class LiveMeetingStreamingTranscriber:
         if not res or not res[0]:
             try:
                 res = self.transcriber._run_whisper_pass(
-                    norm_audio=audio_slice,
+                    norm_audio=proc_slice,
                     language=self._language,
-                    beam_size=1,
+                    beam_size=pass_beam,
                     vad_filter=False,
                     vad_params={},
-                    hotwords=None,
+                    hotwords=hotwords,
                     temperatures=0.0,
-                    initial_prompt=prompt,
+                    initial_prompt=None,
                 )
             except Exception as fb_err:
                 logger.debug("Streaming transcriber fallback pass warning: %s", fb_err)
@@ -441,8 +541,19 @@ class LiveMeetingStreamingTranscriber:
                 self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec - 4.0)
             return
 
-        raw_text = " ".join(s.text.strip() for s in res[0] if s.text.strip())
-        if not raw_text or is_hallucination(raw_text):
+        raw_text, seg_conf, raw_lp, max_nsp = self._score_whisper_segments(res[0])
+        if (
+            not raw_text
+            or (raw_lp is not None and seg_conf < 0.25)
+            or is_hallucination(
+                raw_text,
+                duration_sec=max(0.1, end_sec - start_sec),
+                initial_prompt="",
+                avg_logprob=raw_lp,
+                no_speech_prob=max_nsp,
+                audio_rms=rms,
+            )
+        ):
             if rms < 0.008 and (end_sec - self._audio_cursor_sec) >= 12.0:
                 self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec - 4.0)
             return
@@ -459,51 +570,93 @@ class LiveMeetingStreamingTranscriber:
                         "text": partial,
                         "start_time": start_sec,
                         "source_track": track,
+                        "confidence": seg_conf,
+                        "raw_model_score": raw_lp,
+                        "no_speech_prob": max_nsp,
+                        "confidence_calibrated": False,
                     },
                 )
             return
 
-        # Speech boundary (pause >= 0.45s, speaker switch, or 8.5s turn cap):
+        # Speech boundary (pause >= 0.65s, speaker switch, or 14s turn cap):
         # Commit complete, clean utterance for the primary track.
         confirmed, _ = self._agreement_engine.process_step(
             raw_text, speech_boundary=True, vocabulary=vocab
         )
-        self._commit_confirmed_segment(start_sec, end_sec, track, speaker, confirmed)
+        self._commit_confirmed_segment(
+            start_sec,
+            end_sec,
+            track,
+            speaker,
+            confirmed,
+            confidence=seg_conf,
+            raw_model_score=raw_lp,
+            no_speech_prob=max_nsp,
+        )
         self._audio_cursor_sec = end_sec
 
-        # Also check if the secondary track had simultaneous speech during [start_sec, end_sec]
-        # so remote participant audio (system) is never starved by microphone activity (or vice-versa).
+        # Also check if the secondary track had clear simultaneous speech during [start_sec, end_sec]
         other_track = "system" if track == "mic" else "mic"
         other_slice = sys_slice if other_track == "system" else mic_slice
         other_thresh = 0.0015 if other_track == "system" else 0.0040
         other_rms = float(np.sqrt(np.mean(np.square(other_slice)))) if other_slice.size else 0.0
-        if other_rms >= other_thresh and other_slice.size >= int(TARGET_SAMPLE_RATE * 0.5):
+        if other_rms >= (other_thresh * 1.5) and other_slice.size >= int(TARGET_SAMPLE_RATE * 0.5):
             if other_slice.size > max_samples:
                 other_slice = other_slice[-max_samples:]
-            other_res = self.transcriber._transcribe_single_encode(
-                norm_audio=other_slice,
-                language=self._language,
-                lang_arg=None,
-                is_en_only=False,
-                bilingual_modes=("", "en+hi", "hinglish", "hi_latn"),
-                beam_size=1,
-                vad_filter=False,
-                vad_params={},
-                hotwords=None,
-                temperatures=0.0,
-                effective_prompt=prompt,
-                word_timestamps=False,
-            )
-            if other_res and other_res[0]:
-                other_raw = " ".join(s.text.strip() for s in other_res[0] if s.text.strip())
-                if other_raw and not is_hallucination(other_raw):
-                    other_conf = self._agreement_engine._clean_and_normalize(other_raw, vocab)
-                    other_speaker = (
-                        (getattr(self, "_remote_speaker_label", "Speaker 1") or "Speaker 1")
-                        if other_track == "system"
-                        else "You (Mic)"
-                    )
-                    self._commit_confirmed_segment(start_sec, end_sec, other_track, other_speaker, other_conf)
+            other_has_speech = True
+            if is_real_whisper and other_slice.size >= int(4.0 * TARGET_SAMPLE_RATE):
+                other_vad = self.transcriber._extract_vad_chunk_spans(
+                    other_slice,
+                    dict(threshold=0.35, min_silence_duration_ms=400, speech_pad_ms=200),
+                )
+                if other_vad == []:
+                    other_has_speech = False
+            if other_has_speech:
+                norm_other = normalize_speech_audio(other_slice)
+                other_res = self.transcriber._transcribe_single_encode(
+                    norm_audio=norm_other,
+                    language=self._language,
+                    lang_arg=None,
+                    is_en_only=False,
+                    bilingual_modes=("", "auto", "en+hi", "hinglish", "hi_latn"),
+                    beam_size=1,
+                    vad_filter=False,
+                    vad_params={},
+                    hotwords=hotwords,
+                    temperatures=0.0,
+                    effective_prompt=None,
+                    word_timestamps=False,
+                )
+                if other_res and other_res[0]:
+                    other_raw, other_conf, other_lp, other_nsp = self._score_whisper_segments(other_res[0])
+                    if (
+                        other_raw
+                        and (other_lp is None or other_conf >= 0.25)
+                        and not is_hallucination(
+                            other_raw,
+                            duration_sec=max(0.1, end_sec - start_sec),
+                            initial_prompt="",
+                            avg_logprob=other_lp,
+                            no_speech_prob=other_nsp,
+                            audio_rms=other_rms,
+                        )
+                    ):
+                        other_conf_txt = self._agreement_engine._clean_and_normalize(other_raw, vocab)
+                        other_speaker = (
+                            (getattr(self, "_remote_speaker_label", "Speaker 1") or "Speaker 1")
+                            if other_track == "system"
+                            else "You (Mic)"
+                        )
+                        self._commit_confirmed_segment(
+                            start_sec,
+                            end_sec,
+                            other_track,
+                            other_speaker,
+                            other_conf_txt,
+                            confidence=other_conf,
+                            raw_model_score=other_lp,
+                            no_speech_prob=other_nsp,
+                        )
 
     def _commit_confirmed_segment(
         self,
@@ -512,6 +665,9 @@ class LiveMeetingStreamingTranscriber:
         track: str,
         speaker: str,
         confirmed: str,
+        confidence: float = 0.0,
+        raw_model_score: Optional[float] = None,
+        no_speech_prob: Optional[float] = None,
     ) -> None:
         if not confirmed:
             return
@@ -571,7 +727,7 @@ class LiveMeetingStreamingTranscriber:
                         speaker=speaker,
                         text=confirmed,
                         source_track=track,
-                        confidence=0.95,
+                        confidence=round(float(confidence), 2),
                     )
                 except Exception as db_exc:
                     logger.debug("Failed saving confirmed segment to DB: %s", db_exc)
@@ -585,6 +741,10 @@ class LiveMeetingStreamingTranscriber:
                 "start_time": start_sec,
                 "end_time": end_sec,
                 "source_track": track,
+                "confidence": round(float(confidence), 2),
+                "raw_model_score": raw_model_score,
+                "no_speech_prob": no_speech_prob,
+                "confidence_calibrated": False,
             }
 
             self._recent_emitted.append(seg_dict)

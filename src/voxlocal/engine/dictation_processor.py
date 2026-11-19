@@ -77,6 +77,7 @@ class DictationProcessor:
         (r"\b(?:p\s*l\s*m|p\.l\.m)\b", "PLM"),
         (r"\b(?:e\s*r\s*p|e\.r\.p)\b", "ERP"),
         (r"\bhub\s*spot\b", "HubSpot"),
+        (r"\b(?:Upspot|appspot|app\s+spot)\b", "HubSpot"),
         (r"\bsub\s+categor(y|ies)\b", r"subcategor\1"),
         (r"\bbar\s+code(s?)\b", r"barcode\1"),
         (r"\bstand\s+up\s+(?:call|meeting)\b", "standup meeting"),
@@ -494,6 +495,27 @@ class DictationProcessor:
         (r"\bडिपेंडेंसी\b", "dependency"),
         (r"\bडिलीवर\b", "deliver"),
         (r"\bकनेक्टेड\b", "connected"),
+        (r"\bपीएलएम\s+सपोर्ट\b", "PLM support"),
+        (r"\bपी\s*एल\s*एम\b|\bपी\s*एलम\b", "PLM"),
+        (r"\bसपोर्ट\b", "support"),
+        (r"\bकॉस्टिंग\s+शीट\b|\bकास्टिंग\s+शीट\b", "costing sheet"),
+        (r"\bहबस्पॉट्स\b|\bहब\s*स्पॉट्स\b|\bहबस्पॉट\b", "HubSpot"),
+        (r"\bग्रूप\b|\bग्रुप\b", "group"),
+        (r"\bएक्जामपल\b|\bएग्जांपल\b", "example"),
+        (r"\bमाइक्रोसॉफ्ट\s+ऑफिस\b", "Microsoft Office"),
+        (r"\bबैकअप\b|\bबैक\s+अप\b", "backup"),
+        (r"\bलॉगिन\b|\bलॉग\s+इन\b", "login"),
+        (r"\bकॉपी\b", "copy"),
+        (r"\bमैनेज\b", "manage"),
+        (r"\bकस्टमर\b", "customer"),
+        (r"\bप्रोडक्ट\b", "product"),
+        (r"\bफीचर\b|\bफ़ीचर\b", "feature"),
+        (r"\bरिलीज़\b|\bरिलीज\b", "release"),
+        (r"\bइंटीग्रेशन\b", "integration"),
+        (r"\bमाइग्रेशन\b", "migration"),
+        (r"\bसिस्टम\b", "system"),
+        (r"\bसेटिंग्स\b", "settings"),
+        (r"\bसेटिंग\b", "setting"),
         # Domain name and team entity phonetic corrections
         (r"\b(?:Achilles|Achillesha|achillesha|A\s+village)\b", "Abhilash"),
         (r"\b(?:Hey\s+man|Hey\s+manth|K-month|Hiemont|k-month)\b", "Hemanth"),
@@ -505,8 +527,14 @@ class DictationProcessor:
         (r"\b(?:two\s+PU|to\s+a\s+few)\b", "2 PU"),
     ]
 
-    DEFAULT_HINGLISH_PROMPT = (
-        "Milind, Hemanth, Pankaj, Abhilash, Puneet, Rumjhum, Amar, Astha, WFX, PLM, ERP, World Fashion Exchange. Tech Team, Sprint, Daily Scrum."
+    # Empty initial_prompt prevents Whisper from echoing prompt tokens during silence/pauses;
+    # domain terms and participant names are supplied via hotwords instead.
+    DEFAULT_HINGLISH_PROMPT = ""
+
+    DEFAULT_HINGLISH_HOTWORDS = (
+        "Milind, Hemanth, Pankaj, Abhilash, Puneet, Rumjhum, Amar, Astha, "
+        "WFX, PLM, ERP, World Fashion Exchange, HubSpot, Excel, Microsoft Teams, "
+        "Sprint, Daily Scrum, Tech Team, costing sheet, barcode"
     )
 
     # Conversational dictionary + phonetic mapping for Romanized Hinglish ('hi_latn') mode
@@ -614,6 +642,16 @@ class DictationProcessor:
         "नितिन": "Nitin", "सचिन": "Sachin", "हेमंत": "Hemanth", "आस्था": "Astha", "रिया": "Riya",
         "रिदम": "Rhythm", "रुमझुम": "Rumjhum", "विनीत": "Vineet", "मनोज": "Manoj",
         "अभिलाष": "Abhilash", "अमर": "Amar", "यामिनी": "Yamini", "अनन्या": "Anannya",
+        "पुनीत": "Puneet",
+        "काफी": "kaafi", "काफ़ी": "kaafi", "बताइए": "bataiye", "बताएं": "bataein", "बताओ": "batao",
+        "रहें": "rahein", "सारे": "saare", "सारी": "saari", "सारा": "saara",
+        "दूसरा": "doosra", "दूसरी": "doosri", "दूसरे": "doosre",
+        "वाला": "waala", "वाली": "waali", "वाले": "waale",
+        "अपना": "apna", "अपनी": "apni", "अपने": "apne",
+        "होता": "hota", "होती": "hoti", "होते": "hote",
+        "पता": "pata", "जरूरत": "zaroorat", "ज़रूरत": "zaroorat",
+        "फर्क": "farq", "फ़र्क": "farq", "आधा": "aadha", "डाल": "daal", "डाला": "daala",
+        "करा": "kara", "करी": "kari", "करे": "kare", "करूं": "karoon", "करूँ": "karoon",
     }
 
     FILLER_PATTERN = re.compile(
@@ -667,12 +705,14 @@ class DictationProcessor:
         re.IGNORECASE,
     )
 
-    # Common Whisper silence hallucinations to ignore
+    # Common Whisper silence hallucinations to ignore (unambiguous non-meeting boilerplate)
     HALLUCINATION_PHRASES = {
         "thank you.",
+        "thank you",
         "thanks for watching.",
         "thank you for watching.",
         "subtitles by the amara.org community",
+        "subtitles by the amara.org community.",
         "you",
         ".",
         "।",
@@ -687,6 +727,16 @@ class DictationProcessor:
         "microsoft office word document",
         "word.document.8",
         "msworddoc",
+    }
+
+    # Known legacy prompt-echo strings: NEVER rejected unconditionally because users can
+    # genuinely speak phrases like "Tech Team, Sprint, Daily Scrum." in calls; only rejected
+    # when corroborated by prompt contamination or acoustic failure signals.
+    KNOWN_LEGACY_PROMPT_ECHOES = {
+        "tech team, sprint, daily scrum.",
+        "tech team, sprint, daily scrum",
+        "world fashion exchange. tech team, sprint, daily scrum.",
+        "milind, hemanth, pankaj, abhilash, puneet, rumjhum, amar, astha, wfx, plm, erp, world fashion exchange. tech team, sprint, daily scrum.",
     }
 
     # Spoken word numbers for entity formatting
@@ -801,11 +851,36 @@ class DictationProcessor:
     def devanagari_to_roman_hinglish(cls, text: str) -> str:
         """
         Convert Devanagari Hindi words into natural conversational Roman Hinglish
-        with Hindi schwa deletion and English loanword restoration, preserving
-        existing Latin/English words and punctuation.
+        with Hindi schwa deletion, English loanword restoration, and stray Perso-Arabic
+        cleanup, preserving existing Latin/English words and punctuation.
         """
-        if not text or not any("\u0900" <= ch <= "\u097F" for ch in text):
+        if not text:
             return text
+
+        has_deva = any("\u0900" <= ch <= "\u097F" for ch in text)
+        has_urdu = any("\u0600" <= ch <= "\u06FF" for ch in text)
+        if not has_deva and not has_urdu:
+            return text
+
+        if has_urdu:
+            text = re.sub(r"\baگr\b", "agar", text, flags=re.IGNORECASE)
+            text = re.sub(r"\bmگr\b", "magar", text, flags=re.IGNORECASE)
+            urdu_map = {
+                "گ": "g", "ک": "k", "ق": "q", "ف": "f", "ز": "z",
+                "ش": "sh", "س": "s", "ر": "r", "ڑ": "r", "ا": "a",
+                "آ": "aa", "ن": "n", "ں": "n", "م": "m", "ل": "l",
+                "ت": "t", "ٹ": "t", "د": "d", "ڈ": "d",
+                "ب": "b", "پ": "p", "ہ": "h", "ھ": "h", "ح": "h",
+                "خ": "kh", "غ": "gh", "ج": "j", "چ": "ch", "ی": "y",
+                "ے": "e", "و": "w", "ع": "a", "ث": "s", "ص": "s",
+                "ض": "z", "ط": "t", "ظ": "z", "ذ": "z", "ئ": "y", "ؤ": "o",
+            }
+            text = "".join(
+                urdu_map.get(ch, "" if ("\u0600" <= ch <= "\u06FF") else ch)
+                for ch in text
+            )
+            if not any("\u0900" <= ch <= "\u097F" for ch in text):
+                return text
 
         # Step 1: Normalize orthography and convert Hindi Purna Viram to standard period
         text = cls.normalize_devanagari(text).replace("।", ".")
@@ -889,10 +964,16 @@ class DictationProcessor:
                     i += 1
                 else:
                     # Medial schwa deletion heuristics:
-                    # In Hindi phonology, medial consonant before suffixes like -te, -ti, -ta, -ne, -na, -ke drops inherent 'a':
+                    # Initial syllables (before any vowel is emitted) keep inherent 'a' (e.g. 'बता' -> 'bata');
+                    # medial consonants after a prior vowel before [C][matra] drop inherent 'a' (e.g. 'करते' -> 'karte').
                     if i < n:
                         next_part = word[i:]
-                        if re.match(r"^[क-ह][ािीुूेैोौ]", next_part) and len(word) >= 3 and i >= 1:
+                        has_prior_vowel = any(v in "".join(res).lower() for v in "aeiou")
+                        if (
+                            has_prior_vowel
+                            and re.match(r"^[क-हक़-य़][\u093C]?[ािीुूृेैोौॉ]", next_part)
+                            and len(word) >= 3
+                        ):
                             res.append(c_rom)
                         else:
                             res.append(c_rom + "a")
@@ -901,11 +982,9 @@ class DictationProcessor:
                         res.append(c_rom)
 
             w_out = "".join(res)
-            # Post-cleanups for conversational Hinglish phonetics
+            # Post-cleanups for conversational Hinglish phonetics (only delete medial schwa after a vowel)
             w_out = re.sub(r"([aeiIoOuU])nn([aeiIoOuU])", r"\1n\2", w_out)
-            w_out = re.sub(r"([bcdfghjklmnpqrstvwxyz])a([td]e\b)", r"\1\2", w_out)
-            w_out = re.sub(r"([bcdfghjklmnpqrstvwxyz])a([td]a\b)", r"\1\2", w_out)
-            w_out = re.sub(r"([bcdfghjklmnpqrstvwxyz])a([td]i\b)", r"\1\2", w_out)
+            w_out = re.sub(r"(?<=[aeiou])([bcdfghjklmnpqrstvwxyz]{1,2})a([td][eai]\b)", r"\1\2", w_out)
             w_out = re.sub(r"ee$", "i", w_out)
             return w_out
 
@@ -1125,6 +1204,50 @@ class DictationProcessor:
         deterministically in `DictationProcessor.process()`.
         """
         return ""
+
+    @classmethod
+    def build_whisper_hotwords(
+        cls,
+        vocabulary: Optional[List[Dict[str, Any]]] = None,
+        language: str = "en",
+        participants: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Build a comma-separated hotwords string for Whisper decoder logit biasing
+        without injecting full prompt sentences that trigger silence hallucinations.
+        """
+        terms: List[str] = []
+        seen: set[str] = set()
+
+        def _add(term: str) -> None:
+            t = re.sub(r"\s+", " ", str(term or "").strip()).strip(",.")
+            if not t:
+                return
+            k = t.lower()
+            if k in seen:
+                return
+            seen.add(k)
+            terms.append(t)
+
+        if vocabulary:
+            for item in vocabulary:
+                if not item.get("is_active", 1):
+                    continue
+                repl = str(item.get("replacement", "")).strip()
+                if repl and len(repl) <= 48:
+                    _add(repl)
+
+        if participants:
+            for p in participants:
+                clean_p = str(p or "").strip()
+                if clean_p and clean_p.lower() not in ("you", "you (mic)", "speaker 1", "speaker 2"):
+                    _add(clean_p)
+
+        if str(language or "").lower() in ("en+hi", "hinglish", "hi_latn", "auto", ""):
+            for tok in cls.DEFAULT_HINGLISH_HOTWORDS.split(","):
+                _add(tok)
+
+        return ", ".join(terms[:32])
 
     @classmethod
     def is_sentence_complete(cls, processed_text: str) -> bool:
@@ -1733,11 +1856,13 @@ class DictationProcessor:
             text = re.sub(r"(?:\.{2,}|…)\s*$", "", text).strip()
         text = re.sub(r"(?:\.{3,}|…)", " ", text)
 
-        # 0b. Normalize Devanagari orthography (or transliterate to Roman Hinglish if requested)
+        # 0b. Normalize Devanagari orthography (or transliterate Devanagari/Perso-Arabic to Roman Hinglish)
         if any("\u0900" <= ch <= "\u097F" for ch in text):
             text = cls.normalize_devanagari(text)
             if output_script == "roman":
                 text = cls.devanagari_to_roman_hinglish(text)
+        elif output_script == "roman" and any("\u0600" <= ch <= "\u06FF" for ch in text):
+            text = cls.devanagari_to_roman_hinglish(text)
 
         # 0c. Expand user snippets before cleanup so long structured templates aren't mangled
         if snippets and mode_str != "verbatim":
