@@ -21,6 +21,7 @@ import os
 import sys
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -283,10 +284,16 @@ class TestMeetingStudioPhase5EnterpriseUX(unittest.TestCase):
         drawer = VoxNotetakerDrawer(self.controller)
         try:
             with patch.object(self.controller, "query_meeting_memory", return_value={"answer": "Mike proposed CSV streaming."}) as mock_query:
-                drawer.txt_question.setText("What did Mike say?")
-                drawer._ask_ai()
+                drawer.txt_ask_anything.setText("What did Mike say?")
+                drawer._on_ask_anything_submitted()
+                deadline = time.perf_counter() + 2.0
+                while time.perf_counter() < deadline:
+                    self.app.processEvents()
+                    if "Mike proposed CSV streaming." in drawer.summary_browser.toPlainText():
+                        break
+                    time.sleep(0.015)
                 mock_query.assert_called_once_with("What did Mike say?", meeting_id=self.m1_id)
-                self.assertIn("Mike proposed CSV streaming.", drawer.qa_output.toPlainText())
+                self.assertIn("Mike proposed CSV streaming.", drawer.summary_browser.toPlainText())
         finally:
             drawer.close()
 

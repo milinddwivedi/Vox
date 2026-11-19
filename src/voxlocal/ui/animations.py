@@ -17,8 +17,10 @@ Provides over 100+ micro and macro animations across the application:
 
 from __future__ import annotations
 
+import ctypes
 import math
-from typing import Callable, List, Optional
+import sys
+from typing import Any, Callable, List, Optional
 from PyQt6.QtCore import (
     QEasingCurve,
     QObject,
@@ -62,6 +64,42 @@ from PyQt6.QtWidgets import (
 )
 
 from voxlocal.ui.theme import get_theme_tokens
+
+
+SPI_GETCLIENTAREAANIMATION = 0x1042
+_REDUCED_MOTION_OVERRIDE: Optional[bool] = None
+
+
+def set_reduced_motion_preference(enabled: Optional[bool]) -> None:
+    """Override reduced-motion detection explicitly (None defers to OS setting)."""
+    global _REDUCED_MOTION_OVERRIDE
+    _REDUCED_MOTION_OVERRIDE = None if enabled is None else bool(enabled)
+
+
+def query_os_reduced_motion() -> bool:
+    """Query Windows SPI_GETCLIENTAREAANIMATION; returns True if client-area animations are disabled."""
+    if sys.platform != "win32":
+        return False
+    try:
+        val = ctypes.c_int(1)
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            ctypes.byref(val),
+            0,
+        )
+        return bool(ok and val.value == 0)
+    except Exception:
+        return False
+
+
+def is_reduced_motion_enabled(config: Optional[Any] = None) -> bool:
+    """Return True if user preference or OS Accessibility disables animations."""
+    if config is not None and bool(getattr(config, "reduced_motion", False)):
+        return True
+    if _REDUCED_MOTION_OVERRIDE is not None:
+        return bool(_REDUCED_MOTION_OVERRIDE)
+    return query_os_reduced_motion()
 
 
 # ======================================================================
@@ -119,38 +157,54 @@ class AnimatedPushButton(QPushButton):
     def enterEvent(self, event: QEnterEvent) -> None:
         if self.isEnabled():
             self._anim_y.stop()
-            self._anim_y.setDuration(140)
-            self._anim_y.setStartValue(self._y_offset)
-            self._anim_y.setEndValue(-1.0)
-            self._anim_y.start()
+            if is_reduced_motion_enabled():
+                self._y_offset = 0.0
+                self.update()
+            else:
+                self._anim_y.setDuration(140)
+                self._anim_y.setStartValue(self._y_offset)
+                self._anim_y.setEndValue(-1.0)
+                self._anim_y.start()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         self._anim_y.stop()
-        self._anim_y.setDuration(130)
-        self._anim_y.setStartValue(self._y_offset)
-        self._anim_y.setEndValue(0.0)
-        self._anim_y.start()
+        if is_reduced_motion_enabled():
+            self._y_offset = 0.0
+            self.update()
+        else:
+            self._anim_y.setDuration(130)
+            self._anim_y.setStartValue(self._y_offset)
+            self._anim_y.setEndValue(0.0)
+            self._anim_y.start()
         super().leaveEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if self.isEnabled() and event.button() == Qt.MouseButton.LeftButton:
             self._anim_y.stop()
-            self._anim_y.setDuration(60)
-            self._anim_y.setStartValue(self._y_offset)
-            self._anim_y.setEndValue(0.5)
-            self._anim_y.start()
+            if is_reduced_motion_enabled():
+                self._y_offset = 0.0
+                self.update()
+            else:
+                self._anim_y.setDuration(60)
+                self._anim_y.setStartValue(self._y_offset)
+                self._anim_y.setEndValue(0.5)
+                self._anim_y.start()
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self.isEnabled() and event.button() == Qt.MouseButton.LeftButton:
             self._anim_y.stop()
-            self._anim_y.setDuration(140)
-            self._anim_y.setEasingCurve(VoxMotion.QUIET_LUXURY)
-            self._anim_y.setStartValue(self._y_offset)
-            target = -1.0 if self.underMouse() else 0.0
-            self._anim_y.setEndValue(target)
-            self._anim_y.start()
+            if is_reduced_motion_enabled():
+                self._y_offset = 0.0
+                self.update()
+            else:
+                self._anim_y.setDuration(140)
+                self._anim_y.setEasingCurve(VoxMotion.QUIET_LUXURY)
+                self._anim_y.setStartValue(self._y_offset)
+                target = -1.0 if self.underMouse() else 0.0
+                self._anim_y.setEndValue(target)
+                self._anim_y.start()
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event: QPaintEvent) -> None:
@@ -223,10 +277,10 @@ class ThemeToggleCapsule(QPushButton):
     def _sync_stylesheet(self) -> None:
         t = get_theme_tokens(self._theme)
         is_dark = self._theme == "dark"
-        bg = t.get("secondary_btn_bg", "#30302F" if is_dark else "#FFFFFF")
-        border = t.get("border", "#383836" if is_dark else "#E5E2D9")
-        hover_border = t.get("accent_dawn", "#F0D7FF") if is_dark else t.get("accent_fathom", "#034F46")
-        color = t.get("text", "#1A1A1A")
+        bg = t["secondary_btn_bg"]
+        border = t["border"]
+        hover_border = t["accent_dawn"] if is_dark else t["accent_fathom"]
+        color = t["text"]
 
         self.setStyleSheet(
             f"""
@@ -242,17 +296,20 @@ class ThemeToggleCapsule(QPushButton):
             }}
             QPushButton:hover {{
                 border-color: {hover_border};
-                background-color: {t.get('sidebar_hover', '#262625' if is_dark else '#F0EFEA')};
+                background-color: {t['sidebar_hover']};
             }}
             """
         )
 
     def _on_clicked(self) -> None:
         self._anim_rot.stop()
-        self._anim_rot.setDuration(520)
-        self._anim_rot.setStartValue(0.0)
-        self._anim_rot.setEndValue(360.0)
-        self._anim_rot.start()
+        if is_reduced_motion_enabled():
+            self._rotation_angle = 0.0
+        else:
+            self._anim_rot.setDuration(520)
+            self._anim_rot.setStartValue(0.0)
+            self._anim_rot.setEndValue(360.0)
+            self._anim_rot.start()
 
         new_theme = "light" if self._theme == "dark" else "dark"
         self._theme = new_theme
@@ -288,6 +345,13 @@ class TabTransitionEngine(QObject):
         # Restore any previous page whose transition is still running before
         # animating the newly selected workspace.
         self.cancel_active()
+
+        if is_reduced_motion_enabled():
+            existing_eff = widget.graphicsEffect()
+            if isinstance(existing_eff, QGraphicsOpacityEffect):
+                existing_eff.setOpacity(1.0)
+            self._last_index = new_index
+            return
 
         # Setup Opacity Effect
         effect = widget.graphicsEffect()
@@ -370,13 +434,20 @@ class PulseBeacon(QWidget):
         self._timer.setInterval(33)  # ~30 FPS when active
         self._timer.timeout.connect(self._tick)
         if self._state != "idle":
-            self._timer.start()
+            if is_reduced_motion_enabled():
+                self._halo_alpha = 0.65
+            else:
+                self._timer.start()
 
     def set_state(self, state: str) -> None:
         self._state = state
         if state == "idle":
             if self._timer.isActive():
                 self._timer.stop()
+        elif is_reduced_motion_enabled():
+            if self._timer.isActive():
+                self._timer.stop()
+            self._halo_alpha = 0.65
         else:
             if not self._timer.isActive():
                 self._timer.start()
@@ -385,6 +456,11 @@ class PulseBeacon(QWidget):
     def _tick(self) -> None:
         if self._state == "idle":
             self._timer.stop()
+            return
+        if is_reduced_motion_enabled():
+            self._timer.stop()
+            self._halo_alpha = 0.65
+            self.update()
             return
         self._phase += 0.06
         # Sine wave breathing between 0.35 and 1.0
@@ -465,10 +541,22 @@ class MultiChannelEqualizerWidget(QWidget):
     def set_level(self, level: float) -> None:
         """Normalized level [0.0 .. 1.0]."""
         self._target_level = max(0.0, min(1.0, float(level)))
+        if is_reduced_motion_enabled():
+            if self._timer.isActive():
+                self._timer.stop()
+            self._current_levels = [min(1.0, self._target_level * h) for h in self._harmonics]
+            self.update()
+            return
         if self._target_level > 0.01 and not self._timer.isActive():
             self._timer.start()
 
     def _physics_step(self) -> None:
+        if is_reduced_motion_enabled():
+            if self._timer.isActive():
+                self._timer.stop()
+            self._current_levels = [min(1.0, self._target_level * h) for h in self._harmonics]
+            self.update()
+            return
         self._phase += 0.22
         decay = 0.76
         changed = False
@@ -550,6 +638,12 @@ class ConcentricSoundWaveVisualizer(QWidget):
     def set_active(self, active: bool, color_hex: str = "#10b981") -> None:
         self._active = active
         self._color = QColor(color_hex)
+        if active and is_reduced_motion_enabled():
+            if self._timer.isActive():
+                self._timer.stop()
+            self._phase = 0.15
+            self.update()
+            return
         if active:
             if not self._timer.isActive():
                 self._timer.start()
@@ -559,6 +653,12 @@ class ConcentricSoundWaveVisualizer(QWidget):
             self.update()
 
     def _step(self) -> None:
+        if is_reduced_motion_enabled():
+            if self._timer.isActive():
+                self._timer.stop()
+            self._phase = 0.15 if self._active else 0.0
+            self.update()
+            return
         if self._active:
             self._phase += 0.05
             self.update()
@@ -605,6 +705,9 @@ class AnimatedProgressBar(QProgressBar):
         self._anim.stop()
         self._anim.setStartValue(self.value())
         self._anim.setEndValue(val)
+        if is_reduced_motion_enabled():
+            self.setValue(val)
+            return
         self._anim.start()
 
 
@@ -623,6 +726,7 @@ class ToastNotification(QFrame):
     def __init__(self, title: str, message: str, parent: Optional[QWidget] = None, theme: str = "dark") -> None:
         super().__init__(parent)
         self.toast_title = title
+        self._dismissed = False
         t = get_theme_tokens(theme)
 
         self.setObjectName("voxToastCard")
@@ -684,7 +788,10 @@ class ToastNotification(QFrame):
         self._anim_in.setStartValue(0.0)
         self._anim_in.setEndValue(1.0)
         self._anim_in.setEasingCurve(VoxMotion.QUIET_LUXURY)
-        self._anim_in.start()
+        if is_reduced_motion_enabled():
+            self._effect.setOpacity(1.0)
+        else:
+            self._anim_in.start()
 
         # Auto dismiss timer (stored so updates can extend visibility cleanly)
         self._dismiss_timer = QTimer(self)
@@ -698,6 +805,14 @@ class ToastNotification(QFrame):
         self._dismiss_timer.start(4200)
 
     def dismiss(self) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        if hasattr(self, "_dismiss_timer") and self._dismiss_timer.isActive():
+            self._dismiss_timer.stop()
+        if is_reduced_motion_enabled():
+            self._on_dismiss_finished()
+            return
         self._anim_out = QPropertyAnimation(self._effect, b"opacity")
         self._anim_out.setDuration(200)
         self._anim_out.setStartValue(1.0)

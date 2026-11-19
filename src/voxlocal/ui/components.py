@@ -67,6 +67,7 @@ from PyQt6.QtWidgets import (
 )
 
 from voxlocal.core.logger import get_logger
+from voxlocal.ui.animations import is_reduced_motion_enabled
 from voxlocal.ui.theme import get_theme_tokens, get_ui_font
 from voxlocal.storage.exporter import format_seconds_hms
 
@@ -147,8 +148,13 @@ class VoxToggleSwitch(QCheckBox):
 
     def _on_toggled(self, checked: bool) -> None:
         self._anim.stop()
+        target = 1.0 if checked else 0.0
+        if is_reduced_motion_enabled():
+            self._thumb_pos = target
+            self.update()
+            return
         self._anim.setStartValue(self._thumb_pos)
-        self._anim.setEndValue(1.0 if checked else 0.0)
+        self._anim.setEndValue(target)
         self._anim.start()
 
     def setChecked(self, checked: bool) -> None:
@@ -176,9 +182,9 @@ class VoxToggleSwitch(QCheckBox):
         track_x = 1.0
         radius = track_h / 2.0
 
-        # Colors matching VOX Sand Light / Vast Dark palette
-        active_color = QColor(t.get("accent_dawn", "#F0D7FF")) if is_dark else QColor(t.get("primary_btn_bg", "#1A1A1A"))
-        idle_color = QColor("#383836") if is_dark else QColor("#D5D0C5")
+        # Colors matching VOX palette tokens
+        active_color = QColor(t["accent_dawn"]) if is_dark else QColor(t["primary_btn_bg"])
+        idle_color = QColor(t["toggle_idle_track"])
 
         # Blend track color
         r = int(idle_color.red() + (active_color.red() - idle_color.red()) * self._thumb_pos)
@@ -214,7 +220,7 @@ class VoxToggleSwitch(QCheckBox):
 
         # Thumb body
         thumb_rect = QRectF(thumb_x, thumb_y, thumb_diameter, thumb_diameter)
-        thumb_color = QColor("#1A1A1A") if (is_dark and self._thumb_pos > 0.5) else QColor("#FFFFFF")
+        thumb_color = QColor(t["toggle_thumb_checked"] if self._thumb_pos > 0.5 else t["toggle_thumb"])
         p.setBrush(thumb_color)
         p.drawEllipse(thumb_rect)
 
@@ -381,22 +387,25 @@ class VoxStatusPill(QFrame):
             self._text = text
             self._lbl.setText(text)
 
-        colors = {
-            "recording": ("#EF4444", "rgba(239, 68, 68, 0.12)", "#FCA5A5", "#B91C1C"),
-            "active": ("#10B981", "rgba(16, 185, 129, 0.12)", "#6EE7B7", "#047857"),
-            "success": ("#10B981", "rgba(16, 185, 129, 0.12)", "#6EE7B7", "#047857"),
-            "warning": ("#F59E0B", "rgba(245, 158, 11, 0.12)", "#FCD34D", "#B45309"),
-            "purple": ("#8B5CF6", "rgba(139, 92, 246, 0.12)", "#C4B5FD", "#6D28D9"),
-            "sky": ("#0EA5E9", "rgba(14, 165, 233, 0.12)", "#7DD3FC", "#0369A1"),
-            "neutral": ("#64748B", "rgba(100, 116, 139, 0.12)", "#CBD5E1", "#475569"),
+        t = get_theme_tokens(self._theme)
+        variant_map = {
+            "recording": ("status_danger", "status_danger_bg", "status_danger_text"),
+            "active": ("status_success", "status_success_bg", "status_success_text"),
+            "success": ("status_success", "status_success_bg", "status_success_text"),
+            "warning": ("status_warning", "status_warning_bg", "status_warning_text"),
+            "purple": ("status_purple", "status_purple_bg", "status_purple_text"),
+            "sky": ("status_info", "status_info_bg", "status_info_text"),
+            "neutral": ("status_neutral", "status_neutral_bg", "status_neutral_text"),
         }
-        dot_c, bg_c, dark_text, light_text = colors.get(variant, colors["neutral"])
-        text_c = light_text if self._theme == "light" else dark_text
+        dot_k, bg_k, text_k = variant_map.get(variant, variant_map["neutral"])
+        dot_c = t[dot_k]
+        bg_c = t[bg_k]
+        text_c = t[text_k]
         self.setStyleSheet(
             f"""
             QFrame {{
                 background-color: {bg_c};
-                border: 1px solid {dot_c}33;
+                border: 1px solid {dot_c};
                 border-radius: 12px;
             }}
             """
@@ -487,12 +496,13 @@ class VoxAudioVisualizerBar(QWidget):
         p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
 
         if self._level > 0.005:
+            t = get_theme_tokens(self._theme)
             # Active level bar
             fill_w = max(h, w * self._level)
             grad = QLinearGradient(0, 0, fill_w, 0)
-            grad.setColorAt(0.0, QColor("#10B981"))
-            grad.setColorAt(0.7, QColor("#3B82F6"))
-            grad.setColorAt(1.0, QColor("#EF4444") if self._level > 0.82 else QColor("#3B82F6"))
+            grad.setColorAt(0.0, QColor(t["audio_meter_low"]))
+            grad.setColorAt(0.7, QColor(t["audio_meter_mid"]))
+            grad.setColorAt(1.0, QColor(t["audio_meter_peak"]) if self._level > 0.82 else QColor(t["audio_meter_mid"]))
 
             p.setBrush(grad)
             p.drawRoundedRect(QRectF(0, 0, fill_w, h), r, r)
@@ -518,8 +528,10 @@ class VoxMetricCard(QFrame):
         value: str,
         caption: str = "",
         parent: Optional[QWidget] = None,
+        theme: str = "dark",
     ) -> None:
         super().__init__(parent)
+        self._theme = (theme or "dark").lower()
         self.setObjectName("voxMetricCard")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -528,25 +540,40 @@ class VoxMetricCard(QFrame):
         layout.setSpacing(2)
 
         self.lbl_title = QLabel(title.upper())
-        self.lbl_title.setStyleSheet("font-size: 10px; font-weight: 700; letter-spacing: 0.05em; color: #8B949E; border: none; background: transparent;")
-
         self.lbl_value = QLabel(value)
-        self.lbl_value.setStyleSheet("font-size: 18px; font-weight: 800; color: #F0F6FC; border: none; background: transparent;")
-
         self.lbl_caption = QLabel(caption)
-        self.lbl_caption.setStyleSheet("font-size: 11px; color: #64748B; border: none; background: transparent;")
 
         layout.addWidget(self.lbl_title)
         layout.addWidget(self.lbl_value)
         if caption:
             layout.addWidget(self.lbl_caption)
+        self.set_theme(self._theme)
+
+    def set_theme(self, theme: str) -> None:
+        self._theme = (theme or "dark").lower()
+        t = get_theme_tokens(self._theme)
+        self.lbl_title.setStyleSheet(
+            f"font-size: 10px; font-weight: 700; letter-spacing: 0.05em; "
+            f"color: {t['text_muted']}; border: none; background: transparent;"
+        )
+        self.lbl_value.setStyleSheet(
+            f"font-size: 18px; font-weight: 800; color: {t['text_primary']}; "
+            "border: none; background: transparent;"
+        )
+        self.lbl_caption.setStyleSheet(
+            f"font-size: 11px; color: {t['text_secondary']}; border: none; background: transparent;"
+        )
         self.setStyleSheet(
-            """
-            QFrame#voxMetricCard {
+            f"""
+            QFrame#voxMetricCard {{
+                background-color: {t['surface']};
+                border: 1px solid {t['border']};
                 border-radius: 10px;
-            }
+            }}
             """
         )
+
+    apply_theme = set_theme
 
     def set_value(self, val: str, caption: Optional[str] = None) -> None:
         self.lbl_value.setText(val)
@@ -1772,11 +1799,12 @@ class VoxMeetingComparisonDialog(QDialog):
         self.resize(840, 640)
         self.setMinimumSize(700, 500)
 
-        is_dark = (self.theme != "light")
-        bg_color = "#0F172A" if is_dark else "#F8FAFC"
-        text_color = "#F8FAFC" if is_dark else "#0F172A"
-        card_bg = "#1E293B" if is_dark else "#FFFFFF"
-        border_color = "#334155" if is_dark else "#E2E8F0"
+        t = get_theme_tokens(self.theme)
+        bg_color = t["bg"]
+        text_color = t["text_primary"]
+        card_bg = t["surface"]
+        border_color = t["border"]
+        accent_color = t["accent_fathom"]
 
         self.setStyleSheet(f"""
             QDialog {{
@@ -1814,8 +1842,8 @@ class VoxMeetingComparisonDialog(QDialog):
                 font-weight: 600;
             }}
             QPushButton:hover {{
-                border-color: #38BDF8;
-                color: #38BDF8;
+                border-color: {accent_color};
+                color: {accent_color};
             }}
         """)
 
@@ -1826,7 +1854,7 @@ class VoxMeetingComparisonDialog(QDialog):
         # Header Title
         hdr = QHBoxLayout()
         title_lbl = QLabel("⚖️ Meeting Comparison & Continuity")
-        title_lbl.setStyleSheet("font-size: 16px; font-weight: 800; color: #38BDF8;")
+        title_lbl.setStyleSheet(f"font-size: 16px; font-weight: 800; color: {accent_color};")
         hdr.addWidget(title_lbl)
         hdr.addStretch()
         layout.addLayout(hdr)
@@ -2082,11 +2110,12 @@ class VoxPreMeetingBriefingDialog(QDialog):
         self.resize(800, 620)
         self.setMinimumSize(680, 480)
 
-        is_dark = (self.theme != "light")
-        bg_color = "#0F172A" if is_dark else "#F8FAFC"
-        text_color = "#F8FAFC" if is_dark else "#0F172A"
-        card_bg = "#1E293B" if is_dark else "#FFFFFF"
-        border_color = "#334155" if is_dark else "#E2E8F0"
+        t = get_theme_tokens(self.theme)
+        bg_color = t["bg"]
+        text_color = t["text_primary"]
+        card_bg = t["surface"]
+        border_color = t["border"]
+        accent_color = t["accent_fathom"]
 
         self.setStyleSheet(f"""
             QDialog {{
@@ -2124,8 +2153,8 @@ class VoxPreMeetingBriefingDialog(QDialog):
                 font-weight: 600;
             }}
             QPushButton:hover {{
-                border-color: #38BDF8;
-                color: #38BDF8;
+                border-color: {accent_color};
+                color: {accent_color};
             }}
         """)
 
@@ -2136,7 +2165,7 @@ class VoxPreMeetingBriefingDialog(QDialog):
         # Header Title
         hdr = QHBoxLayout()
         title_lbl = QLabel("🎯 Executive Pre-Meeting Briefing")
-        title_lbl.setStyleSheet("font-size: 16px; font-weight: 800; color: #38BDF8;")
+        title_lbl.setStyleSheet(f"font-size: 16px; font-weight: 800; color: {accent_color};")
         hdr.addWidget(title_lbl)
         hdr.addStretch()
         layout.addLayout(hdr)

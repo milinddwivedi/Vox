@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QKeyEvent
 from PyQt6.QtWidgets import (
     QDialog,
@@ -113,6 +114,11 @@ class VoxCommandPaletteDialog(QDialog):
         self._controller = controller
         self._all_commands: List[PaletteCommand] = commands or []
         self._filtered_commands: List[PaletteCommand] = []
+        self._pending_db_query: str = ""
+        self._db_search_timer = QTimer(self)
+        self._db_search_timer.setSingleShot(True)
+        self._db_search_timer.setInterval(180)
+        self._db_search_timer.timeout.connect(self._append_debounced_db_matches)
 
         self.setWindowTitle("VOX Command Palette")
         self.setModal(True)
@@ -241,7 +247,38 @@ class VoxCommandPaletteDialog(QDialog):
         self._render_items()
 
     def _on_search_changed(self, text: str) -> None:
-        self._filter_commands(text.strip())
+        clean = text.strip()
+        self._pending_db_query = clean
+        self._filter_commands_static(clean)
+        if clean and self._controller and getattr(self._controller, "db", None):
+            self._db_search_timer.start()
+        elif self._db_search_timer.isActive():
+            self._db_search_timer.stop()
+
+    def _filter_commands_static(self, query: str) -> None:
+        q = query.lower()
+        if not q:
+            self._filtered_commands = list(self._all_commands)
+        else:
+            self._filtered_commands = [
+                cmd for cmd in self._all_commands
+                if q in cmd.title.lower() or q in cmd.description.lower() or q in cmd.category.lower()
+            ]
+        self._render_items()
+
+    def _append_debounced_db_matches(self) -> None:
+        query = self._pending_db_query
+        if not query or not self._controller or getattr(self._controller, "_cancel_ask_vox", False):
+            return
+        db = getattr(self._controller, "db", None)
+        db_path = getattr(db, "db_path", None) if db is not None else None
+        if db is None or (db_path and ":memory:" not in str(db_path).lower() and not Path(str(db_path)).exists()):
+            return
+        self._filter_commands_static(query)
+        db_matches = self._search_database_matches(query)
+        if db_matches:
+            self._filtered_commands.extend(db_matches)
+            self._render_items()
 
     def _filter_commands(self, query: str) -> None:
         q = query.lower()
@@ -372,6 +409,21 @@ class VoxCommandPaletteDialog(QDialog):
         else:
             super().keyPressEvent(event)
 
+    def closeEvent(self, event: Any) -> None:
+        if hasattr(self, "_db_search_timer") and self._db_search_timer.isActive():
+            self._db_search_timer.stop()
+        super().closeEvent(event)
+
+    def hideEvent(self, event: Any) -> None:
+        if hasattr(self, "_db_search_timer") and self._db_search_timer.isActive():
+            self._db_search_timer.stop()
+        super().hideEvent(event)
+
+    def done(self, result: int) -> None:
+        if hasattr(self, "_db_search_timer") and self._db_search_timer.isActive():
+            self._db_search_timer.stop()
+        super().done(result)
+
     def show_palette(self) -> None:
         """Center relative to parent and present search focus."""
         if self.parent():
@@ -409,11 +461,19 @@ def create_default_vox_commands(main_window: Any, controller: Optional[Any] = No
         handler=lambda: main_window.navigate_to_workspace("notetaker") if hasattr(main_window, "navigate_to_workspace") else None,
     ))
     cmds.append(PaletteCommand(
+        id="calendar",
+        title="Calendar",
+        description="Upcoming meetings, Outlook/Google/Zoom accounts, and Notetaker prep",
+        category="Workspace",
+        shortcut="Ctrl+3",
+        handler=lambda: main_window.navigate_to_workspace("calendar") if hasattr(main_window, "navigate_to_workspace") else None,
+    ))
+    cmds.append(PaletteCommand(
         id="dictionary",
         title="Dictionary",
         description="Custom vocabulary, jargon, and phonetic replacements",
         category="Workspace",
-        shortcut="Ctrl+3",
+        shortcut="Ctrl+4",
         handler=lambda: main_window.navigate_to_workspace("dictionary") if hasattr(main_window, "navigate_to_workspace") else None,
     ))
     cmds.append(PaletteCommand(
@@ -421,7 +481,7 @@ def create_default_vox_commands(main_window: Any, controller: Optional[Any] = No
         title="Snippets",
         description="Keyword expansion triggers and canned responses",
         category="Workspace",
-        shortcut="Ctrl+4",
+        shortcut="Ctrl+5",
         handler=lambda: main_window.navigate_to_workspace("snippets") if hasattr(main_window, "navigate_to_workspace") else None,
     ))
     cmds.append(PaletteCommand(
@@ -429,7 +489,7 @@ def create_default_vox_commands(main_window: Any, controller: Optional[Any] = No
         title="Style",
         description="Personal tone preferences and transformation profiles",
         category="Workspace",
-        shortcut="Ctrl+5",
+        shortcut="Ctrl+6",
         handler=lambda: main_window.navigate_to_workspace("style") if hasattr(main_window, "navigate_to_workspace") else None,
     ))
     cmds.append(PaletteCommand(
@@ -437,7 +497,7 @@ def create_default_vox_commands(main_window: Any, controller: Optional[Any] = No
         title="Scratchpad",
         description="Document drafts, notes, and dictation staging",
         category="Workspace",
-        shortcut="Ctrl+6",
+        shortcut="Ctrl+7",
         handler=lambda: main_window.navigate_to_workspace("scratchpad") if hasattr(main_window, "navigate_to_workspace") else None,
     ))
     cmds.append(PaletteCommand(
@@ -445,16 +505,8 @@ def create_default_vox_commands(main_window: Any, controller: Optional[Any] = No
         title="Insights",
         description="Usage statistics, speaking speed WPM, and time saved",
         category="Workspace",
-        shortcut="Ctrl+7",
-        handler=lambda: main_window.navigate_to_workspace("insights") if hasattr(main_window, "navigate_to_workspace") else None,
-    ))
-    cmds.append(PaletteCommand(
-        id="calendar",
-        title="Calendar",
-        description="Upcoming meetings, Outlook/Google/Zoom accounts, and Notetaker prep",
-        category="Workspace",
         shortcut="Ctrl+8",
-        handler=lambda: main_window.navigate_to_workspace("calendar") if hasattr(main_window, "navigate_to_workspace") else None,
+        handler=lambda: main_window.navigate_to_workspace("insights") if hasattr(main_window, "navigate_to_workspace") else None,
     ))
     cmds.append(PaletteCommand(
         id="settings",

@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen
+from PyQt6.QtCore import QRectF, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QDesktopServices, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -37,7 +37,8 @@ from PyQt6.QtWidgets import (
 )
 
 from voxlocal.core.logger import get_logger
-from voxlocal.ui.components import VoxEmptyStateWidget, VoxToggleSwitch
+from voxlocal.engine.meeting_intelligence import MeetingIntelligenceEngine
+from voxlocal.ui.components import VoxEmptyStateWidget, VoxPreMeetingBriefingDialog, VoxToggleSwitch
 from voxlocal.ui.theme import get_theme_tokens, get_ui_font
 
 if TYPE_CHECKING:
@@ -75,21 +76,37 @@ class HomePage(QWidget):
 
     navigate_requested = pyqtSignal(str)
     status_toast = pyqtSignal(str, str)
+    open_meeting_requested = pyqtSignal(int)
+    prepare_meeting_requested = pyqtSignal(object)
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.controller = controller
         self._theme = getattr(controller, "theme", "light")
         self._kpi_cards: List[QFrame] = []
+        self._next_meeting: Optional[Any] = None
+        self._feed_search_timer = QTimer(self)
+        self._feed_search_timer.setSingleShot(True)
+        self._feed_search_timer.setInterval(200)
+        self._feed_search_timer.timeout.connect(self.refresh_feed)
         self._build_ui()
         self.apply_theme(self._theme)
 
         self.controller.history_updated.connect(self.refresh_all)
         self.controller.dictation_completed.connect(lambda *_: self.refresh_all())
         if hasattr(self.controller, "calendar_upcoming_changed"):
-            self.controller.calendar_upcoming_changed.connect(self._refresh_upcoming)
+            self.controller.calendar_upcoming_changed.connect(lambda *_: self._refresh_upcoming())
+        if hasattr(self.controller, "meeting_saved_and_transcribed"):
+            self.controller.meeting_saved_and_transcribed.connect(lambda *_: self.refresh_all())
+        if hasattr(self.controller, "meeting_saved"):
+            self.controller.meeting_saved.connect(lambda *_: self.refresh_all())
 
         self.refresh_all()
+
+    def closeEvent(self, event: Any) -> None:
+        if hasattr(self, "_feed_search_timer") and self._feed_search_timer.isActive():
+            self._feed_search_timer.stop()
+        super().closeEvent(event)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -137,20 +154,89 @@ class HomePage(QWidget):
             kpi_row.addWidget(card, 1)
         root.addLayout(kpi_row)
 
-        # Upcoming Meetings compact strip
+        # Next Meeting Spotlight Card (Actionable Join, AI Brief & Local Notetaker)
         self.upcoming_card = QFrame()
         self.upcoming_card.setObjectName("hubCard")
-        u_lay = QHBoxLayout(self.upcoming_card)
-        u_lay.setContentsMargins(16, 10, 16, 10)
-        u_lay.setSpacing(10)
-        self.lbl_upcoming = QLabel("Notetaker ready — detect Teams/Zoom/Meet automatically or open Notetaker.")
-        self.lbl_upcoming.setObjectName("hubMuted")
-        u_lay.addWidget(self.lbl_upcoming, 1)
+        u_outer = QVBoxLayout(self.upcoming_card)
+        u_outer.setContentsMargins(16, 12, 16, 12)
+        u_outer.setSpacing(6)
+
+        u_top = QHBoxLayout()
+        u_top.setSpacing(8)
+        self.lbl_spotlight_badge = QLabel("NOTETAKER READY")
+        self.lbl_spotlight_badge.setObjectName("hubSpotlightBadge")
+        u_top.addWidget(self.lbl_spotlight_badge)
+
+        self.lbl_spotlight_platform = QLabel("")
+        self.lbl_spotlight_platform.setObjectName("hubPlatformPill")
+        self.lbl_spotlight_platform.setVisible(False)
+        u_top.addWidget(self.lbl_spotlight_platform)
+        u_top.addStretch(1)
+
+        self.btn_spotlight_join = QPushButton("Join Meeting")
+        self.btn_spotlight_join.setObjectName("hubFathomBtn")
+        self.btn_spotlight_join.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_spotlight_join.setVisible(False)
+        self.btn_spotlight_join.clicked.connect(self._on_spotlight_join_clicked)
+        u_top.addWidget(self.btn_spotlight_join)
+
+        self.btn_spotlight_brief = QPushButton("AI Brief")
+        self.btn_spotlight_brief.setObjectName("hubSecondaryBtn")
+        self.btn_spotlight_brief.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_spotlight_brief.setVisible(False)
+        self.btn_spotlight_brief.clicked.connect(self._open_spotlight_brief)
+        u_top.addWidget(self.btn_spotlight_brief)
+
+        self.btn_spotlight_record = QPushButton("Record Notetaker")
+        self.btn_spotlight_record.setObjectName("dawnBtn")
+        self.btn_spotlight_record.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_spotlight_record.setVisible(False)
+        self.btn_spotlight_record.clicked.connect(self._on_spotlight_record_clicked)
+        u_top.addWidget(self.btn_spotlight_record)
+
+        self.btn_open_calendar = QPushButton("Calendar")
+        self.btn_open_calendar.setObjectName("hubSecondaryBtn")
+        self.btn_open_calendar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_calendar.clicked.connect(lambda: self.navigate_requested.emit("calendar"))
+        u_top.addWidget(self.btn_open_calendar)
+
         self.btn_open_nt = QPushButton("Open Notetaker")
+        self.btn_open_nt.setObjectName("hubSecondaryBtn")
         self.btn_open_nt.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_nt.clicked.connect(lambda: self.navigate_requested.emit("notetaker"))
-        u_lay.addWidget(self.btn_open_nt)
+        u_top.addWidget(self.btn_open_nt)
+        u_outer.addLayout(u_top)
+
+        self.lbl_upcoming = QLabel("Notetaker ready — detects Teams, Zoom & Meet automatically or start anytime.")
+        self.lbl_upcoming.setObjectName("hubMuted")
+        self.lbl_upcoming.setWordWrap(True)
+        u_outer.addWidget(self.lbl_upcoming)
         root.addWidget(self.upcoming_card)
+
+        # Recent AI Meeting Highlights Strip
+        self.recent_meetings_section = QWidget()
+        rm_outer = QVBoxLayout(self.recent_meetings_section)
+        rm_outer.setContentsMargins(0, 0, 0, 0)
+        rm_outer.setSpacing(8)
+        rm_hdr = QHBoxLayout()
+        rm_hdr.setSpacing(8)
+        lbl_rm_title = QLabel("Recent Meeting Notes")
+        lbl_rm_title.setStyleSheet("font-size: 15px; font-weight: 700;")
+        rm_hdr.addWidget(lbl_rm_title)
+        rm_hdr.addStretch(1)
+        self.btn_view_all_meetings = QPushButton("View All →")
+        self.btn_view_all_meetings.setObjectName("hubSecondaryBtn")
+        self.btn_view_all_meetings.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_view_all_meetings.clicked.connect(lambda: self.navigate_requested.emit("notetaker"))
+        rm_hdr.addWidget(self.btn_view_all_meetings)
+        rm_outer.addLayout(rm_hdr)
+
+        self.recent_meetings_lay = QHBoxLayout()
+        self.recent_meetings_lay.setContentsMargins(0, 0, 0, 0)
+        self.recent_meetings_lay.setSpacing(10)
+        rm_outer.addLayout(self.recent_meetings_lay)
+        self.recent_meetings_section.setVisible(False)
+        root.addWidget(self.recent_meetings_section)
 
         # Dictation Feed Search + Header
         feed_hdr = QHBoxLayout()
@@ -162,7 +248,7 @@ class HomePage(QWidget):
         self.txt_feed_search = QLineEdit()
         self.txt_feed_search.setPlaceholderText("Search recent dictations...")
         self.txt_feed_search.setFixedWidth(280)
-        self.txt_feed_search.textChanged.connect(self.refresh_feed)
+        self.txt_feed_search.textChanged.connect(self._schedule_feed_search)
         feed_hdr.addWidget(self.txt_feed_search)
         root.addLayout(feed_hdr)
 
@@ -198,7 +284,11 @@ class HomePage(QWidget):
     def refresh_all(self) -> None:
         self._refresh_kpis()
         self._refresh_upcoming()
+        self._refresh_recent_meetings()
         self.refresh_feed()
+
+    def _schedule_feed_search(self, _text: str = "") -> None:
+        self._feed_search_timer.start()
 
     def _refresh_kpis(self) -> None:
         stats = self.controller.db.get_dictation_stats()
@@ -216,19 +306,255 @@ class HomePage(QWidget):
         self._kpi_saved_val.setText(f"{int(round(saved_min))} min" if saved_min < 120 else f"{saved_min / 60.0:.1f} hr")
 
     def _refresh_upcoming(self, meetings: Optional[List[Any]] = None) -> None:
-        mgr = getattr(self.controller, "calendar_manager", None)
-        if meetings is None and mgr is not None:
+        if getattr(self.controller, "_cancel_ask_vox", False):
+            return
+        if meetings is None:
+            meetings = []
+            for attr in ("calendar_engine", "calendar_manager"):
+                mgr = getattr(self.controller, attr, None)
+                if mgr is not None and hasattr(mgr, "get_upcoming_meetings"):
+                    try:
+                        res = list(mgr.get_upcoming_meetings() or [])
+                        if res:
+                            meetings = res
+                            break
+                    except Exception:
+                        pass
+
+        now_local = datetime.now().astimezone()
+        chosen = None
+        for m in meetings or []:
+            if getattr(m, "is_cancelled", False):
+                continue
             try:
-                meetings = mgr.get_upcoming_meetings()
+                end_dt = getattr(m, "local_end_time", None) or getattr(m, "end_time", None)
+                if end_dt is not None:
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=now_local.tzinfo)
+                    if end_dt >= now_local:
+                        chosen = m
+                        break
             except Exception:
-                meetings = []
-        if meetings:
-            first = meetings[0]
-            self.lbl_upcoming.setText(f"Next on Calendar: {first.title} · Ready for 1-click local Notetaker.")
-        else:
+                pass
+        if chosen is None:
+            for m in meetings or []:
+                if not getattr(m, "is_cancelled", False):
+                    chosen = m
+                    break
+
+        self._next_meeting = chosen
+        if chosen is None:
+            self.lbl_spotlight_badge.setText("NOTETAKER READY")
+            self.lbl_spotlight_platform.setVisible(False)
+            self.btn_spotlight_join.setVisible(False)
+            self.btn_spotlight_brief.setVisible(False)
+            self.btn_spotlight_record.setVisible(False)
             self.lbl_upcoming.setText("Notetaker ready — auto-detects Teams, Zoom & Meet calls or start anytime.")
+            return
+
+        title = str(getattr(chosen, "title", "") or "Upcoming Meeting")
+        join_url = str(getattr(chosen, "join_url", "") or "").strip()
+        plat = str(getattr(chosen, "meeting_platform_label", "") or getattr(chosen, "platform", "") or "").strip()
+        org = str(getattr(chosen, "organizer_name", "") or getattr(chosen, "organizer", "") or "").strip()
+        atts = list(getattr(chosen, "attendees", []) or [])
+
+        badge_txt = "NEXT MEETING"
+        time_str = ""
+        try:
+            st = getattr(chosen, "local_start_time", None) or getattr(chosen, "start_time", None)
+            et = getattr(chosen, "local_end_time", None) or getattr(chosen, "end_time", None)
+            if st is not None:
+                if st.tzinfo is None:
+                    st = st.replace(tzinfo=now_local.tzinfo)
+                if et is not None and et.tzinfo is None:
+                    et = et.replace(tzinfo=now_local.tzinfo)
+                if et is not None and st <= now_local <= et:
+                    badge_txt = "● LIVE NOW"
+                elif st > now_local:
+                    mins = max(1, int((st - now_local).total_seconds() // 60))
+                    if mins < 60:
+                        badge_txt = f"NEXT MEETING · IN {mins}M"
+                    else:
+                        badge_txt = f"NEXT MEETING · {st.strftime('%I:%M %p').lstrip('0')}"
+                time_str = st.strftime("%a, %I:%M %p").lstrip("0")
+        except Exception:
+            pass
+
+        self.lbl_spotlight_badge.setText(badge_txt)
+        if plat and plat.lower() not in {"generic", "calendar event"}:
+            self.lbl_spotlight_platform.setText(plat)
+            self.lbl_spotlight_platform.setVisible(True)
+        else:
+            self.lbl_spotlight_platform.setVisible(False)
+
+        self.btn_spotlight_join.setVisible(bool(join_url))
+        self.btn_spotlight_brief.setVisible(True)
+        self.btn_spotlight_record.setVisible(True)
+
+        details: List[str] = [title]
+        if time_str:
+            details.append(time_str)
+        if org:
+            details.append(f"Host: {org}")
+        if atts:
+            details.append(f"{len(atts)} attendee{'s' if len(atts) != 1 else ''}")
+        self.lbl_upcoming.setText(" · ".join(details))
+
+    def _on_spotlight_join_clicked(self) -> None:
+        m = self._next_meeting
+        if m is None:
+            return
+        if hasattr(self.controller, "start_meeting_from_calendar"):
+            ok, msg = self.controller.start_meeting_from_calendar(m)
+            self.status_toast.emit("Joining Meeting" if ok else "Meeting Notice", msg or "Opening meeting...")
+            return
+        join_url = str(getattr(m, "join_url", "") or "").strip()
+        if join_url:
+            QDesktopServices.openUrl(QUrl(join_url))
+
+    def _open_spotlight_brief(self) -> None:
+        db = getattr(self.controller, "db", None)
+        if db is None:
+            return
+        topic = str(getattr(self._next_meeting, "title", "") or "")
+        engine = getattr(self.controller, "intelligence", None) or MeetingIntelligenceEngine(db)
+        dlg = VoxPreMeetingBriefingDialog(db, engine, theme=self._theme, initial_topic=topic, parent=self)
+        dlg.exec()
+
+    def _on_spotlight_record_clicked(self) -> None:
+        m = self._next_meeting
+        if m is None:
+            return
+        self.prepare_meeting_requested.emit(m)
+
+    def _clear_layout_widgets(self, lay: Any) -> None:
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+            elif it.layout() is not None:
+                self._clear_layout_widgets(it.layout())
+
+    def _clean_meeting_snippet(self, summary_raw: str) -> str:
+        lines = []
+        for raw_ln in str(summary_raw or "").splitlines():
+            ln = raw_ln.strip()
+            if not ln or set(ln) <= {"=", "-", "*"}:
+                continue
+            if ln.startswith("#"):
+                ln = ln.lstrip("# ").strip()
+            if ln:
+                lines.append(ln)
+            if len(" ".join(lines)) >= 110:
+                break
+        txt = " ".join(lines).strip()
+        if not txt:
+            return "Open to review transcript, decisions & follow-ups."
+        return txt[:110] + ("..." if len(txt) > 110 else "")
+
+    def _refresh_recent_meetings(self) -> None:
+        if not hasattr(self, "recent_meetings_lay"):
+            return
+        if getattr(self.controller, "_cancel_ask_vox", False):
+            return
+        db = getattr(self.controller, "db", None)
+        db_path = getattr(db, "db_path", None) if db is not None else None
+        if db is None or not hasattr(db, "list_meetings") or (
+            db_path and ":memory:" not in str(db_path).lower() and not Path(str(db_path)).exists()
+        ):
+            self.recent_meetings_section.setVisible(False)
+            return
+
+        self._clear_layout_widgets(self.recent_meetings_lay)
+        try:
+            meetings = list(db.list_meetings(limit=3) or [])
+        except Exception:
+            meetings = []
+
+        if not meetings:
+            self.recent_meetings_section.setVisible(False)
+            return
+
+        t = get_theme_tokens(self._theme)
+        for m in meetings[:3]:
+            mid = int(m["id"])
+            title = str(m.get("title") or "Untitled Meeting").strip()
+            status = str(m.get("status") or "completed").lower()
+            platform = str(m.get("source_platform") or m.get("platform") or "Local").strip()
+            snippet = self._clean_meeting_snippet(str(m.get("summary") or ""))
+
+            open_actions = 0
+            if hasattr(db, "list_action_items"):
+                try:
+                    actions = db.list_action_items(meeting_id=mid) or []
+                    open_actions = sum(1 for a in actions if str(a.get("status") or "").lower() != "completed")
+                except Exception:
+                    open_actions = 0
+
+            card = QFrame()
+            card.setObjectName("hubMeetingCard")
+            clay = QVBoxLayout(card)
+            clay.setContentsMargins(14, 10, 14, 10)
+            clay.setSpacing(6)
+
+            top = QHBoxLayout()
+            top.setSpacing(6)
+            lbl_t = QLabel(title if len(title) <= 32 else (title[:29] + "..."))
+            lbl_t.setToolTip(title)
+            lbl_t.setStyleSheet("font-size: 13px; font-weight: 700;")
+            top.addWidget(lbl_t, 1)
+
+            if status == "interrupted":
+                badge = QLabel("⚠ Interrupted")
+                badge.setStyleSheet(
+                    f"background: {t['status_warning_bg']}; color: {t['status_warning_text']}; "
+                    f"border: 1px solid {t['status_warning']}; border-radius: 6px; padding: 1px 7px; "
+                    "font-size: 10px; font-weight: 700;"
+                )
+            else:
+                badge = QLabel(platform)
+                badge.setStyleSheet(
+                    f"background: {t['chip_bg']}; color: {t['text_secondary']}; border: 1px solid {t['chip_border']}; "
+                    "border-radius: 6px; padding: 1px 7px; font-size: 10px; font-weight: 600;"
+                )
+            top.addWidget(badge)
+            clay.addLayout(top)
+
+            lbl_snip = QLabel(snippet)
+            lbl_snip.setObjectName("hubMuted")
+            lbl_snip.setWordWrap(True)
+            clay.addWidget(lbl_snip, 1)
+
+            ftr = QHBoxLayout()
+            ftr.setSpacing(6)
+            act_txt = f"{open_actions} open action{'s' if open_actions != 1 else ''}" if open_actions else "No pending actions"
+            lbl_act = QLabel(act_txt)
+            lbl_act.setStyleSheet(
+                f"color: {t['accent_fathom'] if open_actions else t['text_muted']}; font-size: 11px; font-weight: 600;"
+            )
+            ftr.addWidget(lbl_act, 1)
+
+            btn_open = QPushButton("Open Notes →")
+            btn_open.setObjectName("hubSecondaryBtn")
+            btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_open.clicked.connect(lambda _=False, target_id=mid: self.open_meeting_requested.emit(target_id))
+            ftr.addWidget(btn_open)
+            clay.addLayout(ftr)
+
+            self.recent_meetings_lay.addWidget(card, 1)
+
+        self.recent_meetings_section.setVisible(True)
 
     def refresh_feed(self) -> None:
+        if getattr(self.controller, "_cancel_ask_vox", False):
+            return
+        db = getattr(self.controller, "db", None)
+        db_path = getattr(db, "db_path", None) if db is not None else None
+        if db is None or (db_path and ":memory:" not in str(db_path).lower() and not Path(str(db_path)).exists()):
+            return
         while self.feed_layout.count():
             it = self.feed_layout.takeAt(0)
             w = it.widget()
@@ -410,21 +736,61 @@ class HomePage(QWidget):
             QWidget {{ background-color: {t['bg']}; color: {t['text']}; }}
             QLabel {{ background: transparent; border: none; color: {t['text']}; }}
             QLabel#hubMuted {{ color: {t['text_muted']}; font-size: 11.5px; }}
-            QFrame#hubCard {{
+            QLabel#hubSpotlightBadge {{
+                color: {t['accent_fathom']};
+                font-size: 10.5px;
+                font-weight: 700;
+                letter-spacing: 0.08em;
+            }}
+            QLabel#hubPlatformPill {{
+                background: {t['accent_fathom_tint']};
+                color: {t['accent_fathom']};
+                border: 1px solid {t['accent_fathom']};
+                border-radius: 6px;
+                padding: 2px 8px;
+                font-size: 10.5px;
+                font-weight: 600;
+            }}
+            QFrame#hubCard, QFrame#hubMeetingCard {{
                 background-color: {t['surface']};
                 border: 1px solid {t['border']};
                 border-radius: 12px;
+            }}
+            QPushButton#hubFathomBtn {{
+                background-color: {t['fathom_btn_bg']};
+                color: {t['fathom_btn_text']};
+                border: 1px solid {t['fathom_btn_border']};
+                border-radius: 8px;
+                padding: 5px 12px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton#hubFathomBtn:hover {{
+                background-color: {t['fathom_btn_hover']};
+            }}
+            QPushButton#hubSecondaryBtn {{
+                background-color: {t['surface_secondary']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                border-radius: 8px;
+                padding: 5px 11px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton#hubSecondaryBtn:hover {{
+                background-color: {t['sidebar_hover']};
             }}
             QPushButton#dawnBtn {{
                 background-color: {t['dawn_btn_bg']};
                 color: {t['dawn_btn_text']};
                 border: 1px solid {t['dawn_btn_border']};
                 border-radius: 8px;
-                padding: 7px 14px;
+                padding: 6px 13px;
                 font-weight: 700;
             }}
             """
         )
+        self._refresh_recent_meetings()
         self.refresh_feed()
 
     set_theme = apply_theme

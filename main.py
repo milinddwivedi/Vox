@@ -247,6 +247,14 @@ def main() -> int:
         controller=controller,
         on_open_meeting_studio=lambda _mid=None: open_dashboard_tab("notetaker"),
     )
+
+    def _on_drawer_seek(meeting_id: int, sec: float) -> None:
+        open_dashboard_tab("notetaker")
+        if meeting_id and hasattr(main_window, "notetaker_page"):
+            main_window.notetaker_page.select_meeting(int(meeting_id))
+            main_window.notetaker_page._seek_to_seconds(float(sec))
+
+    notetaker_drawer.seek_requested.connect(_on_drawer_seek)
     cal_prompt = VoxMeetingPromptPopup(theme=getattr(controller, "theme", "light"))
     onboarding_ref: list[VoxOnboardingWizard] = []
 

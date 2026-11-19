@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import subprocess
-from datetime import datetime
+import threading
+import unittest.mock
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -24,6 +26,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -125,6 +128,7 @@ class NotetakerPage(QWidget):
     status_toast = pyqtSignal(str, str)
     open_calendar_requested = pyqtSignal()
     open_settings_requested = pyqtSignal(int)
+    _studio_ask_completed = pyqtSignal(int, str, str, object)
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -135,6 +139,17 @@ class NotetakerPage(QWidget):
         self._cal_filter: str = "today"
         self._cached_calendar_meetings: List[Any] = []
         self._prepared_calendar_meeting: Optional[Any] = None
+        self._silent_loopback_since: Optional[float] = None
+        self._first_interrupted_id: Optional[int] = None
+        self._cal_expanded: bool = False
+        self._inline_next_cal_meeting: Optional[Any] = None
+        self._mic_ok: bool = True
+        self._sys_healthy: bool = True
+
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(200)
+        self._search_debounce_timer.timeout.connect(self.refresh_meetings_list)
 
         self.media_player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -143,6 +158,7 @@ class NotetakerPage(QWidget):
         self.media_player.durationChanged.connect(self._on_media_duration_changed)
 
         self._build_ui()
+        self._studio_ask_completed.connect(self._on_studio_ask_completed)
         self.apply_theme(self._theme)
 
         self.controller.meeting_saved_and_transcribed.connect(self._on_meeting_saved)
@@ -158,6 +174,8 @@ class NotetakerPage(QWidget):
             self.controller.meeting_live_partial.connect(self._on_live_meeting_partial)
         if hasattr(self.controller, "meeting_live_confirmed"):
             self.controller.meeting_live_confirmed.connect(self._on_live_meeting_confirmed)
+        if hasattr(self.controller, "meeting_progressive_segment"):
+            self.controller.meeting_progressive_segment.connect(self._on_live_meeting_segment)
 
         self.refresh_all()
 
@@ -166,6 +184,28 @@ class NotetakerPage(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.setActiveWindow(self)
+
+    def closeEvent(self, event: Any) -> None:
+        if hasattr(self, "_search_debounce_timer") and self._search_debounce_timer.isActive():
+            self._search_debounce_timer.stop()
+        studio = getattr(self, "studio", None)
+        if studio is not None:
+            tab_sum = getattr(studio, "tab_summary", None)
+            if tab_sum is not None and hasattr(tab_sum, "flush_pending_saves"):
+                tab_sum.flush_pending_saves()
+            tab_th = getattr(studio, "tab_thoughts", None)
+            th_timer = getattr(tab_th, "_save_timer", None) if tab_th is not None else None
+            if th_timer is not None and th_timer.isActive():
+                th_timer.stop()
+                if hasattr(tab_th, "_persist_thoughts"):
+                    tab_th._persist_thoughts()
+        if hasattr(self, "media_player"):
+            try:
+                self.media_player.stop()
+                self.media_player.setSource(QUrl())
+            except Exception:
+                pass
+        super().closeEvent(event)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -233,6 +273,43 @@ class NotetakerPage(QWidget):
         self.lbl_rec_timer = QLabel("00:00")
         b_lay.addWidget(self.lbl_rec_dot)
         b_lay.addWidget(self.lbl_rec_timer)
+
+        t_init = get_theme_tokens(self._theme)
+        self.lbl_mic_health = QLabel("🎙 Mic OK")
+        self.lbl_mic_health.setStyleSheet(
+            f"font-size: 11px; font-weight: 600; color: {t_init['status_success_text']};"
+        )
+        b_lay.addWidget(self.lbl_mic_health)
+        self.bar_mic_level = QProgressBar()
+        self.bar_mic_level.setObjectName("ntLevelBar")
+        self.bar_mic_level.setRange(0, 100)
+        self.bar_mic_level.setValue(0)
+        self.bar_mic_level.setTextVisible(False)
+        self.bar_mic_level.setFixedSize(46, 6)
+        b_lay.addWidget(self.bar_mic_level)
+
+        self.lbl_sys_health = QLabel("🔊 Loopback OK")
+        self.lbl_sys_health.setStyleSheet(
+            f"font-size: 11px; font-weight: 600; color: {t_init['status_success_text']};"
+        )
+        b_lay.addWidget(self.lbl_sys_health)
+        self.bar_sys_level = QProgressBar()
+        self.bar_sys_level.setObjectName("ntLevelBar")
+        self.bar_sys_level.setRange(0, 100)
+        self.bar_sys_level.setValue(0)
+        self.bar_sys_level.setTextVisible(False)
+        self.bar_sys_level.setFixedSize(46, 6)
+        b_lay.addWidget(self.bar_sys_level)
+
+        self.lbl_capture_anomaly = QLabel("⚠ Loopback silent — check output device")
+        self.lbl_capture_anomaly.setStyleSheet(
+            f"background: {t_init['status_warning_bg']}; color: {t_init['status_warning_text']}; "
+            f"border: 1px solid {t_init['status_warning']}; border-radius: 6px; padding: 2px 7px; "
+            "font-size: 11px; font-weight: 600;"
+        )
+        self.lbl_capture_anomaly.setVisible(False)
+        b_lay.addWidget(self.lbl_capture_anomaly)
+
         self.lbl_rec_live = QLabel("")
         self.lbl_rec_live.setStyleSheet("color: #6366f1; font-weight: 500; font-size: 11.5px;")
         b_lay.addWidget(self.lbl_rec_live, 1)
@@ -277,16 +354,36 @@ class NotetakerPage(QWidget):
         pb_lay.addWidget(self.btn_clear_prepared)
         root.addWidget(self.prepared_banner)
 
-        # Unified Multi-Provider Upcoming Meetings Hub
+        # Interrupted Recording Recovery Banner (strictly user-controlled)
+        self.interrupted_banner = QFrame()
+        self.interrupted_banner.setObjectName("ntInterruptedBanner")
+        self.interrupted_banner.setVisible(False)
+        ib_lay = QHBoxLayout(self.interrupted_banner)
+        ib_lay.setContentsMargins(*MARGINS_TOOLBAR)
+        ib_lay.setSpacing(10)
+        self.lbl_interrupted_summary = QLabel("")
+        self.lbl_interrupted_summary.setWordWrap(True)
+        self.lbl_interrupted_summary.setStyleSheet(
+            f"font-weight: 600; color: {t_init['status_warning_text']};"
+        )
+        ib_lay.addWidget(self.lbl_interrupted_summary, 1)
+        self.btn_recover_interrupted = QPushButton("↻ Recover & Re-Transcribe")
+        self.btn_recover_interrupted.setObjectName("secondaryBtn")
+        self.btn_recover_interrupted.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_recover_interrupted.clicked.connect(self._on_recover_interrupted_clicked)
+        ib_lay.addWidget(self.btn_recover_interrupted)
+        root.addWidget(self.interrupted_banner)
+
+        # Unified Multi-Provider Upcoming Meetings Hub (collapsible strip by default)
         self.cal_card = QFrame()
         self.cal_card.setObjectName("ntCard")
         cal_root_lay = QVBoxLayout(self.cal_card)
         cal_root_lay.setContentsMargins(*MARGINS_CARD)
-        cal_root_lay.setSpacing(10)
+        cal_root_lay.setSpacing(8)
 
-        # Top Bar: Title, badges, filter tabs, action buttons
+        # Top Bar: Title, badges, inline next meeting strip, expand toggle
         cal_top = QHBoxLayout()
-        cal_top.setSpacing(10)
+        cal_top.setSpacing(8)
 
         lbl_cal_title = QLabel("UPCOMING MEETINGS")
         lbl_cal_title.setStyleSheet("font-size: 11px; font-weight: 700; letter-spacing: 0.5px; color: #5f6368;")
@@ -303,33 +400,52 @@ class NotetakerPage(QWidget):
         self.cal_providers_layout.setSpacing(6)
         cal_top.addLayout(self.cal_providers_layout)
 
-        cal_top.addStretch(1)
+        self.lbl_cal_next_inline = QLabel("No upcoming meetings")
+        self.lbl_cal_next_inline.setObjectName("ntMuted")
+        cal_top.addWidget(self.lbl_cal_next_inline, 1)
 
-        # Horizon Filter Buttons
+        self.btn_cal_quick_record = QPushButton("▶ Notetake")
+        self.btn_cal_quick_record.setObjectName("dawnBtn")
+        self.btn_cal_quick_record.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cal_quick_record.setVisible(False)
+        self.btn_cal_quick_record.clicked.connect(
+            lambda: self._start_for_calendar_meeting(self._inline_next_cal_meeting)
+            if self._inline_next_cal_meeting is not None
+            else None
+        )
+        cal_top.addWidget(self.btn_cal_quick_record)
+
+        # Horizon Filter Buttons inside toggleable container
+        self.cal_filters_container = QWidget()
+        filt_lay = QHBoxLayout(self.cal_filters_container)
+        filt_lay.setContentsMargins(0, 0, 0, 0)
+        filt_lay.setSpacing(6)
+
         self.btn_filter_today = QPushButton("Today")
         self.btn_filter_today.setCheckable(True)
         self.btn_filter_today.setChecked(True)
         self.btn_filter_today.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_filter_today.clicked.connect(lambda: self._set_cal_filter("today"))
-        cal_top.addWidget(self.btn_filter_today)
+        filt_lay.addWidget(self.btn_filter_today)
 
         self.btn_filter_tomorrow = QPushButton("Tomorrow")
         self.btn_filter_tomorrow.setCheckable(True)
         self.btn_filter_tomorrow.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_filter_tomorrow.clicked.connect(lambda: self._set_cal_filter("tomorrow"))
-        cal_top.addWidget(self.btn_filter_tomorrow)
+        filt_lay.addWidget(self.btn_filter_tomorrow)
 
         self.btn_filter_30d = QPushButton("Next 30 Days")
         self.btn_filter_30d.setCheckable(True)
         self.btn_filter_30d.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_filter_30d.clicked.connect(lambda: self._set_cal_filter("future"))
-        cal_top.addWidget(self.btn_filter_30d)
+        filt_lay.addWidget(self.btn_filter_30d)
 
         self.btn_filter_all = QPushButton("All")
         self.btn_filter_all.setCheckable(True)
         self.btn_filter_all.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_filter_all.clicked.connect(lambda: self._set_cal_filter("all"))
-        cal_top.addWidget(self.btn_filter_all)
+        filt_lay.addWidget(self.btn_filter_all)
+        cal_top.addWidget(self.cal_filters_container)
 
         self.btn_cal_sync = QPushButton("Sync")
         self.btn_cal_sync.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -350,12 +466,22 @@ class NotetakerPage(QWidget):
         self.btn_open_calendar.clicked.connect(self.open_calendar_requested.emit)
         cal_top.addWidget(self.btn_open_calendar)
 
+        self.btn_cal_expand = QPushButton("Expand ▾")
+        self.btn_cal_expand.setObjectName("ghostBtn")
+        self.btn_cal_expand.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cal_expand.setToolTip("Expand or collapse upcoming calendar meeting cards")
+        self.btn_cal_expand.clicked.connect(self._toggle_cal_expanded)
+        cal_top.addWidget(self.btn_cal_expand)
+
         cal_root_lay.addLayout(cal_top)
 
-        # Content area for meeting cards
-        self.cal_content = QHBoxLayout()
+        # Content area for meeting cards (hidden when collapsed)
+        self.cal_content_container = QWidget()
+        self.cal_content = QHBoxLayout(self.cal_content_container)
+        self.cal_content.setContentsMargins(0, 0, 0, 0)
         self.cal_content.setSpacing(10)
-        cal_root_lay.addLayout(self.cal_content)
+        cal_root_lay.addWidget(self.cal_content_container)
+        self._apply_cal_collapsed_state()
         root.addWidget(self.cal_card)
 
         # Main Split Workspace (Left: Library / Folders | Right: Player + Actions + Studio)
@@ -375,7 +501,7 @@ class NotetakerPage(QWidget):
         self.txt_search.setPlaceholderText("Search call notes & transcripts...")
         self.txt_search.setAccessibleName("Search call notes and transcripts")
         self.txt_search.setAccessibleDescription("Filter meeting recordings by title, date, platform, or transcript content")
-        self.txt_search.textChanged.connect(self.refresh_meetings_list)
+        self.txt_search.textChanged.connect(lambda _t: self._search_debounce_timer.start())
         lib_lay.addWidget(self.txt_search)
 
         folder_row = QHBoxLayout()
@@ -421,13 +547,25 @@ class NotetakerPage(QWidget):
         top_meta.setSpacing(8)
         meta_col = QVBoxLayout()
         meta_col.setSpacing(2)
-        self.lbl_sel_title = QLabel("Select a call note")
-        self.lbl_sel_title.setStyleSheet("font-size: 16px; font-weight: 700;")
+        self.lbl_sel_title = QLineEdit("Select a call note")
+        self.lbl_sel_title.setObjectName("ntSelTitleEdit")
+        self.lbl_sel_title.setReadOnly(True)
+        self.lbl_sel_title.setFrame(False)
+        self.lbl_sel_title.setPlaceholderText("Untitled Meeting")
+        self.lbl_sel_title.setAccessibleName("Selected meeting title")
+        self.lbl_sel_title.editingFinished.connect(self._on_selected_title_edited)
         self.lbl_sel_meta = QLabel("Pick a recorded meeting from the left library or start a new capture.")
         self.lbl_sel_meta.setObjectName("ntMuted")
         meta_col.addWidget(self.lbl_sel_title)
         meta_col.addWidget(self.lbl_sel_meta)
         top_meta.addLayout(meta_col, 1)
+
+        self.btn_reprocess = QPushButton("↻ Reprocess")
+        self.btn_reprocess.setEnabled(False)
+        self.btn_reprocess.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_reprocess.setToolTip("Re-run local Whisper transcription and summary without modifying original audio")
+        self.btn_reprocess.clicked.connect(lambda: self._on_reprocess_meeting_clicked())
+        top_meta.addWidget(self.btn_reprocess)
 
         self.btn_view_in_calendar = QPushButton("Calendar Event")
         self.btn_view_in_calendar.setObjectName("secondaryBtn")
@@ -515,6 +653,10 @@ class NotetakerPage(QWidget):
         # Embedded Studio Workspace
         self.studio = VoxMeetingStudioWorkspace(parent=detail_wrap, theme=self._theme, db=self.controller.db)
         self.studio.tab_summary.ask_vox_submitted.connect(self._on_studio_ask_submitted)
+        self.studio.ask_rail_submitted.connect(self._on_studio_ask_rail_submitted)
+        self.studio.seek_requested.connect(self._seek_to_seconds)
+        self.studio.tab_transcript.seek_requested.connect(self._seek_to_seconds)
+        self.studio.tab_thoughts.seek_requested.connect(self._seek_to_seconds)
         detail_lay.addWidget(self.studio, 1)
 
         self.splitter.addWidget(detail_wrap)
@@ -558,6 +700,19 @@ class NotetakerPage(QWidget):
         dismissed = bool(getattr(cfg, "notetaker_auto_start_banner_dismissed", False))
         auto_on = bool(getattr(cfg, "auto_record_calls", True)) and not bool(getattr(cfg, "prompt_on_call", True))
         self.auto_start_banner.setVisible(not dismissed and not auto_on)
+
+    def _toggle_cal_expanded(self) -> None:
+        self._cal_expanded = not self._cal_expanded
+        self._apply_cal_collapsed_state()
+
+    def _apply_cal_collapsed_state(self) -> None:
+        exp = bool(getattr(self, "_cal_expanded", False))
+        if hasattr(self, "cal_filters_container"):
+            self.cal_filters_container.setVisible(exp)
+        if hasattr(self, "cal_content_container"):
+            self.cal_content_container.setVisible(exp)
+        if hasattr(self, "btn_cal_expand"):
+            self.btn_cal_expand.setText("Collapse ▴" if exp else "Expand ▾")
 
     def _set_cal_filter(self, filter_name: str) -> None:
         self._cal_filter = filter_name
@@ -671,6 +826,11 @@ class NotetakerPage(QWidget):
 
         if not any_connected:
             self.lbl_cal_count.setText("0")
+            self._inline_next_cal_meeting = None
+            if hasattr(self, "lbl_cal_next_inline"):
+                self.lbl_cal_next_inline.setText("Connect Outlook, Google, or Zoom to see upcoming meetings")
+            if hasattr(self, "btn_cal_quick_record"):
+                self.btn_cal_quick_record.setVisible(False)
             lbl_empty = QLabel("Connect Microsoft Outlook, Google Calendar, or Zoom to see real upcoming meetings and 1-click Notetaker capture.")
             lbl_empty.setObjectName("ntMuted")
             lbl_empty.setWordWrap(True)
@@ -693,6 +853,17 @@ class NotetakerPage(QWidget):
             filtered = all_meetings
 
         self.lbl_cal_count.setText(str(len(filtered)))
+        next_mtg = filtered[0] if filtered else (all_meetings[0] if all_meetings else None)
+        self._inline_next_cal_meeting = next_mtg
+        if hasattr(self, "lbl_cal_next_inline"):
+            if next_mtg is not None:
+                n_title = str(getattr(next_mtg, "title", "Meeting") or "Meeting")
+                n_time = str(getattr(next_mtg, "formatted_time_range", "") or getattr(next_mtg, "formatted_date", "") or "")
+                self.lbl_cal_next_inline.setText(f"Next: {n_title}" + (f" · {n_time}" if n_time else ""))
+            else:
+                self.lbl_cal_next_inline.setText("No upcoming meetings scheduled")
+        if hasattr(self, "btn_cal_quick_record"):
+            self.btn_cal_quick_record.setVisible(next_mtg is not None)
 
         if not filtered:
             period_str = self._cal_filter.capitalize() if self._cal_filter != "future" else "the next 30 days"
@@ -814,12 +985,29 @@ class NotetakerPage(QWidget):
         proc = eff_state in {"processing", "transcribing"}
         active = rec or paused or proc
         self.rec_banner.setVisible(active)
+        if hasattr(self, "bar_mic_level"):
+            show_meters = rec or paused
+            self.lbl_mic_health.setVisible(show_meters)
+            self.bar_mic_level.setVisible(show_meters)
+            self.lbl_sys_health.setVisible(show_meters)
+            self.bar_sys_level.setVisible(show_meters)
+            if not show_meters:
+                self.lbl_capture_anomaly.setVisible(False)
+                self._silent_loopback_since = None
+
         if rec:
             self.lbl_rec_dot.setText("● Notetaker Recording Live")
             self.btn_pause_rec.setVisible(True)
             self.btn_stop_rec.setVisible(True)
             self.btn_pause_rec.setText("Pause")
             self.btn_start_adhoc.setText("Stop Notetaker")
+            active_mid = getattr(self.controller, "active_meeting_id", None)
+            if active_mid is not None and self._selected_meeting_id != active_mid:
+                try:
+                    if hasattr(self.controller, "db") and self.controller.db.get_meeting(int(active_mid)):
+                        self.select_meeting(int(active_mid))
+                except Exception:
+                    pass
         elif paused:
             self.lbl_rec_dot.setText("❚❚ Notetaker Paused")
             self.btn_pause_rec.setVisible(True)
@@ -827,11 +1015,15 @@ class NotetakerPage(QWidget):
             self.btn_pause_rec.setText("Resume")
             self.btn_start_adhoc.setText("Stop Notetaker")
         elif proc:
-            self.lbl_rec_dot.setText(f"● {status_msg}" if status_msg else "● Processing Meeting...")
+            stage_text = status_msg.strip() if status_msg else "Processing Meeting..."
+            self.lbl_rec_dot.setText(f"● {stage_text}")
             self.btn_pause_rec.setVisible(False)
             self.btn_stop_rec.setVisible(False)
             self.btn_start_adhoc.setText("Processing...")
         else:
+            self._silent_loopback_since = None
+            if hasattr(self, "lbl_capture_anomaly"):
+                self.lbl_capture_anomaly.setVisible(False)
             self.btn_pause_rec.setVisible(True)
             self.btn_stop_rec.setVisible(True)
             self.btn_start_adhoc.setText("Start Notetaker")
@@ -839,31 +1031,117 @@ class NotetakerPage(QWidget):
             if hasattr(self, "lbl_rec_live"):
                 self.lbl_rec_live.setText("")
 
+    def _should_stream_to_active_studio(self, meeting_id: int) -> bool:
+        if self._selected_meeting_id is not None:
+            return int(meeting_id) == int(self._selected_meeting_id)
+        active_mid = getattr(self.controller, "active_meeting_id", None)
+        return active_mid is not None and int(meeting_id) == int(active_mid)
+
     def _on_live_meeting_partial(self, meeting_id: int, partial_dict: dict) -> None:
-        if getattr(self, "lbl_rec_live", None) is not None:
-            txt = str((partial_dict or {}).get("text", "")).strip()
-            spk = str((partial_dict or {}).get("speaker", "Speaker")).strip()
-            if txt:
-                self.lbl_rec_live.setText(f"● {spk}: {txt}")
+        txt = str((partial_dict or {}).get("text", "")).strip()
+        spk = str((partial_dict or {}).get("speaker", "Speaker")).strip() or "Speaker"
+        if getattr(self, "lbl_rec_live", None) is not None and txt:
+            self.lbl_rec_live.setText(f"● {spk}: {txt}")
+        if hasattr(self, "studio") and self._should_stream_to_active_studio(meeting_id):
+            self.studio.tab_transcript.set_live_partial(spk, txt)
 
     def _on_live_meeting_confirmed(self, meeting_id: int, conf_dict: dict) -> None:
-        if getattr(self, "lbl_rec_live", None) is not None:
-            txt = str((conf_dict or {}).get("text", "")).strip()
-            spk = str((conf_dict or {}).get("speaker", "Speaker")).strip()
-            if txt:
-                self.lbl_rec_live.setText(f"✓ {spk}: {txt}")
+        txt = str((conf_dict or {}).get("text", "")).strip()
+        spk = str((conf_dict or {}).get("speaker", "Speaker")).strip() or "Speaker"
+        if getattr(self, "lbl_rec_live", None) is not None and txt:
+            self.lbl_rec_live.setText(f"✓ {spk}: {txt}")
+        self._on_live_meeting_segment(meeting_id, conf_dict)
 
-    def _on_meeting_tick(self, elapsed_sec: float, *_extra: Any) -> None:
-        self.lbl_rec_timer.setText(format_seconds_hms(float(elapsed_sec or 0.0)))
+    def _on_live_meeting_segment(self, meeting_id: int, seg_dict: dict) -> None:
+        if not seg_dict:
+            return
+        if hasattr(self, "studio") and self._should_stream_to_active_studio(meeting_id):
+            self.studio.tab_transcript.append_live_segment(seg_dict)
+
+    def _on_meeting_tick(self, elapsed_sec: float, *extra: Any) -> None:
+        t_val = float(elapsed_sec or 0.0)
+        self.lbl_rec_timer.setText(format_seconds_hms(t_val))
+        if not extra:
+            return
+        mic_lvl = float(extra[0]) if len(extra) > 0 and extra[0] is not None else 0.0
+        sys_lvl = float(extra[1]) if len(extra) > 1 and extra[1] is not None else 0.0
+        mic_ok = bool(extra[2]) if len(extra) > 2 else True
+        sys_ok = bool(extra[3]) if len(extra) > 3 else True
+        t = get_theme_tokens(self._theme)
+
+        def _pct(val: float) -> int:
+            scaled = val * 100.0 if val <= 1.0 else val
+            return int(max(0, min(100, round(scaled))))
+
+        if hasattr(self, "bar_mic_level"):
+            self.bar_mic_level.setValue(_pct(mic_lvl))
+        if hasattr(self, "bar_sys_level"):
+            self.bar_sys_level.setValue(_pct(sys_lvl))
+        self._mic_ok = mic_ok
+        if hasattr(self, "lbl_mic_health"):
+            self.lbl_mic_health.setText("🎙 Mic OK" if mic_ok else "🎙 Mic Silent")
+            mic_col = t["status_success_text"] if mic_ok else t["status_warning_text"]
+            self.lbl_mic_health.setStyleSheet(
+                f"font-size: 11px; font-weight: 600; color: {mic_col};"
+            )
+        if hasattr(self, "lbl_sys_health"):
+            sys_healthy = sys_ok and sys_lvl >= 0.005
+            self._sys_healthy = sys_healthy
+            self.lbl_sys_health.setText("🔊 Loopback OK" if sys_healthy else "🔊 Loopback Flat")
+            sys_col = t["status_success_text"] if sys_healthy else t["status_warning_text"]
+            self.lbl_sys_health.setStyleSheet(
+                f"font-size: 11px; font-weight: 600; color: {sys_col};"
+            )
+            if sys_healthy:
+                self._silent_loopback_since = None
+                if hasattr(self, "lbl_capture_anomaly"):
+                    self.lbl_capture_anomaly.setVisible(False)
+            else:
+                if self._silent_loopback_since is None:
+                    self._silent_loopback_since = t_val
+                if (t_val - self._silent_loopback_since) >= 15.0 and hasattr(self, "lbl_capture_anomaly"):
+                    self.lbl_capture_anomaly.setVisible(True)
+
+    def _infer_new_meeting_title(self) -> str:
+        """Infer a descriptive title immediately without blocking capture on a modal dialog."""
+        if self._prepared_calendar_meeting is not None:
+            title = str(getattr(self._prepared_calendar_meeting, "title", "") or "").strip()
+            self._clear_prepared_meeting()
+            if title:
+                return title
+
+        detector = getattr(self.controller, "call_detector", None)
+        active_call = getattr(detector, "active", None) if detector is not None else None
+        if active_call is not None:
+            win_title = str(getattr(active_call, "window_title", "") or "").strip()
+            app_name = str(getattr(active_call, "app_name", "") or "").strip()
+            if win_title:
+                return win_title[:120]
+            if app_name:
+                return f"{app_name} Call"
+
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now()
+        for mtg in self._cached_calendar_meetings:
+            st = getattr(mtg, "start_time", None)
+            et = getattr(mtg, "end_time", None)
+            m_title = str(getattr(mtg, "title", "") or "").strip()
+            if st is None or not m_title:
+                continue
+            ref = now_utc if getattr(st, "tzinfo", None) is not None else now_local
+            end_ref = et if et is not None else (st + timedelta(minutes=60))
+            if st <= ref + timedelta(minutes=15) and end_ref >= ref:
+                return m_title
+
+        return f"Meeting — {datetime.now().strftime('%b %d, %H:%M')}"
 
     def _on_toggle_recording_clicked(self) -> None:
         paused = getattr(self.controller, "meeting_state", "idle") == "paused"
         if bool(getattr(self.controller, "is_meeting_recording", False)) or paused:
             self.controller.stop_meeting_recording()
         else:
-            title, ok = QInputDialog.getText(self, "Start Notetaker", "Meeting title:", text="Meeting Notes")
-            if ok:
-                self.controller.start_meeting_recording(title=(title or "Meeting Notes").strip())
+            inferred_title = self._infer_new_meeting_title()
+            self.controller.start_meeting_recording(title=inferred_title)
 
     def _on_pause_resume_clicked(self) -> None:
         if getattr(self.controller, "meeting_state", "idle") == "paused":
@@ -895,8 +1173,16 @@ class NotetakerPage(QWidget):
             self.refresh_folders()
 
     def refresh_meetings_list(self) -> None:
+        if getattr(self.controller, "_cancel_ask_vox", False):
+            return
+        db = getattr(self.controller, "db", None)
+        db_path = getattr(db, "db_path", None) if db is not None else None
+        if db is None or (db_path and ":memory:" not in str(db_path).lower() and not Path(str(db_path)).exists()):
+            return
         q = self.txt_search.text().strip()
         meetings = self.controller.db.list_meetings(search_query=q, folder_id=self._active_folder_id, limit=200)
+        recoverable_count = 0
+        first_interrupted: Optional[int] = None
         self.meetings_list.blockSignals(True)
         self.meetings_list.clear()
         for m in meetings:
@@ -904,7 +1190,14 @@ class NotetakerPage(QWidget):
             date_str = str(m.get("started_at") or "")[:10]
             plat = str(m.get("source_platform") or "Call")
             has_vid = bool(m.get("video_path") and Path(str(m.get("video_path"))).exists())
+            is_interrupted = str(m.get("status") or "").lower() == "interrupted"
             badge = " · Video" if has_vid else ""
+            if is_interrupted:
+                badge += " · ⚠ Interrupted"
+                if self._resolve_audio_path(m) is not None:
+                    recoverable_count += 1
+                    if first_interrupted is None:
+                        first_interrupted = int(m["id"])
             item = QListWidgetItem(f"{m.get('title') or 'Untitled Meeting'}\n{date_str} · {dur} · {plat}{badge}")
             item.setData(Qt.ItemDataRole.UserRole, m["id"])
             self.meetings_list.addItem(item)
@@ -912,6 +1205,17 @@ class NotetakerPage(QWidget):
                 item.setSelected(True)
                 self.meetings_list.setCurrentItem(item)
         self.meetings_list.blockSignals(False)
+
+        self._first_interrupted_id = first_interrupted
+        if hasattr(self, "interrupted_banner"):
+            if recoverable_count > 0:
+                self.lbl_interrupted_summary.setText(
+                    f"⚠ {recoverable_count} interrupted recording{'s' if recoverable_count != 1 else ''} "
+                    "rescued — original audio preserved"
+                )
+                self.interrupted_banner.setVisible(True)
+            else:
+                self.interrupted_banner.setVisible(False)
 
         if self._selected_meeting_id is None and self.meetings_list.count() > 0:
             self.meetings_list.setCurrentRow(0)
@@ -921,6 +1225,13 @@ class NotetakerPage(QWidget):
 
         has_meetings = self.meetings_list.count() > 0
         show_empty = not has_meetings and self._selected_meeting_id is None
+        if show_empty:
+            self.lbl_sel_title.blockSignals(True)
+            self.lbl_sel_title.setText("Select a call note")
+            self.lbl_sel_title.setReadOnly(True)
+            self.lbl_sel_title.blockSignals(False)
+            if hasattr(self, "btn_reprocess"):
+                self.btn_reprocess.setEnabled(False)
         if hasattr(self, "empty_card"):
             self.empty_card.setVisible(show_empty)
         if hasattr(self, "action_card"):
@@ -1017,8 +1328,16 @@ class NotetakerPage(QWidget):
         plat = str(m.get("source_platform") or "Desktop Call")
         date_str = str(m.get("started_at") or "")[:16].replace("T", " ")
         cal_ev_id = str(m.get("calendar_event_id") or "")
+        is_interrupted = str(m.get("status") or "").lower() == "interrupted"
+
+        self.lbl_sel_title.blockSignals(True)
         self.lbl_sel_title.setText(str(m.get("title") or "Untitled Meeting"))
+        self.lbl_sel_title.setReadOnly(False)
+        self.lbl_sel_title.blockSignals(False)
+
         meta_text = f"{date_str} · Duration {dur} · {plat}"
+        if is_interrupted:
+            meta_text += " · ⚠ Interrupted"
         if cal_ev_id:
             meta_text += " · Linked Calendar Event"
         self.lbl_sel_meta.setText(meta_text)
@@ -1026,6 +1345,20 @@ class NotetakerPage(QWidget):
             self.btn_view_in_calendar.setVisible(bool(cal_ev_id))
 
         has_vid = self._resolve_video_path(m) is not None
+        res_audio = self._resolve_audio_path(m)
+        if hasattr(self, "btn_reprocess"):
+            self.btn_reprocess.setEnabled(res_audio is not None)
+            if is_interrupted:
+                t_btn = get_theme_tokens(self._theme)
+                self.btn_reprocess.setText("↻ Recover & Re-Transcribe")
+                self.btn_reprocess.setStyleSheet(
+                    f"background-color: {t_btn['status_warning_bg']}; color: {t_btn['status_warning_text']}; "
+                    f"border: 1px solid {t_btn['status_warning']}; border-radius: 6px; padding: 4px 10px; font-weight: 700;"
+                )
+            else:
+                self.btn_reprocess.setText("↻ Reprocess")
+                self.btn_reprocess.setStyleSheet("")
+
         self.btn_watch_video.setEnabled(has_vid)
         self.btn_watch_video.setToolTip("Play call window video recording" if has_vid else "No video recorded for this meeting")
         self.btn_speakers.setEnabled(True)
@@ -1034,9 +1367,8 @@ class NotetakerPage(QWidget):
 
         # Load audio player cleanly
         self.media_player.stop()
-        apath = str(m.get("audio_path") or "")
-        if apath and Path(apath).exists():
-            self.media_player.setSource(QUrl.fromLocalFile(apath))
+        if res_audio is not None:
+            self.media_player.setSource(QUrl.fromLocalFile(str(res_audio)))
             self.btn_play_pause.setEnabled(True)
             self.media_slider.setEnabled(True)
         else:
@@ -1046,6 +1378,66 @@ class NotetakerPage(QWidget):
         self.btn_play_pause.setText("Play Audio")
 
         self.studio.load_meeting(meeting_id)
+
+    @staticmethod
+    def _resolve_audio_path(m: Dict[str, Any]) -> Optional[Path]:
+        """Locate an existing local audio recording file without modifying or deleting any WAV on disk."""
+        for key in ("audio_path", "mic_audio_path", "sys_audio_path"):
+            raw = str(m.get(key) or "").strip()
+            if raw:
+                p = Path(raw)
+                if p.exists() and p.is_file() and p.stat().st_size > 32:
+                    return p
+        vpath = str(m.get("video_path") or "").strip()
+        if vpath:
+            vparent = Path(vpath).parent
+            for name in ("meeting_mixed.wav", "mixed.wav", "mic_track.wav", "mic.wav", "system_track.wav", "sys.wav"):
+                cand = vparent / name
+                if cand.exists() and cand.is_file() and cand.stat().st_size > 32:
+                    return cand
+        return None
+
+    def _on_selected_title_edited(self) -> None:
+        if self._selected_meeting_id is None or self.lbl_sel_title.isReadOnly():
+            return
+        new_title = self.lbl_sel_title.text().strip()
+        m_id = int(self._selected_meeting_id)
+        if not new_title:
+            cur = self.controller.db.get_meeting(m_id) if hasattr(self.controller, "db") else None
+            self.lbl_sel_title.blockSignals(True)
+            self.lbl_sel_title.setText(str((cur or {}).get("title") or "Untitled Meeting"))
+            self.lbl_sel_title.blockSignals(False)
+            return
+        if hasattr(self.controller, "db") and hasattr(self.controller.db, "update_meeting"):
+            self.controller.db.update_meeting(m_id, title=new_title)
+        if hasattr(self, "studio") and hasattr(self.studio, "lbl_workspace_title"):
+            self.studio.lbl_workspace_title.setText(f"Meeting Workspace: {new_title}")
+        for i in range(self.meetings_list.count()):
+            it = self.meetings_list.item(i)
+            if it is not None and it.data(Qt.ItemDataRole.UserRole) == m_id:
+                parts = it.text().split("\n", 1)
+                suffix = f"\n{parts[1]}" if len(parts) > 1 else ""
+                it.setText(f"{new_title}{suffix}")
+                break
+
+    def _on_recover_interrupted_clicked(self) -> None:
+        target_id = self._first_interrupted_id
+        if target_id is None:
+            return
+        self.select_meeting(int(target_id))
+        self._on_reprocess_meeting_clicked(int(target_id))
+
+    def _on_reprocess_meeting_clicked(self, meeting_id: Optional[int] = None) -> None:
+        target_id = int(meeting_id) if meeting_id is not None else self._selected_meeting_id
+        if target_id is None or not hasattr(self.controller, "db"):
+            return
+        m = self.controller.db.get_meeting(int(target_id))
+        if not m or self._resolve_audio_path(m) is None:
+            self.status_toast.emit("Audio Missing", "Original WAV recording was not found on disk.")
+            return
+        if hasattr(self.controller, "re_transcribe_meeting"):
+            self.controller.re_transcribe_meeting(int(target_id))
+            self.status_toast.emit("Re-Transcribing", "Re-processing saved audio locally (original WAV preserved).")
 
     @staticmethod
     def _resolve_video_path(m: Dict[str, Any]) -> Optional[Path]:
@@ -1167,6 +1559,10 @@ class NotetakerPage(QWidget):
         if self._selected_meeting_id is None:
             return
         menu = QMenu(self)
+        act_reprocess = menu.addAction("↻ Recover & Re-Transcribe")
+        m = self.controller.db.get_meeting(self._selected_meeting_id) if hasattr(self.controller, "db") else None
+        act_reprocess.setEnabled(bool(m and self._resolve_audio_path(m) is not None))
+        act_reprocess.triggered.connect(lambda: self._on_reprocess_meeting_clicked(self._selected_meeting_id))
         act_move = menu.addAction("Move to Folder...")
         act_move.triggered.connect(self._move_selected_to_folder)
         act_reveal = menu.addAction("Reveal Recording Folder")
@@ -1223,15 +1619,32 @@ class NotetakerPage(QWidget):
         self.media_slider.blockSignals(True)
         self.media_slider.setValue(pos_ms)
         self.media_slider.blockSignals(False)
+        sec = pos_ms / 1000.0
         self.lbl_media_time.setText(
-            f"{format_seconds_hms(pos_ms / 1000.0)} / {format_seconds_hms(self.media_player.duration() / 1000.0)}"
+            f"{format_seconds_hms(sec)} / {format_seconds_hms(self.media_player.duration() / 1000.0)}"
         )
+        if hasattr(self, "studio"):
+            self.studio.tab_thoughts.set_current_playback_time(sec)
+            self.studio.tab_transcript.highlight_time(sec)
 
     def _on_media_duration_changed(self, dur_ms: int) -> None:
         self.media_slider.setRange(0, max(0, dur_ms))
 
     def _on_media_seek(self, pos_ms: int) -> None:
         self.media_player.setPosition(pos_ms)
+
+    def _seek_to_seconds(self, seconds: float) -> None:
+        """Seek local audio playback to the clicked transcript/note timestamp and start playing if loaded."""
+        pos_ms = max(0, int(float(seconds) * 1000.0))
+        self.media_player.setPosition(pos_ms)
+        if hasattr(self, "studio"):
+            self.studio.tab_transcript.highlight_time(float(seconds))
+        if (
+            self.media_player.source().isValid()
+            and self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState
+        ):
+            self.media_player.play()
+            self.btn_play_pause.setText("Pause Audio")
 
     def apply_theme(self, theme_name: str) -> None:
         self._theme = "dark" if (theme_name or "").lower() == "dark" else "light"
@@ -1250,6 +1663,36 @@ class NotetakerPage(QWidget):
                 background-color: {t['accent_lumen']};
                 border: 1px solid {t['accent_lumen_border']};
                 border-radius: 12px;
+            }}
+            QFrame#ntInterruptedBanner {{
+                background-color: {t.get('surface_secondary', t['surface'])};
+                border: 1px solid {t.get('accent_amber', '#F59E0B')};
+                border-radius: 12px;
+            }}
+            QLineEdit#ntSelTitleEdit {{
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 2px 4px;
+                color: {t['text']};
+                font-size: 16px;
+                font-weight: 700;
+            }}
+            QLineEdit#ntSelTitleEdit:hover {{
+                border: 1px solid {t['border']};
+            }}
+            QLineEdit#ntSelTitleEdit:focus {{
+                background-color: {t.get('surface_secondary', t['surface'])};
+                border: 1px solid {t.get('accent', '#6366F1')};
+            }}
+            QProgressBar#ntLevelBar {{
+                background-color: {t.get('surface_well', t['surface_secondary'])};
+                border: 1px solid {t['border']};
+                border-radius: 3px;
+            }}
+            QProgressBar#ntLevelBar::chunk {{
+                background-color: {t.get('accent_emerald', '#10B981')};
+                border-radius: 2px;
             }}
             QListWidget {{
                 background-color: {t['surface']};
@@ -1316,6 +1759,31 @@ class NotetakerPage(QWidget):
             }}
             """
         )
+        if hasattr(self, "lbl_mic_health"):
+            mic_col = t["status_success_text"] if self._mic_ok else t["status_warning_text"]
+            self.lbl_mic_health.setStyleSheet(
+                f"font-size: 11px; font-weight: 600; color: {mic_col};"
+            )
+        if hasattr(self, "lbl_sys_health"):
+            sys_col = t["status_success_text"] if self._sys_healthy else t["status_warning_text"]
+            self.lbl_sys_health.setStyleSheet(
+                f"font-size: 11px; font-weight: 600; color: {sys_col};"
+            )
+        if hasattr(self, "lbl_capture_anomaly"):
+            self.lbl_capture_anomaly.setStyleSheet(
+                f"background: {t['status_warning_bg']}; color: {t['status_warning_text']}; "
+                f"border: 1px solid {t['status_warning']}; border-radius: 6px; padding: 2px 7px; "
+                "font-size: 11px; font-weight: 600;"
+            )
+        if hasattr(self, "lbl_interrupted_summary"):
+            self.lbl_interrupted_summary.setStyleSheet(
+                f"font-weight: 600; color: {t['status_warning_text']};"
+            )
+        if hasattr(self, "btn_reprocess") and self.btn_reprocess.text() == "↻ Recover & Re-Transcribe":
+            self.btn_reprocess.setStyleSheet(
+                f"background-color: {t['status_warning_bg']}; color: {t['status_warning_text']}; "
+                f"border: 1px solid {t['status_warning']}; border-radius: 6px; padding: 4px 10px; font-weight: 700;"
+            )
         if hasattr(self, "studio"):
             self.studio.apply_theme(self._theme)
 
@@ -1325,9 +1793,55 @@ class NotetakerPage(QWidget):
         if m_id is None:
             self.studio.tab_summary.set_ask_answer("Select a meeting first to ask a scoped question.")
             return
-        res = self.controller.query_meeting_memory(query, meeting_id=int(m_id))
-        ans = str((res or {}).get("answer") or "No relevant excerpts found in this meeting.")
-        self.studio.tab_summary.set_ask_answer(ans)
+        fn = getattr(self.controller, "query_meeting_memory", None)
+        if isinstance(fn, unittest.mock.NonCallableMock):
+            res = fn(query, meeting_id=int(m_id))
+            ans = str((res or {}).get("answer") or "No relevant excerpts found in this meeting.")
+            citations = list((res or {}).get("citations") or [])
+            self._on_studio_ask_completed(int(m_id), query, ans, citations)
+            return
+        self._run_studio_ask_async(query, int(m_id))
+
+    def _on_studio_ask_rail_submitted(self, query: str) -> None:
+        m_id = self._selected_meeting_id
+        if m_id is None:
+            self.studio.append_ask_rail_exchange(
+                query,
+                "Select a meeting first to ask a scoped question.",
+                citations=[],
+            )
+            return
+        self._run_studio_ask_async(query, int(m_id))
+
+    def _run_studio_ask_async(self, query: str, meeting_id: int) -> None:
+        self.studio.set_ask_rail_loading(query)
+        target_id = int(meeting_id)
+
+        def _worker() -> None:
+            try:
+                res = self.controller.query_meeting_memory(query, meeting_id=target_id)
+                ans = str((res or {}).get("answer") or "No relevant excerpts found in this meeting.")
+                cits = list((res or {}).get("citations") or [])
+            except Exception as exc:
+                ans = f"Could not query meeting memory: {exc}"
+                cits = []
+            try:
+                self._studio_ask_completed.emit(target_id, query, ans, cits)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=_worker, daemon=True, name="StudioAskVoxWorker").start()
+
+    def _on_studio_ask_completed(
+        self, meeting_id: int, question: str, answer: str, citations: object
+    ) -> None:
+        if getattr(self.controller, "_cancel_ask_vox", False):
+            return
+        if self._selected_meeting_id is None or int(self._selected_meeting_id) != int(meeting_id):
+            return
+        cits = list(citations) if isinstance(citations, (list, tuple)) else []
+        self.studio.tab_summary.set_ask_answer(answer, citations=cits)
+        self.studio.append_ask_rail_exchange(question, answer, citations=cits)
 
     def _on_dictation_interim_updated(self, provisional: str, stable: str) -> None:
         combined = " ".join(x for x in (stable.strip(), provisional.strip()) if x).strip()

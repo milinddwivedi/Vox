@@ -5,6 +5,7 @@ and Cross-Tab State Synchronization in VoxLocal.
 
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import QApplication, QLabel
 from voxlocal.core.config import AppConfig
 from voxlocal.core.controller import AppController
 from voxlocal.win32.startup import StartupManager
+from voxlocal.ui.command_palette import VoxCommandPaletteDialog, create_default_vox_commands
 from voxlocal.ui.floating_widget import FloatingWidget
 from voxlocal.ui.main_window import MainWindow
 
@@ -70,7 +72,7 @@ class TestMicroInteractionsAndShortcuts(unittest.TestCase):
             self.assertEqual(self.main_window.workspace_stack.currentIndex(), idx)
 
     def test_02_settings_search_and_theme_shortcuts(self):
-        """Test Ctrl+, opens Settings, Ctrl+T toggles theme, and Home live search filters entries."""
+        """Test Ctrl+, opens Settings, Ctrl+T toggles theme, and Home/Palette searches debounce DB reads."""
         shortcuts = {sc.key().toString(): sc for sc in self.main_window.findChildren(QShortcut)}
         shortcuts["Ctrl+,"].activated.emit()
         self.app.processEvents()
@@ -81,15 +83,71 @@ class TestMicroInteractionsAndShortcuts(unittest.TestCase):
         self.app.processEvents()
         self.assertNotEqual(self.controller.theme, initial_theme)
 
-        # Home feed live filter
+        # Home feed live filter (200ms debounced)
         self.controller.db.save_dictation("raw alpha", "Alpha deployment ready", duration_sec=2.0)
         self.controller.db.save_dictation("raw beta", "Beta invoice sent", duration_sec=1.5)
         self.main_window.navigate_to_workspace("home")
-        self.main_window.home_page.txt_feed_search.setText("Alpha")
         self.app.processEvents()
-        labels = [lbl.text() for lbl in self.main_window.home_page.feed_container.findChildren(QLabel)]
+
+        home = self.main_window.home_page
+        with patch.object(
+            self.controller.db,
+            "list_dictation_history",
+            wraps=self.controller.db.list_dictation_history,
+        ) as mock_hist:
+            for partial in ("A", "Al", "Alp", "Alpha"):
+                home.txt_feed_search.setText(partial)
+            self.app.processEvents()
+            self.assertTrue(home._feed_search_timer.isActive())
+            self.assertEqual(mock_hist.call_count, 0, "Rapid keystrokes must debounce DB queries")
+
+            deadline = time.perf_counter() + 1.5
+            while time.perf_counter() < deadline:
+                self.app.processEvents()
+                if not home._feed_search_timer.isActive():
+                    break
+                time.sleep(0.015)
+
+            self.assertEqual(mock_hist.call_count, 1)
+
+        labels = [lbl.text() for lbl in home.feed_container.findChildren(QLabel)]
         self.assertTrue(any("Alpha deployment ready" in t for t in labels))
         self.assertFalse(any("Beta invoice sent" in t for t in labels))
+
+        # Command Palette: static commands remain synchronous while DB search debounces
+        palette = VoxCommandPaletteDialog(
+            theme=self.controller.theme,
+            commands=create_default_vox_commands(self.main_window, self.controller),
+            controller=self.controller,
+            parent=self.main_window,
+        )
+        try:
+            palette.txt_search.setText("Set")
+            self.app.processEvents()
+            self.assertTrue(any(c.id == "settings" for c in palette._filtered_commands))
+
+            with patch.object(
+                palette,
+                "_search_database_matches",
+                wraps=palette._search_database_matches,
+            ) as mock_db_search:
+                for partial in ("A", "Al", "Alp", "Alpha"):
+                    palette.txt_search.setText(partial)
+                self.app.processEvents()
+                self.assertTrue(palette._db_search_timer.isActive())
+                self.assertEqual(mock_db_search.call_count, 0)
+
+                deadline = time.perf_counter() + 1.5
+                while time.perf_counter() < deadline:
+                    self.app.processEvents()
+                    if not palette._db_search_timer.isActive():
+                        break
+                    time.sleep(0.015)
+
+                self.assertEqual(mock_db_search.call_count, 1)
+                self.assertTrue(any("Alpha deployment ready" in c.title for c in palette._filtered_commands))
+        finally:
+            palette.close()
 
     def test_03_notetaker_action_items_sync(self):
         """Test Notetaker Studio renders meeting action items cleanly."""

@@ -226,17 +226,17 @@ class TestE2EProductUxAndArchitecture(unittest.TestCase):
     # =========================================================================
 
     def test_theme_tokens_contrast_and_consistency(self) -> None:
-        """Verify Sand Light and Vast Dark design token palettes."""
+        """Verify Nordic Studio Light and Midnight Obsidian Dark design token palettes."""
         # 1. Dark Theme Tokens
         dark_tokens = get_theme_tokens("dark")
-        self.assertEqual(dark_tokens["background"], "#1A1A1A")
-        self.assertEqual(dark_tokens["text_primary"], "#E9E8E1")
+        self.assertEqual(dark_tokens["background"], "#0B0F19")
+        self.assertEqual(dark_tokens["text_primary"], "#F8FAFC")
         self.assertIn("accent", dark_tokens)
 
         # 2. Light Theme Tokens
         light_tokens = get_theme_tokens("light")
-        self.assertEqual(light_tokens["background"], "#FCFCFB")
-        self.assertEqual(light_tokens["text_primary"], "#1A1A1A")
+        self.assertEqual(light_tokens["background"], "#F8FAFC")
+        self.assertEqual(light_tokens["text_primary"], "#0F172A")
         self.assertIn("accent", light_tokens)
 
         # Invariant: Backgrounds must be distinct

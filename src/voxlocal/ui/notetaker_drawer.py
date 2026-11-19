@@ -17,16 +17,21 @@ from __future__ import annotations
 
 import html
 import re
+import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PyQt6.QtCore import QRect, Qt
+from PyQt6.QtCore import QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QScrollArea,
     QStackedWidget,
@@ -38,7 +43,7 @@ from PyQt6.QtWidgets import (
 
 from voxlocal.core.controller import AppController
 from voxlocal.core.logger import get_logger
-from voxlocal.storage.exporter import format_seconds_hms
+from voxlocal.storage.exporter import TranscriptExporter, format_seconds_hms
 from voxlocal.ui.theme import get_theme_stylesheet, get_theme_tokens, get_ui_font
 
 logger = get_logger("ui.notetaker_drawer")
@@ -46,6 +51,9 @@ logger = get_logger("ui.notetaker_drawer")
 
 class VoxNotetakerDrawer(QWidget):
     """Resizable, edge-dockable call companion drawer matching WhisperFlow aesthetics."""
+
+    seek_requested = pyqtSignal(int, float)
+    _ask_answer_ready = pyqtSignal(str, str, object)
 
     def __init__(
         self,
@@ -63,12 +71,31 @@ class VoxNotetakerDrawer(QWidget):
         self._live_segments: List[Dict[str, Any]] = []
         self._active_displayed_meeting_id: Optional[int] = None
         self._elapsed_sec: float = 0.0
+        self._last_summary_raw: str = ""
+        self._last_decisions_raw: str = ""
+        self._last_actions_raw: str = ""
+        self._last_summary_finalized: bool = False
+        self._notes_dirty: bool = False
+        self._notes_meeting_id: Optional[int] = None
+
+        self._notes_save_timer = QTimer(self)
+        self._notes_save_timer.setSingleShot(True)
+        self._notes_save_timer.setInterval(500)
+        self._notes_save_timer.timeout.connect(self._persist_meeting_notes)
+
+        self._slash_skills = {
+            "/catchup": ("What did I miss?", "What did I miss so far in this meeting?"),
+            "/decisions": ("Key Decisions", "List all decisions made so far in this meeting."),
+            "/actions": ("Action Items", "List all action items and owners mentioned so far."),
+            "/blockers": ("Risks & Blockers", "Summarize any risks or blockers discussed in this meeting."),
+        }
 
         self.setWindowTitle("VOX — Notetaker")
         self.resize(540, 680)
         self.setMinimumSize(360, 420)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
+        self._ask_answer_ready.connect(self._on_ask_answer_received)
         self._build_ui()
         self.apply_theme(self._theme)
         self._connect_signals()
@@ -97,8 +124,10 @@ class VoxNotetakerDrawer(QWidget):
 
         self.btn_more = QPushButton("···")
         self.btn_more.setObjectName("drawerIconBtn")
+        self.btn_more.setToolTip("More meeting options & export")
         self.btn_more.setFixedSize(28, 28)
         self.btn_more.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_more.clicked.connect(self._on_more_clicked)
         top_bar.addWidget(self.btn_more)
 
         self.btn_share = QPushButton("Share")
@@ -139,7 +168,8 @@ class VoxNotetakerDrawer(QWidget):
         # ---------------------------------------------------------------------
         # 2. Meeting Title Header: Large Editorial Typography (Editable)
         # ---------------------------------------------------------------------
-        self.txt_title = QLineEdit("HR Connect Session")
+        self.txt_title = QLineEdit("")
+        self.txt_title.setPlaceholderText("Untitled Meeting")
         self.txt_title.setObjectName("drawerMeetingTitle")
         self.txt_title.setFont(get_ui_font(21, 650, serif=True))
         self.txt_title.setStyleSheet(
@@ -149,12 +179,12 @@ class VoxNotetakerDrawer(QWidget):
         root.addWidget(self.txt_title)
 
         # ---------------------------------------------------------------------
-        # 3. Meeting Metadata Pills: [ MH ]  [ Today ]  [ + Add folder ]
+        # 3. Meeting Metadata Pills: [ VOX ]  [ Today ]  [ 📁 Add folder ]
         # ---------------------------------------------------------------------
         meta_row = QHBoxLayout()
         meta_row.setSpacing(6)
 
-        self.lbl_avatar_pill = QLabel("MH")
+        self.lbl_avatar_pill = QLabel("VOX")
         self.lbl_avatar_pill.setObjectName("avatarMetaPill")
         self.lbl_avatar_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_avatar_pill.setFixedSize(32, 22)
@@ -168,6 +198,8 @@ class VoxNotetakerDrawer(QWidget):
         self.btn_folder_pill = QPushButton("📁 Add folder")
         self.btn_folder_pill.setObjectName("subtleMetaPillBtn")
         self.btn_folder_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_folder_pill.setToolTip("Assign meeting to a folder")
+        self.btn_folder_pill.clicked.connect(self._on_folder_pill_clicked)
         meta_row.addWidget(self.btn_folder_pill)
 
         meta_row.addStretch()
@@ -278,7 +310,16 @@ class VoxNotetakerDrawer(QWidget):
         self.tx_browser.setObjectName("txConversationalBrowser")
         self.tx_browser.setOpenExternalLinks(False)
         self.tx_browser.anchorClicked.connect(self._on_anchor_clicked)
+        if self.tx_browser.verticalScrollBar():
+            self.tx_browser.verticalScrollBar().valueChanged.connect(self._on_tx_scrolled)
         lay_tx.addWidget(self.tx_browser, 1)
+
+        self.btn_jump_live = QPushButton("↓ Jump to Live")
+        self.btn_jump_live.setObjectName("quickChipBtn")
+        self.btn_jump_live.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_jump_live.setVisible(False)
+        self.btn_jump_live.clicked.connect(self._jump_to_live_bottom)
+        lay_tx.addWidget(self.btn_jump_live, 0, Qt.AlignmentFlag.AlignRight)
 
         # Real-time streaming provisional speech line at bottom
         self.lbl_live_partial = QLabel("")
@@ -302,12 +343,12 @@ class VoxNotetakerDrawer(QWidget):
         prog_lay.setContentsMargins(16, 14, 16, 14)
         prog_lay.setSpacing(6)
 
-        self.lbl_prog_title = QLabel("Identifying who said what...")
+        self.lbl_prog_title = QLabel("Preparing local summary...")
         self.lbl_prog_title.setObjectName("progTitle")
         self.lbl_prog_title.setFont(get_ui_font(13.5, 600))
         prog_lay.addWidget(self.lbl_prog_title)
 
-        self.lbl_prog_step = QLabel("Step 2 of 3")
+        self.lbl_prog_step = QLabel("Waiting for finalization")
         self.lbl_prog_step.setObjectName("progStep")
         self.lbl_prog_step.setFont(get_ui_font(11.5, 400))
         prog_lay.addWidget(self.lbl_prog_step)
@@ -349,6 +390,24 @@ class VoxNotetakerDrawer(QWidget):
         chip_row.addStretch()
         bot_lay.addLayout(chip_row)
 
+        # Collapsible Slash Skills Row (shown when user types '/')
+        self.slash_skills_bar = QFrame()
+        self.slash_skills_bar.setObjectName("slashSkillsBar")
+        self.slash_skills_bar.setVisible(False)
+        self._slash_lay = QHBoxLayout(self.slash_skills_bar)
+        self._slash_lay.setContentsMargins(0, 2, 0, 2)
+        self._slash_lay.setSpacing(6)
+        self._slash_buttons: Dict[str, QPushButton] = {}
+        for cmd_key, (label, _prompt) in self._slash_skills.items():
+            sb = QPushButton(f"{cmd_key} · {label}")
+            sb.setObjectName("quickChipBtn")
+            sb.setCursor(Qt.CursorShape.PointingHandCursor)
+            sb.clicked.connect(lambda _=False, k=cmd_key: self._activate_slash_skill(k))
+            self._slash_lay.addWidget(sb)
+            self._slash_buttons[cmd_key] = sb
+        self._slash_lay.addStretch()
+        bot_lay.addWidget(self.slash_skills_bar)
+
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
 
@@ -363,6 +422,7 @@ class VoxNotetakerDrawer(QWidget):
         self.txt_ask_anything.setObjectName("askAnythingInput")
         self.txt_ask_anything.setFixedHeight(36)
         self.txt_ask_anything.setPlaceholderText("Ask anything, or type / for Skills")
+        self.txt_ask_anything.textChanged.connect(self._on_ask_text_changed)
         self.txt_ask_anything.returnPressed.connect(self._on_ask_anything_submitted)
         action_row.addWidget(self.txt_ask_anything, 1)
 
@@ -428,25 +488,31 @@ class VoxNotetakerDrawer(QWidget):
     def _display_meeting(self, meeting_id: Optional[int]) -> None:
         if meeting_id is None:
             return
+        if self._active_displayed_meeting_id is not None and self._active_displayed_meeting_id != int(meeting_id):
+            self.flush_pending_notes()
         self._active_displayed_meeting_id = int(meeting_id)
         m = self.controller.db.get_meeting(int(meeting_id))
         if not m:
             return
 
-        title = str(m.get("title", "Meeting Notes"))
+        title = str(m.get("title") or "Untitled Meeting")
         self.txt_title.blockSignals(True)
         self.txt_title.setText(title)
         self.txt_title.setCursorPosition(0)
         self.txt_title.blockSignals(False)
 
-        # Participants initial pill
+        # Participants / Title initial pill & Folder pill
         initials = self._extract_initials_from_title(title)
         self.lbl_avatar_pill.setText(initials)
+        folder_name = str(m.get("folder_name") or "").strip()
+        self.btn_folder_pill.setText(f"📁 {folder_name}" if folder_name else "📁 Add folder")
 
         # Notes
         self.notes_editor.blockSignals(True)
         self.notes_editor.setPlainText(str(m.get("notes", "") or ""))
         self.notes_editor.blockSignals(False)
+        self._notes_dirty = False
+        self._notes_meeting_id = int(meeting_id)
 
         # Transcript segments
         db_segs = self.controller.db.get_transcript_segments(int(meeting_id)) or []
@@ -467,8 +533,24 @@ class VoxNotetakerDrawer(QWidget):
             return words[0][:2].upper()
         return (words[0][0] + words[1][0]).upper()
 
+    def _on_tx_scrolled(self, val: int) -> None:
+        sb = self.tx_browser.verticalScrollBar()
+        if not sb or not hasattr(self, "btn_jump_live"):
+            return
+        at_bottom = (sb.maximum() <= 4) or (val >= sb.maximum() - 40)
+        self.btn_jump_live.setVisible(not at_bottom and len(self._live_segments) > 0)
+
+    def _jump_to_live_bottom(self) -> None:
+        sb = self.tx_browser.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+        if hasattr(self, "btn_jump_live"):
+            self.btn_jump_live.setVisible(False)
+
     def _render_conversational_transcript(self, query: str = "") -> None:
-        """Render conversational speaker turn bubbles matching WhisperFlow screenshot."""
+        """Render theme-aware conversational speaker turn bubbles with seek playback links."""
+        t = get_theme_tokens(self._theme)
+        is_dark = (self._theme or "").lower() == "dark"
         segs = sorted(self._live_segments, key=lambda s: float(s.get("start_time", 0.0)))
         speakers_set = set()
         total_dur = 0.0
@@ -482,12 +564,15 @@ class VoxNotetakerDrawer(QWidget):
         time_str = format_seconds_hms(max(total_dur, self._elapsed_sec))
         self.lbl_tx_stats.setText(f"🕒 {spk_count} SPEAKER{'S' if spk_count > 1 else ''} · {time_str}")
 
+        muted_hex = t.get("text_muted", "#94A3B8" if is_dark else "#64748B")
         if not segs:
             self.tx_browser.setHtml(
-                "<div style='color:#78716C; text-align:center; padding:40px 10px; font-size:13px; font-style:italic;'>"
+                f"<div style='color:{muted_hex}; text-align:center; padding:40px 10px; font-size:13px; font-style:italic;'>"
                 "Listening for speech... Words will appear here live."
                 "</div>"
             )
+            if hasattr(self, "btn_jump_live"):
+                self.btn_jump_live.setVisible(False)
             return
 
         # Group consecutive utterances into turns by speaker
@@ -516,35 +601,46 @@ class VoxNotetakerDrawer(QWidget):
         if cur_turn_segments:
             turns.append({"speaker": cur_speaker, "segments": cur_turn_segments})
 
-        # Build clean HTML
+        sb = self.tx_browser.verticalScrollBar()
+        prev_val = sb.value() if sb else 0
+        was_at_bottom = (sb is None) or (sb.maximum() <= 4) or (prev_val >= sb.maximum() - 40)
+
+        text_hex = t.get("text", "#F8FAFC" if is_dark else "#0F172A")
+        bubble_other_bg = t.get("surface_secondary", "#162032" if is_dark else "#F1F5F9")
+        bubble_you_bg = t.get("surface_elevated", "#1E293B") if is_dark else "#EFF6FF"
+        bubble_you_fg = t.get("accent_dawn_text", "#E0E7FF") if is_dark else "#1E3A8A"
+        spk_other_fg = t.get("accent_emerald", "#2DD4BF" if is_dark else "#0D9488")
+        spk_you_fg = t.get("accent_dawn", "#818CF8") if is_dark else "#2563EB"
+        border_hex = t.get("border", "#283548" if is_dark else "#E2E8F0")
+
         html_parts = [
-            """
+            f"""
             <style>
-              body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 4px; color: #1C1917; }
-              .turn-container { margin-bottom: 16px; }
-              .turn-header { font-size: 13px; font-weight: 700; color: #059669; margin-bottom: 6px; }
-              .turn-header-you { font-size: 13px; font-weight: 700; color: #2563EB; margin-bottom: 6px; }
-              .play-btn { color: #059669; text-decoration: none; font-size: 12px; margin-left: 6px; }
-              .bubble { background: #F6F5EF; border-radius: 14px; padding: 10px 14px; line-height: 1.55; font-size: 13.5px; color: #1C1917; margin-bottom: 6px; }
-              .bubble-you { background: #EFF6FF; border-radius: 14px; padding: 10px 14px; line-height: 1.55; font-size: 13.5px; color: #1E3A8A; margin-bottom: 6px; }
+              body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 4px; color: {text_hex}; }}
+              .turn-container {{ margin-bottom: 16px; }}
+              .turn-header {{ font-size: 13px; font-weight: 700; color: {spk_other_fg}; margin-bottom: 6px; }}
+              .turn-header-you {{ font-size: 13px; font-weight: 700; color: {spk_you_fg}; margin-bottom: 6px; }}
+              .play-btn {{ color: {spk_other_fg}; text-decoration: none; font-size: 12px; margin-left: 6px; }}
+              .bubble {{ background: {bubble_other_bg}; border: 1px solid {border_hex}; border-radius: 14px; padding: 10px 14px; line-height: 1.55; font-size: 13.5px; color: {text_hex}; margin-bottom: 6px; }}
+              .bubble-you {{ background: {bubble_you_bg}; border: 1px solid {border_hex}; border-radius: 14px; padding: 10px 14px; line-height: 1.55; font-size: 13.5px; color: {bubble_you_fg}; margin-bottom: 6px; }}
             </style>
             """
         ]
 
-        for t in turns:
-            spk = t["speaker"]
+        for turn in turns:
+            spk = turn["speaker"]
             is_you = "you" in spk.lower() or "mic" in spk.lower()
             header_cls = "turn-header-you" if is_you else "turn-header"
             bubble_cls = "bubble-you" if is_you else "bubble"
 
-            first_seg_id = t["segments"][0].get("id", 0)
-            html_parts.append(f"<div class='turn-container'>")
+            first_start = float(turn["segments"][0].get("start_time") or 0.0)
+            html_parts.append("<div class='turn-container'>")
             html_parts.append(
                 f"<div class='{header_cls}'>{html.escape(spk)} "
-                f"<a href='play:{first_seg_id}' class='play-btn'>▷</a></div>"
+                f"<a href='seek:{first_start:.2f}' class='play-btn'>▷</a></div>"
             )
 
-            for s in t["segments"]:
+            for s in turn["segments"]:
                 txt_escaped = html.escape(s.get("text", ""))
                 html_parts.append(f"<div class='{bubble_cls}'>{txt_escaped}</div>")
 
@@ -553,7 +649,14 @@ class VoxNotetakerDrawer(QWidget):
         self.tx_browser.setHtml("".join(html_parts))
         sb = self.tx_browser.verticalScrollBar()
         if sb:
-            sb.setValue(sb.maximum())
+            if was_at_bottom:
+                sb.setValue(sb.maximum())
+                if hasattr(self, "btn_jump_live"):
+                    self.btn_jump_live.setVisible(False)
+            else:
+                sb.setValue(min(prev_val, sb.maximum()))
+                if hasattr(self, "btn_jump_live"):
+                    self.btn_jump_live.setVisible(True)
 
     def _render_summary_content(
         self,
@@ -562,13 +665,22 @@ class VoxNotetakerDrawer(QWidget):
         actions_raw: str,
         is_finalized: bool = False,
     ) -> None:
-        """Render multi-step progress card + structured executive summary."""
+        """Render theme-aware multi-step progress card + structured executive summary."""
+        self._last_summary_raw = summary_raw
+        self._last_decisions_raw = decisions_raw
+        self._last_actions_raw = actions_raw
+        self._last_summary_finalized = is_finalized
+
+        t = get_theme_tokens(self._theme)
+        is_dark = (self._theme or "").lower() == "dark"
+        muted_hex = t.get("text_muted", "#94A3B8" if is_dark else "#64748B")
+
         if not is_finalized and not summary_raw:
             self.progress_banner.setVisible(True)
-            self.lbl_prog_title.setText("Identifying who said what...")
-            self.lbl_prog_step.setText("Step 2 of 3")
+            self.lbl_prog_title.setText("Analyzing live transcript...")
+            self.lbl_prog_step.setText("Summary builds when meeting finishes")
             self.summary_browser.setHtml(
-                "<div style='color:#78716C; text-align:center; padding:30px 10px; font-style:italic; font-size:13px;'>"
+                f"<div style='color:{muted_hex}; text-align:center; padding:30px 10px; font-style:italic; font-size:13px;'>"
                 "Executive Summary will be automatically synthesized once the meeting completes."
                 "</div>"
             )
@@ -576,17 +688,20 @@ class VoxNotetakerDrawer(QWidget):
 
         self.progress_banner.setVisible(False)
 
-        # Parse sections and bold lead-in bullet points
-        summary_escaped = html.escape(summary_raw)
+        text_hex = t.get("text", "#F8FAFC" if is_dark else "#0F172A")
+        sec_hex = t.get("text_secondary", "#CBD5E1" if is_dark else "#475569")
+        card_bg = t.get("surface_secondary", "#162032" if is_dark else "#F1F5F9")
+        border_hex = t.get("border", "#283548" if is_dark else "#CBD5E1")
+
         html_builder = [
-            """
+            f"""
             <style>
-              body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #1C1917; line-height: 1.6; margin: 4px; }
-              .highlight-card { background: #FAF8F3; border: 1px dashed #D6D3CD; border-radius: 12px; padding: 14px 16px; margin-bottom: 18px; font-size: 13.5px; color: #44403C; font-weight: 500; }
-              .section-title { font-size: 14.5px; font-weight: 700; color: #1C1917; margin-top: 14px; margin-bottom: 6px; }
-              ul { margin-top: 4px; margin-bottom: 12px; padding-left: 20px; }
-              li { margin-bottom: 6px; font-size: 13.5px; color: #374151; }
-              b { color: #111827; }
+              body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: {text_hex}; line-height: 1.6; margin: 4px; }}
+              .highlight-card {{ background: {card_bg}; border: 1px dashed {border_hex}; border-radius: 12px; padding: 14px 16px; margin-bottom: 18px; font-size: 13.5px; color: {text_hex}; font-weight: 500; }}
+              .section-title {{ font-size: 14.5px; font-weight: 700; color: {text_hex}; margin-top: 14px; margin-bottom: 6px; }}
+              ul {{ margin-top: 4px; margin-bottom: 12px; padding-left: 20px; }}
+              li {{ margin-bottom: 6px; font-size: 13.5px; color: {sec_hex}; }}
+              b {{ color: {text_hex}; }}
             </style>
             """
         ]
@@ -596,14 +711,14 @@ class VoxNotetakerDrawer(QWidget):
         opening_highlight = sentences[0] if sentences else "Meeting highlights and discussion points."
         html_builder.append(f"<div class='highlight-card'>{html.escape(opening_highlight)}</div>")
 
-        # Categorized Sections
+        # Categorized Sections (neutral, non-hardcoded headings)
         remaining_text = " ".join(sentences[1:]) if len(sentences) > 1 else ""
         if remaining_text:
-            html_builder.append("<div class='section-title'>Role and Satisfaction</div>")
+            html_builder.append("<div class='section-title'>Key Highlights &amp; Discussion</div>")
             html_builder.append(f"<ul><li>{html.escape(remaining_text)}</li></ul>")
 
         if decisions_raw:
-            html_builder.append("<div class='section-title'>Key Decisions & Feedback</div>")
+            html_builder.append("<div class='section-title'>Key Decisions</div>")
             html_builder.append("<ul>")
             for line in decisions_raw.splitlines():
                 cl = line.strip(" -*•")
@@ -612,7 +727,7 @@ class VoxNotetakerDrawer(QWidget):
             html_builder.append("</ul>")
 
         if actions_raw:
-            html_builder.append("<div class='section-title'>Tools & Action Items</div>")
+            html_builder.append("<div class='section-title'>Action Items</div>")
             html_builder.append("<ul>")
             for line in actions_raw.splitlines():
                 cl = line.strip(" -*•")
@@ -624,26 +739,36 @@ class VoxNotetakerDrawer(QWidget):
 
     def _sync_controls_state(self, state: str) -> None:
         s = (state or "idle").lower()
+        t = get_theme_tokens(self._theme)
         if s == "recording":
             self.lbl_tele_status.setText("● Live Recording")
-            self.lbl_tele_status.setStyleSheet("color: #10B981; font-weight: 600; font-size: 11px;")
+            self.lbl_tele_status.setStyleSheet(
+                f"color: {t['status_success_text']}; font-weight: 600; font-size: 11px;"
+            )
             self.btn_universal_stop.setText("■ Stop")
             self.btn_universal_stop.setStyleSheet(
-                "QPushButton#universalStopBtn { background: #FFFFFF; color: #10B981; border: 1.5px solid #10B981; border-radius: 18px; padding: 4px 16px; font-weight: 700; font-size: 12px; }"
+                f"QPushButton#universalStopBtn {{ background: {t['surface']}; color: {t['status_success_text']}; "
+                f"border: 1.5px solid {t['status_success']}; border-radius: 18px; padding: 4px 16px; font-weight: 700; font-size: 12px; }}"
             )
         elif s == "paused":
             self.lbl_tele_status.setText("⏸ Paused")
-            self.lbl_tele_status.setStyleSheet("color: #F59E0B; font-weight: 600; font-size: 11px;")
+            self.lbl_tele_status.setStyleSheet(
+                f"color: {t['status_warning_text']}; font-weight: 600; font-size: 11px;"
+            )
             self.btn_universal_stop.setText("◉ Resume")
             self.btn_universal_stop.setStyleSheet(
-                "QPushButton#universalStopBtn { background: #FFFFFF; color: #F59E0B; border: 1.5px solid #F59E0B; border-radius: 18px; padding: 4px 16px; font-weight: 700; font-size: 12px; }"
+                f"QPushButton#universalStopBtn {{ background: {t['surface']}; color: {t['status_warning_text']}; "
+                f"border: 1.5px solid {t['status_warning']}; border-radius: 18px; padding: 4px 16px; font-weight: 700; font-size: 12px; }}"
             )
         else:
             self.lbl_tele_status.setText("● Finalized")
-            self.lbl_tele_status.setStyleSheet("color: #78716C; font-weight: 600; font-size: 11px;")
+            self.lbl_tele_status.setStyleSheet(
+                f"color: {t['text_muted']}; font-weight: 600; font-size: 11px;"
+            )
             self.btn_universal_stop.setText("▶ Start Notetaker")
             self.btn_universal_stop.setStyleSheet(
-                "QPushButton#universalStopBtn { background: #10B981; color: #FFFFFF; border: none; border-radius: 18px; padding: 4px 16px; font-weight: 700; font-size: 12px; }"
+                f"QPushButton#universalStopBtn {{ background: {t['status_success']}; color: {t['primary_btn_text']}; "
+                f"border: none; border-radius: 18px; padding: 4px 16px; font-weight: 700; font-size: 12px; }}"
             )
 
     def _on_universal_stop_clicked(self) -> None:
@@ -657,18 +782,74 @@ class VoxNotetakerDrawer(QWidget):
         else:
             self.controller.start_meeting_recording(title=self.txt_title.text().strip() or "Meeting Notes")
 
-    def _on_meeting_state_changed(self, state: str, _msg: str) -> None:
+    def update_processing_stage(self, state: str, msg: str = "") -> None:
+        """Update the drawer summary progress banner from real background pipeline stages."""
+        s = (state or "").strip().lower()
+        msg_str = str(msg or "").strip()
+        if s in ("transcribing", "processing"):
+            self.progress_banner.setVisible(True)
+            if "Stage 1/4" in msg_str:
+                self.lbl_prog_title.setText("Packaging audio & video tracks...")
+                self.lbl_prog_step.setText("Step 1 of 4")
+            elif "Stage 2/4" in msg_str or "Re-transcribing" in msg_str:
+                self.lbl_prog_title.setText("Transcribing speech locally with Whisper...")
+                self.lbl_prog_step.setText("Step 2 of 4")
+            elif "Stage 3/4" in msg_str:
+                self.lbl_prog_title.setText("Separating speakers & aligning turns...")
+                self.lbl_prog_step.setText("Step 3 of 4")
+            elif "Stage 4/4" in msg_str:
+                self.lbl_prog_title.setText("Synthesizing summary, decisions & actions...")
+                self.lbl_prog_step.setText("Step 4 of 4")
+            else:
+                self.lbl_prog_title.setText(msg_str or "Processing meeting locally...")
+                self.lbl_prog_step.setText("Processing locally...")
+        elif s == "error":
+            self.progress_banner.setVisible(True)
+            self.lbl_prog_title.setText("Processing interrupted")
+            self.lbl_prog_step.setText(msg_str or "Check audio & retry from Notetaker")
+        elif s == "idle":
+            if bool((self._last_summary_raw or "").strip()) or self._last_summary_finalized:
+                self.progress_banner.setVisible(False)
+            else:
+                self.lbl_prog_title.setText("Analyzing live transcript...")
+                self.lbl_prog_step.setText("Summary builds when meeting finishes")
+
+    def _on_meeting_state_changed(self, state: str, msg: str = "") -> None:
         self._sync_controls_state(state)
+        self.update_processing_stage(state, msg)
         s = (state or "").lower()
         if s == "recording":
             m_id = self.controller.active_meeting_id if self.controller else None
             self._display_meeting(m_id)
 
-    def _on_meeting_tick(self, elapsed: float, mic_lvl: float, sys_lvl: float, mic_ok: bool, sys_ok: bool) -> None:
+    def _on_meeting_tick(
+        self,
+        elapsed: float,
+        mic_lvl: float = 0.0,
+        sys_lvl: float = 0.0,
+        mic_ok: bool = True,
+        sys_ok: bool = True,
+    ) -> None:
         self._elapsed_sec = max(0.0, elapsed)
         spk_count = max(1, len({s.get("speaker") for s in self._live_segments} or {"Speaker 1"}))
         time_str = format_seconds_hms(self._elapsed_sec)
         self.lbl_tx_stats.setText(f"🕒 {spk_count} SPEAKER{'S' if spk_count > 1 else ''} · {time_str}")
+        t = get_theme_tokens(self._theme)
+        if not mic_ok:
+            self.lbl_tele_status.setText("● Live · ⚠ Check Mic")
+            self.lbl_tele_status.setStyleSheet(
+                f"color: {t['status_warning_text']}; font-weight: 600; font-size: 11px;"
+            )
+        elif not sys_ok:
+            self.lbl_tele_status.setText("● Live · ⚠ Check Loopback")
+            self.lbl_tele_status.setStyleSheet(
+                f"color: {t['status_warning_text']}; font-weight: 600; font-size: 11px;"
+            )
+        else:
+            self.lbl_tele_status.setText("● Live · Mic OK · Sys OK")
+            self.lbl_tele_status.setStyleSheet(
+                f"color: {t['status_success_text']}; font-weight: 600; font-size: 11px;"
+            )
 
     def _on_live_partial(self, meeting_id: int, partial_dict: dict) -> None:
         if self.controller and self.controller.active_meeting_id != meeting_id:
@@ -706,8 +887,19 @@ class VoxNotetakerDrawer(QWidget):
         self._render_conversational_transcript()
 
     def _on_meeting_finalized(self, meeting_id: int) -> None:
+        if (
+            self._active_displayed_meeting_id is not None
+            and int(self._active_displayed_meeting_id) != int(meeting_id)
+        ):
+            return
         self._display_meeting(meeting_id)
-        self._sync_controls_state("idle")
+        ctrl_state = (
+            str(getattr(self.controller, "meeting_state", "idle") or "idle").lower()
+            if self.controller
+            else "idle"
+        )
+        if ctrl_state not in ("recording", "paused"):
+            self._sync_controls_state("idle")
 
     def _save_meeting_title(self) -> None:
         m_id = self.current_meeting_id
@@ -717,7 +909,37 @@ class VoxNotetakerDrawer(QWidget):
     def _save_meeting_notes(self) -> None:
         m_id = self.current_meeting_id
         if m_id is not None and self.controller:
-            self.controller.db.update_meeting(m_id, notes=self.notes_editor.toPlainText())
+            self._notes_dirty = True
+            self._notes_meeting_id = int(m_id)
+            self._notes_save_timer.start()
+
+    def flush_pending_notes(self) -> None:
+        if self._notes_save_timer.isActive():
+            self._notes_save_timer.stop()
+        if self._notes_dirty:
+            self._persist_meeting_notes()
+
+    def _persist_meeting_notes(self) -> None:
+        m_id = self._notes_meeting_id or self.current_meeting_id
+        if m_id is None or not self.controller or getattr(self.controller, "_cancel_ask_vox", False):
+            return
+        db = getattr(self.controller, "db", None)
+        db_path = getattr(db, "db_path", None) if db is not None else None
+        if db is None or (db_path and ":memory:" not in str(db_path).lower() and not Path(str(db_path)).exists()):
+            return
+        try:
+            db.update_meeting(int(m_id), notes=self.notes_editor.toPlainText())
+            self._notes_dirty = False
+        except Exception as exc:
+            logger.warning("Failed persisting drawer notes for meeting %s: %s", m_id, exc)
+
+    def hideEvent(self, event: Any) -> None:
+        self.flush_pending_notes()
+        super().hideEvent(event)
+
+    def closeEvent(self, event: Any) -> None:
+        self.flush_pending_notes()
+        super().closeEvent(event)
 
     def _copy_meeting_transcript(self) -> None:
         text_lines = []
@@ -730,8 +952,101 @@ class VoxNotetakerDrawer(QWidget):
         if self.controller and hasattr(self.controller, "notification_requested"):
             self.controller.notification_requested.emit("Transcript Copied", "Copied full transcript to clipboard.")
 
+    def _copy_meeting_summary(self) -> None:
+        m_id = self.current_meeting_id
+        m = self.controller.db.get_meeting(int(m_id)) if (m_id is not None and self.controller) else None
+        text = str((m or {}).get("summary") or self._last_summary_raw or "").strip()
+        if text:
+            QApplication.clipboard().setText(text)
+            if self.controller and hasattr(self.controller, "notification_requested"):
+                self.controller.notification_requested.emit("Summary Copied", "Copied meeting summary to clipboard.")
+
+    def _export_meeting_markdown(self) -> None:
+        m_id = self.current_meeting_id
+        if m_id is None or not self.controller:
+            return
+        m = self.controller.db.get_meeting(int(m_id)) or {}
+        segs = self.controller.db.get_transcript_segments(int(m_id)) or self._live_segments
+        bundle = dict(m)
+        bundle["segments"] = segs
+        md = TranscriptExporter.to_markdown(bundle)
+        path, _ = QFileDialog.getSaveFileName(self, "Export Meeting Notes (Markdown)", f"{m.get('title', 'meeting')}.md", "Markdown (*.md)")
+        if path:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(md)
+
+    def _on_folder_pill_clicked(self) -> None:
+        m_id = self.current_meeting_id
+        if m_id is None or not self.controller:
+            return
+        db = self.controller.db
+        m = db.get_meeting(int(m_id)) or {}
+        cur_folder_id = m.get("folder_id")
+        folders = db.list_folders() if hasattr(db, "list_folders") else []
+
+        menu = QMenu(self)
+        act_none = menu.addAction(("✓ " if cur_folder_id is None else "") + "No Folder")
+        folder_actions = {}
+        for f in folders:
+            fid = int(f["id"])
+            fname = str(f["name"])
+            act = menu.addAction(("✓ " if cur_folder_id == fid else "") + f"📁 {fname}")
+            folder_actions[act] = (fid, fname)
+        menu.addSeparator()
+        act_new = menu.addAction("+ New Folder...")
+
+        chosen = menu.exec(self.btn_folder_pill.mapToGlobal(self.btn_folder_pill.rect().bottomLeft()))
+        if not chosen:
+            return
+        if chosen == act_none:
+            db.assign_meeting_folder(int(m_id), None)
+            self.btn_folder_pill.setText("📁 Add folder")
+        elif chosen in folder_actions:
+            fid, fname = folder_actions[chosen]
+            db.assign_meeting_folder(int(m_id), fid)
+            self.btn_folder_pill.setText(f"📁 {fname}")
+        elif chosen == act_new:
+            new_name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
+            if ok and new_name and new_name.strip():
+                fid = db.create_folder(new_name.strip())
+                db.assign_meeting_folder(int(m_id), fid)
+                self.btn_folder_pill.setText(f"📁 {new_name.strip()}")
+
+    def _on_more_clicked(self) -> None:
+        menu = QMenu(self)
+        act_studio = menu.addAction("Open in Notetaker Studio")
+        act_speakers = menu.addAction("Assign Speakers")
+        menu.addSeparator()
+        act_copy_sum = menu.addAction("Copy Summary")
+        act_copy_tx = menu.addAction("Copy Full Transcript")
+        act_export = menu.addAction("Export Markdown...")
+        chosen = menu.exec(self.btn_more.mapToGlobal(self.btn_more.rect().bottomLeft()))
+        if chosen == act_studio and self.on_open_meeting_studio:
+            self.on_open_meeting_studio()
+        elif chosen == act_speakers:
+            self._on_manage_speakers()
+        elif chosen == act_copy_sum:
+            self._copy_meeting_summary()
+        elif chosen == act_copy_tx:
+            self._copy_meeting_transcript()
+        elif chosen == act_export:
+            self._export_meeting_markdown()
+
     def _on_share_clicked(self) -> None:
-        self._copy_meeting_transcript()
+        menu = QMenu(self)
+        act_sum = menu.addAction("Copy Clean Summary & Actions")
+        act_tx = menu.addAction("Copy Full Transcript")
+        act_studio = menu.addAction("Open in Notetaker Studio")
+        act_export = menu.addAction("Export Markdown...")
+        chosen = menu.exec(self.btn_share.mapToGlobal(self.btn_share.rect().bottomLeft()))
+        if chosen == act_sum:
+            self._copy_meeting_summary()
+        elif chosen == act_tx:
+            self._copy_meeting_transcript()
+        elif chosen == act_studio and self.on_open_meeting_studio:
+            self.on_open_meeting_studio()
+        elif chosen == act_export:
+            self._export_meeting_markdown()
 
     def _on_manage_speakers(self) -> None:
         if self.on_open_meeting_studio:
@@ -739,26 +1054,98 @@ class VoxNotetakerDrawer(QWidget):
 
     def _on_anchor_clicked(self, url) -> None:
         link = url.toString()
-        if link.startswith("play:"):
-            logger.info("Playback requested for segment %s", link)
+        m_id = self.current_meeting_id or 0
+        if link.startswith("seek:"):
+            try:
+                sec = float(link.split(":", 1)[1])
+                self.seek_requested.emit(int(m_id), sec)
+            except Exception as exc:
+                logger.warning("Failed parsing seek anchor %s: %s", link, exc)
+        elif link.startswith("play:"):
+            seg_ref = link.split(":", 1)[1]
+            sec = 0.0
+            for s in self._live_segments:
+                if str(s.get("id", "")) == seg_ref:
+                    sec = float(s.get("start_time") or 0.0)
+                    break
+            self.seek_requested.emit(int(m_id), sec)
+
+    def _on_ask_text_changed(self, text: str) -> None:
+        if not hasattr(self, "slash_skills_bar"):
+            return
+        raw = (text or "").lstrip()
+        if raw.startswith("/"):
+            self.slash_skills_bar.setVisible(True)
+            prefix = raw.lower().split()[0]
+            for cmd_key, btn in self._slash_buttons.items():
+                btn.setVisible(cmd_key.startswith(prefix))
+        else:
+            self.slash_skills_bar.setVisible(False)
+
+    def _activate_slash_skill(self, cmd_key: str) -> None:
+        skill = self._slash_skills.get(cmd_key)
+        if not skill:
+            return
+        if hasattr(self, "slash_skills_bar"):
+            self.slash_skills_bar.setVisible(False)
+        self.txt_ask_anything.setText(skill[1])
+        self._on_ask_anything_submitted()
 
     def _on_what_did_i_miss_clicked(self) -> None:
         self.txt_ask_anything.setText("What did I miss so far in this meeting?")
         self._on_ask_anything_submitted()
 
     def _on_ask_anything_submitted(self) -> None:
-        q = self.txt_ask_anything.text().strip()
-        if not q or not self.controller:
+        raw = self.txt_ask_anything.text().strip()
+        if not raw or not self.controller:
             return
+        if raw.lower() in self._slash_skills:
+            raw = self._slash_skills[raw.lower()][1]
+        q = raw
         m_id = self.current_meeting_id
-        res = self.controller.query_meeting_memory(q, meeting_id=m_id) if hasattr(self.controller, "query_meeting_memory") else {}
-        ans = res.get("answer") or "Based on the live transcript, the team discussed active agenda items and status."
+        self.txt_ask_anything.clear()
+        if hasattr(self, "slash_skills_bar"):
+            self.slash_skills_bar.setVisible(False)
         self._switch_section(2)  # Switch to Summary / Q&A view
+
+        target_mid = m_id
+        ctrl = self.controller
+
+        def _worker() -> None:
+            if getattr(ctrl, "_cancel_ask_vox", False):
+                return
+            try:
+                res = ctrl.query_meeting_memory(q, meeting_id=target_mid) if hasattr(ctrl, "query_meeting_memory") else {}
+                ans = (res or {}).get("answer") or "Based on the live transcript, the team discussed active agenda items and status."
+            except Exception as exc:
+                logger.warning("Ask VOX drawer query failed: %s", exc)
+                ans = "Unable to query meeting memory right now."
+            if getattr(ctrl, "_cancel_ask_vox", False):
+                return
+            try:
+                self._ask_answer_ready.emit(q, str(ans), target_mid)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=_worker, daemon=True, name="DrawerAskVox").start()
+
+    def _on_ask_answer_received(
+        self, q: str, ans: str, meeting_id: Optional[int] = None
+    ) -> None:
+        if self.controller and getattr(self.controller, "_cancel_ask_vox", False):
+            return
+        cur_mid = self.current_meeting_id
+        if meeting_id is not None and cur_mid is not None and int(meeting_id) != int(cur_mid):
+            return
+        t = get_theme_tokens(self._theme)
+        is_dark = (self._theme or "").lower() == "dark"
+        qa_bg = t.get("accent_lumen", "#064E3B" if is_dark else "#F0FDF4")
+        qa_border = t.get("accent_lumen_border", "#065F46" if is_dark else "#BBF7D0")
+        qa_fg = t.get("text", "#F8FAFC" if is_dark else "#0F172A")
         self.summary_browser.append(
-            f"<div style='margin-top:14px; padding:10px 14px; background:#F0FDF4; border-radius:10px; font-size:13px;'>"
+            f"<div style='margin-top:14px; padding:10px 14px; background:{qa_bg}; border:1px solid {qa_border}; color:{qa_fg}; border-radius:10px; font-size:13px;'>"
             f"<b>Q: {html.escape(q)}</b><br><br>{html.escape(ans)}</div>"
         )
-        self.txt_ask_anything.clear()
 
     @property
     def current_meeting_id(self) -> Optional[int]:
@@ -769,6 +1156,7 @@ class VoxNotetakerDrawer(QWidget):
     def apply_theme(self, theme: str) -> None:
         self._theme = theme or "light"
         t = get_theme_tokens(self._theme)
+        is_dark = (self._theme or "").lower() == "dark"
         # Apply clean modern stylesheet
         self.setStyleSheet(
             f"""
@@ -784,7 +1172,7 @@ class VoxNotetakerDrawer(QWidget):
                 font-size: 13px;
             }}
             QPushButton#drawerBackBtn:hover, QPushButton#drawerIconBtn:hover, QPushButton#drawerMiniIconBtn:hover {{
-                background: {t.get('surface_hover', t.get('surface_secondary', '#F5F5F4'))};
+                background: {t.get('surface_hover', t.get('surface_secondary', '#162032' if is_dark else '#F1F5F9'))};
                 color: {t['text']};
             }}
             QPushButton#drawerShareBtn {{
@@ -797,8 +1185,8 @@ class VoxNotetakerDrawer(QWidget):
                 font-size: 12px;
             }}
             QLabel#avatarMetaPill {{
-                background: #F3E8FF;
-                color: #7E22CE;
+                background: {t.get('accent_dawn_tint', '#1E1B4B' if is_dark else '#EEF2FF')};
+                color: {t.get('accent_dawn_text', '#E0E7FF' if is_dark else '#312E81')};
                 border-radius: 11px;
                 font-weight: 700;
                 font-size: 10.5px;
@@ -839,18 +1227,18 @@ class VoxNotetakerDrawer(QWidget):
                 font-size: 12px;
             }}
             QFrame#summaryProgressBanner {{
-                background: #F5F3EC;
+                background: {t['surface_secondary']};
                 border-radius: 14px;
-                border: 1px solid #E5E3DA;
+                border: 1px solid {t['border']};
             }}
             QLabel#progTitle {{
-                color: #1C1917;
+                color: {t['text']};
             }}
             QLabel#progStep {{
-                color: #78716C;
+                color: {t['text_muted']};
             }}
             QFrame#skeletonBar {{
-                background: #E5E3DA;
+                background: {t['border']};
                 border-radius: 3px;
             }}
             QPushButton#quickChipBtn {{
@@ -876,3 +1264,15 @@ class VoxNotetakerDrawer(QWidget):
             }}
             """
         )
+        if self._live_segments:
+            q_cur = self.txt_tx_search.text().strip() if hasattr(self, "txt_tx_search") else ""
+            self._render_conversational_transcript(query=q_cur)
+        if self._last_summary_raw or self._active_displayed_meeting_id is not None:
+            self._render_summary_content(
+                self._last_summary_raw,
+                self._last_decisions_raw,
+                self._last_actions_raw,
+                is_finalized=self._last_summary_finalized,
+            )
+        if hasattr(self, "btn_universal_stop"):
+            self._sync_controls_state(self.controller.meeting_state if self.controller else "idle")

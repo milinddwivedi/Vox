@@ -140,8 +140,9 @@ class TestTier1Feature15SemanticTokens:
             val = LIGHT_TOKENS[key]
             assert isinstance(val, str) and len(val) > 0, f"Token {key} is empty"
 
-        assert LIGHT_TOKENS["bg"] == "#FCFCFB"
+        assert LIGHT_TOKENS["bg"] == "#F8FAFC"
         assert LIGHT_TOKENS["surface"] == "#FFFFFF"
+        assert LIGHT_TOKENS["text"] == "#0F172A"
 
     def test_02_dark_tokens_contain_all_required_keys(self) -> None:
         """Validate that DARK_TOKENS dictionary contains all standardized tokens."""
@@ -170,18 +171,19 @@ class TestTier1Feature15SemanticTokens:
             val = DARK_TOKENS[key]
             assert isinstance(val, str) and len(val) > 0, f"Token {key} is empty"
 
-        assert DARK_TOKENS["bg"] == "#1A1A1A"
-        assert DARK_TOKENS["text"] == "#E9E8E1"
+        assert DARK_TOKENS["bg"] == "#0B0F19"
+        assert DARK_TOKENS["surface"] == "#111827"
+        assert DARK_TOKENS["text"] == "#F8FAFC"
 
     def test_03_get_theme_tokens_resolves_correctly(self) -> None:
         """Validate get_theme_tokens helper resolves light/dark and supports dot access."""
         t_light = get_theme_tokens("light")
         assert t_light is LIGHT_TOKENS
-        assert t_light.bg == "#FCFCFB"
+        assert t_light.bg == "#F8FAFC"
 
         t_dark = get_theme_tokens("dark")
         assert t_dark is DARK_TOKENS
-        assert t_dark.bg == "#1A1A1A"
+        assert t_dark.bg == "#0B0F19"
 
         # Case-insensitivity and whitespace stripping
         assert get_theme_tokens("DARK") is DARK_TOKENS
@@ -916,9 +918,9 @@ class TestTier4UxAccessibilityScenarios:
         assert _calc_contrast_ratio(tokens["text_primary"], tokens["surface"]) >= 4.5
         assert _calc_contrast_ratio(tokens["text_pill_primary"], tokens["surface_pill"]) >= 7.0
 
-        # FlowBar pill remains dark obsidian with white text
-        assert tokens["surface_pill"] in ("#1F1F1F", "#000000")
-        assert tokens["text_pill_primary"] == "#FCFCFB"
+        # FlowBar pill remains dark obsidian with light high-contrast text
+        assert tokens["surface_pill"] in ("#0B0F19", "#1F1F1F", "#000000")
+        assert tokens["text_pill_primary"] == "#F8FAFC"
 
     def test_scenario_5_screen_reader_audit_walkthrough(
         self, offscreen_widgets: Dict[str, Any], isolated_controller: AppController

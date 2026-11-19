@@ -75,36 +75,36 @@ class TestThemeAndAnimations(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_theme_tokens_and_palette(self):
-        # Verify Dark theme tokens match Modern Canva / Adobe Creative Cloud palette
+        # Verify Dark theme tokens match Midnight Obsidian palette
         dark_tokens = get_theme_tokens("dark")
-        self.assertEqual(dark_tokens["bg"], "#1A1A1A")
-        self.assertEqual(dark_tokens["surface"], "#202020")
-        self.assertEqual(dark_tokens["text"], "#E9E8E1")
+        self.assertEqual(dark_tokens["bg"], "#0B0F19")
+        self.assertEqual(dark_tokens["surface"], "#111827")
+        self.assertEqual(dark_tokens["text"], "#F8FAFC")
 
-        # Verify Light theme tokens match Modern Slate Porcelain
+        # Verify Light theme tokens match Nordic Studio Light palette
         light_tokens = get_theme_tokens("light")
-        self.assertEqual(light_tokens["bg"], "#FCFCFB")
+        self.assertEqual(light_tokens["bg"], "#F8FAFC")
         self.assertEqual(light_tokens["surface"], "#FFFFFF")
-        self.assertEqual(light_tokens["text"], "#1A1A1A")
+        self.assertEqual(light_tokens["text"], "#0F172A")
 
     def test_theme_stylesheet_generation(self):
         dark_qss = get_theme_stylesheet("dark")
-        self.assertIn("#1A1A1A", dark_qss)
-        self.assertIn("#202020", dark_qss)
+        self.assertIn("#0B0F19", dark_qss)
+        self.assertIn("#111827", dark_qss)
 
         light_qss = get_theme_stylesheet("light")
-        self.assertIn("#FCFCFB", light_qss)
+        self.assertIn("#F8FAFC", light_qss)
         self.assertIn("#FFFFFF", light_qss)
 
         # Dialog and Floating Pill stylesheets
         pill_dark = get_floating_pill_stylesheet("dark")
         pill_light = get_floating_pill_stylesheet("light")
-        self.assertIn("#000000", pill_dark)
-        self.assertIn("#000000", pill_light)
+        self.assertIn("#0B0F19", pill_dark)
+        self.assertIn("#0B0F19", pill_light)
 
         dlg_dark = get_dialog_stylesheet("dark")
         dlg_light = get_dialog_stylesheet("light")
-        self.assertIn("#202020", dlg_dark)
+        self.assertIn("#111827", dlg_dark)
         self.assertIn("#FFFFFF", dlg_light)
 
     def test_controller_theme_switching(self):
@@ -127,14 +127,14 @@ class TestThemeAndAnimations(unittest.TestCase):
     def test_main_window_theme_sync(self):
         # Switching theme via controller should trigger apply_theme in main_window
         self.controller.set_theme("light")
-        self.assertIn("#FCFCFB", self.main_window.styleSheet())
+        self.assertIn("#F8FAFC", self.main_window.styleSheet())
         self.assertEqual(self.main_window.theme_toggle._theme, "light")
-        self.assertIn("#FAF9F7", self.main_window.sidebar.styleSheet())
+        self.assertIn("#F8FAFC", self.main_window.sidebar.styleSheet())
 
         self.controller.set_theme("dark")
-        self.assertIn("#1A1A1A", self.main_window.styleSheet())
+        self.assertIn("#0B0F19", self.main_window.styleSheet())
         self.assertEqual(self.main_window.theme_toggle._theme, "dark")
-        self.assertIn("#141414", self.main_window.sidebar.styleSheet())
+        self.assertIn("#070A12", self.main_window.sidebar.styleSheet())
 
     def test_animated_push_button_physics(self):
         btn = AnimatedPushButton("Click Me")

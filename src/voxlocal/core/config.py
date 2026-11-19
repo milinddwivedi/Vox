@@ -72,6 +72,7 @@ class AppConfig:
     first_run_done: bool = False
     onboarding_completed: bool = False
     theme: str = "light"             # "light" | "dark" | "system"
+    reduced_motion: bool = False     # Accessibility: disable UI transitions and continuous waveform animations
     flow_bar_edge: str = "right"     # "bottom" | "left" | "right" (default right edge vertically centered)
     flow_bar_y_ratio: float = 0.5    # vertical position ratio (0.1 to 0.9)
     flow_bar_hidden_until: float = 0.0

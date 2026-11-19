@@ -15,6 +15,7 @@ import os
 import sys
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -161,13 +162,24 @@ class TestReportsWorkspaceRedesign(unittest.TestCase):
         nt.refresh_all()
         self.assertEqual(nt.meetings_list.count(), 3)
 
-        # 1. Filter library by search query
+        # 1. Filter library by search query (debounced 200ms)
         nt.txt_search.setText("Retro")
-        self.app.processEvents()
+        deadline = time.perf_counter() + 1.5
+        while time.perf_counter() < deadline:
+            self.app.processEvents()
+            if not nt._search_debounce_timer.isActive():
+                break
+            time.sleep(0.015)
         self.assertEqual(nt.meetings_list.count(), 1)
 
         # 2. Clear search & filter by folder
         nt.txt_search.clear()
+        deadline = time.perf_counter() + 1.5
+        while time.perf_counter() < deadline:
+            self.app.processEvents()
+            if not nt._search_debounce_timer.isActive():
+                break
+            time.sleep(0.015)
         idx_folder = nt.combo_folders.findData(f_id)
         self.assertGreaterEqual(idx_folder, 0)
         nt.combo_folders.setCurrentIndex(idx_folder)

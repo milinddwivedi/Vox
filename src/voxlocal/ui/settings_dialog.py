@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
 )
 
 from voxlocal.core.logger import get_logger
+from voxlocal.ui.animations import set_reduced_motion_preference
 from voxlocal.ui.components import VoxAudioVisualizerBar, VoxToggleSwitch
 from voxlocal.ui.theme import (
     MARGINS_CARD,
@@ -691,6 +692,12 @@ class SettingsWorkspaceWidget(QWidget):
             "Launch VOX at Windows Startup",
             "Start quietly in the system tray when you sign in.",
             self._on_startup_toggled,
+        )
+        self.sw_reduced_motion = self._add_toggle_row(
+            app_lay,
+            "Reduced Motion",
+            "Disable UI transitions and continuous waveform animations (also follows Windows Accessibility settings).",
+            self._on_reduced_motion_toggled,
         )
         lay.addWidget(card_app)
 
@@ -1360,6 +1367,7 @@ class SettingsWorkspaceWidget(QWidget):
             (self.sw_show_flow, "show_floating_icon", True),
             (self.sw_hide_screenshare, "hide_in_screen_share", False),
             (self.sw_launch_login, "launch_at_login", True),
+            (self.sw_reduced_motion, "reduced_motion", False),
             (self.sw_sounds, "sound_effects", True),
             (self.sw_mute_sys, "mute_audio_while_dictating", False),
             (self.sw_smart_fmt, "smart_formatting", True),
@@ -1383,6 +1391,7 @@ class SettingsWorkspaceWidget(QWidget):
             is_auto_on = bool(getattr(cfg, "auto_record_calls", True)) and not bool(getattr(cfg, "prompt_on_call", True))
             self.sw_auto_start_call.setChecked(is_auto_on)
             self.sw_auto_start_call.blockSignals(False)
+        set_reduced_motion_preference(True if bool(getattr(cfg, "reduced_motion", False)) else None)
 
         self._populate_mics()
         gain_val = int(round(float(getattr(cfg, "mic_gain", 1.0) or 1.0) * 100))
@@ -1433,6 +1442,10 @@ class SettingsWorkspaceWidget(QWidget):
             pill = getattr(self.controller, "floating_pill", None)
             if pill is not None and hasattr(pill, "set_screen_share_hidden"):
                 pill.set_screen_share_hidden(bool(value))
+
+    def _on_reduced_motion_toggled(self, enabled: bool) -> None:
+        self._save_cfg("reduced_motion", bool(enabled))
+        set_reduced_motion_preference(True if enabled else None)
 
     def _edit_hotkey(self, field_name: str, title: str) -> None:
         current = str(getattr(self.controller.config, field_name, "") or "")

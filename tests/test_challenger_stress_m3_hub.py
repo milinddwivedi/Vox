@@ -102,25 +102,26 @@ class TestCommandPaletteAdversarialStress(unittest.TestCase):
 
     def test_palette_empty_and_whitespace_queries(self):
         """Fuzzy matching on empty strings and various whitespace permutations returns all commands."""
-        # Baseline: initial commands loaded
-        self.assertEqual(len(self.palette._all_commands), 13)
-        self.assertEqual(self.palette.list_widget.count(), 13)
+        # Baseline: initial commands loaded (8 workspaces incl. Calendar Ctrl+3 = 9 routes + 5 actions = 14)
+        self.assertIn("calendar", {c.id for c in self.commands})
+        self.assertEqual(len(self.palette._all_commands), 14)
+        self.assertEqual(self.palette.list_widget.count(), 14)
 
         # Empty string
         self.palette._filter_commands("")
-        self.assertEqual(len(self.palette._filtered_commands), 13)
-        self.assertEqual(self.palette.list_widget.count(), 13)
+        self.assertEqual(len(self.palette._filtered_commands), 14)
+        self.assertEqual(self.palette.list_widget.count(), 14)
         self.assertEqual(self.palette.list_widget.currentRow(), 0)
 
         # Search bar text changed with whitespace triggers stripped query in UI
         self.palette.txt_search.setText("   ")
-        self.assertEqual(len(self.palette._filtered_commands), 13)
-        self.assertEqual(self.palette.list_widget.count(), 13)
+        self.assertEqual(len(self.palette._filtered_commands), 14)
+        self.assertEqual(self.palette.list_widget.count(), 14)
 
         # Multiple whitespace and tab permutations via search bar
         for ws in [" ", "\t", "  \n  ", "\r\n\t"]:
             self.palette.txt_search.setText(ws)
-            self.assertEqual(len(self.palette._filtered_commands), 13)
+            self.assertEqual(len(self.palette._filtered_commands), 14)
             self.assertEqual(self.palette.list_widget.currentRow(), 0)
 
     def test_palette_500_char_and_adversarial_queries(self):
@@ -162,17 +163,17 @@ class TestCommandPaletteAdversarialStress(unittest.TestCase):
     def test_palette_rapid_keyboard_navigation(self):
         """Rapid keyboard events (Up/Down/Enter/Escape) within bounds."""
         self.palette.set_commands(self.commands)
-        self.assertEqual(self.palette.list_widget.count(), 13)
+        self.assertEqual(self.palette.list_widget.count(), 14)
         self.assertEqual(self.palette.list_widget.currentRow(), 0)
 
         down_event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Down, Qt.KeyboardModifier.NoModifier)
         up_event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Up, Qt.KeyboardModifier.NoModifier)
 
-        # Rapidly press Down 30 times (more than 13 items)
+        # Rapidly press Down 30 times (more than 14 items)
         for _ in range(30):
             self.palette.keyPressEvent(down_event)
-        # Must clamp strictly to last item (index 12)
-        self.assertEqual(self.palette.list_widget.currentRow(), 12)
+        # Must clamp strictly to last item (index 13)
+        self.assertEqual(self.palette.list_widget.currentRow(), 13)
 
         # Rapidly press Up 40 times
         for _ in range(40):
@@ -185,7 +186,7 @@ class TestCommandPaletteAdversarialStress(unittest.TestCase):
         for _ in range(100):
             if random.random() > 0.5:
                 self.palette.keyPressEvent(down_event)
-                curr_row = min(12, curr_row + 1)
+                curr_row = min(13, curr_row + 1)
             else:
                 self.palette.keyPressEvent(up_event)
                 curr_row = max(0, curr_row - 1)
@@ -194,7 +195,7 @@ class TestCommandPaletteAdversarialStress(unittest.TestCase):
         # Enter key execution
         executed_signals = []
         self.palette.command_executed.connect(lambda cmd_id: executed_signals.append(cmd_id))
-        self.palette.list_widget.setCurrentRow(3)  # Snippets
+        self.palette.list_widget.setCurrentRow(4)  # Snippets (after Home, Notetaker, Calendar, Dictionary)
         enter_event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier)
         self.palette.keyPressEvent(enter_event)
 

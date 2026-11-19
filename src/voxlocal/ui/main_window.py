@@ -9,11 +9,9 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
-    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -27,7 +25,7 @@ from PyQt6.QtWidgets import (
 from voxlocal import __version__
 from voxlocal.core.logger import get_logger
 from voxlocal.storage.exporter import format_seconds_hms
-from voxlocal.ui.animations import ThemeToggleCapsule, ToastNotification
+from voxlocal.ui.animations import ThemeToggleCapsule, ToastNotification, set_reduced_motion_preference
 from voxlocal.ui.calendar_page import CalendarPage
 from voxlocal.ui.command_palette import VoxCommandPaletteDialog, create_default_vox_commands
 from voxlocal.ui.hub_pages import (
@@ -90,85 +88,6 @@ class VoxWorkspaceStack(QStackedWidget):
         return ""
 
 
-class GlobalSearchDialog(QDialog):
-    """Ctrl+K universal jump palette across dictations, notes, meetings, snippets & words."""
-
-    jump_requested = pyqtSignal(str, object)
-
-    def __init__(self, controller: AppController, theme: str = "light", parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.controller = controller
-        self._theme = "dark" if (theme or "").lower() == "dark" else "light"
-        t = get_theme_tokens(self._theme)
-        self.setWindowTitle("Search VOX")
-        self.resize(560, 400)
-        self.setStyleSheet(
-            f"QDialog {{ background-color: {t['surface']}; color: {t['text']}; border: 1px solid {t['border']}; }}"
-            f"QLineEdit {{ background: {t['input_bg']}; color: {t['text']}; border: 1px solid {t['border']}; "
-            f"border-radius: 8px; padding: 8px 12px; font-size: 13px; }}"
-            f"QListWidget {{ background: {t['bg']}; color: {t['text']}; border: 1px solid {t['line']}; border-radius: 8px; }}"
-        )
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 16, 16, 16)
-        lay.setSpacing(10)
-
-        self.txt = QLineEdit()
-        self.txt.setAccessibleName("Search query input")
-        self.txt.setAccessibleDescription("Enter search terms across dictations, meetings, dictionary, snippets, and scratchpad notes")
-        self.txt.setPlaceholderText("Search dictations, meetings, dictionary, snippets, or notes...")
-        self.txt.textChanged.connect(self._run_search)
-        lay.addWidget(self.txt)
-
-        self.results = QListWidget()
-        self.results.setAccessibleName("Search results list")
-        self.results.setAccessibleDescription("Matching results list across workspaces. Use arrow keys to select and Enter to open.")
-        self.results.itemActivated.connect(self._activate)
-        self.results.itemDoubleClicked.connect(self._activate)
-        lay.addWidget(self.results, 1)
-
-        self.setTabOrder(self.txt, self.results)
-
-        self._run_search("")
-
-    def _run_search(self, query: str) -> None:
-        q = query.strip()
-        self.results.clear()
-        db = self.controller.db
-
-        for d in db.list_dictation_history(search_query=q, limit=5):
-            preview = str(d.get("final_text") or d.get("raw_text") or "").replace("\n", " ")[:70]
-            it = QListWidgetItem(f"[Home · Dictation]  {preview}")
-            it.setData(Qt.ItemDataRole.UserRole, ("home", d["id"]))
-            self.results.addItem(it)
-
-        for m in db.list_meetings(search_query=q, limit=5):
-            it = QListWidgetItem(f"[Notetaker · Meeting]  {m.get('title') or 'Untitled Meeting'}")
-            it.setData(Qt.ItemDataRole.UserRole, ("notetaker", m["id"]))
-            self.results.addItem(it)
-
-        for v in db.search_vocabulary(query=q, active_only=False)[:5]:
-            it = QListWidgetItem(f"[Dictionary]  {v.get('spoken_phrase')} → {v.get('replacement')}")
-            it.setData(Qt.ItemDataRole.UserRole, ("dictionary", v["id"]))
-            self.results.addItem(it)
-
-        for s in db.list_snippets(search_query=q)[:4]:
-            it = QListWidgetItem(f"[Snippet]  \"{s.get('trigger_phrase')}\"")
-            it.setData(Qt.ItemDataRole.UserRole, ("snippets", s["id"]))
-            self.results.addItem(it)
-
-        for n in db.list_notes(search_query=q)[:4]:
-            it = QListWidgetItem(f"[Scratchpad]  {n.get('title') or 'Untitled note'}")
-            it.setData(Qt.ItemDataRole.UserRole, ("scratchpad", n["id"]))
-            self.results.addItem(it)
-
-    def _activate(self, item: QListWidgetItem) -> None:
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if data:
-            self.jump_requested.emit(str(data[0]), data[1])
-            self.accept()
-
-
 class MainWindow(QMainWindow):
     """Primary VOX Hub desktop application window matching Wispr Flow UX."""
 
@@ -177,11 +96,11 @@ class MainWindow(QMainWindow):
     WORKSPACES: List[Dict[str, str]] = [
         {"id": "home", "route": "/home", "shortcut": "Ctrl+1", "name": "Home"},
         {"id": "notetaker", "route": "/notetaker", "shortcut": "Ctrl+2", "name": "Notetaker"},
-        {"id": "dictionary", "route": "/dictionary", "shortcut": "Ctrl+3", "name": "Dictionary"},
-        {"id": "snippets", "route": "/snippets", "shortcut": "Ctrl+4", "name": "Snippets"},
-        {"id": "style", "route": "/style", "shortcut": "Ctrl+5", "name": "Style"},
-        {"id": "scratchpad", "route": "/scratchpad", "shortcut": "Ctrl+6", "name": "Scratchpad"},
-        {"id": "insights", "route": "/insights", "shortcut": "Ctrl+7", "name": "Insights"},
+        {"id": "dictionary", "route": "/dictionary", "shortcut": "Ctrl+4", "name": "Dictionary"},
+        {"id": "snippets", "route": "/snippets", "shortcut": "Ctrl+5", "name": "Snippets"},
+        {"id": "style", "route": "/style", "shortcut": "Ctrl+6", "name": "Style"},
+        {"id": "scratchpad", "route": "/scratchpad", "shortcut": "Ctrl+7", "name": "Scratchpad"},
+        {"id": "insights", "route": "/insights", "shortcut": "Ctrl+8", "name": "Insights"},
         {"id": "settings", "route": "/settings", "shortcut": "Ctrl+,", "name": "Settings"},
     ]
 
@@ -226,8 +145,11 @@ class MainWindow(QMainWindow):
         self.on_exit_app = on_exit_app or (lambda: None)
         self._force_quit = False
         self._theme = getattr(controller, "theme", "light")
+        cfg = getattr(controller, "config", None)
+        set_reduced_motion_preference(True if bool(getattr(cfg, "reduced_motion", False)) else None)
         self.nav_buttons: List[QPushButton] = []
         self.sidebar_buttons: List[QPushButton] = self.nav_buttons
+        self.sidebar_section_headers: List[QLabel] = []
         self._toasts: List[ToastNotification] = []
 
         # Ask VOX stream test/compatibility state
@@ -317,21 +239,35 @@ class MainWindow(QMainWindow):
         sb_lay.addWidget(self.btn_global_search)
         sb_lay.addSpacing(8)
 
-        # Primary Nav (0..6)
+        # Grouped Primary Nav (0..6 + Calendar at idx 8)
+        self.sidebar_section_headers.clear()
+
+        def _add_sb_section(title: str) -> None:
+            hdr_lbl = QLabel(title)
+            hdr_lbl.setObjectName("sbSectionHeader")
+            self.sidebar_section_headers.append(hdr_lbl)
+            sb_lay.addWidget(hdr_lbl)
+
+        _nav_icons = ["⌂", "🎙", "📖", "⚡", "✦", "✎", "◔"]
         nav_descriptions = [
             ("Home workspace", "Navigate to Home dictation history feed, keyboard shortcut Control+1"),
             ("Notetaker workspace", "Navigate to Notetaker meeting intelligence and recordings, keyboard shortcut Control+2"),
-            ("Dictionary workspace", "Navigate to Dictionary and vocabulary replacements, keyboard shortcut Control+3"),
-            ("Snippets workspace", "Navigate to Snippets keyword expansion triggers, keyboard shortcut Control+4"),
-            ("Style workspace", "Navigate to Style and tone formatting profiles, keyboard shortcut Control+5"),
-            ("Scratchpad workspace", "Navigate to Scratchpad notes and drafting canvas, keyboard shortcut Control+6"),
-            ("Insights workspace", "Navigate to Insights speech statistics and usage analytics, keyboard shortcut Control+7"),
+            ("Dictionary workspace", "Navigate to Dictionary and vocabulary replacements, keyboard shortcut Control+4"),
+            ("Snippets workspace", "Navigate to Snippets keyword expansion triggers, keyboard shortcut Control+5"),
+            ("Style workspace", "Navigate to Style and tone formatting profiles, keyboard shortcut Control+6"),
+            ("Scratchpad workspace", "Navigate to Scratchpad notes and drafting canvas, keyboard shortcut Control+7"),
+            ("Insights workspace", "Navigate to Insights speech statistics and usage analytics, keyboard shortcut Control+8"),
         ]
+        _add_sb_section("CORE")
         for idx, ws in enumerate(self.WORKSPACES[:7]):
-            btn = QPushButton(ws["name"])
+            if idx == 2:
+                _add_sb_section("VOICE & STYLE")
+            elif idx == 6:
+                _add_sb_section("INSIGHTS")
+            btn = QPushButton(f"{_nav_icons[idx]}  {ws['name']}")
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setFixedHeight(36)
+            btn.setFixedHeight(33)
             if idx < len(nav_descriptions):
                 btn.setAccessibleName(nav_descriptions[idx][0])
                 btn.setAccessibleDescription(nav_descriptions[idx][1])
@@ -339,84 +275,97 @@ class MainWindow(QMainWindow):
             self.nav_buttons.append(btn)
             sb_lay.addWidget(btn)
             if idx == 1:
-                self.btn_calendar = QPushButton("Calendar")
+                self.btn_calendar = QPushButton("📅  Calendar")
                 self.btn_calendar.setCheckable(True)
                 self.btn_calendar.setCursor(Qt.CursorShape.PointingHandCursor)
-                self.btn_calendar.setFixedHeight(36)
+                self.btn_calendar.setFixedHeight(33)
                 self.btn_calendar.setAccessibleName("Calendar workspace")
                 self.btn_calendar.setAccessibleDescription(
-                    "Navigate to Calendar ecosystem, connected accounts, and upcoming meetings, keyboard shortcut Control+8"
+                    "Navigate to Calendar ecosystem, connected accounts, and upcoming meetings, keyboard shortcut Control+3"
                 )
                 self.btn_calendar.clicked.connect(lambda: self.navigate_to_workspace("calendar"))
                 sb_lay.addWidget(self.btn_calendar)
 
         sb_lay.addStretch(1)
 
-        # Utility Footer
+        # Compact Utility Footer
         sep = QFrame()
         sep.setFixedHeight(1)
         sep.setObjectName("sbDivider")
         sb_lay.addWidget(sep)
-        sb_lay.addSpacing(6)
+        sb_lay.addSpacing(4)
 
-        btn_settings = QPushButton("Settings")
+        btn_settings = QPushButton("⚙  Settings")
         btn_settings.setCheckable(True)
         btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_settings.setFixedHeight(34)
+        btn_settings.setFixedHeight(32)
         btn_settings.setAccessibleName("Settings workspace")
         btn_settings.setAccessibleDescription("Navigate to application settings and preferences, keyboard shortcut Control+Comma")
         btn_settings.clicked.connect(lambda: self.navigate_to_workspace(7))
         self.nav_buttons.append(btn_settings)
         sb_lay.addWidget(btn_settings)
 
-        self.btn_open_scratchpad = QPushButton("Floating Scratchpad")
-        self.btn_open_scratchpad.setObjectName("sbUtilBtn")
+        util_row1 = QHBoxLayout()
+        util_row1.setSpacing(4)
+        self.btn_open_scratchpad = QPushButton("Scratchpad")
+        self.btn_open_scratchpad.setObjectName("sbCompactUtilBtn")
+        self.btn_open_scratchpad.setFixedHeight(28)
+        self.btn_open_scratchpad.setToolTip("Open Floating Scratchpad")
         self.btn_open_scratchpad.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_scratchpad.setAccessibleName("Open Floating Scratchpad")
         self.btn_open_scratchpad.setAccessibleDescription("Open the resizable floating scratchpad window for quick note-taking")
         self.btn_open_scratchpad.clicked.connect(self._emit_open_scratchpad)
-        sb_lay.addWidget(self.btn_open_scratchpad)
+        util_row1.addWidget(self.btn_open_scratchpad, 1)
 
-        self.btn_open_drawer = QPushButton("Notetaker Drawer")
-        self.btn_open_drawer.setObjectName("sbUtilBtn")
+        self.btn_open_drawer = QPushButton("Live Drawer")
+        self.btn_open_drawer.setObjectName("sbCompactUtilBtn")
+        self.btn_open_drawer.setFixedHeight(28)
+        self.btn_open_drawer.setToolTip("Open Live Notetaker Drawer")
         self.btn_open_drawer.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_drawer.setAccessibleName("Open Notetaker Drawer")
         self.btn_open_drawer.setAccessibleDescription("Open the context-aware slide-out live notetaker drawer")
         self.btn_open_drawer.clicked.connect(self._emit_open_drawer)
-        sb_lay.addWidget(self.btn_open_drawer)
+        util_row1.addWidget(self.btn_open_drawer, 1)
+        sb_lay.addLayout(util_row1)
 
-        self.btn_replay_tour = QPushButton("Replay Tour")
-        self.btn_replay_tour.setObjectName("sbUtilBtn")
-        self.btn_replay_tour.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_replay_tour.setAccessibleName("Replay Onboarding Tour")
-        self.btn_replay_tour.setAccessibleDescription("Launch the interactive onboarding tour and desktop feature walkthrough")
-        self.btn_replay_tour.clicked.connect(self.replay_tour_requested.emit)
-        sb_lay.addWidget(self.btn_replay_tour)
-
+        util_row2 = QHBoxLayout()
+        util_row2.setSpacing(4)
         self.btn_toggle_float = QPushButton("Hide Flow Bar")
-        self.btn_toggle_float.setObjectName("sbUtilBtn")
+        self.btn_toggle_float.setObjectName("sbCompactUtilBtn")
+        self.btn_toggle_float.setFixedHeight(26)
         self.btn_toggle_float.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_toggle_float.setAccessibleName("Toggle Flow Bar")
         self.btn_toggle_float.setAccessibleDescription("Toggle visibility of the floating desktop Flow Bar pill")
         self.btn_toggle_float.clicked.connect(self._toggle_floating_bar)
-        sb_lay.addWidget(self.btn_toggle_float)
+        util_row2.addWidget(self.btn_toggle_float, 1)
 
-        self.btn_check_updates = QPushButton("Check for Updates")
-        self.btn_check_updates.setObjectName("sbUtilBtn")
+        self.btn_replay_tour = QPushButton("Tour")
+        self.btn_replay_tour.setObjectName("sbCompactUtilBtn")
+        self.btn_replay_tour.setFixedHeight(26)
+        self.btn_replay_tour.setToolTip("Replay Onboarding Tour")
+        self.btn_replay_tour.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_replay_tour.setAccessibleName("Replay Onboarding Tour")
+        self.btn_replay_tour.setAccessibleDescription("Launch the interactive onboarding tour and desktop feature walkthrough")
+        self.btn_replay_tour.clicked.connect(self.replay_tour_requested.emit)
+        util_row2.addWidget(self.btn_replay_tour)
+
+        self.btn_check_updates = QPushButton("Updates")
+        self.btn_check_updates.setObjectName("sbCompactUtilBtn")
+        self.btn_check_updates.setFixedHeight(26)
+        self.btn_check_updates.setToolTip("Check for Updates")
         self.btn_check_updates.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_check_updates.setAccessibleName("Check for Updates")
         self.btn_check_updates.setAccessibleDescription("Check for latest VOX updates and improvements")
         self.btn_check_updates.clicked.connect(self._on_manual_check_updates)
-        sb_lay.addWidget(self.btn_check_updates)
+        util_row2.addWidget(self.btn_check_updates)
+        sb_lay.addLayout(util_row2)
 
         # ---- Left Sidebar User Profile & Plan Status Card ----
-        sb_lay.addStretch()
-
         self.plan_card = QFrame()
         self.plan_card.setObjectName("planStatusCard")
         plan_card_lay = QVBoxLayout(self.plan_card)
-        plan_card_lay.setContentsMargins(12, 10, 12, 12)
-        plan_card_lay.setSpacing(6)
+        plan_card_lay.setContentsMargins(10, 8, 10, 8)
+        plan_card_lay.setSpacing(4)
 
         # 1. User Profile Row (Full width for avatar + name/email — never squeezed horizontally)
         profile_row = QHBoxLayout()
@@ -522,13 +471,17 @@ class MainWindow(QMainWindow):
 
         # Explicit tab order chain for left sidebar
         self.setTabOrder(self.btn_global_search, self.nav_buttons[0])
-        for i in range(len(self.nav_buttons) - 1):
+        self.setTabOrder(self.nav_buttons[0], self.nav_buttons[1])
+        self.setTabOrder(self.nav_buttons[1], self.btn_calendar)
+        self.setTabOrder(self.btn_calendar, self.nav_buttons[2])
+        for i in range(2, len(self.nav_buttons) - 1):
             self.setTabOrder(self.nav_buttons[i], self.nav_buttons[i + 1])
         self.setTabOrder(self.nav_buttons[-1], self.btn_open_scratchpad)
         self.setTabOrder(self.btn_open_scratchpad, self.btn_open_drawer)
-        self.setTabOrder(self.btn_open_drawer, self.btn_replay_tour)
-        self.setTabOrder(self.btn_replay_tour, self.btn_toggle_float)
-        self.setTabOrder(self.btn_toggle_float, self.btn_plan_upgrade)
+        self.setTabOrder(self.btn_open_drawer, self.btn_toggle_float)
+        self.setTabOrder(self.btn_toggle_float, self.btn_replay_tour)
+        self.setTabOrder(self.btn_replay_tour, self.btn_check_updates)
+        self.setTabOrder(self.btn_check_updates, self.btn_plan_upgrade)
 
         root.addWidget(self.sidebar)
 
@@ -539,6 +492,8 @@ class MainWindow(QMainWindow):
 
         self.home_page = HomePage(self.controller, parent=self)
         self.home_page.navigate_requested.connect(self.navigate_to_workspace)
+        self.home_page.open_meeting_requested.connect(self._on_open_recording_from_calendar)
+        self.home_page.prepare_meeting_requested.connect(self._on_prepare_notetaker_from_calendar)
         self.home_page.status_toast.connect(self.show_toast)
 
         self.notetaker_page = NotetakerPage(self.controller, parent=self)
@@ -595,7 +550,7 @@ class MainWindow(QMainWindow):
         for idx, ws in enumerate(self.WORKSPACES):
             sc = QShortcut(QKeySequence(ws["shortcut"]), self)
             sc.activated.connect(lambda i=idx: self.navigate_to_workspace(i))
-        QShortcut(QKeySequence("Ctrl+8"), self).activated.connect(lambda: self.navigate_to_workspace("calendar"))
+        QShortcut(QKeySequence("Ctrl+3"), self).activated.connect(lambda: self.navigate_to_workspace("calendar"))
         QShortcut(QKeySequence("Ctrl+K"), self).activated.connect(self._open_global_search)
         QShortcut(QKeySequence("Ctrl+T"), self).activated.connect(self.controller.toggle_theme)
 
@@ -791,6 +746,13 @@ class MainWindow(QMainWindow):
             QFrame#leftSidebar {{ background-color: {t['sidebar_bg']}; border-right: 1px solid {t['line']}; }}
             QLabel {{ color: {t['text']}; border: none; background: transparent; }}
             QLabel#sbMutedLabel {{ color: {t['text_dim']}; font-size: 11px; padding: 6px 8px 0 8px; }}
+            QLabel#sbSectionHeader {{
+                color: {t['text_dim']};
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.08em;
+                padding: 6px 10px 2px 10px;
+            }}
             QFrame#sbDivider, QFrame#profileDivider {{ background-color: {t['line']}; border: none; max-height: 1px; }}
             QPushButton {{
                 text-align: left;
@@ -819,6 +781,20 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
                 padding: 5px 10px;
                 color: {t['text_muted']};
+            }}
+            QPushButton#sbCompactUtilBtn {{
+                text-align: center;
+                background-color: {t['surface']};
+                border: 1px solid {t['border']};
+                border-radius: 6px;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 3px 6px;
+                color: {t['text_secondary']};
+            }}
+            QPushButton#sbCompactUtilBtn:hover {{
+                background-color: {t['sidebar_hover']};
+                color: {t['text']};
             }}
             QFrame#planStatusCard {{
                 background-color: {t['surface']};
@@ -1130,12 +1106,13 @@ class MainWindow(QMainWindow):
                     display_name = user_name if user_name != "Guest User" else user_email.split("@")[0]
                     # Format display text cleanly with ellipsis across full card width (145 px)
                     fm = self.lbl_user_name.fontMetrics()
-                    elided_name = fm.elidedText(display_name, Qt.TextElideMode.ElideRight, 145)
+                    elide_w = max(175, self.lbl_user_name.width())
+                    elided_name = fm.elidedText(display_name, Qt.TextElideMode.ElideRight, elide_w)
                     self.lbl_user_name.setText(elided_name)
                     self.lbl_user_name.setToolTip(f"{user_name}\n{user_email}\n(Click to view Account & Subscription)")
 
                     fm_email = self.lbl_user_email.fontMetrics()
-                    elided_email = fm_email.elidedText(user_email, Qt.TextElideMode.ElideRight, 145)
+                    elided_email = fm_email.elidedText(user_email, Qt.TextElideMode.ElideRight, elide_w)
                     self.lbl_user_email.setText(elided_email)
                     self.lbl_user_email.setToolTip(user_email)
                     self.lbl_user_email.setVisible(True)
@@ -1274,6 +1251,27 @@ class MainWindow(QMainWindow):
         self._force_quit = True
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        for page_attr, timer_attr in (
+            ("home_page", "_feed_search_timer"),
+            ("notetaker_page", "_search_debounce_timer"),
+            ("calendar_page", "_search_debounce_timer"),
+        ):
+            page = getattr(self, page_attr, None)
+            timer = getattr(page, timer_attr, None) if page is not None else None
+            if timer is not None and timer.isActive():
+                timer.stop()
+        nt = getattr(self, "notetaker_page", None)
+        studio = getattr(nt, "studio", None) if nt is not None else None
+        if studio is not None:
+            tab_sum = getattr(studio, "tab_summary", None)
+            if tab_sum is not None and hasattr(tab_sum, "flush_pending_saves"):
+                tab_sum.flush_pending_saves()
+            tab_th = getattr(studio, "tab_thoughts", None)
+            th_timer = getattr(tab_th, "_save_timer", None) if tab_th is not None else None
+            if th_timer is not None and th_timer.isActive():
+                th_timer.stop()
+                if hasattr(tab_th, "_persist_thoughts"):
+                    tab_th._persist_thoughts()
         if self._force_quit:
             event.accept()
             return

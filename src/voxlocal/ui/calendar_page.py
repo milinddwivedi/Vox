@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -22,6 +24,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -498,6 +501,19 @@ class CalendarPage(QWidget):
         self._search_text: str = ""
         self._filter_buttons: Dict[str, QPushButton] = {}
         self._current_spotlight: Optional[CalendarMeeting] = None
+        self._anchor_date: date = datetime.now().astimezone().date()
+        self._week_show_weekends: bool = False
+        self._inspected_meeting: Optional[CalendarMeeting] = None
+        self._inspected_recording_id: Optional[int] = None
+        self._inspected_brief_md: str = ""
+        self._right_panel_mode: str = "inspector"
+        self._user_pinned_right_mode: bool = False
+        self._week_day_columns: List[Tuple[date, QFrame]] = []
+
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(200)
+        self._search_debounce_timer.timeout.connect(self._refresh_meetings_only)
 
         self._build_ui()
         self.apply_theme(self._theme)
@@ -511,6 +527,13 @@ class CalendarPage(QWidget):
         self._tick_timer.setInterval(60000)
         self._tick_timer.timeout.connect(self.refresh)
         self._tick_timer.start()
+
+    def closeEvent(self, event: Any) -> None:
+        for tmr_attr in ("_tick_timer", "_search_debounce_timer"):
+            tmr = getattr(self, tmr_attr, None)
+            if tmr is not None and tmr.isActive():
+                tmr.stop()
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------ UI Build
     def _build_ui(self) -> None:
@@ -555,6 +578,28 @@ class CalendarPage(QWidget):
         self.btn_add_account.clicked.connect(lambda: self._open_connect_dialog())
         hdr.addWidget(self.btn_add_account)
         outer.addLayout(hdr)
+
+        # ---- Top Clickable Account Health Pills Strip ----
+        self.accounts_health_bar = QFrame()
+        self.accounts_health_bar.setObjectName("calHealthStrip")
+        health_outer = QHBoxLayout(self.accounts_health_bar)
+        health_outer.setContentsMargins(12, 8, 12, 8)
+        health_outer.setSpacing(8)
+        self.accounts_health_lay = QHBoxLayout()
+        self.accounts_health_lay.setSpacing(8)
+        health_outer.addLayout(self.accounts_health_lay, 1)
+        self.btn_toggle_accounts_panel = QPushButton("Accounts (0)")
+        self.btn_toggle_accounts_panel.setCheckable(True)
+        self.btn_toggle_accounts_panel.setObjectName("calMiniBtn")
+        self.btn_toggle_accounts_panel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_accounts_panel.clicked.connect(
+            lambda: self.set_right_panel_mode(
+                "accounts" if self._right_panel_mode != "accounts" else "inspector",
+                user_initiated=True,
+            )
+        )
+        health_outer.addWidget(self.btn_toggle_accounts_panel)
+        outer.addWidget(self.accounts_health_bar)
 
         # ---- Overview KPI Strip + Next Meeting Spotlight ----
         kpi_row = QHBoxLayout()
@@ -670,6 +715,14 @@ class CalendarPage(QWidget):
         self.btn_view_timeline.clicked.connect(lambda: self.set_view_mode("timeline"))
         filter_bar.addWidget(self.btn_view_timeline)
 
+        self.btn_view_week = QPushButton("Week")
+        self.btn_view_week.setCheckable(True)
+        self.btn_view_week.setChecked(False)
+        self.btn_view_week.setObjectName("calFilterBtn")
+        self.btn_view_week.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_view_week.clicked.connect(lambda: self.set_view_mode("week"))
+        filter_bar.addWidget(self.btn_view_week)
+
         self.btn_toggle_briefing = QPushButton("✦ Daily Pulse")
         self.btn_toggle_briefing.setCheckable(True)
         self.btn_toggle_briefing.setChecked(False)
@@ -679,6 +732,49 @@ class CalendarPage(QWidget):
         filter_bar.addWidget(self.btn_toggle_briefing)
 
         left_col.addLayout(filter_bar)
+
+        # ---- Date Navigation Bar (Day Flow & Week modes) ----
+        self.date_nav_bar = QFrame()
+        self.date_nav_bar.setObjectName("calNavStrip")
+        self.date_nav_bar.setVisible(False)
+        nav_lay = QHBoxLayout(self.date_nav_bar)
+        nav_lay.setContentsMargins(8, 4, 8, 4)
+        nav_lay.setSpacing(6)
+
+        self.btn_nav_prev = QPushButton("‹")
+        self.btn_nav_prev.setObjectName("calMiniBtn")
+        self.btn_nav_prev.setFixedWidth(28)
+        self.btn_nav_prev.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_nav_prev.clicked.connect(lambda: self._shift_anchor_date(-1))
+        nav_lay.addWidget(self.btn_nav_prev)
+
+        self.btn_nav_today = QPushButton("Today")
+        self.btn_nav_today.setObjectName("calMiniBtn")
+        self.btn_nav_today.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_nav_today.clicked.connect(self._reset_anchor_today)
+        nav_lay.addWidget(self.btn_nav_today)
+
+        self.btn_nav_next = QPushButton("›")
+        self.btn_nav_next.setObjectName("calMiniBtn")
+        self.btn_nav_next.setFixedWidth(28)
+        self.btn_nav_next.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_nav_next.clicked.connect(lambda: self._shift_anchor_date(1))
+        nav_lay.addWidget(self.btn_nav_next)
+
+        self.lbl_nav_range = QLabel("")
+        self.lbl_nav_range.setFont(get_ui_font(12, 600))
+        nav_lay.addWidget(self.lbl_nav_range)
+        nav_lay.addStretch(1)
+
+        self.btn_week_weekend = QPushButton("7-Day")
+        self.btn_week_weekend.setCheckable(True)
+        self.btn_week_weekend.setObjectName("calMiniBtn")
+        self.btn_week_weekend.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_week_weekend.setVisible(False)
+        self.btn_week_weekend.clicked.connect(self._toggle_week_weekends)
+        nav_lay.addWidget(self.btn_week_weekend)
+
+        left_col.addWidget(self.date_nav_bar)
 
         # ---- Daily Pulse & Executive Intelligence Strip ----
         self.pulse_container = QFrame()
@@ -769,19 +865,33 @@ class CalendarPage(QWidget):
 
         body.addLayout(left_col, 7)
 
-        # RIGHT COLUMN: Connected Accounts Manager
+        # RIGHT COLUMN: Contextual Meeting Inspector / Accounts Manager Stack
         right_card = QFrame()
         right_card.setObjectName("calSidePanel")
         right_card.setMinimumWidth(300)
-        right_card.setMaximumWidth(390)
+        right_card.setMaximumWidth(400)
         r_lay = QVBoxLayout(right_card)
         r_lay.setContentsMargins(16, 14, 16, 14)
         r_lay.setSpacing(10)
 
         r_hdr = QHBoxLayout()
-        lbl_acc_hdr = QLabel("Connected Accounts")
-        lbl_acc_hdr.setFont(get_ui_font(15, 600))
-        r_hdr.addWidget(lbl_acc_hdr)
+        r_hdr.setSpacing(6)
+        self.btn_right_inspector = QPushButton("Inspector")
+        self.btn_right_inspector.setCheckable(True)
+        self.btn_right_inspector.setChecked(True)
+        self.btn_right_inspector.setObjectName("calFilterBtnActive")
+        self.btn_right_inspector.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_right_inspector.clicked.connect(lambda: self.set_right_panel_mode("inspector", user_initiated=True))
+        r_hdr.addWidget(self.btn_right_inspector)
+
+        self.btn_right_accounts = QPushButton("Accounts")
+        self.btn_right_accounts.setCheckable(True)
+        self.btn_right_accounts.setChecked(False)
+        self.btn_right_accounts.setObjectName("calFilterBtn")
+        self.btn_right_accounts.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_right_accounts.clicked.connect(lambda: self.set_right_panel_mode("accounts", user_initiated=True))
+        r_hdr.addWidget(self.btn_right_accounts)
+
         r_hdr.addStretch(1)
         self.btn_side_add = QPushButton("+ Connect")
         self.btn_side_add.setObjectName("calDawnBtn")
@@ -790,6 +900,143 @@ class CalendarPage(QWidget):
         r_hdr.addWidget(self.btn_side_add)
         r_lay.addLayout(r_hdr)
 
+        self.right_panel_stack = QStackedWidget()
+
+        # Page 0: Contextual Meeting Inspector + Local AI Carry-Over Brief
+        self.inspector_page = QWidget()
+        insp_outer = QVBoxLayout(self.inspector_page)
+        insp_outer.setContentsMargins(0, 0, 0, 0)
+        insp_outer.setSpacing(8)
+
+        insp_scroll = QScrollArea()
+        insp_scroll.setWidgetResizable(True)
+        insp_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        insp_host = QWidget()
+        insp_host.setObjectName("calScrollHost")
+        insp_lay = QVBoxLayout(insp_host)
+        insp_lay.setContentsMargins(0, 2, 4, 6)
+        insp_lay.setSpacing(10)
+
+        insp_meta_card = QFrame()
+        insp_meta_card.setObjectName("calInspectorCard")
+        im_lay = QVBoxLayout(insp_meta_card)
+        im_lay.setContentsMargins(14, 12, 14, 12)
+        im_lay.setSpacing(6)
+
+        self.lbl_insp_platform = QLabel("")
+        self.lbl_insp_platform.setVisible(False)
+        im_lay.addWidget(self.lbl_insp_platform, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.lbl_insp_title = QLabel("Select a meeting to inspect")
+        self.lbl_insp_title.setFont(get_ui_font(15, 600))
+        self.lbl_insp_title.setWordWrap(True)
+        im_lay.addWidget(self.lbl_insp_title)
+
+        self.lbl_insp_time = QLabel("Click any meeting in Agenda, Day Flow, or Week Grid.")
+        self.lbl_insp_time.setObjectName("calMutedText")
+        self.lbl_insp_time.setWordWrap(True)
+        im_lay.addWidget(self.lbl_insp_time)
+
+        self.lbl_insp_source = QLabel("")
+        self.lbl_insp_source.setObjectName("calMutedText")
+        self.lbl_insp_source.setWordWrap(True)
+        self.lbl_insp_source.setVisible(False)
+        im_lay.addWidget(self.lbl_insp_source)
+
+        self.lbl_insp_attendees = QLabel("")
+        self.lbl_insp_attendees.setObjectName("calMutedText")
+        self.lbl_insp_attendees.setWordWrap(True)
+        self.lbl_insp_attendees.setVisible(False)
+        im_lay.addWidget(self.lbl_insp_attendees)
+
+        insp_btns = QHBoxLayout()
+        insp_btns.setSpacing(6)
+        self.btn_insp_join = QPushButton("Join Meeting")
+        self.btn_insp_join.setObjectName("calFathomBtn")
+        self.btn_insp_join.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_insp_join.setVisible(False)
+        self.btn_insp_join.clicked.connect(
+            lambda: self._on_join_meeting(self._inspected_meeting) if self._inspected_meeting else None
+        )
+        insp_btns.addWidget(self.btn_insp_join)
+
+        self.btn_insp_prepare = QPushButton("Prepare Notetaker")
+        self.btn_insp_prepare.setObjectName("calDawnBtn")
+        self.btn_insp_prepare.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_insp_prepare.setEnabled(False)
+        self.btn_insp_prepare.clicked.connect(
+            lambda: self._on_prepare_notetaker(self._inspected_meeting) if self._inspected_meeting else None
+        )
+        insp_btns.addWidget(self.btn_insp_prepare)
+        im_lay.addLayout(insp_btns)
+
+        insp_btns2 = QHBoxLayout()
+        insp_btns2.setSpacing(6)
+        self.btn_insp_recording = QPushButton("View Recording")
+        self.btn_insp_recording.setObjectName("calSecondaryBtn")
+        self.btn_insp_recording.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_insp_recording.setVisible(False)
+        self.btn_insp_recording.clicked.connect(
+            lambda: self.open_meeting_recording_requested.emit(int(self._inspected_recording_id))
+            if self._inspected_recording_id
+            else None
+        )
+        insp_btns2.addWidget(self.btn_insp_recording)
+
+        self.btn_insp_details = QPushButton("Full Details")
+        self.btn_insp_details.setObjectName("calMiniBtn")
+        self.btn_insp_details.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_insp_details.setEnabled(False)
+        self.btn_insp_details.clicked.connect(
+            lambda: self._open_meeting_details(self._inspected_meeting, self._inspected_recording_id)
+            if self._inspected_meeting
+            else None
+        )
+        insp_btns2.addWidget(self.btn_insp_details)
+        insp_btns2.addStretch(1)
+        im_lay.addLayout(insp_btns2)
+        insp_lay.addWidget(insp_meta_card)
+
+        self.insp_brief_card = QFrame()
+        self.insp_brief_card.setObjectName("calInspectorCard")
+        ib_lay = QVBoxLayout(self.insp_brief_card)
+        ib_lay.setContentsMargins(14, 12, 14, 12)
+        ib_lay.setSpacing(8)
+
+        ib_hdr = QHBoxLayout()
+        lbl_brief_eye = QLabel("AI PRE-MEETING BRIEF")
+        lbl_brief_eye.setObjectName("calKpiLabel")
+        ib_hdr.addWidget(lbl_brief_eye)
+        ib_hdr.addStretch(1)
+        self.btn_insp_copy_brief = QPushButton("Copy Brief")
+        self.btn_insp_copy_brief.setObjectName("calMiniBtn")
+        self.btn_insp_copy_brief.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_insp_copy_brief.setEnabled(False)
+        self.btn_insp_copy_brief.clicked.connect(self._copy_inspected_brief)
+        ib_hdr.addWidget(self.btn_insp_copy_brief)
+        ib_lay.addLayout(ib_hdr)
+
+        self.lbl_insp_brief_meta = QLabel("Prior context from your local SQLite meetings.")
+        self.lbl_insp_brief_meta.setObjectName("calMutedText")
+        self.lbl_insp_brief_meta.setWordWrap(True)
+        ib_lay.addWidget(self.lbl_insp_brief_meta)
+
+        self.txt_insp_brief = QLabel("Select an upcoming meeting to generate a local carry-over brief.")
+        self.txt_insp_brief.setWordWrap(True)
+        self.txt_insp_brief.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.txt_insp_brief.setFont(get_ui_font(12, 400))
+        ib_lay.addWidget(self.txt_insp_brief)
+
+        insp_lay.addWidget(self.insp_brief_card)
+        insp_lay.addStretch(1)
+        insp_scroll.setWidget(insp_host)
+        insp_outer.addWidget(insp_scroll, 1)
+        self.right_panel_stack.addWidget(self.inspector_page)
+
+        # Page 1: Connected Accounts Manager (preserved cleanly)
+        self.accounts_page = QWidget()
+        acc_p_lay = QVBoxLayout(self.accounts_page)
+        acc_p_lay.setContentsMargins(0, 0, 0, 0)
         self.accounts_scroll = QScrollArea()
         self.accounts_scroll.setWidgetResizable(True)
         self.accounts_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -799,8 +1046,10 @@ class CalendarPage(QWidget):
         self.accounts_lay.setContentsMargins(0, 2, 4, 6)
         self.accounts_lay.setSpacing(10)
         self.accounts_scroll.setWidget(self.accounts_host)
-        r_lay.addWidget(self.accounts_scroll, 1)
+        acc_p_lay.addWidget(self.accounts_scroll, 1)
+        self.right_panel_stack.addWidget(self.accounts_page)
 
+        r_lay.addWidget(self.right_panel_stack, 1)
         body.addWidget(right_card, 4)
         outer.addLayout(body, 1)
 
@@ -830,7 +1079,14 @@ class CalendarPage(QWidget):
         if filter_id not in self._filter_buttons:
             filter_id = "upcoming"
         self._active_filter = filter_id
+        today_d = datetime.now().astimezone().date()
+        if filter_id == "tomorrow":
+            self._anchor_date = today_d + timedelta(days=1)
+        else:
+            self._anchor_date = today_d
         self._sync_filter_button_states()
+        if hasattr(self, "btn_week_weekend"):
+            self.btn_week_weekend.setVisible(self._view_mode == "week" or (self._view_mode == "timeline" and filter_id == "week"))
         self.refresh()
 
     def _sync_filter_button_states(self) -> None:
@@ -841,21 +1097,194 @@ class CalendarPage(QWidget):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
+    def _style_toggle_btn(self, btn: Optional[QPushButton], active: bool) -> None:
+        if btn is None:
+            return
+        btn.setChecked(active)
+        btn.setObjectName("calFilterBtnActive" if active else "calFilterBtn")
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
+
     def set_view_mode(self, mode: str) -> None:
-        if mode not in ("agenda", "timeline"):
+        if mode not in ("agenda", "timeline", "week"):
             mode = "agenda"
         self._view_mode = mode
-        if hasattr(self, "btn_view_agenda") and hasattr(self, "btn_view_timeline"):
-            self.btn_view_agenda.setChecked(mode == "agenda")
-            self.btn_view_agenda.setObjectName("calFilterBtnActive" if mode == "agenda" else "calFilterBtn")
-            self.btn_view_agenda.style().unpolish(self.btn_view_agenda)
-            self.btn_view_agenda.style().polish(self.btn_view_agenda)
-
-            self.btn_view_timeline.setChecked(mode == "timeline")
-            self.btn_view_timeline.setObjectName("calFilterBtnActive" if mode == "timeline" else "calFilterBtn")
-            self.btn_view_timeline.style().unpolish(self.btn_view_timeline)
-            self.btn_view_timeline.style().polish(self.btn_view_timeline)
+        self._style_toggle_btn(getattr(self, "btn_view_agenda", None), mode == "agenda")
+        self._style_toggle_btn(getattr(self, "btn_view_timeline", None), mode == "timeline")
+        self._style_toggle_btn(getattr(self, "btn_view_week", None), mode == "week")
+        if hasattr(self, "date_nav_bar"):
+            self.date_nav_bar.setVisible(mode in ("timeline", "week"))
+        if hasattr(self, "btn_week_weekend"):
+            self.btn_week_weekend.setVisible(mode == "week" or (mode == "timeline" and self._active_filter == "week"))
         self.refresh()
+
+    def _shift_anchor_date(self, delta_steps: int) -> None:
+        is_week = (self._view_mode == "week") or (self._view_mode == "timeline" and self._active_filter == "week")
+        days = (7 * delta_steps) if is_week else delta_steps
+        self._anchor_date = self._anchor_date + timedelta(days=days)
+        self._refresh_meetings_only()
+
+    def _reset_anchor_today(self) -> None:
+        self._anchor_date = datetime.now().astimezone().date()
+        self._refresh_meetings_only()
+
+    def _toggle_week_weekends(self) -> None:
+        if hasattr(self, "btn_week_weekend"):
+            self._week_show_weekends = bool(self.btn_week_weekend.isChecked())
+        self._refresh_meetings_only()
+
+    def set_right_panel_mode(self, mode: str, user_initiated: bool = True) -> None:
+        clean_mode = "accounts" if str(mode).lower() == "accounts" else "inspector"
+        self._right_panel_mode = clean_mode
+        if user_initiated:
+            self._user_pinned_right_mode = True
+        if hasattr(self, "right_panel_stack"):
+            self.right_panel_stack.setCurrentIndex(1 if clean_mode == "accounts" else 0)
+        self._style_toggle_btn(getattr(self, "btn_right_inspector", None), clean_mode == "inspector")
+        self._style_toggle_btn(getattr(self, "btn_right_accounts", None), clean_mode == "accounts")
+        toggle_btn = getattr(self, "btn_toggle_accounts_panel", None)
+        if toggle_btn is not None:
+            is_acc = (clean_mode == "accounts")
+            toggle_btn.setChecked(is_acc)
+            toggle_btn.setObjectName("calFilterBtnActive" if is_acc else "calMiniBtn")
+            toggle_btn.style().unpolish(toggle_btn)
+            toggle_btn.style().polish(toggle_btn)
+
+    def inspect_meeting(self, meeting: Optional[CalendarMeeting], recording_id: Optional[int] = None) -> None:
+        """Select a calendar meeting in the Contextual Inspector and show the Inspector tab."""
+        self._populate_inspector(meeting, recording_id)
+        self.set_right_panel_mode("inspector", user_initiated=True)
+
+    def _populate_inspector(self, meeting: Optional[CalendarMeeting], recording_id: Optional[int] = None) -> None:
+        self._inspected_meeting = meeting
+        self._inspected_recording_id = int(recording_id) if recording_id else None
+        self._inspected_brief_md = ""
+        if not hasattr(self, "lbl_insp_title"):
+            return
+
+        t = get_theme_tokens(self._theme)
+        if meeting is None:
+            self.lbl_insp_platform.setVisible(False)
+            self.lbl_insp_title.setText("Select a meeting to inspect")
+            self.lbl_insp_time.setText("Click any meeting in Agenda, Day Flow, or Week Grid.")
+            self.lbl_insp_source.setVisible(False)
+            self.lbl_insp_attendees.setVisible(False)
+            self.btn_insp_join.setVisible(False)
+            self.btn_insp_prepare.setEnabled(False)
+            self.btn_insp_recording.setVisible(False)
+            self.btn_insp_details.setEnabled(False)
+            self.btn_insp_copy_brief.setEnabled(False)
+            self.lbl_insp_brief_meta.setText("Prior context from your local SQLite meetings.")
+            self.txt_insp_brief.setText("Select an upcoming meeting to generate a local carry-over brief.")
+            return
+
+        plat_name, plat_color = _platform_display_info(meeting.platform, t)
+        self.lbl_insp_platform.setText(plat_name)
+        self.lbl_insp_platform.setStyleSheet(
+            f"background: {plat_color}; color: #FFFFFF; border-radius: 6px; padding: 2px 8px; font-size: 11px; font-weight: 600;"
+        )
+        self.lbl_insp_platform.setVisible(True)
+        self.lbl_insp_title.setText(meeting.title or "Untitled Meeting")
+
+        time_str, rel_str = _format_time_window(meeting)
+        date_str = meeting.local_start_time.strftime("%a, %b %d, %Y")
+        self.lbl_insp_time.setText(f"{date_str} · {time_str}" + (f" ({rel_str})" if rel_str else ""))
+
+        src_parts = []
+        src_acc = (meeting.source_accounts[0] if meeting.source_accounts else "") or meeting.calendar_provider_label
+        if src_acc:
+            src_parts.append(src_acc)
+        org = meeting.organizer_name or meeting.organizer
+        if org:
+            src_parts.append(f"Host: {org}")
+        if src_parts:
+            self.lbl_insp_source.setText(" · ".join(src_parts))
+            self.lbl_insp_source.setVisible(True)
+        else:
+            self.lbl_insp_source.setVisible(False)
+
+        atts = list(meeting.attendees or [])
+        if atts:
+            preview = ", ".join(atts[:8]) + (f" (+{len(atts) - 8} more)" if len(atts) > 8 else "")
+            self.lbl_insp_attendees.setText(f"Attendees ({len(atts)}): {preview}")
+            self.lbl_insp_attendees.setVisible(True)
+        else:
+            self.lbl_insp_attendees.setVisible(False)
+
+        self.btn_insp_join.setVisible(bool(meeting.join_url))
+        self.btn_insp_prepare.setEnabled(True)
+        self.btn_insp_recording.setVisible(bool(recording_id))
+        self.btn_insp_details.setEnabled(True)
+
+        # Generate offline AI Pre-Meeting Carry-Over Brief from local SQLite history
+        db = getattr(self.controller, "db", None)
+        db_path = getattr(db, "db_path", None) if db is not None else None
+        has_real_db = bool(
+            db is not None
+            and hasattr(db, "list_meetings")
+            and isinstance(db_path, (str, os.PathLike if hasattr(os, "PathLike") else str))
+            and (":memory:" in str(db_path).lower() or Path(str(db_path)).exists())
+        )
+        if db is not None and hasattr(db, "list_meetings") and not has_real_db:
+            try:
+                sample = db.list_meetings(limit=1)
+                has_real_db = isinstance(sample, list)
+            except Exception:
+                has_real_db = False
+
+        if not has_real_db:
+            self.lbl_insp_brief_meta.setText("Local SQLite history ready after your first recorded call.")
+            self.txt_insp_brief.setText("Prior decisions and unresolved action items for matching calls will appear here.")
+            self.btn_insp_copy_brief.setEnabled(False)
+            return
+
+        try:
+            from voxlocal.engine.meeting_intelligence import MeetingIntelligenceEngine
+
+            brief = MeetingIntelligenceEngine(db).generate_pre_meeting_briefing(meeting.title or "")
+            rel_mtgs = brief.get("relevant_meetings") or []
+            decs = brief.get("key_decisions") or brief.get("prior_decisions") or []
+            acts = brief.get("open_action_items") or []
+            self._inspected_brief_md = str(brief.get("briefing_markdown") or "").strip()
+
+            self.lbl_insp_brief_meta.setText(
+                f"Matched {len(rel_mtgs)} prior meeting{'s' if len(rel_mtgs) != 1 else ''} · "
+                f"{len(decs)} decision{'s' if len(decs) != 1 else ''} · "
+                f"{len(acts)} open action{'s' if len(acts) != 1 else ''}"
+            )
+            lines: List[str] = []
+            if decs:
+                lines.append("Prior Decisions:")
+                for d in decs[:3]:
+                    lines.append(f"• {d.get('decision', '')}")
+            if acts:
+                lines.append("Open Action Items:")
+                for a in acts[:4]:
+                    owner = a.get("owner") or "Team"
+                    lines.append(f"• [{owner}] {a.get('description', '')}")
+            if not lines:
+                lines.append("No prior decisions or open action items matched this meeting title.")
+            self.txt_insp_brief.setText("\n".join(lines))
+            self.btn_insp_copy_brief.setEnabled(bool(self._inspected_brief_md))
+        except Exception as exc:
+            logger.debug("Inspector carry-over brief skipped: %s", exc)
+            self.lbl_insp_brief_meta.setText("Pre-meeting brief unavailable.")
+            self.txt_insp_brief.setText("Click 'Prepare Notetaker' to record this meeting locally.")
+            self.btn_insp_copy_brief.setEnabled(False)
+
+    def _copy_inspected_brief(self) -> None:
+        txt = self._inspected_brief_md or (self.txt_insp_brief.text() if hasattr(self, "txt_insp_brief") else "")
+        if not txt:
+            return
+        try:
+            QGuiApplication.clipboard().setText(txt)
+            ok = True
+        except Exception:
+            ok = copy_to_clipboard_win32(txt)
+        if ok:
+            self.status_toast.emit("Brief Copied", "Pre-Meeting Brief copied to clipboard.")
+        else:
+            self.status_toast.emit("Copy Failed", "Could not copy Pre-Meeting Brief to clipboard.")
 
     def _toggle_briefing(self) -> None:
         self._briefing_expanded = not self._briefing_expanded
@@ -886,7 +1315,16 @@ class CalendarPage(QWidget):
 
     def _on_search_changed(self, text: str) -> None:
         self._search_text = text.strip().lower()
-        self.refresh()
+        self._search_debounce_timer.start()
+
+    def _refresh_meetings_only(self) -> None:
+        """Re-render only the filtered meetings panel without rebuilding accounts, KPIs, or Daily Pulse."""
+        if getattr(self.controller, "_cancel_ask_vox", False):
+            return
+        accounts = self._get_accounts()
+        meetings = self._get_all_meetings()
+        recording_map = self._get_recording_map()
+        self._render_meetings_panel(accounts, meetings, recording_map)
 
     # ------------------------------------------------------------------ Data & Render
     def _get_accounts(self) -> List[Dict[str, Any]]:
@@ -925,6 +1363,8 @@ class CalendarPage(QWidget):
             return {}
 
     def refresh(self) -> None:
+        if getattr(self.controller, "_cancel_ask_vox", False):
+            return
         accounts = self._get_accounts()
         health = self._get_sync_health()
         meetings = self._get_all_meetings()
@@ -935,6 +1375,26 @@ class CalendarPage(QWidget):
         self._sync_account_dropdown(accounts)
         self._render_accounts_panel(accounts)
         self._render_meetings_panel(accounts, meetings, recording_map)
+
+        if not self._user_pinned_right_mode:
+            target_mode = "accounts" if (not accounts and not meetings) else "inspector"
+            self.set_right_panel_mode(target_mode, user_initiated=False)
+
+        target_insp = self._inspected_meeting
+        preserved_rid = self._inspected_recording_id
+        if self._inspected_meeting is not None:
+            for m in meetings:
+                if m.id == self._inspected_meeting.id:
+                    target_insp = m
+                    break
+        if target_insp is None:
+            target_insp = self._current_spotlight or (meetings[0] if meetings else None)
+        resolved_rid = (
+            recording_map.get(target_insp.id, preserved_rid if target_insp is self._inspected_meeting else None)
+            if target_insp
+            else None
+        )
+        self._populate_inspector(target_insp, resolved_rid)
 
     def _render_daily_pulse(self, meetings: List[CalendarMeeting]) -> None:
         if not hasattr(self, "pulse_container"):
@@ -1174,7 +1634,7 @@ class CalendarPage(QWidget):
             self._selected_account_filter = ""
         self.cmb_account_filter.blockSignals(False)
 
-    def _clear_layout(self, lay: QVBoxLayout) -> None:
+    def _clear_layout(self, lay: Any) -> None:
         while lay.count():
             item = lay.takeAt(0)
             w = item.widget()
@@ -1182,10 +1642,86 @@ class CalendarPage(QWidget):
                 w.hide()
                 w.setParent(None)
                 w.deleteLater()
+            elif item.layout() is not None:
+                self._clear_layout(item.layout())
+
+    def _render_account_health_pills(self, accounts: List[Dict[str, Any]], t: Dict[str, Any]) -> None:
+        if not hasattr(self, "accounts_health_lay"):
+            return
+        self._clear_layout(self.accounts_health_lay)
+        if hasattr(self, "btn_toggle_accounts_panel"):
+            self.btn_toggle_accounts_panel.setText(f"Accounts ({len(accounts)})")
+
+        if not accounts:
+            lbl = QLabel("No calendars connected")
+            lbl.setObjectName("calMutedText")
+            self.accounts_health_lay.addWidget(lbl)
+            btn_connect = QPushButton("Connect Outlook / Google / Zoom / ICS")
+            btn_connect.setObjectName("calDawnBtn")
+            btn_connect.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_connect.clicked.connect(lambda: self._open_connect_dialog(0))
+            self.accounts_health_lay.addWidget(btn_connect)
+            self.accounts_health_lay.addStretch(1)
+            return
+
+        for acc in accounts:
+            aid = str(acc.get("account_id") or "")
+            ptype = str(acc.get("provider_type") or "")
+            _, p_label = _provider_display_info(ptype)
+            p_short = {
+                "ms_graph": "Outlook",
+                "google": "Google",
+                "zoom": "Zoom",
+                "ics": "ICS Feed",
+                "outlook_mapi": "Outlook MAPI",
+            }.get(ptype.lower(), p_label.split()[0])
+            full_ident = str(acc.get("account_email") or acc.get("display_name") or p_label)
+            ident = full_ident if len(full_ident) <= 18 else (full_ident[:15] + "...")
+            enabled = bool(acc.get("enabled", True))
+            is_healthy = bool(acc.get("is_healthy", False))
+            state = str(acc.get("connection_state") or "connected").lower()
+            raw_err = str(acc.get("last_error") or "")
+            is_offline_msg = "offline" in raw_err.lower() or "internet" in raw_err.lower() or state in {"offline_cached", "network_offline"}
+            needs_reauth = (
+                state in {"expired", "admin_approval_required", "admin_blocked"}
+                or (enabled and state in {"failed", "sync_error"} and not is_offline_msg)
+                or (enabled and not acc.get("is_authenticated", True) and state not in {"connected", "syncing", "disabled", "offline_cached"})
+            )
+
+            if not enabled or state in {"disabled", "paused"}:
+                icon_txt, suffix = "⏸", "Paused"
+                bg, fg, bdr = t["chip_bg"], t["text_muted"], t["border"]
+            elif needs_reauth:
+                icon_txt, suffix = "⚠", "Reconnect"
+                bg, fg, bdr = t["accent_coral_tint"], t["accent_crimson"], t["accent_crimson"]
+            elif is_offline_msg:
+                icon_txt, suffix = "○", "Offline"
+                bg, fg, bdr = t["chip_bg"], t["text_muted"], t["border"]
+            else:
+                icon_txt, suffix = "✓", p_short
+                bg, fg, bdr = t["accent_emerald_tint"], t["accent_emerald"], t["accent_emerald"]
+
+            pill_label = f"{icon_txt} {p_short} · {ident}" + (f" · {suffix}" if suffix != p_short else "")
+            pill = QPushButton(pill_label)
+            pill.setObjectName("calHealthPillBtn")
+            pill.setCursor(Qt.CursorShape.PointingHandCursor)
+            pill.setStyleSheet(
+                f"QPushButton#calHealthPillBtn {{ background: {bg}; color: {fg}; border: 1px solid {bdr}; "
+                f"border-radius: 14px; padding: 3px 10px; font-size: 11px; font-weight: 600; }}"
+            )
+            if needs_reauth:
+                pill.setToolTip(f"Click to reconnect {p_label} ({full_ident})")
+                pill.clicked.connect(lambda _=False, account_id=aid, pt=ptype: self._on_reconnect_account(account_id, pt))
+            else:
+                pill.setToolTip(f"Manage {p_label} account ({full_ident})")
+                pill.clicked.connect(lambda: self.set_right_panel_mode("accounts", user_initiated=True))
+            self.accounts_health_lay.addWidget(pill)
+        self.accounts_health_lay.addStretch(1)
 
     def _render_accounts_panel(self, accounts: List[Dict[str, Any]]) -> None:
         self._clear_layout(self.accounts_lay)
         t = get_theme_tokens(self._theme)
+        self._render_account_health_pills(accounts, t)
 
         if not accounts:
             empty = QFrame()
@@ -1207,6 +1743,7 @@ class CalendarPage(QWidget):
                 (0, "Connect Microsoft Outlook"),
                 (1, "Connect Google Calendar"),
                 (2, "Connect Zoom"),
+                (3, "Add Calendar Feed (.ics)"),
             ):
                 b = QPushButton(label)
                 b.setObjectName("calSecondaryBtn")
@@ -1385,6 +1922,31 @@ class CalendarPage(QWidget):
         lay.addLayout(act_row2)
         return card
 
+    def _matches_account_and_search(self, m: CalendarMeeting) -> bool:
+        if self._selected_account_filter:
+            src_match = (m.account_id == self._selected_account_filter) or (
+                self._selected_account_filter in (m.source_accounts or [])
+            )
+            if not src_match and ":" in self._selected_account_filter:
+                email_part = self._selected_account_filter.split(":", 1)[1].lower()
+                src_match = any(email_part in s.lower() for s in (m.source_accounts or []))
+            if not src_match:
+                return False
+
+        if self._search_text:
+            haystack = " ".join([
+                m.title or "",
+                m.organizer or "",
+                m.organizer_name or "",
+                m.platform or "",
+                m.meeting_platform_label,
+                m.calendar_name or "",
+                " ".join(m.attendees or []),
+            ]).lower()
+            if self._search_text not in haystack:
+                return False
+        return True
+
     def _filter_meetings(self, meetings: List[CalendarMeeting]) -> List[CalendarMeeting]:
         filtered: List[CalendarMeeting] = []
         for m in meetings:
@@ -1394,30 +1956,8 @@ class CalendarPage(QWidget):
                 continue
             elif self._active_filter == "week" and not m.is_this_week:
                 continue
-
-            if self._selected_account_filter:
-                src_match = (m.account_id == self._selected_account_filter) or (
-                    self._selected_account_filter in (m.source_accounts or [])
-                )
-                # Also match if email portion of account_id matches source_accounts
-                if not src_match and ":" in self._selected_account_filter:
-                    email_part = self._selected_account_filter.split(":", 1)[1].lower()
-                    src_match = any(email_part in s.lower() for s in (m.source_accounts or []))
-                if not src_match:
-                    continue
-
-            if self._search_text:
-                haystack = " ".join([
-                    m.title or "",
-                    m.organizer or "",
-                    m.organizer_name or "",
-                    m.platform or "",
-                    m.meeting_platform_label,
-                    m.calendar_name or "",
-                    " ".join(m.attendees or []),
-                ]).lower()
-                if self._search_text not in haystack:
-                    continue
+            if not self._matches_account_and_search(m):
+                continue
             filtered.append(m)
         return filtered
 
@@ -1428,12 +1968,19 @@ class CalendarPage(QWidget):
         recording_map: Dict[str, int],
     ) -> None:
         self._clear_layout(self.meetings_lay)
+        self._week_day_columns = []
         t = get_theme_tokens(self._theme)
-        filtered = self._filter_meetings(meetings)
+
+        if self._view_mode == "week" or (self._view_mode == "timeline" and self._active_filter == "week"):
+            self._render_week_grid_panel(accounts, meetings, recording_map, t)
+            return
 
         if self._view_mode == "timeline":
-            self._render_timeline_panel(accounts, filtered, recording_map, t)
+            timeline_filtered = [m for m in meetings if self._matches_account_and_search(m)]
+            self._render_timeline_panel(accounts, timeline_filtered, recording_map, t)
             return
+
+        filtered = self._filter_meetings(meetings)
 
         if not filtered:
             empty = QFrame()
@@ -1492,6 +2039,119 @@ class CalendarPage(QWidget):
 
         self.meetings_lay.addStretch(1)
 
+    def _render_week_grid_panel(
+        self,
+        accounts: List[Dict[str, Any]],
+        all_meetings: List[CalendarMeeting],
+        recording_map: Dict[str, int],
+        t: Dict[str, Any],
+    ) -> None:
+        self._week_day_columns = []
+        now_local = datetime.now().astimezone()
+        today_date = now_local.date()
+        week_start = self._anchor_date - timedelta(days=self._anchor_date.weekday())
+
+        candidates = [
+            m for m in all_meetings
+            if not m.is_cancelled and self._matches_account_and_search(m)
+        ]
+        week_end = week_start + timedelta(days=6)
+        has_weekend_mtg = any(
+            week_start <= m.local_start_time.date() <= week_end and m.local_start_time.weekday() >= 5
+            for m in candidates
+        )
+        num_days = 7 if (self._week_show_weekends or has_weekend_mtg) else 5
+        days = [week_start + timedelta(days=i) for i in range(num_days)]
+
+        if hasattr(self, "lbl_nav_range"):
+            self.lbl_nav_range.setText(f"{days[0].strftime('%b %d')} – {days[-1].strftime('%b %d, %Y')}")
+
+        if not candidates and not accounts:
+            empty = QFrame()
+            empty.setObjectName("calCard")
+            e_lay = QVBoxLayout(empty)
+            e_lay.setContentsMargins(24, 28, 24, 28)
+            e_lay.setSpacing(10)
+            lbl = QLabel("No Calendars Connected")
+            lbl.setFont(get_ui_font(16, 600))
+            e_lay.addWidget(lbl)
+            sub = QLabel("Connect Microsoft Outlook, Google Calendar, or Zoom to view your Week Grid.")
+            sub.setObjectName("calMutedText")
+            e_lay.addWidget(sub)
+            cta = QPushButton("Connect Your First Calendar")
+            cta.setObjectName("calFathomBtn")
+            cta.setCursor(Qt.CursorShape.PointingHandCursor)
+            cta.clicked.connect(lambda: self._open_connect_dialog())
+            e_lay.addWidget(cta, 0, Qt.AlignmentFlag.AlignLeft)
+            self.meetings_lay.addWidget(empty)
+            self.meetings_lay.addStretch(1)
+            return
+
+        grid_host = QFrame()
+        grid_host.setObjectName("calWeekGridHost")
+        cols_lay = QHBoxLayout(grid_host)
+        cols_lay.setContentsMargins(4, 4, 4, 4)
+        cols_lay.setSpacing(8)
+
+        for d in days:
+            is_today = (d == today_date)
+            col_frame = QFrame()
+            col_frame.setObjectName("calWeekDayColToday" if is_today else "calWeekDayCol")
+            col_lay = QVBoxLayout(col_frame)
+            col_lay.setContentsMargins(8, 8, 8, 8)
+            col_lay.setSpacing(6)
+
+            hdr_row = QHBoxLayout()
+            hdr_row.setSpacing(4)
+            lbl_day = QLabel(d.strftime("%a %d"))
+            lbl_day.setFont(get_ui_font(12, 700))
+            hdr_row.addWidget(lbl_day)
+            hdr_row.addStretch(1)
+            if is_today:
+                now_badge = QLabel(f"● NOW {now_local.strftime('%I:%M %p').lstrip('0')}")
+                now_badge.setStyleSheet(
+                    f"background: {t['accent_coral_tint']}; color: {t['accent_crimson']}; "
+                    f"border-radius: 4px; padding: 1px 5px; font-size: 9.5px; font-weight: 700;"
+                )
+                hdr_row.addWidget(now_badge)
+            col_lay.addLayout(hdr_row)
+
+            day_mtgs = sorted(
+                [m for m in candidates if m.local_start_time.date() == d],
+                key=lambda x: x.local_start_time,
+            )
+            if not day_mtgs:
+                lbl_free = QLabel("Free")
+                lbl_free.setObjectName("calMutedText")
+                col_lay.addWidget(lbl_free)
+            else:
+                for m in day_mtgs:
+                    rec_id = recording_map.get(m.id)
+                    _, plat_color = _platform_display_info(m.platform, t)
+                    t_label = m.local_start_time.strftime("%I:%M %p").lstrip("0")
+                    text_parts = [f"{t_label} · {m.title or 'Untitled'}"]
+                    if rec_id:
+                        text_parts.append("✓ Recorded")
+                    ev_btn = QPushButton("\n".join(text_parts))
+                    ev_btn.setObjectName("calWeekEventBlock")
+                    ev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    ev_btn.setToolTip(f"{m.title or 'Meeting'} ({m.meeting_platform_label})")
+                    ev_btn.setStyleSheet(
+                        f"QPushButton#calWeekEventBlock {{ text-align: left; background: {t['surface_secondary']}; "
+                        f"color: {t['text_primary']}; border: 1px solid {t['border']}; border-left: 4px solid {plat_color}; "
+                        f"border-radius: 6px; padding: 6px 8px; font-size: 11.5px; font-weight: 600; }}"
+                        f"QPushButton#calWeekEventBlock:hover {{ border-color: {plat_color}; background: {t['surface_hover']}; }}"
+                    )
+                    ev_btn.clicked.connect(lambda _=False, mt=m, rid=rec_id: self.inspect_meeting(mt, rid))
+                    col_lay.addWidget(ev_btn)
+
+            col_lay.addStretch(1)
+            cols_lay.addWidget(col_frame, 1)
+            self._week_day_columns.append((d, col_frame))
+
+        self.meetings_lay.addWidget(grid_host)
+        self.meetings_lay.addStretch(1)
+
     def _render_timeline_panel(
         self,
         accounts: List[Dict[str, Any]],
@@ -1500,17 +2160,17 @@ class CalendarPage(QWidget):
         t: Dict[str, Any],
     ) -> None:
         now_local = datetime.now().astimezone()
-        if self._active_filter == "tomorrow":
-            target_date = (now_local + timedelta(days=1)).date()
-            date_title = f"TOMORROW'S FLOW — {(now_local + timedelta(days=1)).strftime('%A, %b %d')}"
-        elif self._active_filter == "week":
-            target_date = now_local.date()
-            date_title = f"THIS WEEK'S FLOW — TODAY ({now_local.strftime('%A, %b %d')})"
-        else:
-            target_date = now_local.date()
-            date_title = f"TODAY'S FLOW — {now_local.strftime('%A, %b %d, %Y')}"
-
+        target_date = self._anchor_date
         is_today = (target_date == now_local.date())
+        if is_today:
+            date_title = f"TODAY'S FLOW — {target_date.strftime('%A, %b %d, %Y')}"
+        elif target_date == (now_local + timedelta(days=1)).date():
+            date_title = f"TOMORROW'S FLOW — {target_date.strftime('%A, %b %d, %Y')}"
+        else:
+            date_title = f"DAY FLOW — {target_date.strftime('%A, %b %d, %Y')}"
+
+        if hasattr(self, "lbl_nav_range"):
+            self.lbl_nav_range.setText(target_date.strftime("%a, %b %d, %Y"))
 
         tl_hdr = QHBoxLayout()
         lbl_tl_title = QLabel(date_title.upper())
@@ -1699,6 +2359,12 @@ class CalendarPage(QWidget):
         btn_prep.clicked.connect(lambda _=False, mt=m: self._on_prepare_notetaker(mt))
         act_col.addWidget(btn_prep)
 
+        btn_insp = QPushButton("Inspect")
+        btn_insp.setObjectName("calMiniBtn")
+        btn_insp.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_insp.clicked.connect(lambda _=False, mt=m, rid=recording_id: self.inspect_meeting(mt, rid))
+        act_col.addWidget(btn_insp)
+
         btn_det = QPushButton("Details")
         btn_det.setObjectName("calMiniBtn")
         btn_det.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1813,6 +2479,12 @@ class CalendarPage(QWidget):
             act.addWidget(btn_rec)
 
         act.addStretch(1)
+        btn_inspect = QPushButton("Inspect")
+        btn_inspect.setObjectName("calMiniBtn")
+        btn_inspect.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_inspect.clicked.connect(lambda _=False, mt=m, rid=recording_id: self.inspect_meeting(mt, rid))
+        act.addWidget(btn_inspect)
+
         btn_details = QPushButton("Details")
         btn_details.setObjectName("calMiniBtn")
         btn_details.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1933,10 +2605,21 @@ class CalendarPage(QWidget):
                 font-weight: 700;
                 letter-spacing: 0.6px;
             }}
-            QFrame#calCard, QFrame#calMeetingCard, QFrame#calSidePanel, QFrame#calTimelineBlock {{
+            QFrame#calCard, QFrame#calMeetingCard, QFrame#calSidePanel, QFrame#calTimelineBlock,
+            QFrame#calHealthStrip, QFrame#calNavStrip, QFrame#calInspectorCard, QFrame#calWeekGridHost {{
                 background: {t['surface']};
                 border: 1px solid {t['border']};
                 border-radius: 12px;
+            }}
+            QFrame#calWeekDayCol {{
+                background: {t['background']};
+                border: 1px solid {t['border']};
+                border-radius: 10px;
+            }}
+            QFrame#calWeekDayColToday {{
+                background: {t['surface_secondary']};
+                border: 1.5px solid {t['accent_fathom']};
+                border-radius: 10px;
             }}
             QFrame#calSpotlightCard {{
                 background: {t['surface_secondary']};

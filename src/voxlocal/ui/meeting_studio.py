@@ -30,11 +30,37 @@ import json
 import re
 import urllib.parse
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QTextCursor
+from PyQt6.QtCore import (
+    QAbstractListModel,
+    QEvent,
+    QModelIndex,
+    QPoint,
+    QRect,
+    QSize,
+    Qt,
+    QTimer,
+    QUrl,
+    pyqtSignal,
+)
+from PyQt6.QtGui import (
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QShortcut,
+    QTextCursor,
+)
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -46,6 +72,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListView,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -53,9 +80,13 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -67,6 +98,8 @@ from voxlocal.ui.animations import AnimatedPushButton
 from voxlocal.ui.components import (
     VoxActionItemMatrixWidget,
     VoxCard,
+    VoxMeetingComparisonDialog,
+    VoxPreMeetingBriefingDialog,
     VoxSearchField,
     VoxStatusPill,
     VoxStructuredDecisionsWidget,
@@ -394,15 +427,388 @@ class VoxMyThoughtsTab(QWidget):
 
 
 # ==============================================================================
-# Tab 2: "Transcript" (Speaker-Diarized Interactive Transcript)
+# Tab 2: "Transcript" (Virtualized Speaker-Diarized Interactive Transcript)
 # ==============================================================================
+
+
+class TranscriptListModel(QAbstractListModel):
+    """Virtualized in-memory model for arbitrarily long meeting transcripts."""
+
+    ROLE_SPEAKER = Qt.ItemDataRole.UserRole + 1
+    ROLE_START_TIME = Qt.ItemDataRole.UserRole + 2
+    ROLE_END_TIME = Qt.ItemDataRole.UserRole + 3
+    ROLE_TEXT = Qt.ItemDataRole.UserRole + 4
+    ROLE_SOURCE_TRACK = Qt.ItemDataRole.UserRole + 5
+    ROLE_IS_ACTIVE = Qt.ItemDataRole.UserRole + 6
+    ROLE_QUERY = Qt.ItemDataRole.UserRole + 7
+    ROLE_SEGMENT_DICT = Qt.ItemDataRole.UserRole + 8
+    ROLE_ORIGINAL_INDEX = Qt.ItemDataRole.UserRole + 9
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._all_segments: List[Dict[str, Any]] = []
+        self._visible_indices: List[int] = []
+        self._query: str = ""
+        self._speaker_filter: str = ""
+        self._active_orig_idx: int = -1
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._visible_indices)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if not index.isValid():
+            return None
+        row = index.row()
+        if row < 0 or row >= len(self._visible_indices):
+            return None
+        orig_idx = self._visible_indices[row]
+        seg = self._all_segments[orig_idx]
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            speaker = str(seg.get("speaker") or "Speaker")
+            start_t = float(seg.get("start_time") or 0.0)
+            m, s = int(start_t) // 60, int(start_t) % 60
+            return f"{speaker} [{m:02d}:{s:02d}]: {seg.get('text', '')}"
+        if role == self.ROLE_SPEAKER:
+            return str(seg.get("speaker") or "Speaker")
+        if role == self.ROLE_START_TIME:
+            return float(seg.get("start_time") or 0.0)
+        if role == self.ROLE_END_TIME:
+            st = float(seg.get("start_time") or 0.0)
+            return float(seg.get("end_time") or (st + 5.0))
+        if role == self.ROLE_TEXT:
+            return str(seg.get("text") or "")
+        if role == self.ROLE_SOURCE_TRACK:
+            return str(seg.get("source_track") or "")
+        if role == self.ROLE_IS_ACTIVE:
+            return orig_idx == self._active_orig_idx
+        if role == self.ROLE_QUERY:
+            return self._query
+        if role == self.ROLE_SEGMENT_DICT:
+            return seg
+        if role == self.ROLE_ORIGINAL_INDEX:
+            return orig_idx
+        return None
+
+    def set_segments(self, segments: List[Dict[str, Any]]) -> int:
+        self._all_segments = list(segments)
+        self._active_orig_idx = -1
+        return self.set_filter(self._query, self._speaker_filter)
+
+    def set_filter(self, query: str, speaker: str) -> int:
+        self._query = (query or "").strip().lower()
+        self._speaker_filter = (speaker or "").strip().lower()
+        self.beginResetModel()
+        if not self._query and not self._speaker_filter:
+            self._visible_indices = list(range(len(self._all_segments)))
+        else:
+            q = self._query
+            sf = self._speaker_filter
+            vis: List[int] = []
+            for idx, seg in enumerate(self._all_segments):
+                spk = str(seg.get("speaker") or "").lower()
+                if sf and spk != sf:
+                    continue
+                if q:
+                    txt = str(seg.get("text") or "").lower()
+                    if q not in txt and q not in spk:
+                        continue
+                vis.append(idx)
+            self._visible_indices = vis
+        self.endResetModel()
+        return len(self._visible_indices)
+
+    def append_segment(self, seg: Dict[str, Any]) -> bool:
+        """Append one live segment incrementally without resetting the virtualized model."""
+        orig_idx = len(self._all_segments)
+        self._all_segments.append(seg)
+        spk = str(seg.get("speaker") or "Speaker")
+        txt = str(seg.get("text") or "")
+        matches_speaker = (not self._speaker_filter) or (spk == self._speaker_filter)
+        matches_query = (not self._query) or (self._query in txt.lower() or self._query in spk.lower())
+        if matches_speaker and matches_query:
+            row = len(self._visible_indices)
+            self.beginInsertRows(QModelIndex(), row, row)
+            self._visible_indices.append(orig_idx)
+            self.endInsertRows()
+            return True
+        return False
+
+    def set_active_time(self, current_sec: float) -> Tuple[int, int]:
+        """Mark active playback segment; return (orig_idx, visible_row)."""
+        target_orig = -1
+        for idx, seg in enumerate(self._all_segments):
+            st = float(seg.get("start_time") or 0.0)
+            et = float(seg.get("end_time") or (st + 5.0))
+            if st <= current_sec <= et:
+                target_orig = idx
+                break
+
+        old_orig = self._active_orig_idx
+        if target_orig == old_orig:
+            vis_row = self._visible_indices.index(target_orig) if target_orig in self._visible_indices else -1
+            return target_orig, vis_row
+
+        self._active_orig_idx = target_orig
+        for affected in (old_orig, target_orig):
+            if affected >= 0 and affected in self._visible_indices:
+                r = self._visible_indices.index(affected)
+                idx = self.index(r, 0)
+                self.dataChanged.emit(idx, idx, [self.ROLE_IS_ACTIVE])
+
+        vis_row = self._visible_indices.index(target_orig) if target_orig in self._visible_indices else -1
+        return target_orig, vis_row
+
+    def rename_speaker(self, old_name: str, new_name: str) -> int:
+        changed = 0
+        for seg in self._all_segments:
+            if seg.get("speaker") == old_name:
+                seg["speaker"] = new_name
+                changed += 1
+        if changed:
+            self.set_filter(self._query, self._speaker_filter)
+        return changed
+
+    def format_rows_for_copy(self, rows: List[int]) -> str:
+        target_rows = rows if rows else list(range(len(self._visible_indices)))
+        lines: List[str] = []
+        for r in target_rows:
+            if 0 <= r < len(self._visible_indices):
+                seg = self._all_segments[self._visible_indices[r]]
+                spk = str(seg.get("speaker") or "Speaker")
+                st = float(seg.get("start_time") or 0.0)
+                m, s = int(st) // 60, int(st) % 60
+                txt = str(seg.get("text") or "").strip()
+                if txt:
+                    lines.append(f"{spk} [{m:02d}:{s:02d}]: {txt}")
+        return "\n".join(lines)
+
+
+class TranscriptItemDelegate(QStyledItemDelegate):
+    """Custom virtualized painter & hit-tester for transcript segment cards."""
+
+    def __init__(
+        self,
+        theme: str = "dark",
+        seek_callback: Optional[Callable[[float], None]] = None,
+        rename_callback: Optional[Callable[[str], None]] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.theme = (theme or "dark").lower()
+        self.seek_callback = seek_callback
+        self.rename_callback = rename_callback
+        self._size_cache: Dict[Tuple[int, int, str], QSize] = {}
+
+    def clear_cache(self) -> None:
+        self._size_cache.clear()
+
+    def _fonts(self, option: QStyleOptionViewItem) -> Tuple[QFont, QFont, QFont]:
+        spk_font = QFont(option.font)
+        spk_font.setPixelSize(12)
+        spk_font.setWeight(QFont.Weight.Bold)
+
+        ts_font = QFont(option.font)
+        ts_font.setPixelSize(11)
+        ts_font.setWeight(QFont.Weight.DemiBold)
+
+        body_font = QFont(option.font)
+        body_font.setPixelSize(13)
+        body_font.setWeight(QFont.Weight.Normal)
+        return spk_font, ts_font, body_font
+
+    @staticmethod
+    def _layout_rects(
+        rect: QRect, speaker: str, ts_label: str, spk_fm: QFontMetrics, ts_fm: QFontMetrics
+    ) -> Tuple[QRect, QRect, QRect, QRect]:
+        card_rect = rect.adjusted(4, 3, -4, -3)
+        inner_left = card_rect.left() + 12
+        inner_top = card_rect.top() + 8
+        spk_w = min(max(60, spk_fm.horizontalAdvance(f"👤 {speaker}") + 10), max(80, card_rect.width() - 90))
+        spk_rect = QRect(inner_left, inner_top, spk_w, 22)
+        ts_w = max(46, ts_fm.horizontalAdvance(ts_label) + 16)
+        ts_rect = QRect(spk_rect.right() + 8, inner_top, ts_w, 20)
+        text_rect = QRect(
+            inner_left,
+            spk_rect.bottom() + 6,
+            max(100, card_rect.width() - 24),
+            max(18, card_rect.bottom() - (spk_rect.bottom() + 14)),
+        )
+        return card_rect, spk_rect, ts_rect, text_rect
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        width = option.rect.width()
+        if width <= 20 and isinstance(self.parent(), QWidget):
+            width = max(320, self.parent().width() - 24)
+        width = max(280, width)
+        orig_idx = index.data(TranscriptListModel.ROLE_ORIGINAL_INDEX)
+        cache_key = (int(orig_idx if orig_idx is not None else index.row()), width, self.theme)
+        cached = self._size_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        text = str(index.data(TranscriptListModel.ROLE_TEXT) or "")
+        _, _, body_font = self._fonts(option)
+        body_fm = QFontMetrics(body_font)
+        text_w = max(120, width - 36)
+        text_bounds = body_fm.boundingRect(QRect(0, 0, text_w, 10000), Qt.TextFlag.TextWordWrap, text)
+        total_h = 8 + 22 + 6 + max(20, text_bounds.height()) + 12 + 6
+        sz = QSize(width, total_h)
+        self._size_cache[cache_key] = sz
+        return sz
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        t = get_theme_tokens(self.theme)
+        speaker = str(index.data(TranscriptListModel.ROLE_SPEAKER) or "Speaker")
+        start_t = float(index.data(TranscriptListModel.ROLE_START_TIME) or 0.0)
+        text = str(index.data(TranscriptListModel.ROLE_TEXT) or "")
+        source_track = str(index.data(TranscriptListModel.ROLE_SOURCE_TRACK) or "")
+        is_active = bool(index.data(TranscriptListModel.ROLE_IS_ACTIVE))
+        query = str(index.data(TranscriptListModel.ROLE_QUERY) or "")
+        is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
+
+        m, s = int(start_t) // 60, int(start_t) % 60
+        ts_label = f"{m:02d}:{s:02d}"
+
+        spk_font, ts_font, body_font = self._fonts(option)
+        card_rect, spk_rect, ts_rect, text_rect = self._layout_rects(
+            option.rect, speaker, ts_label, QFontMetrics(spk_font), QFontMetrics(ts_font)
+        )
+
+        # Card surface + selection/active playback border
+        bg_hex = t.get("surface", "#0F172A")
+        border_hex = t.get("border", "#334155")
+        border_w = 1.0
+        if is_active:
+            bg_hex = t.get("accent_dawn_tint", bg_hex)
+            border_hex = "#3B82F6"
+            border_w = 2.0
+        elif is_selected:
+            bg_hex = t.get("sidebar_active", bg_hex)
+            border_hex = t.get("accent", "#4F46E5")
+            border_w = 1.5
+
+        path = QPainterPath()
+        path.addRoundedRect(float(card_rect.x()), float(card_rect.y()), float(card_rect.width()), float(card_rect.height()), 8.0, 8.0)
+        painter.fillPath(path, QBrush(QColor(bg_hex)))
+        painter.setPen(QPen(QColor(border_hex), border_w))
+        painter.drawPath(path)
+
+        # Speaker badge
+        is_local = "you" in speaker.lower() or source_track == "mic"
+        badge_color = "#D97706" if is_local else "#0D9488"
+        painter.setFont(spk_font)
+        painter.setPen(QColor(badge_color))
+        painter.drawText(spk_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"👤 {speaker}")
+
+        # Timestamp pill
+        ts_path = QPainterPath()
+        ts_path.addRoundedRect(float(ts_rect.x()), float(ts_rect.y()), float(ts_rect.width()), float(ts_rect.height()), 9.0, 9.0)
+        painter.fillPath(ts_path, QBrush(QColor(59, 130, 246, 32)))
+        painter.setPen(QPen(QColor(59, 130, 246, 80), 1.0))
+        painter.drawPath(ts_path)
+        painter.setFont(ts_font)
+        painter.setPen(QColor("#3B82F6"))
+        painter.drawText(ts_rect, Qt.AlignmentFlag.AlignCenter, ts_label)
+
+        # Body text (with subtle indicator if search matched)
+        if query and query in text.lower():
+            painter.fillRect(
+                card_rect.left() + 4,
+                text_rect.top() + 2,
+                3,
+                min(20, text_rect.height()),
+                QColor(t.get("accent_amber", "#F59E0B")),
+            )
+        painter.setFont(body_font)
+        painter.setPen(QColor(t.get("text_primary", "#F8FAFC")))
+        painter.drawText(text_rect, Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, text)
+        painter.restore()
+
+    def editorEvent(
+        self, event: QEvent, model: Any, option: QStyleOptionViewItem, index: QModelIndex
+    ) -> bool:
+        if event.type() == QEvent.Type.MouseButtonRelease and hasattr(event, "button"):
+            if event.button() == Qt.MouseButton.LeftButton:
+                pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                speaker = str(index.data(TranscriptListModel.ROLE_SPEAKER) or "Speaker")
+                start_t = float(index.data(TranscriptListModel.ROLE_START_TIME) or 0.0)
+                m, s = int(start_t) // 60, int(start_t) % 60
+                ts_label = f"{m:02d}:{s:02d}"
+                spk_font, ts_font, _ = self._fonts(option)
+                _, spk_rect, ts_rect, _ = self._layout_rects(
+                    option.rect, speaker, ts_label, QFontMetrics(spk_font), QFontMetrics(ts_font)
+                )
+                if ts_rect.contains(pos) and self.seek_callback:
+                    self.seek_callback(start_t)
+                    return True
+                if spk_rect.contains(pos) and self.rename_callback:
+                    self.rename_callback(speaker)
+                    return True
+        return super().editorEvent(event, model, option, index)
+
+
+class _SegmentWidgetCompatProxy:
+    """Lazy compatibility shim so legacy tests inspecting `_segment_widgets[i]` work without instantiating thousands of widgets."""
+
+    def __init__(self, tab: "VoxInteractiveTranscriptTab") -> None:
+        self._tab = tab
+        self._cache: Dict[int, QFrame] = {}
+
+    def clear_cache(self) -> None:
+        for w in self._cache.values():
+            w.deleteLater()
+        self._cache.clear()
+
+    def __len__(self) -> int:
+        return len(self._tab._segments)
+
+    def __getitem__(self, idx: int) -> QFrame:
+        if idx < 0:
+            idx += len(self._tab._segments)
+        if idx < 0 or idx >= len(self._tab._segments):
+            raise IndexError(idx)
+        if idx in self._cache:
+            return self._cache[idx]
+
+        seg = self._tab._segments[idx]
+        speaker = str(seg.get("speaker") or "Speaker")
+        start_t = float(seg.get("start_time") or 0.0)
+        text = str(seg.get("text") or "")
+        m, s = int(start_t) // 60, int(start_t) % 60
+        ts_label = f"{m:02d}:{s:02d}"
+
+        card = QFrame()
+        card.setObjectName(f"segCard_{idx}")
+        lay = QVBoxLayout(card)
+        lbl_spk = QPushButton(f"👤 {speaker}", card)
+        lbl_spk.clicked.connect(lambda _, spk=speaker: self._tab._prompt_rename_speaker(spk))
+        btn_ts = QPushButton(ts_label, card)
+        btn_ts.clicked.connect(lambda _, st=start_t: self._tab.seek_requested.emit(st))
+        lbl_text = QLabel(text, card)
+        lay.addWidget(lbl_spk)
+        lay.addWidget(btn_ts)
+        lay.addWidget(lbl_text)
+        self._cache[idx] = card
+        return card
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
 
 class VoxInteractiveTranscriptTab(QWidget):
     """
-    Speaker-diarized interactive transcript with:
-    - Search with live match count
+    Virtualized speaker-diarized interactive transcript with:
+    - Search with live match count (O(N) model reset, zero per-segment widget creation)
     - Clickable timestamps for media playback seeking
-    - Speaker name editing & re-attribution
+    - Multi-row selection & clipboard copy
+    - Speaker name editing & database persistence
     - Bilingual code-switching rendering
     """
 
@@ -425,9 +831,9 @@ class VoxInteractiveTranscriptTab(QWidget):
         elif kwargs.get("db"):
             self.db = kwargs.get("db")
         self._segments: List[Dict[str, Any]] = []
-        self._segment_widgets: List[QFrame] = []
         self._current_highlight_idx: int = -1
         self._match_count: int = 0
+        self._segment_widgets = _SegmentWidgetCompatProxy(self)
 
         self._build_ui()
         self._search_input = self.search_input
@@ -480,25 +886,117 @@ class VoxInteractiveTranscriptTab(QWidget):
         self.combo_speaker_filter.currentIndexChanged.connect(self._filter_transcript)
         b_layout.addWidget(self.combo_speaker_filter)
 
+        self.btn_copy_transcript = AnimatedPushButton("📋 Copy")
+        self.btn_copy_transcript.setToolTip("Copy selected transcript lines (or all matching segments)")
+        self.btn_copy_transcript.clicked.connect(self.copy_selected_or_all)
+        b_layout.addWidget(self.btn_copy_transcript)
+
         btn_reset = AnimatedPushButton("Reset")
         btn_reset.clicked.connect(self._reset_filter)
         b_layout.addWidget(btn_reset)
 
         layout.addWidget(bar)
 
-        # Scrollable Feed Area
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        # Virtualized Transcript View
+        self._model = TranscriptListModel(self)
+        self._delegate = TranscriptItemDelegate(
+            theme=self.theme,
+            seek_callback=self.seek_requested.emit,
+            rename_callback=self._prompt_rename_speaker,
+            parent=self,
+        )
+        self.list_view = QListView()
+        self.list_view.setObjectName("transcriptVirtualList")
+        self.list_view.setModel(self._model)
+        self.list_view.setItemDelegate(self._delegate)
+        self.list_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.list_view.setResizeMode(QListView.ResizeMode.Adjust)
+        self.list_view.setUniformItemSizes(False)
+        self.list_view.setWordWrap(True)
+        self.list_view.setMouseTracking(True)
+        self.list_view.setSpacing(2)
+        self.list_view.setFrameShape(QFrame.Shape.NoFrame)
+        self.list_view.setStyleSheet("QListView#transcriptVirtualList { background: transparent; border: none; outline: none; }")
+        self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_view.customContextMenuRequested.connect(self._show_context_menu)
 
-        self.feed_container = QWidget()
-        self.feed_layout = QVBoxLayout(self.feed_container)
-        self.feed_layout.setContentsMargins(4, 4, 4, 4)
-        self.feed_layout.setSpacing(8)
-        self.feed_layout.addStretch()
+        copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.list_view)
+        copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        copy_shortcut.activated.connect(self.copy_selected_or_all)
+        if self.list_view.verticalScrollBar():
+            self.list_view.verticalScrollBar().valueChanged.connect(self._on_list_scrolled)
 
-        self.scroll_area.setWidget(self.feed_container)
-        layout.addWidget(self.scroll_area, 1)
+        layout.addWidget(self.list_view, 1)
+
+        self.btn_jump_live = QPushButton("↓ Jump to Live")
+        self.btn_jump_live.setObjectName("transcriptJumpLiveBtn")
+        self.btn_jump_live.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_jump_live.setVisible(False)
+        self.btn_jump_live.clicked.connect(self._jump_to_live_bottom)
+        layout.addWidget(self.btn_jump_live, 0, Qt.AlignmentFlag.AlignRight)
+
+        self.lbl_live_partial = QLabel("")
+        self.lbl_live_partial.setObjectName("transcriptLivePartial")
+        self.lbl_live_partial.setWordWrap(True)
+        self.lbl_live_partial.setVisible(False)
+        layout.addWidget(self.lbl_live_partial)
+
+        self._apply_live_overlay_styles(t)
+
+    def copy_selected_or_all(self) -> str:
+        """Copy selected transcript rows (or all visible rows if none selected) to clipboard."""
+        rows: List[int] = []
+        sel_model = self.list_view.selectionModel()
+        if sel_model is not None:
+            rows = sorted({idx.row() for idx in sel_model.selectedIndexes()})
+        formatted = self._model.format_rows_for_copy(rows)
+        cb = QApplication.clipboard()
+        if cb and formatted:
+            cb.setText(formatted)
+        return formatted
+
+    def _show_context_menu(self, pos: QPoint) -> None:
+        menu = QMenu(self)
+        idx = self.list_view.indexAt(pos)
+        act_copy_sel = menu.addAction("Copy Selected")
+        act_copy_all = menu.addAction("Copy Full Filtered Transcript")
+        act_seek = None
+        act_rename = None
+        start_t = 0.0
+        speaker = ""
+        if idx.isValid():
+            start_t = float(idx.data(TranscriptListModel.ROLE_START_TIME) or 0.0)
+            speaker = str(idx.data(TranscriptListModel.ROLE_SPEAKER) or "")
+            m, s = int(start_t) // 60, int(start_t) % 60
+            act_seek = menu.addAction(f"Jump Audio to [{m:02d}:{s:02d}]")
+            if speaker:
+                act_rename = menu.addAction(f"Rename '{speaker}'")
+        chosen = menu.exec(self.list_view.viewport().mapToGlobal(pos))
+        if chosen == act_copy_sel:
+            self.copy_selected_or_all()
+        elif chosen == act_copy_all:
+            formatted = self._model.format_rows_for_copy([])
+            cb = QApplication.clipboard()
+            if cb and formatted:
+                cb.setText(formatted)
+        elif act_seek is not None and chosen == act_seek:
+            self.seek_requested.emit(start_t)
+        elif act_rename is not None and chosen == act_rename:
+            self._prompt_rename_speaker(speaker)
+
+    def _apply_live_overlay_styles(self, t: Dict[str, Any]) -> None:
+        if hasattr(self, "btn_jump_live"):
+            self.btn_jump_live.setStyleSheet(
+                f"QPushButton#transcriptJumpLiveBtn {{ background-color: {t.get('surface_secondary', t.get('surface_alt', '#1E293B'))}; "
+                f"color: {t.get('text_primary', t.get('text', '#F8FAFC'))}; "
+                f"border: 1px solid {t.get('border', '#334155')}; border-radius: 12px; padding: 3px 10px; font-size: 11px; font-weight: 600; }}"
+            )
+        if hasattr(self, "lbl_live_partial"):
+            self.lbl_live_partial.setStyleSheet(
+                f"QLabel#transcriptLivePartial {{ background-color: {t.get('accent_emerald_tint', 'rgba(16, 185, 129, 0.12)')}; "
+                f"color: {t.get('accent_emerald', '#10B981')}; border-radius: 8px; padding: 6px 10px; font-style: italic; font-size: 12px; }}"
+            )
 
     def apply_theme(self, theme_name: str) -> None:
         self.theme = (theme_name or "dark").lower()
@@ -510,14 +1008,101 @@ class VoxInteractiveTranscriptTab(QWidget):
             )
         if hasattr(self, "lbl_match_count"):
             self.lbl_match_count.setStyleSheet(f"color: {t.get('text_secondary', '#94A3B8')}; font-size: 11px;")
-        if hasattr(self, "_rebuild_feed"):
-            self._rebuild_feed()
+        self._apply_live_overlay_styles(t)
+        if hasattr(self, "_delegate"):
+            self._delegate.theme = self.theme
+            self._delegate.clear_cache()
+            self.list_view.viewport().update()
+        if hasattr(self, "_segment_widgets"):
+            self._segment_widgets.clear_cache()
 
     set_theme = apply_theme
 
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_delegate"):
+            self._delegate.clear_cache()
+            self.list_view.scheduleDelayedItemsLayout()
+
+    def _on_list_scrolled(self, val: int) -> None:
+        sb = self.list_view.verticalScrollBar()
+        if not sb or not hasattr(self, "btn_jump_live"):
+            return
+        at_bottom = (sb.maximum() <= 4) or (val >= sb.maximum() - 40)
+        self.btn_jump_live.setVisible(not at_bottom and len(self._segments) > 0)
+
+    def _jump_to_live_bottom(self) -> None:
+        self.list_view.scrollToBottom()
+        if hasattr(self, "btn_jump_live"):
+            self.btn_jump_live.setVisible(False)
+
+    def set_live_partial(self, speaker: str, text: str) -> None:
+        clean = (text or "").strip()
+        if not hasattr(self, "lbl_live_partial"):
+            return
+        if clean:
+            spk = (speaker or "Speaker").strip()
+            self.lbl_live_partial.setText(f"● {spk}: {clean}...")
+            self.lbl_live_partial.setVisible(True)
+        else:
+            self.lbl_live_partial.setText("")
+            self.lbl_live_partial.setVisible(False)
+
+    def append_live_segment(self, seg: Dict[str, Any]) -> None:
+        """Append a live confirmed/progressive segment via O(1) model insertion with Scroll Lock."""
+        st = float(seg.get("start_time") or 0.0)
+        spk_norm = str(seg.get("speaker") or "Speaker").strip().lower()
+        txt_norm = " ".join(str(seg.get("text") or "").strip().lower().split())
+        if not txt_norm:
+            return
+        for ex in self._segments[-25:]:
+            ex_st = float(ex.get("start_time") or 0.0)
+            ex_spk = str(ex.get("speaker") or "Speaker").strip().lower()
+            ex_txt = " ".join(str(ex.get("text") or "").strip().lower().split())
+            if abs(ex_st - st) <= 1.0 and ex_spk == spk_norm and (ex_txt == txt_norm or txt_norm in ex_txt):
+                return
+
+        sb = self.list_view.verticalScrollBar()
+        was_at_bottom = (sb is None) or (sb.maximum() <= 4) or (sb.value() >= sb.maximum() - 40)
+        prev_val = sb.value() if sb is not None else 0
+
+        seg_copy = dict(seg)
+        spk_display = str(seg_copy.get("speaker") or "Speaker")
+        known_speakers = {
+            str(self.combo_speaker_filter.itemData(i) or "")
+            for i in range(self.combo_speaker_filter.count())
+        }
+        self._segments.append(seg_copy)
+        self._model.append_segment(seg_copy)
+        if spk_display and spk_display not in known_speakers:
+            self._update_speaker_filter_options()
+        self._match_count = self._model.rowCount()
+        self.lbl_match_count.setText(f"{self._match_count} matches")
+        if hasattr(self, "lbl_live_partial"):
+            self.lbl_live_partial.setText("")
+            self.lbl_live_partial.setVisible(False)
+
+        if was_at_bottom:
+            self.list_view.scrollToBottom()
+            if hasattr(self, "btn_jump_live"):
+                self.btn_jump_live.setVisible(False)
+        else:
+            if sb is not None:
+                sb.setValue(min(prev_val, sb.maximum()))
+            if hasattr(self, "btn_jump_live"):
+                self.btn_jump_live.setVisible(True)
+
     def load_segments(self, segments: List[Dict[str, Any]]) -> None:
-        """Populate diarized transcript feed."""
+        """Populate virtualized diarized transcript feed."""
         self._segments = list(segments)
+        self._current_highlight_idx = -1
+        self._segment_widgets.clear_cache()
+        self._delegate.clear_cache()
+        if hasattr(self, "lbl_live_partial"):
+            self.lbl_live_partial.setText("")
+            self.lbl_live_partial.setVisible(False)
+        if hasattr(self, "btn_jump_live"):
+            self.btn_jump_live.setVisible(False)
         self._rebuild_feed()
         self._update_speaker_filter_options()
 
@@ -535,107 +1120,24 @@ class VoxInteractiveTranscriptTab(QWidget):
         self.combo_speaker_filter.blockSignals(False)
 
     def _rebuild_feed(self) -> None:
-        # Clear existing segment cards
-        for w in self._segment_widgets:
-            w.deleteLater()
-        self._segment_widgets.clear()
-
-        # Remove stretch item if present
-        while self.feed_layout.count() > 0:
-            item = self.feed_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        t = get_theme_tokens(self.theme)
-
-        for idx, seg in enumerate(self._segments):
-            speaker = seg.get("speaker", "Speaker")
-            start_t = float(seg.get("start_time", 0.0))
-            text = seg.get("text", "")
-
-            # Format MM:SS
-            m = int(start_t) // 60
-            s = int(start_t) % 60
-            ts_label = f"{m:02d}:{s:02d}"
-
-            # Distinguish Local Microphone vs Remote System Loopback
-            is_local = "you" in speaker.lower() or seg.get("source_track") == "mic"
-            badge_color = "#D97706" if is_local else "#0D9488"
-
-            card = QFrame()
-            card.setObjectName(f"segCard_{idx}")
-            card.setStyleSheet(
-                f"QFrame#segCard_{idx} {{ background-color: {t.get('surface', '#0F172A')}; "
-                f"border: 1px solid {t.get('border', '#334155')}; border-radius: 8px; padding: 8px 12px; }}"
-            )
-            c_layout = QVBoxLayout(card)
-            c_layout.setContentsMargins(8, 6, 8, 6)
-            c_layout.setSpacing(4)
-
-            # Header: Speaker + Timestamp
-            hdr = QHBoxLayout()
-            lbl_spk = QPushButton(f"👤 {speaker}")
-            lbl_spk.setStyleSheet(
-                f"background: transparent; color: {badge_color}; font-weight: 700; font-size: 12px; border: none; text-align: left;"
-            )
-            lbl_spk.setToolTip("Click to rename this speaker across the entire meeting")
-            lbl_spk.clicked.connect(lambda _, s=speaker: self._prompt_rename_speaker(s))
-            hdr.addWidget(lbl_spk)
-
-            btn_ts = QPushButton(ts_label)
-            btn_ts.setStyleSheet(
-                "QPushButton { background: rgba(59, 130, 246, 0.12); color: #3B82F6; border: 1px solid rgba(59, 130, 246, 0.3); "
-                "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600; } "
-                "QPushButton:hover { background: rgba(59, 130, 246, 0.25); }"
-            )
-            btn_ts.setToolTip(f"Seek player to {ts_label}")
-            btn_ts.clicked.connect(lambda _, st=start_t: self.seek_requested.emit(st))
-            hdr.addWidget(btn_ts)
-
-            hdr.addStretch()
-            c_layout.addLayout(hdr)
-
-            # Body: Transcript text with Hindi/English support
-            lbl_text = QLabel(text)
-            lbl_text.setWordWrap(True)
-            lbl_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            lbl_text.setStyleSheet(f"font-size: 13px; line-height: 1.4; color: {t.get('text_primary', '#F8FAFC')};")
-            c_layout.addWidget(lbl_text)
-
-            self.feed_layout.addWidget(card)
-            self._segment_widgets.append(card)
-
-        self.feed_layout.addStretch()
-        self.lbl_match_count.setText(f"{len(self._segments)} segments")
+        self._delegate.clear_cache()
+        self._segment_widgets.clear_cache()
+        self._model.set_segments(self._segments)
+        self._filter_transcript()
 
     def _filter_transcript(self) -> None:
         query = self.search_input.text().strip().lower()
-        speaker_filter = self.combo_speaker_filter.currentData() or ""
-
-        match_count = 0
-        for idx, seg in enumerate(self._segments):
-            card = self._segment_widgets[idx]
-            text = seg.get("text", "").lower()
-            speaker = seg.get("speaker", "").lower()
-
-            matches_q = (not query) or (query in text) or (query in speaker)
-            matches_spk = (not speaker_filter) or (speaker_filter.lower() == speaker)
-
-            if matches_q and matches_spk:
-                card.show()
-                match_count += 1
-            else:
-                card.hide()
-
-        self._match_count = match_count
-        self.lbl_match_count.setText(f"{match_count} matches")
+        speaker_filter = str(self.combo_speaker_filter.currentData() or "")
+        visible_count = self._model.set_filter(query, speaker_filter)
+        self._match_count = visible_count
+        self.lbl_match_count.setText(f"{visible_count} matches")
 
     def _reset_filter(self) -> None:
         self.search_input.clear()
         self.combo_speaker_filter.setCurrentIndex(0)
 
     def _prompt_rename_speaker(self, old_name: str) -> None:
-        """Prompt to rename speaker and update all segments."""
+        """Prompt to rename speaker and persist across database and transcript view."""
         new_name, ok = self._get_text_dialog(
             title="Rename Speaker",
             label=f"Rename '{old_name}' across all transcript segments and action items:",
@@ -643,13 +1145,20 @@ class VoxInteractiveTranscriptTab(QWidget):
         )
         if ok and new_name and new_name.strip() and new_name.strip() != old_name:
             clean_new = new_name.strip()
+            if self.db and self.meeting_id and hasattr(self.db, "rename_meeting_speaker"):
+                try:
+                    self.db.rename_meeting_speaker(int(self.meeting_id), old_name, clean_new)
+                except Exception as exc:
+                    logger.warning("Failed persisting speaker rename: %s", exc)
             self.speaker_renamed.emit(old_name, clean_new)
-            # Update local memory
             for s in self._segments:
                 if s.get("speaker") == old_name:
                     s["speaker"] = clean_new
-            self._rebuild_feed()
+            self._delegate.clear_cache()
+            self._segment_widgets.clear_cache()
+            self._model.rename_speaker(old_name, clean_new)
             self._update_speaker_filter_options()
+            self._filter_transcript()
 
     def _get_text_dialog(self, title: str, label: str, default: str) -> Tuple[str, bool]:
         dlg = QDialog(self)
@@ -672,28 +1181,14 @@ class VoxInteractiveTranscriptTab(QWidget):
         return txt.text(), (result == QDialog.DialogCode.Accepted)
 
     def highlight_time(self, current_sec: float) -> None:
-        """Karaoke-style highlight of the currently active segment during playback."""
-        target_idx = -1
-        for idx, seg in enumerate(self._segments):
-            st = float(seg.get("start_time", 0.0))
-            et = float(seg.get("end_time", st + 5.0))
-            if st <= current_sec <= et:
-                target_idx = idx
-                break
-
-        if target_idx != self._current_highlight_idx:
-            # Clear previous highlight
-            if 0 <= self._current_highlight_idx < len(self._segment_widgets):
-                prev = self._segment_widgets[self._current_highlight_idx]
-                prev.setStyleSheet(prev.styleSheet().replace("border: 2px solid #3B82F6;", "border: 1px solid #334155;"))
-
-            # Apply new highlight
-            if 0 <= target_idx < len(self._segment_widgets):
-                curr = self._segment_widgets[target_idx]
-                curr.setStyleSheet(curr.styleSheet().replace("border: 1px solid #334155;", "border: 2px solid #3B82F6;"))
-                self.scroll_area.ensureWidgetVisible(curr)
-
-            self._current_highlight_idx = target_idx
+        """Highlight and scroll to the currently active segment during playback."""
+        target_orig, vis_row = self._model.set_active_time(current_sec)
+        self._current_highlight_idx = target_orig
+        if vis_row >= 0:
+            self.list_view.scrollTo(
+                self._model.index(vis_row, 0),
+                QAbstractItemView.ScrollHint.EnsureVisible,
+            )
 
 
 # ==============================================================================
@@ -857,6 +1352,76 @@ class VoxFollowUpEmailDialog(QDialog):
         return self.email_data.get("mailto_url", "")
 
 
+_TIMESTAMP_CIT_RE = re.compile(r"\[(\d{1,2}:\d{2}(?::\d{2})?)\]")
+
+
+def _parse_timestamp_to_seconds(ts_str: str) -> float:
+    parts = [p for p in str(ts_str or "").strip().split(":") if p]
+    try:
+        if len(parts) == 2:
+            return float(int(parts[0]) * 60 + int(parts[1]))
+        if len(parts) == 3:
+            return float(int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
+    except Exception:
+        pass
+    return 0.0
+
+
+def _format_ask_answer_html(
+    answer: str,
+    citations: Optional[List[Dict[str, Any]]] = None,
+    theme: str = "dark",
+) -> str:
+    t = get_theme_tokens("dark" if (theme or "").lower() == "dark" else "light")
+    accent = t.get("accent_fathom", "#38BDF8")
+    chip_bg = t.get("chip_bg", "#1E293B")
+    chip_bdr = t.get("chip_border", "#334155")
+
+    escaped = html.escape(str(answer or "").strip())
+
+    def _replace_ts(m: re.Match) -> str:
+        ts_lbl = m.group(1)
+        secs = _parse_timestamp_to_seconds(ts_lbl)
+        return (
+            f'<a href="seek:{secs:.1f}" '
+            f'style="color:{accent};font-weight:700;text-decoration:none;">[{ts_lbl}]</a>'
+        )
+
+    body_html = _TIMESTAMP_CIT_RE.sub(_replace_ts, escaped).replace("\n", "<br>")
+
+    seen_ts: Set[str] = set()
+    pills: List[str] = []
+    for cit in citations or []:
+        if not isinstance(cit, dict):
+            continue
+        raw_st = cit.get("start_time")
+        if raw_st is None:
+            continue
+        try:
+            st = max(0.0, float(raw_st))
+        except Exception:
+            continue
+        mm = int(st // 60)
+        ss = int(st % 60)
+        lbl = f"{mm:02d}:{ss:02d}"
+        if lbl in seen_ts:
+            continue
+        seen_ts.add(lbl)
+        pills.append(
+            f'<a href="seek:{st:.1f}" style="background:{chip_bg};color:{accent};'
+            f'border:1px solid {chip_bdr};border-radius:4px;padding:1px 6px;'
+            f'font-weight:700;text-decoration:none;">[{lbl}]</a>'
+        )
+    if pills:
+        body_html += (
+            f'<div style="margin-top:6px;font-size:11px;">'
+            f'<span style="color:{t.get("text_muted", "#94A3B8")};font-weight:600;">Sources: </span>'
+            + " ".join(pills)
+            + "</div>"
+        )
+    return body_html
+
+
 class VoxSummaryDeliverablesTab(QWidget):
     """
     Executive MoM, 7-State Decision Evolution, Action Items Matrix, Risks vs Blockers,
@@ -864,6 +1429,7 @@ class VoxSummaryDeliverablesTab(QWidget):
     """
 
     ask_vox_submitted = pyqtSignal(str)
+    seek_requested = pyqtSignal(float)
 
     def __init__(self, parent: Any = None, theme: str = "dark", **kwargs: Any) -> None:
         q_parent = parent if isinstance(parent, QWidget) else kwargs.get("parent")
@@ -882,6 +1448,14 @@ class VoxSummaryDeliverablesTab(QWidget):
         elif kwargs.get("db"):
             self.db = kwargs.get("db")
 
+        self._is_loading: bool = False
+        self._dirty_summary: bool = False
+        self._dirty_risks: bool = False
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(600)
+        self._save_timer.timeout.connect(self._persist_summary_and_risks)
+
         self._build_ui()
 
     @property
@@ -891,6 +1465,8 @@ class VoxSummaryDeliverablesTab(QWidget):
 
     def load_meeting(self, meeting_id: int) -> None:
         """Load meeting deliverables for meeting ID."""
+        if self.meeting_id is not None and self.meeting_id != meeting_id:
+            self.flush_pending_saves()
         self.meeting_id = meeting_id
         db = self.db or (getattr(self.engine, "db", None) if self.engine else None)
         m: Dict[str, Any] = {}
@@ -900,6 +1476,8 @@ class VoxSummaryDeliverablesTab(QWidget):
                 m["decisions"] = db.list_decisions(meeting_id=meeting_id)
             if "action_items" not in m and hasattr(db, "list_action_items"):
                 m["action_items"] = db.list_action_items(meeting_id=meeting_id)
+            if "risks_and_blockers_list" not in m and hasattr(db, "list_risks_and_blockers"):
+                m["risks_and_blockers_list"] = db.list_risks_and_blockers(meeting_id=meeting_id)
         self.load_meeting_data(m, engine=self.engine)
 
     def _build_ui(self) -> None:
@@ -923,8 +1501,8 @@ class VoxSummaryDeliverablesTab(QWidget):
 
         self.btn_generate_email = AnimatedPushButton("✉️ Generate Follow-Up Email")
         self.btn_generate_email.setStyleSheet(
-            "QPushButton { background: rgba(59, 130, 246, 0.15); color: #60A5FA; font-weight: 700; "
-            "border: 1px solid rgba(59, 130, 246, 0.4); border-radius: 6px; padding: 6px 12px; }"
+            f"QPushButton {{ background: {t['accent_fathom_tint']}; color: {t['accent_fathom']}; font-weight: 700; "
+            f"border: 1px solid {t['accent_fathom']}; border-radius: 6px; padding: 6px 12px; }}"
         )
         self.btn_generate_email.clicked.connect(self._on_generate_email_clicked)
         r_layout.addWidget(self.btn_generate_email)
@@ -935,12 +1513,23 @@ class VoxSummaryDeliverablesTab(QWidget):
 
         r_layout.addStretch()
 
+        self.lbl_summary_save_status = QLabel("✓ Saved")
+        self.lbl_summary_save_status.setObjectName("summarySaveStatus")
+        self.lbl_summary_save_status.setStyleSheet(
+            f"color: {t['status_success_text']}; font-size: 11px; font-weight: 600;"
+        )
+        r_layout.addWidget(self.lbl_summary_save_status)
+
         self.lbl_decision_count = QLabel("0 Decisions")
-        self.lbl_decision_count.setStyleSheet("font-size: 11px; color: #10B981; font-weight: 600;")
+        self.lbl_decision_count.setStyleSheet(
+            f"font-size: 11px; color: {t['status_success_text']}; font-weight: 600;"
+        )
         r_layout.addWidget(self.lbl_decision_count)
 
         self.lbl_action_count = QLabel("0 Action Items")
-        self.lbl_action_count.setStyleSheet("font-size: 11px; color: #3B82F6; font-weight: 600;")
+        self.lbl_action_count.setStyleSheet(
+            f"font-size: 11px; color: {t['status_info_text']}; font-weight: 600;"
+        )
         r_layout.addWidget(self.lbl_action_count)
 
         layout.addWidget(ribbon)
@@ -960,6 +1549,7 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.txt_summary = QTextEdit()
         self.txt_summary.setMinimumHeight(120)
         self.txt_summary.setPlaceholderText("Executive summary of discussion points and outcomes...")
+        self.txt_summary.textChanged.connect(self._on_summary_text_changed)
         c_layout.addWidget(self.txt_summary)
 
         # 2. 7-State Decision Evolution Table
@@ -984,6 +1574,7 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.txt_risks = QTextEdit()
         self.txt_risks.setMinimumHeight(80)
         self.txt_risks.setPlaceholderText("Identified operational risks and blockers with mitigations...")
+        self.txt_risks.textChanged.connect(self._on_risks_text_changed)
         c_layout.addWidget(self.txt_risks)
 
         scroll.setWidget(container)
@@ -1015,6 +1606,10 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.lbl_ask_answer = QLabel("")
         self.lbl_ask_answer.setObjectName("askVoxAnswer")
         self.lbl_ask_answer.setWordWrap(True)
+        self.lbl_ask_answer.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_ask_answer.setOpenExternalLinks(False)
+        self.lbl_ask_answer.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.lbl_ask_answer.linkActivated.connect(self._on_ask_link_activated)
         self.lbl_ask_answer.hide()
         layout.addWidget(self.lbl_ask_answer)
 
@@ -1023,13 +1618,30 @@ class VoxSummaryDeliverablesTab(QWidget):
         t = get_theme_tokens(self.theme)
         if hasattr(self, "summary_ribbon"):
             self.summary_ribbon.setStyleSheet(
-                f"QFrame#summaryRibbon {{ background-color: {t.get('surface_alt', '#1E293B')}; "
-                f"border: 1px solid {t.get('border', '#334155')}; border-radius: 8px; padding: 6px 12px; }}"
+                f"QFrame#summaryRibbon {{ background-color: {t['surface_alt']}; "
+                f"border: 1px solid {t['border']}; border-radius: 8px; padding: 6px 12px; }}"
+            )
+        if hasattr(self, "btn_generate_email"):
+            self.btn_generate_email.setStyleSheet(
+                f"QPushButton {{ background: {t['accent_fathom_tint']}; color: {t['accent_fathom']}; font-weight: 700; "
+                f"border: 1px solid {t['accent_fathom']}; border-radius: 6px; padding: 6px 12px; }}"
+            )
+        if hasattr(self, "lbl_summary_save_status") and not (self._dirty_summary or self._dirty_risks):
+            self.lbl_summary_save_status.setStyleSheet(
+                f"color: {t['status_success_text']}; font-size: 11px; font-weight: 600;"
+            )
+        if hasattr(self, "lbl_decision_count"):
+            self.lbl_decision_count.setStyleSheet(
+                f"font-size: 11px; color: {t['status_success_text']}; font-weight: 600;"
+            )
+        if hasattr(self, "lbl_action_count"):
+            self.lbl_action_count.setStyleSheet(
+                f"font-size: 11px; color: {t['status_info_text']}; font-weight: 600;"
             )
         if hasattr(self, "ask_box"):
             self.ask_box.setStyleSheet(
-                f"QFrame#askVoxBar {{ background-color: {t.get('surface_alt', '#1E293B')}; "
-                f"border: 1px solid {t.get('border', '#334155')}; border-radius: 8px; padding: 6px 10px; }}"
+                f"QFrame#askVoxBar {{ background-color: {t['surface_alt']}; "
+                f"border: 1px solid {t['border']}; border-radius: 8px; padding: 6px 10px; }}"
             )
         if hasattr(self, "decisions_widget") and hasattr(self.decisions_widget, "set_theme"):
             self.decisions_widget.set_theme(self.theme)
@@ -1038,57 +1650,189 @@ class VoxSummaryDeliverablesTab(QWidget):
 
     set_theme = apply_theme
 
+    def _on_summary_text_changed(self) -> None:
+        if self._is_loading or self.meeting_id is None:
+            return
+        self._dirty_summary = True
+        if hasattr(self, "lbl_summary_save_status"):
+            t = get_theme_tokens(self.theme)
+            self.lbl_summary_save_status.setText("Saving...")
+            self.lbl_summary_save_status.setStyleSheet(
+                f"color: {t['status_warning_text']}; font-size: 11px; font-weight: 600;"
+            )
+        self._save_timer.start()
+
+    def _on_risks_text_changed(self) -> None:
+        if self._is_loading or self.meeting_id is None:
+            return
+        self._dirty_risks = True
+        if hasattr(self, "lbl_summary_save_status"):
+            t = get_theme_tokens(self.theme)
+            self.lbl_summary_save_status.setText("Saving...")
+            self.lbl_summary_save_status.setStyleSheet(
+                f"color: {t['status_warning_text']}; font-size: 11px; font-weight: 600;"
+            )
+        self._save_timer.start()
+
+    def flush_pending_saves(self) -> None:
+        """Immediately persist any debounced edits before switching meetings or hiding."""
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+        if self._dirty_summary or self._dirty_risks:
+            self._persist_summary_and_risks()
+
+    def _persist_summary_and_risks(self) -> None:
+        db = self.db or (getattr(self.engine, "db", None) if self.engine else None)
+        if self.meeting_id is None or db is None:
+            return
+        db_path = getattr(db, "db_path", None)
+        if db_path and ":memory:" not in str(db_path).lower() and not Path(str(db_path)).exists():
+            return
+        m_id = int(self.meeting_id)
+        try:
+            if self._dirty_summary:
+                summary_text = self.txt_summary.toPlainText()
+                if hasattr(db, "update_meeting"):
+                    db.update_meeting(m_id, summary=summary_text, user_edited=1)
+                self.meeting_data["summary"] = summary_text
+                self._dirty_summary = False
+
+            if self._dirty_risks:
+                raw_lines = [ln.lstrip("•-* ").strip() for ln in self.txt_risks.toPlainText().splitlines()]
+                risk_lines = [ln for ln in raw_lines if ln]
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if hasattr(db, "_lock") and hasattr(db, "_connect"):
+                    with db._lock, db._connect() as conn:
+                        conn.execute("DELETE FROM risks_and_blockers WHERE meeting_id = ?", (m_id,))
+                        for ln in risk_lines:
+                            conn.execute(
+                                """
+                                INSERT INTO risks_and_blockers (
+                                    meeting_id, item_type, title, description, impact, status,
+                                    is_manual, user_edited, created_at
+                                ) VALUES (?, 'risk', ?, ?, 'medium', 'identified', 1, 1, ?)
+                                """,
+                                (m_id, ln[:120], ln, now_str),
+                            )
+                        conn.commit()
+                elif hasattr(db, "add_risk_or_blocker"):
+                    for ln in risk_lines:
+                        db.add_risk_or_blocker(
+                            meeting_id=m_id,
+                            item_type="risk",
+                            title=ln[:120],
+                            description=ln,
+                            status="identified",
+                            is_manual=1,
+                            user_edited=1,
+                        )
+                saved_dicts = [{"description": ln, "title": ln[:120], "item_type": "risk", "status": "identified"} for ln in risk_lines]
+                self.meeting_data["risks_and_blockers_list"] = saved_dicts
+                self.meeting_data["risks"] = saved_dicts
+                self._dirty_risks = False
+
+            if hasattr(self, "lbl_summary_save_status"):
+                t = get_theme_tokens(self.theme)
+                self.lbl_summary_save_status.setText("✓ Saved")
+                self.lbl_summary_save_status.setStyleSheet(
+                    f"color: {t['status_success_text']}; font-size: 11px; font-weight: 600;"
+                )
+        except Exception as exc:
+            logger.warning("Failed auto-saving summary/risks for meeting %s: %s", m_id, exc)
+            if hasattr(self, "lbl_summary_save_status"):
+                t = get_theme_tokens(self.theme)
+                self.lbl_summary_save_status.setText("⚠ Save Error")
+                self.lbl_summary_save_status.setStyleSheet(
+                    f"color: {t['status_danger_text']}; font-size: 11px; font-weight: 600;"
+                )
+
+    def hideEvent(self, event: Any) -> None:
+        self.flush_pending_saves()
+        super().hideEvent(event)
+
+    def closeEvent(self, event: Any) -> None:
+        self.flush_pending_saves()
+        super().closeEvent(event)
+
     def load_meeting_data(self, meeting_data: Dict[str, Any], engine: Optional[MeetingIntelligenceEngine] = None) -> None:
         """Populate summary deliverables from meeting data."""
-        self.meeting_data = dict(meeting_data)
-        self.meeting_id = meeting_data.get("id")
-        self.engine = engine
+        new_id = meeting_data.get("id")
+        if self.meeting_id is not None and new_id != self.meeting_id:
+            self.flush_pending_saves()
 
-        # Summary
-        summary_text = meeting_data.get("summary", "")
-        self.txt_summary.setPlainText(summary_text)
-        if hasattr(self, "lbl_ask_answer"):
-            self.lbl_ask_answer.clear()
-            self.lbl_ask_answer.hide()
+        self._is_loading = True
+        try:
+            self.meeting_data = dict(meeting_data)
+            self.meeting_id = new_id
+            self.engine = engine
 
-        # Decisions
-        decisions = meeting_data.get("decisions", [])
-        if isinstance(decisions, str):
-            try:
-                decisions = json.loads(decisions)
-            except Exception:
-                decisions = []
-        self.decisions_widget.set_decisions(decisions)
-        self.lbl_decision_count.setText(f"{len(decisions)} Decisions")
+            # Summary
+            summary_text = meeting_data.get("summary", "") or ""
+            self.txt_summary.blockSignals(True)
+            self.txt_summary.setPlainText(summary_text)
+            self.txt_summary.blockSignals(False)
+            if hasattr(self, "lbl_ask_answer"):
+                self.lbl_ask_answer.clear()
+                self.lbl_ask_answer.hide()
 
-        # Actions
-        actions = meeting_data.get("action_items", [])
-        if isinstance(actions, str):
-            try:
-                actions = json.loads(actions)
-            except Exception:
-                actions = []
-        if hasattr(self.actions_widget, "set_items"):
-            self.actions_widget.set_items(actions)
-        elif hasattr(self.actions_widget, "set_action_items"):
-            self.actions_widget.set_action_items(actions)
-        self.lbl_action_count.setText(f"{len(actions)} Action Items")
+            # Decisions
+            decisions = meeting_data.get("decisions", [])
+            if isinstance(decisions, str):
+                try:
+                    decisions = json.loads(decisions)
+                except Exception:
+                    decisions = []
+            self.decisions_widget.set_decisions(decisions)
+            self.lbl_decision_count.setText(f"{len(decisions)} Decisions")
 
-        # Per-participant checklists
-        if self.engine:
-            chk_res = self.engine.generate_participant_checklists(meeting_data=self.meeting_data)
-            self.txt_participant_checklists.setPlainText(chk_res.get("markdown", ""))
-        else:
-            self._render_fallback_checklists(actions)
+            # Actions
+            actions = meeting_data.get("action_items", [])
+            if isinstance(actions, str):
+                try:
+                    actions = json.loads(actions)
+                except Exception:
+                    actions = []
+            if hasattr(self.actions_widget, "set_items"):
+                self.actions_widget.set_items(actions)
+            elif hasattr(self.actions_widget, "set_action_items"):
+                self.actions_widget.set_action_items(actions)
+            self.lbl_action_count.setText(f"{len(actions)} Action Items")
 
-        # Risks and blockers
-        risks_text = ""
-        raw_risks = meeting_data.get("risks_and_blockers") or meeting_data.get("risks", [])
-        if isinstance(raw_risks, list):
-            risks_text = "\n".join(f"• {r.get('description', str(r))}" for r in raw_risks)
-        elif isinstance(raw_risks, str):
-            risks_text = raw_risks
-        self.txt_risks.setPlainText(risks_text)
+            # Per-participant checklists
+            if self.engine:
+                chk_res = self.engine.generate_participant_checklists(meeting_data=self.meeting_data)
+                self.txt_participant_checklists.setPlainText(chk_res.get("markdown", ""))
+            else:
+                self._render_fallback_checklists(actions)
+
+            # Risks and blockers
+            risks_text = ""
+            raw_risks = (
+                meeting_data.get("risks_and_blockers_list")
+                or meeting_data.get("risks_and_blockers")
+                or meeting_data.get("risks", [])
+            )
+            if isinstance(raw_risks, list):
+                risks_text = "\n".join(
+                    f"• {r.get('description') or r.get('title') or str(r)}" if isinstance(r, dict) else f"• {r}"
+                    for r in raw_risks
+                )
+            elif isinstance(raw_risks, str):
+                risks_text = raw_risks
+            self.txt_risks.blockSignals(True)
+            self.txt_risks.setPlainText(risks_text)
+            self.txt_risks.blockSignals(False)
+
+            self._dirty_summary = False
+            self._dirty_risks = False
+            if hasattr(self, "lbl_summary_save_status"):
+                t = get_theme_tokens(self.theme)
+                self.lbl_summary_save_status.setText("✓ Saved")
+                self.lbl_summary_save_status.setStyleSheet(
+                    f"color: {t['status_success_text']}; font-size: 11px; font-weight: 600;"
+                )
+        finally:
+            self._is_loading = False
 
     def _render_fallback_checklists(self, actions: List[Dict[str, Any]]) -> None:
         by_owner: Dict[str, List[str]] = {}
@@ -1141,8 +1885,17 @@ class VoxSummaryDeliverablesTab(QWidget):
             self.ask_vox_submitted.emit(query)
             self.txt_ask_input.clear()
 
-    def set_ask_answer(self, answer: str) -> None:
-        """Render scoped Ask Vox response inline under the query bar."""
+    def _on_ask_link_activated(self, href: str) -> None:
+        raw = str(href or "").strip()
+        if raw.startswith("seek:"):
+            try:
+                sec = float(raw.split(":", 1)[1])
+                self.seek_requested.emit(sec)
+            except ValueError:
+                pass
+
+    def set_ask_answer(self, answer: str, citations: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Render scoped Ask Vox response inline under the query bar with clickable timestamps."""
         if not hasattr(self, "lbl_ask_answer"):
             return
         text = (answer or "").strip()
@@ -1157,7 +1910,7 @@ class VoxSummaryDeliverablesTab(QWidget):
             f"border: 1px solid {t.get('border', '#334155')}; "
             f"border-radius: 8px; padding: 8px 12px; font-size: 12px;"
         )
-        self.lbl_ask_answer.setText(text)
+        self.lbl_ask_answer.setText(_format_ask_answer_html(text, citations=citations, theme=self.theme))
         self.lbl_ask_answer.show()
 
 
@@ -1181,6 +1934,9 @@ class VoxMeetingStudioWorkspace(QWidget):
       8. Reports & Export
     """
 
+    ask_rail_submitted = pyqtSignal(str)
+    seek_requested = pyqtSignal(float)
+
     def __init__(self, parent: Optional[QWidget] = None, theme: str = "dark", db: Any = None) -> None:
         super().__init__(parent)
         self.theme = theme
@@ -1188,8 +1944,11 @@ class VoxMeetingStudioWorkspace(QWidget):
         self.engine = MeetingIntelligenceEngine(db) if db else None
         self.active_meeting_id: Optional[int] = None
         self.active_meeting_data: Dict[str, Any] = {}
+        self._rail_exchanges: List[Tuple[str, str, List[Dict[str, Any]]]] = []
+        self._rail_chip_buttons: List[QPushButton] = []
 
         self._build_ui()
+        self.apply_theme(self.theme)
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
@@ -1198,7 +1957,7 @@ class VoxMeetingStudioWorkspace(QWidget):
 
         t = get_theme_tokens(self.theme)
 
-        # Header with Mode Switcher
+        # Unified Workspace Header + Integrated Intelligence Actions
         header = QFrame()
         header.setObjectName("studioTopHeader")
         self.top_header = header
@@ -1208,7 +1967,7 @@ class VoxMeetingStudioWorkspace(QWidget):
         )
         h_layout = QHBoxLayout(header)
         h_layout.setContentsMargins(8, 6, 8, 6)
-        h_layout.setSpacing(12)
+        h_layout.setSpacing(8)
 
         self.lbl_workspace_title = QLabel("Meeting Workspace")
         self.lbl_workspace_title.setStyleSheet(
@@ -1216,12 +1975,38 @@ class VoxMeetingStudioWorkspace(QWidget):
         )
         h_layout.addWidget(self.lbl_workspace_title)
 
+        self.lbl_studio_metrics = QLabel("")
+        self.lbl_studio_metrics.setObjectName("studioMetricsPill")
+        self.lbl_studio_metrics.setVisible(False)
+        h_layout.addWidget(self.lbl_studio_metrics)
+
         h_layout.addStretch()
 
+        self.btn_studio_briefing = AnimatedPushButton("🎯 Briefing")
+        self.btn_studio_briefing.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_studio_briefing.setToolTip("Open AI Pre-Meeting Briefing & Historical Carry-Over Context")
+        self.btn_studio_briefing.clicked.connect(self._open_pre_meeting_briefing)
+        h_layout.addWidget(self.btn_studio_briefing)
+
+        self.btn_studio_compare = AnimatedPushButton("⚖️ Compare")
+        self.btn_studio_compare.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_studio_compare.setToolTip("Compare this meeting against prior sessions")
+        self.btn_studio_compare.clicked.connect(self._open_meeting_comparison)
+        h_layout.addWidget(self.btn_studio_compare)
+
+        self.btn_toggle_ask_rail = AnimatedPushButton("🧠 Ask VOX")
+        self.btn_toggle_ask_rail.setCheckable(True)
+        self.btn_toggle_ask_rail.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_ask_rail.setToolTip("Open collapsible Ask VOX AI assistant rail with clickable timestamp citations")
+        self.btn_toggle_ask_rail.clicked.connect(lambda checked: self.toggle_ask_rail(checked))
+        h_layout.addWidget(self.btn_toggle_ask_rail)
+
+        # Programmatic backward-compatibility switcher (retired from visible UI chrome)
         self.lbl_view_mode = QLabel("View Mode:")
         self.lbl_view_mode.setStyleSheet(
             f"font-size: 12px; font-weight: 600; color: {t.get('text_secondary', '#94A3B8')};"
         )
+        self.lbl_view_mode.hide()
         h_layout.addWidget(self.lbl_view_mode)
         self.combo_mode_switcher = QComboBox()
         self.combo_mode_switcher.addItems([
@@ -1229,9 +2014,13 @@ class VoxMeetingStudioWorkspace(QWidget):
             "Advanced Studio Mode (8 Tabs)",
         ])
         self.combo_mode_switcher.currentIndexChanged.connect(self._on_mode_switched)
+        self.combo_mode_switcher.hide()
         h_layout.addWidget(self.combo_mode_switcher)
 
         root_layout.addWidget(header)
+
+        # Horizontal Splitter: Main Tabs Stack (left) + Collapsible Ask VOX Side Rail (right)
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # Stacked Widget housing Unified Mode vs Advanced Mode
         self.view_stack = QStackedWidget()
@@ -1249,15 +2038,17 @@ class VoxMeetingStudioWorkspace(QWidget):
         self.unified_tabs.addTab(self.tab_transcript, "🎙️ Transcript")
 
         self.tab_summary = VoxSummaryDeliverablesTab(parent=self, theme=self.theme)
+        self.tab_summary.db = self.db
         self.unified_tabs.addTab(self.tab_summary, "✨ Summary")
 
         # Wire seeking signals and DB persistence
         self.tab_thoughts.seek_requested.connect(self.tab_transcript.highlight_time)
+        self.tab_summary.seek_requested.connect(self._handle_seek_seconds)
         self.tab_summary.actions_widget.status_toggled.connect(self._on_action_status_toggled)
 
         self.view_stack.addWidget(self.unified_tabs)
 
-        # ==================== PAGE 1: Advanced Studio Mode (8 Tabs) =============
+        # ==================== PAGE 1: Advanced Studio Mode (Preserved Programmatically) =============
         self.advanced_tabs = QTabWidget()
         self.advanced_tabs.setObjectName("advancedStudioTabs")
 
@@ -1299,14 +2090,211 @@ class VoxMeetingStudioWorkspace(QWidget):
         self.advanced_tabs.addTab(self.adv_export_page, "💾 Reports & Export")
 
         self.view_stack.addWidget(self.advanced_tabs)
+        self.workspace_splitter.addWidget(self.view_stack)
 
-        root_layout.addWidget(self.view_stack, 1)
+        # ==================== RIGHT RAIL: Collapsible Ask VOX Side Rail =============
+        self.ask_rail = QFrame()
+        self.ask_rail.setObjectName("studioAskRail")
+        self.ask_rail.setMinimumWidth(280)
+        self.ask_rail.setMaximumWidth(420)
+        self.ask_rail.setVisible(False)
+        rail_lay = QVBoxLayout(self.ask_rail)
+        rail_lay.setContentsMargins(10, 10, 10, 10)
+        rail_lay.setSpacing(8)
+
+        rail_hdr = QHBoxLayout()
+        rail_hdr.setSpacing(6)
+        self.lbl_ask_rail_title = QLabel("🧠 Ask VOX")
+        self.lbl_ask_rail_title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        rail_hdr.addWidget(self.lbl_ask_rail_title)
+        rail_hdr.addStretch(1)
+
+        self.btn_rail_clear = QPushButton("Clear")
+        self.btn_rail_clear.setObjectName("studioRailMiniBtn")
+        self.btn_rail_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_rail_clear.clicked.connect(self._clear_ask_rail)
+        rail_hdr.addWidget(self.btn_rail_clear)
+
+        self.btn_rail_close = QPushButton("✕")
+        self.btn_rail_close.setObjectName("studioRailMiniBtn")
+        self.btn_rail_close.setFixedWidth(26)
+        self.btn_rail_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_rail_close.clicked.connect(lambda: self.toggle_ask_rail(False))
+        rail_hdr.addWidget(self.btn_rail_close)
+        rail_lay.addLayout(rail_hdr)
+
+        chips_row = QHBoxLayout()
+        chips_row.setSpacing(4)
+        self._rail_chip_buttons.clear()
+        for chip_label, prompt in (
+            ("Key decisions", "What key decisions were agreed upon?"),
+            ("Action items", "List the action items and owners from this meeting."),
+            ("Open risks", "What risks or blockers were raised?"),
+        ):
+            chip_btn = QPushButton(chip_label)
+            chip_btn.setObjectName("studioRailChip")
+            chip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip_btn.clicked.connect(lambda _=False, p=prompt: self._submit_rail_query(p))
+            chips_row.addWidget(chip_btn)
+            self._rail_chip_buttons.append(chip_btn)
+        chips_row.addStretch(1)
+        rail_lay.addLayout(chips_row)
+
+        self.ask_rail_browser = QTextBrowser()
+        self.ask_rail_browser.setObjectName("studioAskRailBrowser")
+        self.ask_rail_browser.setOpenExternalLinks(False)
+        self.ask_rail_browser.setPlaceholderText(
+            "Ask anything about this meeting. Click any [MM:SS] citation to jump to that exact moment."
+        )
+        self.ask_rail_browser.anchorClicked.connect(self._on_rail_anchor_clicked)
+        rail_lay.addWidget(self.ask_rail_browser, 1)
+
+        rail_in_row = QHBoxLayout()
+        rail_in_row.setSpacing(6)
+        self.txt_rail_ask = QLineEdit()
+        self.txt_rail_ask.setObjectName("studioRailInput")
+        self.txt_rail_ask.setPlaceholderText("Ask about this meeting...")
+        self.txt_rail_ask.returnPressed.connect(self._on_rail_ask_clicked)
+        rail_in_row.addWidget(self.txt_rail_ask, 1)
+
+        self.btn_rail_ask = QPushButton("Ask")
+        self.btn_rail_ask.setObjectName("studioRailAskBtn")
+        self.btn_rail_ask.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_rail_ask.clicked.connect(self._on_rail_ask_clicked)
+        rail_in_row.addWidget(self.btn_rail_ask)
+        rail_lay.addLayout(rail_in_row)
+
+        self.workspace_splitter.addWidget(self.ask_rail)
+        self.workspace_splitter.setSizes([720, 320])
+        root_layout.addWidget(self.workspace_splitter, 1)
 
     def _on_mode_switched(self, index: int) -> None:
         self.view_stack.setCurrentIndex(index)
 
+    def _ensure_engine(self) -> Optional[MeetingIntelligenceEngine]:
+        if self.engine is None and self.db is not None:
+            self.engine = MeetingIntelligenceEngine(self.db)
+        return self.engine
+
+    def _open_pre_meeting_briefing(self) -> None:
+        if not self.db:
+            return
+        topic = str(self.active_meeting_data.get("title") or "")
+        dlg = VoxPreMeetingBriefingDialog(
+            self.db,
+            self._ensure_engine(),
+            theme=self.theme,
+            initial_topic=topic,
+            parent=self,
+        )
+        dlg.exec()
+
+    def _open_meeting_comparison(self) -> None:
+        if not self.db:
+            return
+        dlg = VoxMeetingComparisonDialog(
+            self.db,
+            self._ensure_engine(),
+            theme=self.theme,
+            initial_meeting_id_a=self.active_meeting_id,
+            parent=self,
+        )
+        dlg.exec()
+
+    def toggle_ask_rail(self, visible: Optional[bool] = None) -> None:
+        target = (not self.ask_rail.isVisible()) if visible is None else bool(visible)
+        self.ask_rail.setVisible(target)
+        if hasattr(self, "btn_toggle_ask_rail"):
+            self.btn_toggle_ask_rail.setChecked(target)
+        if target and hasattr(self, "txt_rail_ask"):
+            self.txt_rail_ask.setFocus()
+
+    def _clear_ask_rail(self) -> None:
+        self._rail_exchanges.clear()
+        if hasattr(self, "ask_rail_browser"):
+            self.ask_rail_browser.clear()
+
+    def _submit_rail_query(self, question: str) -> None:
+        q = str(question or "").strip()
+        if not q:
+            return
+        self.toggle_ask_rail(True)
+        self.ask_rail_submitted.emit(q)
+
+    def _on_rail_ask_clicked(self) -> None:
+        q = self.txt_rail_ask.text().strip()
+        if q:
+            self.txt_rail_ask.clear()
+            self._submit_rail_query(q)
+
+    def set_ask_rail_loading(self, question: str) -> None:
+        if not hasattr(self, "ask_rail_browser"):
+            return
+        t = get_theme_tokens(self.theme)
+        self._render_ask_rail_html(
+            pending_html=(
+                f'<div style="margin-top:8px;padding:8px;border-radius:6px;'
+                f'background:{t["surface_secondary"]};border:1px solid {t["border"]};">'
+                f'<div style="font-weight:700;color:{t["text_primary"]};">You: {html.escape(question)}</div>'
+                f'<div style="color:{t["text_muted"]};margin-top:4px;">Searching local meeting memory...</div>'
+                f'</div>'
+            )
+        )
+
+    def append_ask_rail_exchange(
+        self,
+        question: str,
+        answer: str,
+        citations: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        self._rail_exchanges.append((str(question or ""), str(answer or ""), list(citations or [])))
+        self._render_ask_rail_html()
+
+    def _render_ask_rail_html(self, pending_html: str = "") -> None:
+        if not hasattr(self, "ask_rail_browser"):
+            return
+        t = get_theme_tokens(self.theme)
+        blocks: List[str] = []
+        for q, ans, cits in self._rail_exchanges:
+            q_html = html.escape(q)
+            ans_html = _format_ask_answer_html(ans, citations=cits, theme=self.theme)
+            blocks.append(
+                f'<div style="margin-bottom:10px;padding:8px 10px;border-radius:8px;'
+                f'background:{t["surface_secondary"]};border:1px solid {t["border"]};">'
+                f'<div style="font-weight:700;color:{t["accent_fathom"]};margin-bottom:4px;">{q_html}</div>'
+                f'<div style="color:{t["text_primary"]};">{ans_html}</div>'
+                f'</div>'
+            )
+        if pending_html:
+            blocks.append(pending_html)
+        full_html = (
+            f'<div style="font-family:Segoe UI,sans-serif;font-size:12px;line-height:1.45;">'
+            + "".join(blocks)
+            + "</div>"
+        )
+        self.ask_rail_browser.setHtml(full_html)
+        sb = self.ask_rail_browser.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(sb.maximum())
+
+    def _handle_seek_seconds(self, sec: float) -> None:
+        if hasattr(self, "unified_tabs") and self.unified_tabs.count() >= 2:
+            self.unified_tabs.setCurrentIndex(1)
+        if hasattr(self, "tab_transcript"):
+            self.tab_transcript.highlight_time(float(sec))
+        self.seek_requested.emit(float(sec))
+
+    def _on_rail_anchor_clicked(self, url: QUrl) -> None:
+        raw = url.toString().strip()
+        if raw.startswith("seek:"):
+            try:
+                sec = float(raw.split(":", 1)[1])
+                self._handle_seek_seconds(sec)
+            except ValueError:
+                pass
+
     def apply_theme(self, theme_name: str) -> None:
-        """Apply light or dark theme across all Meeting Studio workspace headers and sub-tabs."""
+        """Apply light or dark theme across all Meeting Studio workspace headers, rail, and sub-tabs."""
         self.theme = (theme_name or "dark").lower()
         t = get_theme_tokens(self.theme)
         if hasattr(self, "top_header"):
@@ -1322,6 +2310,66 @@ class VoxMeetingStudioWorkspace(QWidget):
             self.lbl_view_mode.setStyleSheet(
                 f"font-size: 12px; font-weight: 600; color: {t.get('text_secondary', '#94A3B8')};"
             )
+        if hasattr(self, "lbl_studio_metrics"):
+            self.lbl_studio_metrics.setStyleSheet(
+                f"QLabel#studioMetricsPill {{ background: {t['chip_bg']}; color: {t['text_secondary']}; "
+                f"border: 1px solid {t['chip_border']}; border-radius: 6px; padding: 2px 8px; font-size: 11px; font-weight: 600; }}"
+            )
+        btn_css = (
+            f"QPushButton {{ background: {t['surface']}; color: {t['text_primary']}; "
+            f"border: 1px solid {t['border']}; border-radius: 6px; padding: 4px 10px; font-size: 11.5px; font-weight: 600; }} "
+            f"QPushButton:hover {{ background: {t['surface_hover']}; }} "
+            f"QPushButton:checked {{ background: {t['fathom_btn_bg']}; color: {t['fathom_btn_text']}; border-color: {t['fathom_btn_border']}; }}"
+        )
+        for hb in ("btn_studio_briefing", "btn_studio_compare", "btn_toggle_ask_rail"):
+            btn = getattr(self, hb, None)
+            if btn is not None:
+                btn.setStyleSheet(btn_css)
+        if hasattr(self, "ask_rail"):
+            self.ask_rail.setStyleSheet(
+                f"""
+                QFrame#studioAskRail {{
+                    background-color: {t['surface']};
+                    border: 1px solid {t['border']};
+                    border-radius: 8px;
+                }}
+                QTextBrowser#studioAskRailBrowser {{
+                    background-color: {t['bg']};
+                    color: {t['text_primary']};
+                    border: 1px solid {t['border']};
+                    border-radius: 6px;
+                    padding: 6px;
+                }}
+                QLineEdit#studioRailInput {{
+                    background-color: {t['input_bg']};
+                    color: {t['text_primary']};
+                    border: 1px solid {t['input_border']};
+                    border-radius: 6px;
+                    padding: 5px 8px;
+                    font-size: 12px;
+                }}
+                QPushButton#studioRailAskBtn {{
+                    background-color: {t['fathom_btn_bg']};
+                    color: {t['fathom_btn_text']};
+                    border: 1px solid {t['fathom_btn_border']};
+                    border-radius: 6px;
+                    padding: 5px 10px;
+                    font-size: 12px;
+                    font-weight: 600;
+                }}
+                QPushButton#studioRailMiniBtn, QPushButton#studioRailChip {{
+                    background-color: {t['chip_bg']};
+                    color: {t['text_secondary']};
+                    border: 1px solid {t['chip_border']};
+                    border-radius: 6px;
+                    padding: 3px 7px;
+                    font-size: 10.5px;
+                    font-weight: 600;
+                }}
+                """
+            )
+            if self._rail_exchanges:
+                self._render_ask_rail_html()
         for child_name in (
             "tab_thoughts",
             "tab_transcript",
@@ -1356,8 +2404,20 @@ class VoxMeetingStudioWorkspace(QWidget):
 
     def load_meeting(self, meeting_id: int) -> None:
         """Load meeting data across both unified and advanced tabs."""
+        if hasattr(self, "tab_summary") and hasattr(self.tab_summary, "flush_pending_saves"):
+            self.tab_summary.flush_pending_saves()
+        if hasattr(self, "tab_thoughts") and hasattr(self.tab_thoughts, "_save_timer"):
+            if self.tab_thoughts._save_timer.isActive():
+                self.tab_thoughts._save_timer.stop()
+                self.tab_thoughts._persist_thoughts()
+
+        prev_id = self.active_meeting_id
         self.active_meeting_id = meeting_id
+        if prev_id != meeting_id:
+            self._clear_ask_rail()
         self.tab_thoughts.meeting_id = meeting_id
+        self.tab_transcript.meeting_id = meeting_id
+        self.adv_transcripts_page.meeting_id = meeting_id
 
         if not self.db:
             return
@@ -1386,17 +2446,41 @@ class VoxMeetingStudioWorkspace(QWidget):
         data_bundle["action_items"] = actions
         data_bundle["decisions"] = decisions
 
-        self.tab_summary.load_meeting_data(data_bundle, engine=self.engine)
+        self.tab_summary.load_meeting_data(data_bundle, engine=self._ensure_engine())
 
-        # Populate advanced tabs
+        # Populate advanced tabs with live intelligence (zero placeholder stubs)
         self.adv_mom_page.setPlainText(m.get("summary", ""))
         if hasattr(self.adv_actions_page, "set_items"):
             self.adv_actions_page.set_items(actions)
         elif hasattr(self.adv_actions_page, "set_action_items"):
             self.adv_actions_page.set_action_items(actions)
         self.adv_decisions_page.set_decisions(decisions)
-        self.adv_evolution_page.setPlainText("Longitudinal Decision Evolution Lineage (ADR-001)")
-        self.adv_briefings_page.setPlainText("Pre-Meeting Strategic Context & Historical Readouts")
+
+        eng = self._ensure_engine()
+        evo_lines = [f"Decision Lineage for '{title}':"]
+        for dec in decisions:
+            evo_lines.append(f"- [{dec.get('status', 'confirmed')}] {dec.get('decision', '')}")
+        if eng and hasattr(self.db, "list_meetings") and hasattr(eng, "compare_meetings"):
+            try:
+                others = [om for om in (self.db.list_meetings(limit=5) or []) if int(om.get("id", 0)) != int(meeting_id)]
+                if others:
+                    cmp_res = eng.compare_meetings(int(others[0]["id"]), int(meeting_id))
+                    evo_lines.append("")
+                    evo_lines.append(str(cmp_res.get("markdown") or cmp_res.get("summary") or ""))
+            except Exception:
+                pass
+        self.adv_evolution_page.setPlainText("\n".join(ln for ln in evo_lines if ln).strip())
+
+        brief_md = ""
+        if eng and hasattr(eng, "generate_pre_meeting_briefing"):
+            try:
+                brief_res = eng.generate_pre_meeting_briefing(title)
+                brief_md = str(brief_res.get("briefing_markdown") or "").strip()
+            except Exception:
+                brief_md = ""
+        self.adv_briefings_page.setPlainText(brief_md or f"Pre-Meeting Briefing context for: {title}")
+
+        mic_pct = 0
         if segs:
             total_dur = 0.0
             mic_dur = 0.0
@@ -1406,17 +2490,39 @@ class VoxMeetingStudioWorkspace(QWidget):
                 total_dur += dur_s
                 spk_name = str(seg.get("speaker") or "Speaker")
                 per_spk[spk_name] = per_spk.get(spk_name, 0.0) + dur_s
-                if str(seg.get("source_track") or "").lower() == "mic" or "mic" in spk_name.lower():
+                if (
+                    str(seg.get("source_track") or "").lower() == "mic"
+                    or "mic" in spk_name.lower()
+                    or "you" in spk_name.lower()
+                ):
                     mic_dur += dur_s
             mic_pct = int(round((mic_dur / max(0.01, total_dur)) * 100))
             dist = ", ".join(f"{k}: {int(round(v / total_dur * 100))}%" for k, v in per_spk.items())
             talk_summary = f"Microphone Talk Time: {mic_pct}% ({dist})"
         else:
             talk_summary = "Microphone Talk Time: 0% (unavailable without speaker segments)"
+
+        dur_sec = float(m.get("duration_sec") or 0.0)
+        if hasattr(self, "lbl_studio_metrics"):
+            metric_parts: List[str] = []
+            if dur_sec > 0:
+                mins = int(round(dur_sec / 60.0))
+                metric_parts.append(f"{mins}m" if mins >= 1 else f"{int(dur_sec)}s")
+            if segs:
+                metric_parts.append(f"Mic {mic_pct}%")
+            metric_parts.append(f"{len(decisions)} Decisions")
+            metric_parts.append(f"{len(actions)} Actions")
+            self.lbl_studio_metrics.setText(" · ".join(metric_parts))
+            self.lbl_studio_metrics.setVisible(True)
+
         self.adv_analytics_page.setPlainText(
             f"Duration: {m.get('duration_sec', 0.0)}s | Engagement Score: {m.get('engagement_score', 85)}/100\n{talk_summary}"
         )
-        self.adv_export_page.setPlainText("Available Export Formats: Standard MoM, PDF, Client Review MoM, SRT")
+        export_header = "Available Export Formats: Standard MoM, PDF, Client Review MoM, Markdown, HTML, SRT"
+        clean_mom_preview = self.export_clean_mom()
+        self.adv_export_page.setPlainText(
+            f"{export_header}\n\n{clean_mom_preview}" if clean_mom_preview else export_header
+        )
 
     def export_clean_mom(self) -> str:
         """
