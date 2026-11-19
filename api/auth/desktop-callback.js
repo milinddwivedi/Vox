@@ -67,7 +67,7 @@ module.exports = async function handler(req, res) {
   const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || supabaseAnonKey;
 
   const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ['290945439058-kipvted3lsi25t8fjts2mpdm1addciop', 'apps.googleusercontent.com'].join('.');
-  const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || ['GOCSPX', 'sFOPfmCar-5OUZkqlHK26U1_BQeZ'].join('-');
+  const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
   const headers = req.headers || {};
   const proto = (headers['x-forwarded-proto'] || 'https');
   const host = headers['x-forwarded-host'] || headers.host || 'vox-voice-assistant.vercel.app';
@@ -80,8 +80,8 @@ module.exports = async function handler(req, res) {
   let serverIsPro = false;
 
   if (code && !error) {
-    // 2A. Direct Google OAuth code exchange
-    if (code.startsWith('4/') || code.length > 25) {
+    // 2A. Direct Google OAuth code exchange (fallback when secret is configured in env)
+    if ((code.startsWith('4/') || code.length > 25) && GOOGLE_CLIENT_SECRET) {
       try {
         const querystring = require('querystring');
         const https = require('https');
