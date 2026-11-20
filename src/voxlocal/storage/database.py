@@ -293,6 +293,11 @@ class LocalDatabase:
                 ("calendar_provider", "ALTER TABLE meetings ADD COLUMN calendar_provider TEXT DEFAULT '';"),
                 ("calendar_account_id", "ALTER TABLE meetings ADD COLUMN calendar_account_id TEXT DEFAULT '';"),
                 ("user_id", "ALTER TABLE meetings ADD COLUMN user_id TEXT DEFAULT 'default';"),
+                ("completeness_report_json", "ALTER TABLE meetings ADD COLUMN completeness_report_json TEXT DEFAULT '';"),
+                ("finalization_reason", "ALTER TABLE meetings ADD COLUMN finalization_reason TEXT DEFAULT '';"),
+                ("cleaned_transcript", "ALTER TABLE meetings ADD COLUMN cleaned_transcript TEXT DEFAULT '';"),
+                ("raw_text", "ALTER TABLE transcript_segments ADD COLUMN raw_text TEXT DEFAULT '';"),
+                ("is_uncertain", "ALTER TABLE transcript_segments ADD COLUMN is_uncertain INTEGER DEFAULT 0;"),
             ]:
                 try:
                     conn.execute(ddl)
@@ -801,6 +806,9 @@ class LocalDatabase:
             "calendar_provider",
             "calendar_account_id",
             "user_id",
+            "completeness_report_json",
+            "finalization_reason",
+            "cleaned_transcript",
         }
         fields = {k: v for k, v in kwargs.items() if k in allowed}
         if not fields:
@@ -821,10 +829,14 @@ class LocalDatabase:
         text: str = "",
         source_track: str = "mixed",
         confidence: float = 1.0,
+        raw_text: str = "",
+        is_uncertain: bool = False,
     ) -> int:
         norm_txt = text.strip()
         if not norm_txt:
             return 0
+        raw_val = (raw_text or norm_txt).strip()
+        unc_flag = 1 if is_uncertain else 0
         st_round = round(float(start_time), 2)
         et_round = round(float(end_time), 2)
         with self._lock, self._connect() as conn:
@@ -856,10 +868,17 @@ class LocalDatabase:
                     conn.execute(
                         """
                         UPDATE transcript_segments
-                        SET text = ?, end_time = ?, confidence = ?
+                        SET text = ?, raw_text = ?, end_time = ?, confidence = ?, is_uncertain = ?
                         WHERE id = ?
                         """,
-                        (norm_txt, max(et_round, float(ex_row["end_time"])), max(confidence, float(ex_row["confidence"])), ex_id),
+                        (
+                            norm_txt,
+                            raw_val,
+                            max(et_round, float(ex_row["end_time"])),
+                            max(confidence, float(ex_row["confidence"])),
+                            unc_flag,
+                            ex_id,
+                        ),
                     )
                     conn.commit()
                     return ex_id
@@ -871,8 +890,8 @@ class LocalDatabase:
                 """
                 INSERT INTO transcript_segments (
                     meeting_id, segment_index, start_time, end_time,
-                    speaker, source_track, text, confidence
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    speaker, source_track, text, confidence, raw_text, is_uncertain
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     meeting_id,
@@ -883,6 +902,8 @@ class LocalDatabase:
                     source_track,
                     norm_txt,
                     confidence,
+                    raw_val,
+                    unc_flag,
                 ),
             )
             conn.commit()
@@ -901,12 +922,14 @@ class LocalDatabase:
                 text = str(seg.get("text", "")).strip()
                 if not text:
                     continue
+                raw_text = str(seg.get("raw_text") or text).strip()
+                is_unc = 1 if bool(seg.get("is_uncertain", False)) else 0
                 conn.execute(
                     """
                     INSERT INTO transcript_segments (
                         meeting_id, segment_index, start_time, end_time,
-                        speaker, source_track, text, confidence
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        speaker, source_track, text, confidence, raw_text, is_uncertain
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         meeting_id,
@@ -917,6 +940,8 @@ class LocalDatabase:
                         source_track,
                         text,
                         float(seg.get("confidence", 1.0)),
+                        raw_text,
+                        is_unc,
                     ),
                 )
                 mm = int(start_t // 60)

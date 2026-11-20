@@ -8,17 +8,46 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+import importlib.util
+import json
 import os
 import platform
 import shutil
+import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from voxlocal.core.logger import get_app_root, get_logger
 
 logger = get_logger("hardware")
+
+
+@dataclass
+class ExecutionProfile:
+    """Adaptive live + offline ASR execution plan selected from host CPU, RAM, and GPU headroom."""
+
+    tier_id: str
+    tier_label: str
+    live_backend: str
+    live_model: str
+    live_device: str
+    live_compute_type: str
+    offline_backend: str
+    offline_model: str
+    offline_device: str
+    offline_compute_type: str
+    safe_cpu_threads: int
+    live_best_effort: bool
+    max_concurrent_models: int
+    hf_runtime_available: bool
+    free_vram_mb: Optional[int]
+    fallback_reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 class MEMORYSTATUSEX(ctypes.Structure):
@@ -248,3 +277,307 @@ class HardwareProfiler:
                 "Capture and audio recordings take strict real-time priority over post-meeting AI generation.",
             ]
         }
+
+    @staticmethod
+    def _query_live_gpu_vram_mb() -> Tuple[Optional[int], Optional[int]]:
+        """Query current `(used_mb, free_mb)` via nvidia-smi without initializing CUDA context."""
+        try:
+            kw: Dict[str, Any] = dict(stderr=subprocess.DEVNULL, text=True, timeout=2.0)
+            if os.name == "nt":
+                kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.used,memory.free",
+                    "--format=csv,noheader,nounits",
+                ],
+                **kw,
+            ).strip()
+            if out:
+                parts = [p.strip() for p in out.splitlines()[0].split(",")]
+                if len(parts) >= 2:
+                    return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return None, None
+
+    @staticmethod
+    def _check_hf_asr_runtime_available() -> bool:
+        """Return True iff torch and transformers can be found without importing either eagerly."""
+        try:
+            return (
+                importlib.util.find_spec("torch") is not None
+                and importlib.util.find_spec("transformers") is not None
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _has_local_hf_asr_checkpoint(model_id: str, models_dir: Optional[Path] = None) -> bool:
+        """Check cleanly if an HF ASR checkpoint (Qwen3/Maya) already exists locally on disk."""
+        mid = str(model_id or "").strip()
+        if not mid:
+            return False
+        p_direct = Path(mid)
+        if p_direct.is_dir() and (p_direct / "config.json").exists():
+            return True
+
+        base_dirs: List[Path] = []
+        if models_dir is not None:
+            base_dirs.append(Path(models_dir))
+        app_root = get_app_root()
+        base_dirs.append(app_root / "data" / "models")
+
+        slugs: List[str] = []
+        low = mid.lower()
+        if "maya" in low:
+            slugs.append("maya-transcribe")
+        elif "hinglish" in low or "moorlee" in low:
+            slugs.append("qwen3-asr-0.6b-hinglish")
+        elif "qwen3-asr" in low:
+            slugs.append("qwen3-asr-0.6b")
+        slugs.append(mid.replace("/", "--"))
+
+        for bd in base_dirs:
+            for slug in slugs:
+                for cand in (bd / "challengers" / slug, bd / "hf_asr" / slug, bd / slug):
+                    if (cand / "config.json").exists() and (
+                        (cand / "model.safetensors").exists() or list(cand.glob("*.safetensors"))
+                    ):
+                        return True
+            hub_dir = bd / f"models--{mid.replace('/', '--')}" / "snapshots"
+            if hub_dir.exists() and any((s / "config.json").exists() for s in hub_dir.iterdir() if s.is_dir()):
+                return True
+
+        hf_hub = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{mid.replace('/', '--')}" / "snapshots"
+        if hf_hub.exists() and any((s / "config.json").exists() for s in hf_hub.iterdir() if s.is_dir()):
+            return True
+        return False
+
+    @classmethod
+    def select_execution_profile(
+        cls,
+        config: Any = None,
+        force_refresh: bool = False,
+    ) -> ExecutionProfile:
+        """
+        Determine hardware-adaptive live & offline ASR execution settings across Tier 1, Tier 2,
+        and Tier 3 devices while never loading two heavy models simultaneously.
+        """
+        prof = cls.get_profile(force_refresh=force_refresh)
+        hf_avail = cls._check_hf_asr_runtime_available()
+        used_vram, free_vram = cls._query_live_gpu_vram_mb() if prof.cuda_available else (None, None)
+        if prof.cuda_available and free_vram is None and prof.gpu_vram_gb > 0:
+            free_vram = int(round(prof.gpu_vram_gb * 1024 * 0.7))
+
+        models_dir_raw = getattr(config, "models_dir", "") if config is not None else ""
+        models_dir = Path(models_dir_raw) if models_dir_raw else None
+        hf_model_id = str(getattr(config, "hf_asr_model_id", "Qwen/Qwen3-ASR-0.6B-hf") or "Qwen/Qwen3-ASR-0.6B-hf")
+        hf_rc_enabled = bool(getattr(config, "enable_hf_asr_rc", False)) if config is not None else False
+        live_pref = str(getattr(config, "live_asr_backend", "auto") or "auto").strip().lower()
+        off_pref = str(getattr(config, "offline_asr_backend", "auto") or "auto").strip().lower()
+        adaptive_enabled = bool(getattr(config, "enable_hardware_adaptive_asr", True)) if config is not None else True
+
+        hf_ckpt_ok = cls._has_local_hf_asr_checkpoint(hf_model_id, models_dir=models_dir) if hf_avail else False
+        fallback_reasons: List[str] = []
+
+        # Tier 1: Minimum office laptop (8 GB RAM or <= 4 threads without CUDA)
+        if prof.ram_total_gb < 11.5 or (not prof.cuda_available and prof.cpu_threads <= 4):
+            threads = max(2, min(4, prof.cpu_threads - 1 if prof.cpu_threads > 2 else prof.cpu_threads))
+            if not prof.cuda_available:
+                fallback_reasons.append("No NVIDIA CUDA GPU; using CPU int8 profile.")
+            if prof.ram_total_gb < 11.5:
+                fallback_reasons.append(f"Total RAM {prof.ram_total_gb:.1f} GB < 11.5 GB (Tier 1 conservative profile).")
+            return ExecutionProfile(
+                tier_id="tier1_minimum",
+                tier_label="Tier 1: Minimum Office Laptop (8 GB / CPU-Only)",
+                live_backend="faster_whisper",
+                live_model="base",
+                live_device="cpu",
+                live_compute_type="int8",
+                offline_backend="faster_whisper",
+                offline_model="small",
+                offline_device="cpu",
+                offline_compute_type="int8",
+                safe_cpu_threads=threads,
+                live_best_effort=True,
+                max_concurrent_models=1,
+                hf_runtime_available=hf_avail,
+                free_vram_mb=free_vram,
+                fallback_reason=" ".join(fallback_reasons),
+            )
+
+        # Tier 3 candidate check: >= 15 GB RAM, >= 6 CPU threads, active NVIDIA CUDA & >= 2600 MB free VRAM
+        has_tier3_gpu = (
+            prof.ram_total_gb >= 15.0
+            and prof.cpu_threads >= 6
+            and prof.cuda_available
+            and free_vram is not None
+            and free_vram >= 2600
+        )
+
+        if has_tier3_gpu:
+            threads = max(4, min(8, prof.cpu_threads - 2))
+            want_hf_offline = hf_rc_enabled or (off_pref == "hf_qwen3_asr")
+            if want_hf_offline and hf_avail and hf_ckpt_ok and off_pref != "faster_whisper":
+                off_backend = "hf_qwen3_asr"
+                off_model = hf_model_id
+                off_dev = "cuda"
+                off_ctype = "float16"
+            else:
+                if want_hf_offline and not hf_avail:
+                    fallback_reasons.append("Optional PyTorch/Transformers HF ASR runtime not installed; using faster-whisper.")
+                elif want_hf_offline and not hf_ckpt_ok:
+                    fallback_reasons.append(f"HF checkpoint '{hf_model_id}' not cached locally; using faster-whisper.")
+                off_backend = "faster_whisper"
+                off_model = (
+                    str(getattr(config, "whisper_model", "large-v3-turbo") or "large-v3-turbo")
+                    if (config is not None and not adaptive_enabled)
+                    else "large-v3-turbo"
+                )
+                off_dev = "cuda"
+                off_ctype = "int8"
+
+            if live_pref == "hf_qwen3_asr" and hf_avail and hf_ckpt_ok and free_vram >= 3200:
+                live_backend = "hf_qwen3_asr"
+                live_model = hf_model_id
+                live_dev = "cuda"
+                live_ctype = "float16"
+            else:
+                if live_pref == "hf_qwen3_asr" and free_vram < 3200:
+                    fallback_reasons.append(f"Free VRAM {free_vram} MB < 3200 MB for HF live streaming; using Whisper Turbo.")
+                live_backend = "faster_whisper"
+                live_model = "large-v3-turbo"
+                live_dev = "cuda"
+                live_ctype = "int8"
+
+            return ExecutionProfile(
+                tier_id="tier3_performance",
+                tier_label="Tier 3: Performance Laptop / Workstation (16-32 GB / CUDA GPU)",
+                live_backend=live_backend,
+                live_model=live_model,
+                live_device=live_dev,
+                live_compute_type=live_ctype,
+                offline_backend=off_backend,
+                offline_model=off_model,
+                offline_device=off_dev,
+                offline_compute_type=off_ctype,
+                safe_cpu_threads=threads,
+                live_best_effort=False,
+                max_concurrent_models=1,
+                hf_runtime_available=hf_avail,
+                free_vram_mb=free_vram,
+                fallback_reason=" ".join(fallback_reasons),
+            )
+
+        # Tier 2: Standard Office Laptop (16 GB class, integrated graphics or < 2600 MB free VRAM)
+        threads = max(4, min(6, prof.cpu_threads - 2 if prof.cpu_threads > 4 else prof.cpu_threads))
+        if not prof.cuda_available:
+            fallback_reasons.append("Integrated graphics / CPU-only system; selecting CPU int8 profile.")
+        elif free_vram is not None and free_vram < 2600:
+            fallback_reasons.append(f"Free GPU VRAM ({free_vram} MB) < 2600 MB headroom; falling back cleanly to CPU int8.")
+
+        off_model = "large-v3-turbo" if prof.ram_avail_gb >= 4.5 else "small"
+        if prof.ram_avail_gb < 4.5:
+            fallback_reasons.append(f"Available RAM ({prof.ram_avail_gb:.1f} GB) < 4.5 GB; offline model set to 'small'.")
+
+        return ExecutionProfile(
+            tier_id="tier2_standard",
+            tier_label="Tier 2: Standard Office Laptop (16 GB / Integrated Graphics or Low VRAM)",
+            live_backend="faster_whisper",
+            live_model="small",
+            live_device="cpu",
+            live_compute_type="int8",
+            offline_backend="faster_whisper",
+            offline_model=off_model,
+            offline_device="cpu",
+            offline_compute_type="int8",
+            safe_cpu_threads=threads,
+            live_best_effort=True,
+            max_concurrent_models=1,
+            hf_runtime_available=hf_avail,
+            free_vram_mb=free_vram,
+            fallback_reason=" ".join(fallback_reasons),
+        )
+
+    @classmethod
+    def run_hardware_diagnostics(
+        cls,
+        run_short_benchmark: bool = False,
+        config: Any = None,
+    ) -> Dict[str, Any]:
+        """Collect portable hardware, memory, GPU, and ExecutionProfile diagnostics for any Windows laptop."""
+        prof = cls.get_profile(force_refresh=True)
+        exec_prof = cls.select_execution_profile(config=config, force_refresh=False)
+        used_mb, free_mb = cls._query_live_gpu_vram_mb()
+
+        diag: Dict[str, Any] = {
+            "platform": sys.platform,
+            "os": f"{prof.os_name} (Build {prof.os_build})",
+            "machine": platform.machine(),
+            "cpu_name": prof.cpu_name,
+            "cpu_cores_est": prof.cpu_cores,
+            "cpu_threads_logical": prof.cpu_threads,
+            "ram_total_gb": prof.ram_total_gb,
+            "ram_available_gb": prof.ram_avail_gb,
+            "disk_free_gb": prof.disk_free_gb,
+            "gpu_name": prof.gpu_name,
+            "gpu_type": prof.gpu_type,
+            "cuda_available": prof.cuda_available,
+            "gpu_vram_used_mb": used_mb,
+            "gpu_vram_free_mb": free_mb,
+            "hf_asr_runtime_available": cls._check_hf_asr_runtime_available(),
+            "is_minimum_met": prof.is_minimum_met,
+            "is_recommended_met": prof.is_recommended_met,
+            "hardware_tier": exec_prof.tier_id,
+            "execution_profile": exec_prof.to_dict(),
+        }
+
+        if run_short_benchmark:
+            bench: Dict[str, Any] = {"executed": False}
+            try:
+                import numpy as np
+                from voxlocal.engine.transcriber import LocalWhisperTranscriber
+
+                model_name = exec_prof.live_model if exec_prof.live_backend == "faster_whisper" else "small"
+                t0 = time.perf_counter()
+                tr = LocalWhisperTranscriber(
+                    models_dir=getattr(config, "models_dir", None) if config else None,
+                    model_name=model_name,
+                    compute_device="cpu",
+                    compute_type="int8",
+                    cpu_threads=exec_prof.safe_cpu_threads,
+                )
+                if tr.is_model_cached(model_name):
+                    ok, msg = tr.ensure_loaded(model_name)
+                    load_s = time.perf_counter() - t0
+                    if ok and tr._model is not None:
+                        clip_sec = 3.0
+                        sr = 16000
+                        t_arr = np.linspace(0, clip_sec, int(clip_sec * sr), dtype=np.float32)
+                        synth = (0.02 * np.sin(2.0 * np.pi * 220.0 * t_arr)).astype(np.float32)
+                        t_inf0 = time.perf_counter()
+                        segs, _ = tr._model.transcribe(synth, beam_size=1, vad_filter=False)
+                        list(segs)
+                        inf_s = time.perf_counter() - t_inf0
+                        tr.unload_model()
+                        bench = {
+                            "executed": True,
+                            "model": model_name,
+                            "device": "cpu",
+                            "compute_type": "int8",
+                            "threads": exec_prof.safe_cpu_threads,
+                            "load_sec": round(load_s, 3),
+                            "clip_sec": clip_sec,
+                            "infer_sec": round(inf_s, 3),
+                            "synthetic_rtf": round(inf_s / clip_sec, 4),
+                        }
+                    else:
+                        bench = {"executed": False, "reason": msg}
+                else:
+                    bench = {"executed": False, "reason": f"Model '{model_name}' not cached locally"}
+            except Exception as exc:
+                bench = {"executed": False, "error": str(exc)}
+            diag["short_cpu_benchmark"] = bench
+
+        return diag

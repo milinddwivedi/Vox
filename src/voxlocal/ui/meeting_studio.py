@@ -443,6 +443,7 @@ class TranscriptListModel(QAbstractListModel):
     ROLE_QUERY = Qt.ItemDataRole.UserRole + 7
     ROLE_SEGMENT_DICT = Qt.ItemDataRole.UserRole + 8
     ROLE_ORIGINAL_INDEX = Qt.ItemDataRole.UserRole + 9
+    ROLE_IS_UNCERTAIN = Qt.ItemDataRole.UserRole + 10
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -490,6 +491,8 @@ class TranscriptListModel(QAbstractListModel):
             return seg
         if role == self.ROLE_ORIGINAL_INDEX:
             return orig_idx
+        if role == self.ROLE_IS_UNCERTAIN:
+            return bool(seg.get("is_uncertain", False))
         return None
 
     def set_segments(self, segments: List[Dict[str, Any]]) -> int:
@@ -669,6 +672,7 @@ class TranscriptItemDelegate(QStyledItemDelegate):
         text = str(index.data(TranscriptListModel.ROLE_TEXT) or "")
         source_track = str(index.data(TranscriptListModel.ROLE_SOURCE_TRACK) or "")
         is_active = bool(index.data(TranscriptListModel.ROLE_IS_ACTIVE))
+        is_uncertain = bool(index.data(TranscriptListModel.ROLE_IS_UNCERTAIN))
         query = str(index.data(TranscriptListModel.ROLE_QUERY) or "")
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
 
@@ -692,6 +696,9 @@ class TranscriptItemDelegate(QStyledItemDelegate):
             bg_hex = t.get("sidebar_active", bg_hex)
             border_hex = t.get("accent", "#4F46E5")
             border_w = 1.5
+        elif is_uncertain:
+            border_hex = t.get("accent_amber", "#F59E0B")
+            border_w = 1.2
 
         path = QPainterPath()
         path.addRoundedRect(float(card_rect.x()), float(card_rect.y()), float(card_rect.width()), float(card_rect.height()), 8.0, 8.0)
@@ -715,6 +722,17 @@ class TranscriptItemDelegate(QStyledItemDelegate):
         painter.setFont(ts_font)
         painter.setPen(QColor("#3B82F6"))
         painter.drawText(ts_rect, Qt.AlignmentFlag.AlignCenter, ts_label)
+
+        if is_uncertain and (card_rect.right() - ts_rect.right()) >= 88:
+            unc_rect = QRect(ts_rect.right() + 8, ts_rect.top(), 76, ts_rect.height())
+            unc_path = QPainterPath()
+            unc_path.addRoundedRect(float(unc_rect.x()), float(unc_rect.y()), float(unc_rect.width()), float(unc_rect.height()), 9.0, 9.0)
+            painter.fillPath(unc_path, QBrush(QColor(245, 158, 11, 36)))
+            painter.setPen(QPen(QColor(245, 158, 11, 110), 1.0))
+            painter.drawPath(unc_path)
+            painter.setFont(ts_font)
+            painter.setPen(QColor(t.get("status_warning_text", "#F59E0B")))
+            painter.drawText(unc_rect, Qt.AlignmentFlag.AlignCenter, "⚠ Uncertain")
 
         # Body text (with subtle indicator if search matched)
         if query and query in text.lower():
@@ -2505,11 +2523,29 @@ class VoxMeetingStudioWorkspace(QWidget):
         dur_sec = float(m.get("duration_sec") or 0.0)
         if hasattr(self, "lbl_studio_metrics"):
             metric_parts: List[str] = []
+            raw_status = str(m.get("status") or "").strip().lower()
+            status_map = {
+                "recording": "Live (Provisional)",
+                "transcribing": "Finalizing",
+                "processing": "Finalizing",
+                "finalizing": "Finalizing",
+                "completed": "Completed",
+                "incomplete": "Incomplete",
+                "interrupted": "Interrupted",
+                "finalization_failed": "Finalization Failed",
+                "error": "Finalization Failed",
+                "failed": "Finalization Failed",
+            }
+            if raw_status in status_map:
+                metric_parts.append(status_map[raw_status])
             if dur_sec > 0:
                 mins = int(round(dur_sec / 60.0))
                 metric_parts.append(f"{mins}m" if mins >= 1 else f"{int(dur_sec)}s")
             if segs:
                 metric_parts.append(f"Mic {mic_pct}%")
+                unc_segs = sum(1 for s in segs if bool(s.get("is_uncertain")))
+                if unc_segs > 0:
+                    metric_parts.append(f"{unc_segs} Uncertain")
             metric_parts.append(f"{len(decisions)} Decisions")
             metric_parts.append(f"{len(actions)} Actions")
             self.lbl_studio_metrics.setText(" · ".join(metric_parts))

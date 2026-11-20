@@ -28,7 +28,7 @@ if getattr(sys, "frozen", False) and (SRC_DIR / "voxlocal").exists():
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-if "--print-version" not in sys.argv:
+if "--print-version" not in sys.argv and "--hardware-diagnostics" not in sys.argv:
     from PyQt6.QtCore import QtMsgType, qInstallMessageHandler
     from PyQt6.QtWidgets import QApplication, QMessageBox
 
@@ -97,12 +97,39 @@ def main() -> int:
         action="store_true",
         help="Print the application version and exit immediately",
     )
+    parser.add_argument(
+        "--hardware-diagnostics",
+        action="store_true",
+        help="Print portable JSON hardware & adaptive ASR tier diagnostics and exit",
+    )
+    parser.add_argument(
+        "--diagnostics-out",
+        type=str,
+        default="",
+        help="Optional output file path when running with --hardware-diagnostics",
+    )
     args = parser.parse_args()
 
     if getattr(args, "print_version", False):
         from voxlocal import __version__
 
         print(__version__)
+        return 0
+
+    if getattr(args, "hardware_diagnostics", False):
+        import json
+        from voxlocal.core.config import AppConfig
+        from voxlocal.core.hardware import HardwareProfiler
+
+        cfg = AppConfig.load()
+        diag = HardwareProfiler.run_hardware_diagnostics(run_short_benchmark=False, config=cfg)
+        rendered = json.dumps(diag, indent=2, ensure_ascii=False)
+        out_path = getattr(args, "diagnostics_out", "") or ""
+        if out_path:
+            out_p = Path(out_path)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(rendered + "\n", encoding="utf-8")
+        print(rendered)
         return 0
 
     setup_logging()

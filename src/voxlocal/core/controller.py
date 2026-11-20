@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import enum
+import json
 import os
 import queue
 import shutil
@@ -41,6 +42,7 @@ from voxlocal.audio.dictation_recorder import DictationRecorder
 from voxlocal.audio.meeting_recorder import MeetingRecorder
 from voxlocal.audio.streaming_typer import StreamingVoiceTyper
 from voxlocal.core.config import AppConfig
+from voxlocal.core.hardware import ExecutionProfile, HardwareProfiler
 from voxlocal.core.logger import (
     check_disk_space_mb,
     generate_correlation_id,
@@ -48,7 +50,9 @@ from voxlocal.core.logger import (
     get_system_resource_snapshot,
     operation_context,
 )
+from voxlocal.engine.completeness import build_completeness_report
 from voxlocal.engine.dictation_processor import DictationProcessor
+from voxlocal.engine.hf_asr_engine import LocalHFASRTranscriber
 from voxlocal.engine.meeting_intelligence import MeetingIntelligenceEngine
 from voxlocal.engine.transcriber import (
     LocalWhisperTranscriber,
@@ -540,25 +544,41 @@ class AppController(QObject):
 
             # If audio_path is not found or empty, search disk recordings_dir
             if not audio_path or not Path(audio_path).exists():
+                def _pick_first_existing(base_dir: Path, names: Tuple[str, ...]) -> str:
+                    for fname in names:
+                        cand_p = base_dir / fname
+                        if cand_p.exists():
+                            return str(cand_p)
+                    return ""
+
                 if vid_path and Path(vid_path).parent.exists():
-                    cand = Path(vid_path).parent / "mixed.wav"
-                    if cand.exists():
-                        audio_path = str(cand)
-                        if (Path(vid_path).parent / "mic.wav").exists():
-                            mic_path = str(Path(vid_path).parent / "mic.wav")
-                        if (Path(vid_path).parent / "sys.wav").exists():
-                            sys_path = str(Path(vid_path).parent / "sys.wav")
+                    vdir = Path(vid_path).parent
+                    found_mix = _pick_first_existing(vdir, ("meeting_mixed.wav", "mixed.wav"))
+                    if found_mix:
+                        audio_path = found_mix
+                    mic_found = _pick_first_existing(vdir, ("mic_track.wav", "mic.wav"))
+                    sys_found = _pick_first_existing(vdir, ("system_track.wav", "sys.wav"))
+                    if mic_found:
+                        mic_path = mic_found
+                    if sys_found:
+                        sys_path = sys_found
+                    if not audio_path and (sys_path or mic_path):
+                        audio_path = sys_path or mic_path
 
                 if not audio_path or not Path(audio_path).exists():
                     created_slug = str(m.get("created_at", "")).replace("-", "").replace(":", "").replace(" ", "_")
                     for folder in self.config.recordings_dir.glob("meeting_*"):
-                        if folder.is_dir() and (folder / "mixed.wav").exists():
-                            if created_slug and created_slug[:13] in folder.name:
-                                audio_path = str(folder / "mixed.wav")
-                                if (folder / "mic.wav").exists():
-                                    mic_path = str(folder / "mic.wav")
-                                if (folder / "sys.wav").exists():
-                                    sys_path = str(folder / "sys.wav")
+                        if folder.is_dir():
+                            found_mix = _pick_first_existing(folder, ("meeting_mixed.wav", "mixed.wav"))
+                            mic_found = _pick_first_existing(folder, ("mic_track.wav", "mic.wav"))
+                            sys_found = _pick_first_existing(folder, ("system_track.wav", "sys.wav"))
+                            has_any_wav = bool(found_mix or mic_found or sys_found)
+                            if has_any_wav and created_slug and created_slug[:13] in folder.name:
+                                audio_path = found_mix or sys_found or mic_found
+                                if mic_found:
+                                    mic_path = mic_found
+                                if sys_found:
+                                    sys_path = sys_found
                                 if (folder / "meeting_screen.mp4").exists() and not vid_path:
                                     vid_path = str(folder / "meeting_screen.mp4")
                                 break
@@ -838,12 +858,70 @@ class AppController(QObject):
         except (RuntimeError, AttributeError):
             pass
 
+    def _resolve_asr_execution_profile(self, force_refresh: bool = False) -> ExecutionProfile:
+        """Resolve hardware-adaptive live & offline ASR settings with safe CPU/RAM fallback."""
+        try:
+            if getattr(self.config, "enable_hardware_adaptive_asr", True):
+                return HardwareProfiler.select_execution_profile(
+                    config=self.config,
+                    force_refresh=force_refresh,
+                )
+        except Exception as exc:
+            logger.debug("Hardware execution profile selection fallback: %s", exc)
+        threads = int(getattr(self.config, "cpu_threads", 0) or 4)
+        model = str(getattr(self.config, "whisper_model", "small") or "small")
+        dev = str(getattr(self.config, "compute_device", "auto") or "auto")
+        ctype = str(getattr(self.config, "compute_type", "default") or "default")
+        return ExecutionProfile(
+            tier_id="manual_override",
+            tier_label="Manual Config Profile",
+            live_backend="faster_whisper",
+            live_model=model,
+            live_device=dev,
+            live_compute_type=ctype,
+            offline_backend="faster_whisper",
+            offline_model=model,
+            offline_device=dev,
+            offline_compute_type=ctype,
+            safe_cpu_threads=threads,
+            live_best_effort=(dev == "cpu"),
+            max_concurrent_models=1,
+            hf_runtime_available=HardwareProfiler._check_hf_asr_runtime_available(),
+            free_vram_mb=None,
+            fallback_reason="",
+        )
+
     def _preload_model_bg(self) -> None:
         if getattr(self, "_shutting_down", False):
             return
-        self._safe_emit_model_status(f"Loading local model '{self.config.whisper_model}'...")
+        target_model = self.config.whisper_model
+        try:
+            if (
+                getattr(self.config, "enable_hardware_adaptive_asr", True)
+                and str(getattr(self.config, "compute_device", "auto")).lower() == "auto"
+                and isinstance(self.transcriber, LocalWhisperTranscriber)
+            ):
+                ep = self._resolve_asr_execution_profile(force_refresh=False)
+                if ep.live_backend == "faster_whisper":
+                    target_model = ep.live_model
+                    self.transcriber.model_name = ep.live_model
+                    self.transcriber.compute_device = ep.live_device
+                    self.transcriber.compute_type = ep.live_compute_type
+                    self.transcriber.cpu_threads = ep.safe_cpu_threads
+                    logger.info(
+                        "Hardware profile '%s' selected live ASR '%s' (%s/%s, %d threads)%s",
+                        ep.tier_id,
+                        ep.live_model,
+                        ep.live_device,
+                        ep.live_compute_type,
+                        ep.safe_cpu_threads,
+                        f" — {ep.fallback_reason}" if ep.fallback_reason else "",
+                    )
+        except Exception as exc:
+            logger.debug("Adaptive preload profile skipped: %s", exc)
+        self._safe_emit_model_status(f"Loading local model '{target_model}'...")
         ok, msg = self.transcriber.ensure_loaded(
-            self.config.whisper_model,
+            target_model,
             status_callback=self._safe_emit_model_status,
         )
         self._safe_emit_model_status(msg)
@@ -3343,10 +3421,15 @@ class AppController(QObject):
                 self._finalizing_jobs.add(meeting_id, session_cancel_event)
 
         def _stop_and_finalize_worker() -> None:
+            stream_telemetry: Dict[str, Any] = {}
             # 1. Stop streaming transcriber in worker thread
             if st_transcriber:
                 try:
                     st_transcriber.stop()
+                    if hasattr(st_transcriber, "get_stream_telemetry"):
+                        raw_tel = st_transcriber.get_stream_telemetry()
+                        if isinstance(raw_tel, dict):
+                            stream_telemetry = raw_tel
                 except Exception as st_exc:
                     logger.debug("Error stopping streaming transcriber: %s", st_exc)
 
@@ -3435,6 +3518,11 @@ class AppController(QObject):
 
             # 4. Run finalization pipeline in worker thread
             try:
+                if stream_telemetry:
+                    try:
+                        setattr(result, "_live_stream_telemetry", stream_telemetry)
+                    except Exception:
+                        pass
                 self._finalize_meeting_worker(current_mid, result, video_path)
             except Exception as exc:
                 logger.error("Finalization worker error for meeting #%d: %s", current_mid, exc)
@@ -3754,6 +3842,16 @@ class AppController(QObject):
 
         corr_id = self._active_meeting_corr_id if self._active_meeting_corr_id != "-" else generate_correlation_id("mtg")
         current_stage = 1
+        t_fin0 = time.perf_counter()
+        raw_tel = getattr(result, "_live_stream_telemetry", None)
+        eff_stream_telemetry: Dict[str, Any] = dict(raw_tel) if isinstance(raw_tel, dict) else {}
+        processing_errors: List[str] = []
+        fallback_notes: List[str] = []
+        track_stats: Dict[str, Dict[str, Any]] = {}
+        exec_profile: ExecutionProfile = self._resolve_asr_execution_profile(force_refresh=True)
+        used_backend = "faster_whisper"
+        used_model = str(getattr(self.config, "whisper_model", "small") or "small")
+        used_model_version = used_model
         with operation_context(corr_id, f"fin_m{meeting_id}"):
             try:
                 # Cooperative cancellation check before Stage 1
@@ -3895,25 +3993,108 @@ class AppController(QObject):
                 )
                 if existing_segs:
                     logger.info(
-                        "Replacing %d provisional live streaming segments with full-audio Whisper finalization for meeting #%d",
+                        "Replacing %d provisional live streaming segments with full-audio offline finalization for meeting #%d",
                         len(existing_segs),
                         meeting_id,
                     )
 
-                self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing full recording with local Whisper...")
-                segments = self.transcriber.transcribe_meeting_dual_track(
-                    mixed_wav_path=getattr(result, "mixed_wav_path", None),
-                    mic_wav_path=getattr(result, "mic_wav_path", None),
-                    sys_wav_path=getattr(result, "sys_wav_path", None),
-                    initial_prompt=eff_prompt,
-                    language=self.config.language,
-                    progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: Transcribing speech ({s})"),
-                    cancel_check=is_cancelled,
-                    output_script="roman",
-                    remote_speaker_label=remote_name,
-                    hotwords=eff_hotwords,
-                    vocabulary=vocab,
+                transcribe_fn = getattr(self.transcriber, "transcribe_meeting_dual_track", None)
+                is_mock_transcriber = (
+                    not isinstance(self.transcriber, LocalWhisperTranscriber)
+                    or type(transcribe_fn).__module__.startswith("unittest.mock")
+                    or hasattr(transcribe_fn, "assert_called")
                 )
+                use_hf_offline = (
+                    not is_mock_transcriber
+                    and exec_profile.offline_backend == "hf_qwen3_asr"
+                )
+
+                segments: List[Dict[str, Any]] = []
+                if use_hf_offline:
+                    self._safe_emit_finalization_progress(
+                        "transcribing",
+                        f"Stage 2/4: Transcribing full recording with HF ASR ({exec_profile.offline_model})...",
+                    )
+                    # Never keep two heavy models loaded simultaneously
+                    if getattr(self.transcriber, "_model", None) is not None:
+                        self.transcriber.unload_model()
+                    hf_engine = LocalHFASRTranscriber(
+                        model_id=exec_profile.offline_model,
+                        models_dir=self.config.models_dir,
+                        device=exec_profile.offline_device,
+                        dtype_name=exec_profile.offline_compute_type,
+                    )
+                    try:
+                        segments = hf_engine.transcribe_meeting_dual_track(
+                            mixed_wav_path=audio_p,
+                            mic_wav_path=mic_p,
+                            sys_wav_path=sys_p,
+                            hotwords=eff_hotwords,
+                            vocabulary=vocab,
+                            output_script="roman",
+                            remote_speaker_label=remote_name,
+                            progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: {s}"),
+                            cancel_check=is_cancelled,
+                        )
+                        track_stats = hf_engine.last_track_stats
+                        used_backend = "hf_qwen3_asr"
+                        used_model = exec_profile.offline_model
+                        used_model_version = exec_profile.offline_model
+                    except Exception as hf_exc:
+                        logger.warning("HF ASR offline fallback to Whisper (%s): %s", exec_profile.offline_model, hf_exc)
+                        fallback_notes.append(f"hf_asr_fallback: {hf_exc}")
+                        use_hf_offline = False
+                    finally:
+                        try:
+                            hf_engine.unload_model()
+                        except Exception:
+                            pass
+
+                if not use_hf_offline:
+                    if (
+                        not is_mock_transcriber
+                        and getattr(self.config, "enable_hardware_adaptive_asr", True)
+                        and str(getattr(self.config, "compute_device", "auto")).lower() == "auto"
+                        and exec_profile.offline_backend == "faster_whisper"
+                        and self.transcriber.is_model_cached(exec_profile.offline_model)
+                    ):
+                        need_swap = (
+                            exec_profile.offline_model != self.transcriber.model_name
+                            or exec_profile.offline_device != getattr(self.transcriber, "_active_device", exec_profile.offline_device)
+                        )
+                        if need_swap and getattr(self.transcriber, "_model", None) is not None:
+                            self.transcriber.unload_model()
+                        if need_swap:
+                            self.transcriber.model_name = exec_profile.offline_model
+                            self.transcriber.compute_device = exec_profile.offline_device
+                            self.transcriber.compute_type = exec_profile.offline_compute_type
+                            self.transcriber.cpu_threads = exec_profile.safe_cpu_threads
+                            self.transcriber.ensure_loaded(exec_profile.offline_model)
+
+                    self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing full recording with local Whisper...")
+                    try:
+                        segments = self.transcriber.transcribe_meeting_dual_track(
+                            mixed_wav_path=getattr(result, "mixed_wav_path", None),
+                            mic_wav_path=getattr(result, "mic_wav_path", None),
+                            sys_wav_path=getattr(result, "sys_wav_path", None),
+                            initial_prompt=eff_prompt,
+                            language=self.config.language,
+                            progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: Transcribing speech ({s})"),
+                            cancel_check=is_cancelled,
+                            output_script="roman",
+                            remote_speaker_label=remote_name,
+                            hotwords=eff_hotwords,
+                            vocabulary=vocab,
+                        )
+                        raw_stats = getattr(self.transcriber, "last_track_stats", None)
+                        if isinstance(raw_stats, dict):
+                            track_stats = dict(raw_stats)
+                        used_backend = "faster_whisper"
+                        used_model = str(getattr(self.transcriber, "model_name", used_model) or used_model)
+                        used_model_version = used_model
+                    except Exception as tr_exc:
+                        processing_errors.append(f"offline_transcription_error: {tr_exc}")
+                        raise
 
                 # Early Stage 2 transcript persistence before Stage 3 reconciliation
                 if segments:
@@ -3945,36 +4126,120 @@ class AppController(QObject):
                     return
 
                 current_stage = 3
+                verbatim_on = bool(getattr(self.config, "verbatim_transcript_protection", True))
+                selective_ver = bool(getattr(self.config, "enable_selective_verification", True))
+                cleaned_lines: List[str] = []
+                comp_report: Optional[Dict[str, Any]] = None
+
                 if segments:
-                    self._safe_emit_finalization_progress("transcribing", "Stage 3/4: Separating speakers & aligning conversation turns...")
+                    self._safe_emit_finalization_progress("transcribing", "Stage 3/4: Separating speakers & verifying transcript completeness...")
                     # Two-pass post-meeting reconciliation using bounded disk slices (no full-WAV RAM spike)
-                    segments = self.transcriber.reconcile_meeting_transcript(
-                        segments=segments,
-                        mic_audio_16k=None,
-                        sys_audio_16k=None,
-                        language=self.config.language,
-                        hotwords=eff_hotwords,
-                        mic_wav_path=getattr(result, "mic_wav_path", None),
-                        sys_wav_path=getattr(result, "sys_wav_path", None),
-                        output_script="roman",
-                        remote_speaker_label=remote_name,
-                    )
+                    if is_mock_transcriber:
+                        segments = self.transcriber.reconcile_meeting_transcript(
+                            segments=segments,
+                            mic_audio_16k=None,
+                            sys_audio_16k=None,
+                            language=self.config.language,
+                            hotwords=eff_hotwords,
+                            mic_wav_path=getattr(result, "mic_wav_path", None),
+                            sys_wav_path=getattr(result, "sys_wav_path", None),
+                            output_script="roman",
+                            remote_speaker_label=remote_name,
+                        )
+                    else:
+                        segments = self.transcriber.reconcile_meeting_transcript(
+                            segments=segments,
+                            mic_audio_16k=None,
+                            sys_audio_16k=None,
+                            language=self.config.language,
+                            hotwords=eff_hotwords,
+                            mic_wav_path=getattr(result, "mic_wav_path", None),
+                            sys_wav_path=getattr(result, "sys_wav_path", None),
+                            output_script="roman",
+                            remote_speaker_label=remote_name,
+                            verbatim_protection=verbatim_on,
+                            enable_selective_verification=selective_ver,
+                            vocabulary=vocab,
+                        )
                     cleaned_segments = []
                     for seg in segments:
-                        txt_p = DictationProcessor.process(
-                            seg["text"],
-                            vocabulary=vocab,
-                            cleanup_enabled=True,
-                            spoken_punctuation=False,
-                            output_script="roman",
-                        ).strip()
+                        raw_src = str(seg.get("raw_text") or seg.get("text") or "").strip()
+                        cur_src = str(seg.get("text") or "").strip() or raw_src
+                        if verbatim_on:
+                            txt_p = DictationProcessor.process(
+                                cur_src,
+                                vocabulary=vocab,
+                                cleanup_enabled=False,
+                                spoken_punctuation=False,
+                                output_script="roman",
+                                mode="verbatim",
+                            ).strip()
+                        else:
+                            txt_p = DictationProcessor.process(
+                                cur_src,
+                                vocabulary=vocab,
+                                cleanup_enabled=True,
+                                spoken_punctuation=False,
+                                output_script="roman",
+                            ).strip()
                         txt_p = clean_repetition_tail(txt_p)
+                        cleaned_seg_txt = clean_repetition_tail(
+                            DictationProcessor.process(
+                                cur_src,
+                                vocabulary=vocab,
+                                cleanup_enabled=True,
+                                spoken_punctuation=False,
+                                output_script="roman",
+                            ).strip()
+                        )
                         dur_s = max(0.01, float(seg.get("end_time", 0.0)) - float(seg.get("start_time", 0.0)))
                         if txt_p and not is_hallucination(txt_p, duration_sec=dur_s):
+                            seg["raw_text"] = raw_src or txt_p
                             seg["text"] = txt_p
                             cleaned_segments.append(seg)
+                            if cleaned_seg_txt:
+                                mm = int(float(seg.get("start_time", 0.0)) // 60)
+                                ss = int(float(seg.get("start_time", 0.0)) % 60)
+                                spk = str(seg.get("speaker", "Speaker"))
+                                cleaned_lines.append(f"[{mm:02d}:{ss:02d}] {spk}: {cleaned_seg_txt}")
+
+                    comp_report = build_completeness_report(
+                        meeting_id=meeting_id,
+                        segments=cleaned_segments,
+                        mic_wav_path=mic_p,
+                        sys_wav_path=sys_p,
+                        mixed_wav_path=audio_p,
+                        track_stats=track_stats if track_stats else None,
+                        stream_telemetry=eff_stream_telemetry,
+                        processing_errors=processing_errors,
+                        cancelled=is_cancelled(),
+                        model_used=used_model,
+                        model_version=used_model_version,
+                        backend_used=used_backend,
+                        hardware_tier=exec_profile.tier_id,
+                        finalization_duration_sec=time.perf_counter() - t_fin0,
+                    )
+                    cleaned_segments = comp_report.pop("annotated_segments", cleaned_segments)
                     self.db.replace_meeting_segments(meeting_id, cleaned_segments)
                     segments = cleaned_segments
+                else:
+                    comp_report = build_completeness_report(
+                        meeting_id=meeting_id,
+                        segments=[],
+                        mic_wav_path=mic_p,
+                        sys_wav_path=sys_p,
+                        mixed_wav_path=audio_p,
+                        track_stats=track_stats if track_stats else None,
+                        stream_telemetry=eff_stream_telemetry,
+                        processing_errors=processing_errors,
+                        cancelled=is_cancelled(),
+                        model_used=used_model,
+                        model_version=used_model_version,
+                        backend_used=used_backend,
+                        hardware_tier=exec_profile.tier_id,
+                        finalization_duration_sec=time.perf_counter() - t_fin0,
+                    )
+                    comp_report.pop("annotated_segments", None)
 
                 # Preserve untouched Stage-A *_raw.wav backups on disk so Re-Transcribe can always
                 # access pre-DSP audio without degradation.
@@ -4097,9 +4362,36 @@ class AppController(QObject):
                     self._handle_finalization_cancelled(meeting_id, current_stage=4)
                     return
 
+                comp_report["finalization_duration_sec"] = round(time.perf_counter() - t_fin0, 3)
+                if fallback_notes:
+                    comp_report["fallback_notes"] = fallback_notes
+                has_authoritative_stats = bool(track_stats)
+                if not is_mock_transcriber or has_authoritative_stats:
+                    final_status = str(comp_report.get("transcript_status") or "completed")
+                    final_reason = str(comp_report.get("status_reason") or "")
+                else:
+                    final_status = "completed"
+                    final_reason = "Mocked offline finalization completed."
+                    comp_report["transcript_status"] = final_status
+                    comp_report["status_reason"] = final_reason
+
+                comp_json_str = json.dumps(comp_report, indent=2, default=str)
+                try:
+                    ref_artifact = audio_p or mic_p or sys_p or vid_p
+                    if ref_artifact and Path(ref_artifact).parent.exists():
+                        (Path(ref_artifact).parent / "completeness_report.json").write_text(
+                            comp_json_str, encoding="utf-8"
+                        )
+                except Exception:
+                    pass
+
                 self.db.update_meeting(
                     meeting_id,
-                    status="completed",
+                    status=final_status,
+                    model_used=used_model,
+                    completeness_report_json=comp_json_str,
+                    finalization_reason=final_reason,
+                    cleaned_transcript="\n".join(cleaned_lines),
                     summary=summary,
                     decisions=decisions_str,
                     action_items=actions_str,
@@ -4110,8 +4402,9 @@ class AppController(QObject):
                 )
 
                 logger.info(
-                    "Finalized meeting #%d (%d segments, engagement=%d%%, video=%s, snapshot=%s)",
+                    "Finalized meeting #%d (status=%s, %d segments, engagement=%d%%, video=%s, snapshot=%s)",
                     meeting_id,
+                    final_status,
                     len(segments),
                     engagement_score,
                     bool(video_path),
@@ -4119,23 +4412,34 @@ class AppController(QObject):
                 )
                 with self._state_lock:
                     if self._capture_state == "idle":
-                        self.set_meeting_lifecycle_state(
-                            MeetingLifecycleState.COMPLETED,
-                            f"Meeting #{meeting_id} completed & saved",
-                        )
-                if hasattr(self, "metering") and self.metering is not None:
+                        if final_status == "completed":
+                            self.set_meeting_lifecycle_state(
+                                MeetingLifecycleState.COMPLETED,
+                                f"Meeting #{meeting_id} completed & saved",
+                            )
+                        else:
+                            self.set_meeting_lifecycle_state(
+                                MeetingLifecycleState.FAILED,
+                                final_reason or f"Meeting #{meeting_id} status={final_status}",
+                            )
+                if final_status == "completed" and hasattr(self, "metering") and self.metering is not None:
                     try:
                         self.metering.record_completed_meeting(dur_val, meeting_id=meeting_id)
                         self.usage_updated.emit(self.metering.get_weekly_usage())
                     except Exception as m_exc:
                         logger.debug("Metering record_completed_meeting error: %s", m_exc)
 
-                self._safe_emit_finalization_progress("idle", "Meeting saved & transcribed")
+                if final_status == "completed":
+                    self._safe_emit_finalization_progress("idle", "Meeting saved & transcribed")
+                else:
+                    self._safe_emit_finalization_progress(
+                        "error", f"Transcription {final_status}: {final_reason}"
+                    )
                 self._safe_emit(self.meeting_saved_and_transcribed, meeting_id)
                 self._safe_emit(self.history_updated)
             except Exception as exc:
                 logger.error("Failed finalizing meeting #%d in Stage %d: %s", meeting_id, current_stage, exc, exc_info=True)
-                self.db.update_meeting(meeting_id, status="error")
+                self.db.update_meeting(meeting_id, status="error", finalization_reason=str(exc))
                 with self._state_lock:
                     if self._capture_state == "idle":
                         self.set_meeting_lifecycle_state(

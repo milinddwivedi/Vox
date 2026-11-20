@@ -31,6 +31,13 @@ class AppConfig:
     cpu_threads: int = 8
     language: str = "en+hi"          # en+hi (Auto Switch) | hi | hi_latn | en | auto
     transcribe_profile: str = "balanced"  # fast | balanced | max_accuracy
+    enable_hardware_adaptive_asr: bool = True
+    enable_hf_asr_rc: bool = False
+    hf_asr_model_id: str = "Qwen/Qwen3-ASR-0.6B-hf"
+    live_asr_backend: str = "auto"   # auto | faster_whisper | hf_qwen3_asr
+    offline_asr_backend: str = "auto"  # auto | faster_whisper | hf_qwen3_asr
+    verbatim_transcript_protection: bool = True
+    enable_selective_verification: bool = True
 
     # Local LLM Engine (Offline Meeting Intelligence & Q&A)
     llm_model: str = "Llama-3.2-1B-Instruct-ct2-int8"

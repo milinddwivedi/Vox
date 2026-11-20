@@ -64,6 +64,7 @@ def isolated_controller(qapp: QApplication, tmp_path: Path):
     ctrl.transcriber.load_model = MagicMock(return_value=True)
     ctrl.transcriber.is_model_loaded = MagicMock(return_value=True)
     ctrl.transcriber.transcribe_file = MagicMock(return_value=[])
+    ctrl.transcriber.transcribe_meeting_dual_track = MagicMock(return_value=[])
 
     yield ctrl
 

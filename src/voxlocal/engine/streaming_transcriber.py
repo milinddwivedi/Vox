@@ -153,9 +153,29 @@ class LiveMeetingStreamingTranscriber:
         self._current_track: str = "system"
         self._step_accumulated_sec: float = 0.0
 
+        # Live streaming telemetry counters
+        self._dropped_chunks: int = 0
+        self._max_backlog_sec: float = 0.0
+        self._current_backlog_sec: float = 0.0
+        self._revision_count: int = 0
+        self._last_flush_cursor_sec: float = 0.0
+
     @property
     def is_active(self) -> bool:
         return self._active
+
+    def get_stream_telemetry(self) -> Dict[str, Any]:
+        """Return live streaming completeness and latency telemetry."""
+        with self._lock:
+            return {
+                "audio_cursor_sec": round(float(self._audio_cursor_sec), 3),
+                "last_flush_cursor_sec": round(float(self._last_flush_cursor_sec), 3),
+                "segment_count": int(self._segment_index),
+                "dropped_chunks": int(self._dropped_chunks),
+                "max_backlog_sec": round(float(self._max_backlog_sec), 3),
+                "current_backlog_sec": round(float(self._current_backlog_sec), 3),
+                "revision_count": int(self._revision_count),
+            }
 
     def start(
         self,
@@ -187,6 +207,11 @@ class LiveMeetingStreamingTranscriber:
             self._current_speaker = self._remote_speaker_label
             self._current_track = "system"
             self._step_accumulated_sec = 0.0
+            self._dropped_chunks = 0
+            self._max_backlog_sec = 0.0
+            self._current_backlog_sec = 0.0
+            self._revision_count = 0
+            self._last_flush_cursor_sec = 0.0
 
             # Pre-warm model in background so first spoken word incurs zero CUDA compile latency
             threading.Thread(
@@ -212,7 +237,7 @@ class LiveMeetingStreamingTranscriber:
             self._paused = False
 
     def stop(self) -> None:
-        """Stop streaming transcription and flush any pending speech."""
+        """Stop streaming transcription and flush any pending speech through EOF."""
         with self._lock:
             if not self._active:
                 return
@@ -220,20 +245,24 @@ class LiveMeetingStreamingTranscriber:
             self._stop_event.set()
 
         if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=1.5)
+            self._worker_thread.join(timeout=2.5)
             self._worker_thread = None
 
         try:
             rec = self._recorder
-            if rec is not None and self.transcriber is not None:
+            if rec is not None:
                 now_sec = float(getattr(rec, "elapsed_seconds", 0.0))
                 flush_start = float(self._audio_cursor_sec)
-                if now_sec - flush_start >= 0.45:
+                if self.transcriber is not None and (now_sec - flush_start) >= 0.20:
                     mic_s, sys_s, actual_s = rec.get_audio_window(flush_start, now_sec)
                     m_rms = float(np.sqrt(np.mean(mic_s ** 2))) if mic_s.size else 0.0
                     s_rms = float(np.sqrt(np.mean(sys_s ** 2))) if sys_s.size else 0.0
                     remote_label = getattr(self, "_remote_speaker_label", "Speaker 1") or "Speaker 1"
-                    if self._speech_active and (m_rms >= 0.0025 or s_rms >= 0.0010):
+                    cur_track_active = (
+                        (self._current_track == "mic" and m_rms >= 0.0018)
+                        or (self._current_track == "system" and s_rms >= 0.0008)
+                    )
+                    if self._speech_active and cur_track_active:
                         self._execute_transcribe_pass(
                             actual_s,
                             now_sec,
@@ -242,8 +271,8 @@ class LiveMeetingStreamingTranscriber:
                             speech_boundary=True,
                             force_flush=True,
                         )
-                    elif s_rms >= 0.0012 or m_rms >= 0.0035:
-                        tr = "mic" if (m_rms / 0.0035) > (s_rms / 0.0012) else "system"
+                    elif s_rms >= 0.0009 or m_rms >= 0.0022:
+                        tr = "mic" if (m_rms / 0.0022) > (s_rms / 0.0009) else "system"
                         sp = "You (Mic)" if tr == "mic" else remote_label
                         self._execute_transcribe_pass(
                             actual_s,
@@ -253,6 +282,9 @@ class LiveMeetingStreamingTranscriber:
                             speech_boundary=True,
                             force_flush=True,
                         )
+                self._audio_cursor_sec = max(float(self._audio_cursor_sec), now_sec)
+                self._last_flush_cursor_sec = float(self._audio_cursor_sec)
+                self._current_backlog_sec = 0.0
         except Exception as flush_exc:
             logger.debug("Live streaming stop flush skipped: %s", flush_exc)
 
@@ -300,6 +332,11 @@ class LiveMeetingStreamingTranscriber:
         window_dur = now_sec - actual_start
         if window_dur < 0.4:
             return
+
+        backlog = max(0.0, float(now_sec) - float(self._audio_cursor_sec))
+        self._current_backlog_sec = backlog
+        if backlog > self._max_backlog_sec:
+            self._max_backlog_sec = backlog
 
         # Dual-track VAD energy assessment on the latest 0.45s tail so ambient mic noise
         # or earlier speech in the window never masks silence or remote participant speech.
@@ -454,8 +491,12 @@ class LiveMeetingStreamingTranscriber:
             return
         mic_slice, sys_slice, actual_start = self._recorder.get_audio_window(start_sec, end_sec)
         audio_slice = mic_slice if track == "mic" else sys_slice
-        if audio_slice.size < int(TARGET_SAMPLE_RATE * 0.4):
+        min_samples = int(TARGET_SAMPLE_RATE * (0.20 if force_flush else 0.4))
+        if audio_slice.size < min_samples:
             return
+        if force_flush and audio_slice.size < int(TARGET_SAMPLE_RATE * 0.45):
+            pad_n = int(TARGET_SAMPLE_RATE * 0.45) - int(audio_slice.size)
+            audio_slice = np.pad(audio_slice, (0, pad_n), mode="constant")
 
         # Ensure Whisper model is ready before attempting inference
         if not self.transcriber.is_model_loaded():
@@ -467,6 +508,7 @@ class LiveMeetingStreamingTranscriber:
         # Clamp audio slice to at most 25 seconds to stay safely within Whisper's 30s single-encode window
         max_samples = int(TARGET_SAMPLE_RATE * 25.0)
         if audio_slice.size > max_samples:
+            self._dropped_chunks += 1
             audio_slice = audio_slice[-max_samples:]
 
         vocab = self.db.list_vocabulary(active_only=True) if self.db else []
@@ -563,6 +605,7 @@ class LiveMeetingStreamingTranscriber:
             # live partial preview without slicing the audio cursor mid-word or fragmenting DB rows.
             partial = self._agreement_engine._clean_and_normalize(raw_text, vocab)
             if partial and self.on_partial and self._meeting_id is not None:
+                self._revision_count += 1
                 self.on_partial(
                     self._meeting_id,
                     {
@@ -574,6 +617,8 @@ class LiveMeetingStreamingTranscriber:
                         "raw_model_score": raw_lp,
                         "no_speech_prob": max_nsp,
                         "confidence_calibrated": False,
+                        "provisional": True,
+                        "transcript_stage": "live",
                     },
                 )
             return
@@ -594,6 +639,7 @@ class LiveMeetingStreamingTranscriber:
             no_speech_prob=max_nsp,
         )
         self._audio_cursor_sec = end_sec
+        self._last_flush_cursor_sec = max(self._last_flush_cursor_sec, float(end_sec))
 
         # Also check if the secondary track had clear simultaneous speech during [start_sec, end_sec]
         other_track = "system" if track == "mic" else "mic"
@@ -745,6 +791,8 @@ class LiveMeetingStreamingTranscriber:
                 "raw_model_score": raw_model_score,
                 "no_speech_prob": no_speech_prob,
                 "confidence_calibrated": False,
+                "provisional": True,
+                "transcript_stage": "live",
             }
 
             self._recent_emitted.append(seg_dict)
@@ -752,6 +800,7 @@ class LiveMeetingStreamingTranscriber:
                 self._recent_emitted = self._recent_emitted[-50:]
 
             self._audio_cursor_sec = max(self._audio_cursor_sec, end_sec)
+            self._last_flush_cursor_sec = max(self._last_flush_cursor_sec, float(self._audio_cursor_sec))
 
             if self.on_confirmed:
                 self.on_confirmed(m_id, seg_dict)

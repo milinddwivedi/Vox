@@ -93,6 +93,8 @@ class _Track:
 
     def close(self) -> None:
         try:
+            if self.total == 0:
+                self.wav.writeframes(b"")
             self.wav.close()
         except Exception:
             pass
@@ -342,6 +344,7 @@ class MeetingRecorder:
                     w.setnchannels(1)
                     w.setsampwidth(2)
                     w.setframerate(TARGET_SAMPLE_RATE)
+                    w.writeframes(b"")
             except Exception as stub_exc:
                 logger.debug("Failed initializing stub mixed WAV: %s", stub_exc)
 

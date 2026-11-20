@@ -996,7 +996,7 @@ class NotetakerPage(QWidget):
                 self._silent_loopback_since = None
 
         if rec:
-            self.lbl_rec_dot.setText("● Notetaker Recording Live")
+            self.lbl_rec_dot.setText("● Recording Live (Transcript Provisional)")
             self.btn_pause_rec.setVisible(True)
             self.btn_stop_rec.setVisible(True)
             self.btn_pause_rec.setText("Pause")
@@ -1009,17 +1009,17 @@ class NotetakerPage(QWidget):
                 except Exception:
                     pass
         elif paused:
-            self.lbl_rec_dot.setText("❚❚ Notetaker Paused")
+            self.lbl_rec_dot.setText("❚❚ Notetaker Paused (Transcript Provisional)")
             self.btn_pause_rec.setVisible(True)
             self.btn_stop_rec.setVisible(True)
             self.btn_pause_rec.setText("Resume")
             self.btn_start_adhoc.setText("Stop Notetaker")
         elif proc:
-            stage_text = status_msg.strip() if status_msg else "Processing Meeting..."
-            self.lbl_rec_dot.setText(f"● {stage_text}")
+            stage_text = status_msg.strip() if status_msg else "Finalizing full transcript..."
+            self.lbl_rec_dot.setText(f"⏳ {stage_text}")
             self.btn_pause_rec.setVisible(False)
             self.btn_stop_rec.setVisible(False)
-            self.btn_start_adhoc.setText("Processing...")
+            self.btn_start_adhoc.setText("Finalizing...")
         else:
             self._silent_loopback_since = None
             if hasattr(self, "lbl_capture_anomaly"):
@@ -1190,14 +1190,16 @@ class NotetakerPage(QWidget):
             date_str = str(m.get("started_at") or "")[:10]
             plat = str(m.get("source_platform") or "Call")
             has_vid = bool(m.get("video_path") and Path(str(m.get("video_path"))).exists())
-            is_interrupted = str(m.get("status") or "").lower() == "interrupted"
+            raw_status = str(m.get("status") or "").strip().lower()
+            is_recoverable = raw_status in ("interrupted", "incomplete", "finalization_failed", "error", "failed")
             badge = " · Video" if has_vid else ""
-            if is_interrupted:
-                badge += " · ⚠ Interrupted"
-                if self._resolve_audio_path(m) is not None:
-                    recoverable_count += 1
-                    if first_interrupted is None:
-                        first_interrupted = int(m["id"])
+            status_badge = self._format_status_badge(raw_status)
+            if status_badge and raw_status not in ("completed", ""):
+                badge += f" · {status_badge}"
+            if is_recoverable and self._resolve_audio_path(m) is not None:
+                recoverable_count += 1
+                if first_interrupted is None:
+                    first_interrupted = int(m["id"])
             item = QListWidgetItem(f"{m.get('title') or 'Untitled Meeting'}\n{date_str} · {dur} · {plat}{badge}")
             item.setData(Qt.ItemDataRole.UserRole, m["id"])
             self.meetings_list.addItem(item)
@@ -1312,6 +1314,23 @@ class NotetakerPage(QWidget):
         if mid is not None:
             self.select_meeting(int(mid))
 
+    @staticmethod
+    def _format_status_badge(raw_status: str) -> str:
+        st = str(raw_status or "").strip().lower()
+        mapping = {
+            "recording": "● Live (Provisional)",
+            "transcribing": "⏳ Finalizing...",
+            "processing": "⏳ Finalizing...",
+            "finalizing": "⏳ Finalizing...",
+            "completed": "✓ Completed",
+            "incomplete": "⚠ Incomplete",
+            "interrupted": "⚠ Interrupted",
+            "finalization_failed": "✕ Finalization Failed",
+            "error": "✕ Finalization Failed",
+            "failed": "✕ Finalization Failed",
+        }
+        return mapping.get(st, "")
+
     def select_meeting(self, meeting_id: int) -> None:
         self._selected_meeting_id = meeting_id
         if hasattr(self, "empty_card"):
@@ -1328,7 +1347,8 @@ class NotetakerPage(QWidget):
         plat = str(m.get("source_platform") or "Desktop Call")
         date_str = str(m.get("started_at") or "")[:16].replace("T", " ")
         cal_ev_id = str(m.get("calendar_event_id") or "")
-        is_interrupted = str(m.get("status") or "").lower() == "interrupted"
+        raw_status = str(m.get("status") or "").strip().lower()
+        is_recoverable = raw_status in ("interrupted", "incomplete", "finalization_failed", "error", "failed")
 
         self.lbl_sel_title.blockSignals(True)
         self.lbl_sel_title.setText(str(m.get("title") or "Untitled Meeting"))
@@ -1336,8 +1356,29 @@ class NotetakerPage(QWidget):
         self.lbl_sel_title.blockSignals(False)
 
         meta_text = f"{date_str} · Duration {dur} · {plat}"
-        if is_interrupted:
-            meta_text += " · ⚠ Interrupted"
+        status_badge = self._format_status_badge(raw_status)
+        if status_badge:
+            meta_text += f" · {status_badge}"
+        comp_raw = str(m.get("completeness_report_json") or "").strip()
+        if comp_raw:
+            try:
+                comp = json.loads(comp_raw)
+                unc_cnt = int(comp.get("uncertain_segment_count") or 0)
+                cov_vals = [
+                    v
+                    for v in (
+                        comp.get("mic_track_coverage_pct"),
+                        comp.get("system_track_coverage_pct"),
+                        comp.get("mixed_track_coverage_pct"),
+                    )
+                    if v is not None
+                ]
+                if cov_vals:
+                    meta_text += f" · {min(cov_vals):.0f}% audio processed"
+                if unc_cnt > 0:
+                    meta_text += f" · {unc_cnt} uncertain span{'s' if unc_cnt != 1 else ''}"
+            except Exception:
+                pass
         if cal_ev_id:
             meta_text += " · Linked Calendar Event"
         self.lbl_sel_meta.setText(meta_text)
@@ -1348,7 +1389,7 @@ class NotetakerPage(QWidget):
         res_audio = self._resolve_audio_path(m)
         if hasattr(self, "btn_reprocess"):
             self.btn_reprocess.setEnabled(res_audio is not None)
-            if is_interrupted:
+            if is_recoverable:
                 t_btn = get_theme_tokens(self._theme)
                 self.btn_reprocess.setText("↻ Recover & Re-Transcribe")
                 self.btn_reprocess.setStyleSheet(

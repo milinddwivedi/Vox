@@ -186,6 +186,9 @@ def read_only_db_state() -> Tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]
                 ).fetchall()
             ]
             m_dict = dict(m_row)
+            for opt_col in ("completeness_report_json", "finalization_reason", "cleaned_transcript"):
+                if opt_col in m_dict and (m_dict[opt_col] or "") == "":
+                    m_dict.pop(opt_col, None)
             m_dict["baseline_segments"] = segs
             meetings[mid] = m_dict
         return meetings, vocab

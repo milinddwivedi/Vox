@@ -1102,7 +1102,13 @@ class LocalWhisperTranscriber:
         self._active_device: str = "cpu"
         self._readiness_state: Optional[str] = None
         self._readiness_message: str = ""
+        self._last_track_stats: Dict[str, Dict[str, Any]] = {}
         self.speaker_profile_store = LocalSpeakerProfileStore()
+
+    @property
+    def last_track_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Return per-track sample-accounting telemetry from the latest transcription run."""
+        return {k: dict(v) for k, v in self._last_track_stats.items()}
 
     def _get_fast_interim_model(self) -> Optional[WhisperModel]:
         """Lazy loader for fast auxiliary interim model (e.g. 'base') for sub-150ms live preview."""
@@ -2811,12 +2817,33 @@ class LocalWhisperTranscriber:
         are never cut mid-syllable, while preserving `diarizer` speaker centroids across all windows.
         """
         total_dur = get_wav_duration_sec(wav_path)
-        if total_dur <= 0.1:
+        if total_dur <= 0.05:
+            self._last_track_stats[source_track] = {
+                "wav_path": str(wav_path),
+                "duration_sec": round(float(max(0.0, total_dur)), 4),
+                "samples_captured": 0,
+                "samples_processed": 0,
+                "cursor_sec": 0.0,
+                "windows": 0,
+                "cancelled": False,
+            }
             return []
+
+        expected_total_samples = int(round(total_dur * TARGET_SAMPLE_RATE))
 
         if total_dur <= window_sec * 1.15:
             audio = load_wav_as_16k_f32(wav_path)
-            if audio.size == 0 or float(np.max(np.abs(audio))) < 0.0004:
+            n_samp = int(audio.size)
+            self._last_track_stats[source_track] = {
+                "wav_path": str(wav_path),
+                "duration_sec": round(float(total_dur), 4),
+                "samples_captured": n_samp or expected_total_samples,
+                "samples_processed": n_samp,
+                "cursor_sec": round(float(n_samp) / float(TARGET_SAMPLE_RATE), 4),
+                "windows": 1,
+                "cancelled": False,
+            }
+            if n_samp == 0 or float(np.max(np.abs(audio))) < 0.0004:
                 return []
             return self.transcribe_audio_segments(
                 audio,
@@ -2834,12 +2861,16 @@ class LocalWhisperTranscriber:
                 vocabulary=vocabulary,
             )
 
-        # Long recording: process in pause-aligned bounded windows
+        # Long recording: process in pause-aligned bounded windows all the way to EOF
         all_segments: List[Dict[str, Any]] = []
         cursor = 0.0
         win_idx = 0
-        while cursor < total_dur - 0.25:
+        processed_samples = 0
+        processed_end_sec = 0.0
+        was_cancelled = False
+        while cursor < total_dur - 0.05:
             if cancel_check and cancel_check():
+                was_cancelled = True
                 logger.info("Windowed transcription cancelled at %.1fs / %.1fs", cursor, total_dur)
                 break
             win_idx += 1
@@ -2872,6 +2903,9 @@ class LocalWhisperTranscriber:
                 pct = min(99, int(round((cursor / max(1.0, total_dur)) * 100)))
                 progress_callback(f"Transcribing {source_track} track ({pct}% • window {win_idx})...")
 
+            processed_samples += int(slice_audio.size)
+            processed_end_sec = max(processed_end_sec, cursor + actual_dur)
+
             if float(np.max(np.abs(slice_audio))) >= 0.0004:
                 win_segs = self.transcribe_audio_segments(
                     slice_audio,
@@ -2890,7 +2924,17 @@ class LocalWhisperTranscriber:
                 )
                 all_segments.extend(win_segs)
 
-            cursor += max(1.0, actual_dur)
+            cursor += max(0.05, actual_dur)
+
+        self._last_track_stats[source_track] = {
+            "wav_path": str(wav_path),
+            "duration_sec": round(float(total_dur), 4),
+            "samples_captured": expected_total_samples,
+            "samples_processed": int(processed_samples),
+            "cursor_sec": round(float(processed_end_sec), 4),
+            "windows": int(win_idx),
+            "cancelled": bool(was_cancelled),
+        }
 
         return all_segments
 
@@ -2927,6 +2971,7 @@ class LocalWhisperTranscriber:
         - Keeps source_track (`system`/`mic`), acoustic cluster (`Speaker 1`, `Speaker 2`),
           and calendar participant attribution separated.
         """
+        self._last_track_stats = {}
         eff_mic_path = self._prefer_raw_wav_path(mic_wav_path)
         eff_sys_path = self._prefer_raw_wav_path(sys_wav_path)
         has_mic = bool(eff_mic_path and os.path.exists(eff_mic_path))
@@ -3043,13 +3088,17 @@ class LocalWhisperTranscriber:
         sys_wav_path: str = "",
         output_script: str = "roman",
         remote_speaker_label: str = "",
+        verbatim_protection: bool = True,
+        enable_selective_verification: bool = True,
+        vocabulary: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Two-pass post-meeting reconciliation pass:
         1. Eliminates low-confidence micro-glitch turns (< 0.65s) without erasing valid short interjections.
         2. Merges adjacent segments from the same speaker separated by <= 0.8s pause.
-        3. For segments with confidence < 0.78, re-runs high-accuracy beam-5 multi-temperature transcription
-           on the isolated raw audio slice (preferring untouched `*_raw.wav` if present) and enforces Romanized Hinglish.
+        3. For low-confidence segments when `enable_selective_verification` is enabled, re-runs high-accuracy
+           beam-3 verification on the isolated raw slice (preferring untouched `*_raw.wav`), preserving both
+           primary and verification hypotheses plus raw verbatim text.
         """
         if not segments:
             return []
@@ -3065,6 +3114,8 @@ class LocalWhisperTranscriber:
                 d["start"] = d["start_time"]
             if "end" not in d:
                 d["end"] = d["end_time"]
+            if not d.get("raw_text") and d.get("text"):
+                d["raw_text"] = str(d.get("text", "")).strip()
             norm_input.append(d)
 
         sorted_segs = [
@@ -3179,7 +3230,7 @@ class LocalWhisperTranscriber:
         has_mic_disk = bool(eff_mic_disk and os.path.exists(eff_mic_disk))
         has_sys_disk = bool(eff_sys_disk and os.path.exists(eff_sys_disk))
 
-        if has_mic_mem or has_sys_mem or has_mic_disk or has_sys_disk:
+        if enable_selective_verification and (has_mic_mem or has_sys_mem or has_mic_disk or has_sys_disk):
             with self._lock:
                 refinements_done = 0
                 for seg in reconciled:
@@ -3212,6 +3263,17 @@ class LocalWhisperTranscriber:
 
                     if slice_audio is not None and slice_audio.size > int(0.3 * TARGET_SAMPLE_RATE):
                         refinements_done += 1
+                        hyps = list(seg.get("verification_hypotheses") or [])
+                        if not hyps:
+                            hyps.append(
+                                {
+                                    "source": "primary",
+                                    "text": str(seg.get("text", "")),
+                                    "raw_text": str(seg.get("raw_text") or seg.get("text", "")),
+                                    "confidence": round(conf, 3),
+                                    "raw_model_score": seg.get("raw_model_score"),
+                                }
+                            )
                         slice_rms = float(np.sqrt(np.mean(np.square(slice_audio))))
                         norm_slice = normalize_speech_audio(slice_audio)
                         ref_segs, _ = self._run_whisper_pass(
@@ -3246,7 +3308,7 @@ class LocalWhisperTranscriber:
                             refined_text = DictationProcessor.devanagari_to_roman_hinglish(refined_raw).strip()
                         else:
                             refined_text = refined_raw
-                        if (
+                        accept_ref = bool(
                             refined_text
                             and not is_hallucination(
                                 refined_text,
@@ -3258,7 +3320,19 @@ class LocalWhisperTranscriber:
                             )
                             and len(refined_text.split()) >= max(1, len(seg["text"].split()) - 1)
                             and refined_conf > conf + 0.10
-                        ):
+                        )
+                        hyps.append(
+                            {
+                                "source": "selective_verification",
+                                "text": refined_text,
+                                "raw_text": refined_raw,
+                                "confidence": round(refined_conf, 3),
+                                "raw_model_score": round(mean_ref_lp, 4) if mean_ref_lp is not None else None,
+                                "accepted": accept_ref,
+                            }
+                        )
+                        seg["verification_hypotheses"] = hyps
+                        if accept_ref:
                             seg["raw_text"] = refined_raw
                             seg["text"] = refined_text
                             seg["confidence"] = round(refined_conf, 2)
@@ -3266,9 +3340,11 @@ class LocalWhisperTranscriber:
                             seg["no_speech_prob"] = round(max_ref_nsp, 4) if max_ref_nsp is not None else None
                             seg["confidence_calibrated"] = False
                             seg["low_confidence"] = refined_conf < 0.45
+                        else:
+                            seg["is_uncertain"] = True
 
-        # Final guarantee: ensure all meeting segments are in Romanized Hinglish + Domain Normalized when output_script == 'roman',
-        # remove any micro-slice hallucinations, and sort strictly chronologically.
+        # Final guarantee: preserve verbatim raw_text + enforce Romanized Hinglish when requested
+        # without silently truncating or summarizing user speech.
         dp = DictationProcessor()
         final_reconciled: List[Dict[str, Any]] = []
         for seg in reconciled:
@@ -3281,6 +3357,7 @@ class LocalWhisperTranscriber:
             txt = seg.get("text", "").strip()
             if not txt:
                 continue
+            seg.setdefault("raw_text", txt)
             dur = max(0.01, e_val - s_val)
             seg_lp = seg.get("raw_model_score")
             seg_nsp = seg.get("no_speech_prob")
@@ -3294,7 +3371,23 @@ class LocalWhisperTranscriber:
                 continue
             if output_script == "roman":
                 txt = DictationProcessor.devanagari_to_roman_hinglish(txt)
-            txt = dp.process(txt).strip()
+            if verbatim_protection:
+                txt = dp.process(
+                    txt,
+                    vocabulary=vocabulary,
+                    cleanup_enabled=False,
+                    spoken_punctuation=False,
+                    output_script=output_script,
+                    mode="verbatim",
+                ).strip()
+            else:
+                txt = dp.process(
+                    txt,
+                    vocabulary=vocabulary,
+                    cleanup_enabled=True,
+                    spoken_punctuation=False,
+                    output_script=output_script,
+                ).strip()
             if not txt or is_hallucination(
                 txt,
                 duration_sec=dur,
@@ -3305,6 +3398,7 @@ class LocalWhisperTranscriber:
                 continue
             seg["text"] = txt
             seg.setdefault("confidence_calibrated", False)
+            seg.setdefault("transcript_stage", "offline")
             final_reconciled.append(seg)
 
         final_reconciled.sort(key=lambda s: (float(s["start_time"]), float(s["end_time"])))
