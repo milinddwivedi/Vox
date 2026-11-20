@@ -92,6 +92,10 @@ class MainWindow(QMainWindow):
     """Primary VOX Hub desktop application window matching Wispr Flow UX."""
 
     replay_tour_requested = pyqtSignal()
+    update_check_ui_result = pyqtSignal(bool, dict, str)
+    update_download_progress = pyqtSignal(int, int, int, str)
+    update_ready_to_install = pyqtSignal(str, str)
+    update_download_failed = pyqtSignal(str)
 
     WORKSPACES: List[Dict[str, str]] = [
         {"id": "home", "route": "/home", "shortcut": "Ctrl+1", "name": "Home"},
@@ -156,6 +160,8 @@ class MainWindow(QMainWindow):
         self._current_ask_vox_id = 0
         self._ask_vox_is_streaming = False
         self._ask_vox_buffer = ""
+        self._update_in_progress: bool = False
+        self._manual_update_check_pending: bool = False
         self.citations_list = QListWidget()
         self.citations_list.setAccessibleName("Ask VOX citation sources")
         self.citations_list.setAccessibleDescription("List of transcript citations and timestamps supporting the generated response")
@@ -186,7 +192,26 @@ class MainWindow(QMainWindow):
         if hasattr(self.controller, "toast_requested"):
             self.controller.toast_requested.connect(self.show_toast)
         if hasattr(self.controller, "update_check_completed"):
-            self.controller.update_check_completed.connect(self._on_update_available)
+            self.controller.update_check_completed.connect(
+                self._on_update_available,
+                Qt.ConnectionType.QueuedConnection,
+            )
+        self.update_check_ui_result.connect(
+            self._on_manual_check_ui_result,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.update_download_progress.connect(
+            self._on_update_download_progress,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.update_ready_to_install.connect(
+            self._on_update_ready_to_install,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.update_download_failed.connect(
+            self._on_update_download_failed,
+            Qt.ConnectionType.QueuedConnection,
+        )
         if hasattr(self.controller, "model_status_changed"):
             self.controller.model_status_changed.connect(self._on_model_status_changed)
 
@@ -460,6 +485,26 @@ class MainWindow(QMainWindow):
         plan_card_lay.addWidget(self.btn_user_sign_out)
 
         sb_lay.addWidget(self.plan_card)
+
+        self.update_progress_card = QFrame()
+        self.update_progress_card.setObjectName("updateProgressCard")
+        upd_lay = QVBoxLayout(self.update_progress_card)
+        upd_lay.setContentsMargins(10, 8, 10, 8)
+        upd_lay.setSpacing(5)
+        self.lbl_update_status = QLabel("Checking for updates...")
+        self.lbl_update_status.setObjectName("updateStatusLabel")
+        self.lbl_update_status.setWordWrap(True)
+        upd_lay.addWidget(self.lbl_update_status)
+        self.bar_update_progress = QProgressBar()
+        self.bar_update_progress.setObjectName("updateProgressBar")
+        self.bar_update_progress.setFixedHeight(8)
+        self.bar_update_progress.setTextVisible(False)
+        self.bar_update_progress.setRange(0, 100)
+        self.bar_update_progress.setValue(0)
+        upd_lay.addWidget(self.bar_update_progress)
+        self.update_progress_card.setVisible(False)
+        sb_lay.addWidget(self.update_progress_card)
+
         sb_lay.addSpacing(4)
 
         self.lbl_privacy_badge = QLabel(f"v{__version__} · 100% Local AI · Offline")
@@ -617,6 +662,7 @@ class MainWindow(QMainWindow):
         else:
             self.show()
             self.showNormal()
+        self.setWindowState((self.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive)
         self.raise_()
         self.activateWindow()
 
@@ -851,6 +897,25 @@ class MainWindow(QMainWindow):
                 color: #EF4444;
                 border-color: #EF4444;
             }}
+            QFrame#updateProgressCard {{
+                background-color: {t['surface']};
+                border: 1px solid {t['border']};
+                border-radius: 10px;
+            }}
+            QLabel#updateStatusLabel {{
+                color: {t['text_secondary']};
+                font-size: 11px;
+                font-weight: 600;
+            }}
+            QProgressBar#updateProgressBar {{
+                border: none;
+                background-color: {t['surface_well']};
+                border-radius: 4px;
+            }}
+            QProgressBar#updateProgressBar::chunk {{
+                background-color: {t['accent_emerald']};
+                border-radius: 4px;
+            }}
             """
         )
 
@@ -948,22 +1013,43 @@ class MainWindow(QMainWindow):
             self.show_toast("Sign-In", msg)
 
     def _on_manual_check_updates(self) -> None:
-        """User clicked 'Check for Updates' in sidebar."""
-        from voxlocal import __version__
+        """User clicked 'Updates' in sidebar."""
+        if self._update_in_progress:
+            self.show_toast("Update in Progress", "VOX is already downloading and installing an update.")
+            return
+        self._manual_update_check_pending = True
+        self.btn_check_updates.setEnabled(False)
+        self.btn_check_updates.setText("Checking...")
+        self.lbl_update_status.setText("Checking for VOX updates...")
+        self.bar_update_progress.setRange(0, 0)
+        self.update_progress_card.setVisible(True)
         self.show_toast("Checking for Updates", "Connecting to VOX update server...")
-        def _bg():
-            is_avail, manifest, msg = self.controller.check_for_updates(timeout_sec=10)
-            if not is_avail:
-                from PyQt6.QtCore import QTimer
-                QTimer.singleShot(
-                    0,
-                    lambda: self.show_toast(
-                        "VOX Up to Date",
-                        msg or f"You are using the latest version of VOX (v{__version__}).",
-                    ),
-                )
+
+        def _bg() -> None:
+            try:
+                is_avail, manifest, msg = self.controller.check_for_updates(timeout_sec=12)
+            except Exception as exc:
+                is_avail, manifest, msg = False, {}, f"Update check failed: {exc}"
+            self.update_check_ui_result.emit(bool(is_avail), dict(manifest or {}), str(msg or ""))
+
         import threading
         threading.Thread(target=_bg, daemon=True, name="ManualUpdateCheck").start()
+
+    def _on_manual_check_ui_result(self, is_avail: bool, manifest: Dict[str, Any], msg: str) -> None:
+        """Handled safely on the GUI thread when a manual update check completes."""
+        self._manual_update_check_pending = False
+        if self._update_in_progress:
+            return
+        if not is_avail:
+            self.update_progress_card.setVisible(False)
+            self.bar_update_progress.setRange(0, 100)
+            self.bar_update_progress.setValue(0)
+            self.btn_check_updates.setEnabled(True)
+            self.btn_check_updates.setText("Updates")
+            self.show_toast(
+                "VOX Up to Date",
+                msg or f"You are using the latest version of VOX (v{__version__}).",
+            )
 
     def _on_model_status_changed(self, msg: str) -> None:
         if not msg:
@@ -976,25 +1062,39 @@ class MainWindow(QMainWindow):
 
     def _on_update_available(self, is_avail: bool, manifest: Dict[str, Any], msg: str) -> None:
         """Display an in-app update notification when a new version is detected."""
-        if not is_avail or not manifest:
+        if not is_avail or not manifest or self._update_in_progress:
             return
+        if self.update_progress_card.isVisible() and not self._update_in_progress:
+            self.update_progress_card.setVisible(False)
+            self.bar_update_progress.setRange(0, 100)
+            self.bar_update_progress.setValue(0)
         version = str(manifest.get("version", "Latest"))
-        notes = str(manifest.get("release_notes") or "New performance improvements and features.")
+        raw_notes = manifest.get("release_notes")
+        if isinstance(raw_notes, list):
+            notes = "\n".join(f"• {str(n)}" for n in raw_notes[:4] if str(n).strip())
+        else:
+            notes = str(raw_notes or "New performance improvements and features.")
         from PyQt6.QtWidgets import QMessageBox
         box = QMessageBox(self)
         box.setWindowTitle(f"VOX Update Available (v{version})")
         box.setText(f"A new version of VOX (v{version}) is ready to install!")
-        box.setInformativeText(f"{notes}\n\nWould you like to update VOX now?")
+        box.setInformativeText(
+            f"Current: v{__version__}  \u2192  Latest: v{version}\n\n"
+            f"{notes}\n\n"
+            "Would you like to download and install the update now?"
+        )
         btn_update = box.addButton("⚡ Update Now", QMessageBox.ButtonRole.AcceptRole)
-        btn_later = box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(btn_update)
         box.exec()
         if box.clickedButton() == btn_update:
             self._start_in_app_update(manifest)
+        else:
+            self.btn_check_updates.setEnabled(True)
+            self.btn_check_updates.setText("Updates")
 
     def _start_in_app_update(self, manifest: Dict[str, Any]) -> None:
         """Downloads the cryptographically verified installer in background and restarts."""
-        from voxlocal import __version__
         if getattr(self.controller, "capture_state", "idle") in ("recording", "paused"):
             defer_msg = (
                 "An active meeting recording is currently in progress. "
@@ -1003,50 +1103,126 @@ class MainWindow(QMainWindow):
             self.show_toast("Update Deferred", defer_msg)
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Meeting Recording in Progress", defer_msg)
+            self.btn_check_updates.setEnabled(True)
+            self.btn_check_updates.setText("Updates")
             return
 
         ver = str(manifest.get("version", __version__))
+        self._update_in_progress = True
+        self.btn_check_updates.setEnabled(False)
+        self.btn_check_updates.setText("Updating 0%")
+        self.lbl_update_status.setText(f"Starting download for VOX v{ver}...")
+        self.bar_update_progress.setRange(0, 100)
+        self.bar_update_progress.setValue(0)
+        self.update_progress_card.setVisible(True)
         self.show_toast("Downloading Update...", f"Fetching VOX v{ver} in background...")
 
-        def _bg_downloader():
+        def _bg_downloader() -> None:
             import tempfile
             dest_dir = Path(tempfile.gettempdir()) / "vox_updater"
             dest_dir.mkdir(parents=True, exist_ok=True)
             installer_dest = dest_dir / f"VoxLocal-Setup-{ver}.exe"
-            
+
             mgr = getattr(self.controller, "update_manager", None)
             if not mgr:
                 from voxlocal.core.updater import UpdateManager
                 mgr = UpdateManager()
 
-            ok, dl_msg = mgr.download_and_verify(manifest, installer_dest)
+            last_emitted_pct = [-1]
+
+            def _on_progress(downloaded: int, total: int, pct: int) -> None:
+                clamped_pct = max(0, min(100, int(pct)))
+                if clamped_pct == last_emitted_pct[0] and downloaded < total:
+                    return
+                last_emitted_pct[0] = clamped_pct
+                stage = (
+                    "Verifying Ed25519 signature & SHA-256..."
+                    if clamped_pct >= 100
+                    else f"Downloading VOX v{ver}..."
+                )
+                self.update_download_progress.emit(int(downloaded), int(total), clamped_pct, stage)
+
+            ok, dl_msg = mgr.download_and_verify(
+                manifest,
+                installer_dest,
+                progress_callback=_on_progress,
+            )
             if ok and installer_dest.exists():
                 logger.info("Update downloaded and verified: %s", installer_dest)
-                from PyQt6.QtCore import QTimer
-
-                def _apply_and_restart():
-                    self.show_toast("Installing Update", "Restarting VOX to complete installation...")
-                    import subprocess, sys
-                    from pathlib import Path
-                    from PyQt6.QtWidgets import QApplication
-
-                    app_exe = Path(sys.executable)
-                    cmd = (
-                        f'Start-Sleep -Milliseconds 600; '
-                        f'Start-Process -FilePath "{installer_dest}" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" -Wait; '
-                        f'if (Test-Path "{app_exe}") {{ Start-Process -FilePath "{app_exe}" }}'
-                    )
-                    subprocess.Popen(["powershell", "-WindowStyle", "Hidden", "-Command", cmd])
-                    QApplication.instance().quit()
-
-                QTimer.singleShot(400, _apply_and_restart)
+                self.update_ready_to_install.emit(str(installer_dest), ver)
             else:
                 logger.warning("Auto-update failed: %s", dl_msg)
-                if hasattr(self.controller, "toast_requested"):
-                    self.controller.toast_requested.emit("Update Notice", f"Auto-update could not complete: {dl_msg}")
+                self.update_download_failed.emit(str(dl_msg or "Download failed"))
 
         import threading
         threading.Thread(target=_bg_downloader, daemon=True, name="InAppAutoUpdater").start()
+
+    def _on_update_download_progress(self, downloaded: int, total: int, pct: int, stage: str) -> None:
+        """Update inline sidebar progress bar live on the GUI thread."""
+        self.update_progress_card.setVisible(True)
+        self.bar_update_progress.setRange(0, 100)
+        self.bar_update_progress.setValue(max(0, min(100, int(pct))))
+        if total > 0:
+            dl_mb = downloaded / (1024 * 1024)
+            tot_mb = total / (1024 * 1024)
+            self.lbl_update_status.setText(f"{stage} ({pct}% · {dl_mb:.1f}/{tot_mb:.1f} MB)")
+        else:
+            self.lbl_update_status.setText(f"{stage} ({pct}%)")
+        self.btn_check_updates.setText(f"Updating {pct}%")
+
+    def _on_update_download_failed(self, err_msg: str) -> None:
+        """Reset update progress UI on GUI thread if download/verification fails."""
+        self._update_in_progress = False
+        self.btn_check_updates.setEnabled(True)
+        self.btn_check_updates.setText("Updates")
+        self.bar_update_progress.setRange(0, 100)
+        self.bar_update_progress.setValue(0)
+        self.lbl_update_status.setText(f"Update failed: {err_msg}")
+        self.show_toast("Update Notice", f"Auto-update could not complete: {err_msg}")
+
+    def _on_update_ready_to_install(self, installer_path: str, ver: str) -> None:
+        """Launch silent installer handoff, close current app cleanly, and relaunch updated build."""
+        import os
+        import subprocess
+        import sys
+
+        self.update_progress_card.setVisible(True)
+        self.bar_update_progress.setRange(0, 0)
+        self.lbl_update_status.setText(f"Installing VOX v{ver} & restarting...")
+        self.btn_check_updates.setText("Restarting...")
+        self.show_toast("Installing Update", f"Installing VOX v{ver} and restarting...")
+
+        installer_dest = Path(installer_path)
+        if getattr(sys, "frozen", False) and Path(sys.executable).name.lower() == "voxlocal.exe":
+            target_install_dir = Path(sys.executable).resolve().parent
+        else:
+            local_app_data = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            target_install_dir = Path(local_app_data) / "Programs" / "VOX"
+        relaunch_exe = target_install_dir / "VoxLocal.exe"
+
+        cmd = (
+            f'Start-Sleep -Milliseconds 900; '
+            f'Start-Process -FilePath "{installer_dest}" -ArgumentList @("--silent", "--no-launch", "--install-dir", "{target_install_dir}") -Wait; '
+            f'if (Test-Path "{relaunch_exe}") {{ Start-Process -FilePath "{relaunch_exe}" -WorkingDirectory "{target_install_dir}" }}'
+        )
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
+            subprocess, "DETACHED_PROCESS", 0x00000008
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
+            creationflags=creation_flags,
+        )
+
+        def _quit_cleanly() -> None:
+            try:
+                if callable(self.on_exit_app):
+                    self.on_exit_app()
+            finally:
+                inst = QApplication.instance()
+                if inst is not None:
+                    inst.quit()
+
+        QTimer.singleShot(250, _quit_cleanly)
 
     def _on_sign_out_clicked(self) -> None:
         """Logs out the active user and reverts to Guest Free mode."""

@@ -1,6 +1,12 @@
 const { supabase, authenticateUser } = require('../_lib/supabase');
 
 const RELEASE_CATALOG = {
+  'releases/1.0.11/VoxLocal-Setup.exe': {
+    version: '1.0.11',
+    filename: 'VoxLocal-Setup.exe',
+    sha256: '473a78952c3b99f14938b1bbed811e63689a9770aafc298ec7345b241bb4ea03',
+    size_bytes: 31016421,
+  },
   'releases/1.0.10/VoxLocal-Setup.exe': {
     version: '1.0.10',
     filename: 'VoxLocal-Setup.exe',
@@ -68,10 +74,10 @@ const RELEASE_CATALOG = {
     size_bytes: 10148603,
   },
   'VoxLocal-Setup.exe': {
-    version: '1.0.10',
+    version: '1.0.11',
     filename: 'VoxLocal-Setup.exe',
-    sha256: '7639900b8ca85a42f9519ce667f6164b4512c514908c6c09ec3bc7e68a2e335b',
-    size_bytes: 31005826,
+    sha256: '473a78952c3b99f14938b1bbed811e63689a9770aafc298ec7345b241bb4ea03',
+    size_bytes: 31016421,
   },
 };
 
@@ -98,7 +104,7 @@ module.exports = async function handler(req, res) {
     }
 
     // 2. Validate requested artifact
-    const requestedArtifact = (req.body && req.body.artifact) || 'releases/1.0.10/VoxLocal-Setup.exe';
+    const requestedArtifact = (req.body && req.body.artifact) || 'releases/1.0.11/VoxLocal-Setup.exe';
     const metadata = RELEASE_CATALOG[requestedArtifact] || RELEASE_CATALOG['VoxLocal-Setup.exe'];
     if (!metadata) {
       return res.status(404).json({
@@ -122,8 +128,8 @@ module.exports = async function handler(req, res) {
     }
 
     if (!downloadUrl) {
-      // Tag-pinned GitHub Fastly CDN delivery for verified v1.0.10 binary
-      downloadUrl = 'https://raw.githubusercontent.com/milinddwivedi/Vox/v1.0.10/docs/downloads/VoxLocal-Setup.exe';
+      // Tag-pinned GitHub Fastly CDN delivery for verified v1.0.11 binary
+      downloadUrl = 'https://raw.githubusercontent.com/milinddwivedi/Vox/v1.0.11/docs/downloads/VoxLocal-Setup.exe';
     }
 
     return res.status(200).json({

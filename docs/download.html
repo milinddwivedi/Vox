@@ -374,7 +374,7 @@
         <div>
           <div style="font-weight:700; font-size:20px; margin-bottom:4px; display:flex; align-items:center; gap:8px;">
             <span>VoxLocal-Setup.exe</span>
-            <span style="font-size:12px; background:rgba(16,185,129,0.15); color:#10B981; border:1px solid rgba(16,185,129,0.3); border-radius:999px; padding:2px 8px; font-weight:700;">Latest v1.0.10</span>
+            <span style="font-size:12px; background:rgba(16,185,129,0.15); color:#10B981; border:1px solid rgba(16,185,129,0.3); border-radius:999px; padding:2px 8px; font-weight:700;">Latest v1.0.11</span>
           </div>
           <div style="font-size:13px; color:var(--text-muted);">Windows 10/11 (64-bit) · 29.6 MB · Cryptographically Verified</div>
         </div>
@@ -389,7 +389,7 @@
       </div>
 
       <div class="checksum-bar" style="margin-top:16px;">
-        <span>SHA-256 Digest:</span>7639900b8ca85a42f9519ce667f6164b4512c514908c6c09ec3bc7e68a2e335b
+        <span>SHA-256 Digest:</span>473a78952c3b99f14938b1bbed811e63689a9770aafc298ec7345b241bb4ea03
       </div>
 
       <!-- Account & Desktop Sync Section -->
@@ -543,7 +543,7 @@
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + _currentUserSession.access_token,
           },
-          body: JSON.stringify({ artifact: 'releases/1.0.10/VoxLocal-Setup.exe' })
+          body: JSON.stringify({ artifact: 'releases/1.0.11/VoxLocal-Setup.exe' })
         }).catch(() => {});
       }
 

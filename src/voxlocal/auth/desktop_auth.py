@@ -125,6 +125,7 @@ class DesktopAuthBroker:
         self._current_user: Optional[UserProfile] = None
         self._explicitly_signed_out: bool = False
         self.on_session_synced: Optional[Callable[[UserProfile], None]] = None
+        self.on_focus_window_requested: Optional[Callable[[], None]] = None
         self._background_servers: List[HTTPServer] = []
         self._stop_background_listener = threading.Event()
         DesktopAuthBroker._active_broker = self
@@ -707,17 +708,29 @@ class _AuthLoopbackHandler(BaseHTTPRequestHandler):
         broker = DesktopAuthBroker._active_broker or getattr(self.server, "auth_broker", None)
 
         if parsed.path in ("/health", "/status"):
+            from voxlocal import __version__
             u = broker.get_current_user() if broker else None
             res = {
                 "ok": True,
                 "app": "voxlocal",
-                "version": "1.0.0",
+                "version": __version__,
                 "authenticated": u is not None,
                 "email": u.email if u else None,
                 "name": u.display_name if u else None,
                 "is_pro": u.is_pro if u else False
             }
             self._send_json(200, json.dumps(res).encode("utf-8"))
+            return
+
+        if parsed.path == "/focus-window":
+            focused = False
+            if broker and callable(getattr(broker, "on_focus_window_requested", None)):
+                try:
+                    broker.on_focus_window_requested()
+                    focused = True
+                except Exception as focus_exc:
+                    logger.debug("Loopback focus callback error: %s", focus_exc)
+            self._send_json(200, json.dumps({"ok": True, "focused": focused}).encode("utf-8"))
             return
 
         if parsed.path == "/sync-session":

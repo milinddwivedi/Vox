@@ -629,3 +629,91 @@ def test_rapid_call_switch_recorder_isolation_and_retranscribe_path_update():
                 ctrl.shutdown()
 
 
+def test_in_app_updater_progress_bar_and_install_handoff():
+    import time
+    from unittest.mock import MagicMock
+    from PyQt6.QtWidgets import QApplication
+    from voxlocal.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory(prefix="vox_upd_ui_") as td:
+        tmp = Path(td)
+        cfg = AppConfig(storage_dir=str(tmp), auto_record_calls=False, prompt_on_call=False)
+        ctrl = MagicMock()
+        ctrl.config = cfg
+        ctrl.theme = "light"
+        ctrl.registered_ui_hwnds = set()
+        ctrl.db = LocalDatabase(tmp / "test.db")
+        ctrl.get_account_status.return_value = {"signed_in": False, "user_id": "default", "email": "", "is_pro": False}
+        ctrl.entitlement.get_effective_entitlement.return_value = {"is_pro": False, "limits": {"dictation_words_weekly": 3000}}
+        ctrl.metering.get_weekly_usage.return_value = {"dictation_words": 0}
+
+        exit_calls = []
+        win = MainWindow(ctrl, floating_widget=MagicMock(), on_exit_app=lambda: exit_calls.append(True))
+        try:
+            win.show()
+            app.processEvents()
+            assert win.update_progress_card.isVisible() is False
+
+            win._on_update_download_progress(15_000_000, 30_000_000, 50, "Downloading VOX v1.0.11...")
+            app.processEvents()
+            assert win.update_progress_card.isVisible() is True
+            assert win.bar_update_progress.value() == 50
+            assert "50%" in win.lbl_update_status.text()
+            assert "50%" in win.btn_check_updates.text()
+
+            installer_stub = tmp / "VoxLocal-Setup-1.0.11.exe"
+            installer_stub.write_bytes(b"MZ")
+            popen_calls = []
+            with patch("subprocess.Popen", side_effect=lambda *a, **kw: popen_calls.append((a, kw)) or MagicMock()):
+                win._on_update_ready_to_install(str(installer_stub), "1.0.11")
+                assert len(popen_calls) == 1
+                cmd_str = popen_calls[0][0][0][-1]
+                assert "--silent" in cmd_str
+                assert "--no-launch" in cmd_str
+                assert "--install-dir" in cmd_str
+                deadline = time.monotonic() + 2.0
+                while not exit_calls and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(0.05)
+            assert exit_calls == [True]
+        finally:
+            win.prepare_force_quit()
+            win.close()
+            ctrl.db.close()
+
+
+def test_loopback_focus_window_endpoint_triggers_callback():
+    import threading
+    import urllib.request
+    from http.server import HTTPServer
+    from voxlocal.auth.desktop_auth import DesktopAuthBroker, _AuthLoopbackHandler
+
+    with tempfile.TemporaryDirectory(prefix="vox_loop_focus_") as td:
+        tmp = Path(td)
+        with patch.object(DesktopAuthBroker, "start_background_sync_listener"), patch.object(
+            DesktopAuthBroker, "register_windows_uri_scheme"
+        ):
+            broker = DesktopAuthBroker(vault_path=tmp / "auth_session.vault")
+        focus_hits = []
+        broker.on_focus_window_requested = lambda: focus_hits.append(True)
+
+        server = HTTPServer(("127.0.0.1", 0), _AuthLoopbackHandler)
+        server.auth_broker = broker  # type: ignore[attr-defined]
+        port = server.server_address[1]
+        t = threading.Thread(target=server.handle_request, daemon=True)
+        t.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/focus-window", timeout=5) as resp:
+                assert resp.status == 200
+                data = json.loads(resp.read().decode("utf-8"))
+                assert data["ok"] is True
+                assert data["focused"] is True
+            assert focus_hits == [True]
+        finally:
+            t.join(timeout=2.0)
+            server.server_close()
+            broker.close()
+
+
+

@@ -4,7 +4,7 @@
  * with native Content-Disposition attachment headers.
  */
 
-const SUPABASE_STORAGE_URL = 'https://raw.githubusercontent.com/milinddwivedi/Vox/v1.0.10/docs/downloads/VoxLocal-Setup.exe';
+const SUPABASE_STORAGE_URL = 'https://raw.githubusercontent.com/milinddwivedi/Vox/v1.0.11/docs/downloads/VoxLocal-Setup.exe';
 const FALLBACK_DIRECT_URL = 'https://raw.githubusercontent.com/milinddwivedi/Vox/main/docs/downloads/VoxLocal-Setup.exe';
 
 module.exports = async function handler(req, res) {

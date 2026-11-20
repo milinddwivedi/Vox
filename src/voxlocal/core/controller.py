@@ -211,6 +211,7 @@ class AppController(QObject):
     upgrade_dialog_requested = pyqtSignal(str)        # (reason_string)
     usage_updated = pyqtSignal(dict)                  # (weekly_usage_dict)
     update_check_completed = pyqtSignal(bool, dict, str) # (is_available, manifest, message)
+    focus_main_window_requested = pyqtSignal()
 
     def __init__(self, config: Optional[AppConfig] = None) -> None:
         super().__init__()
@@ -225,6 +226,7 @@ class AppController(QObject):
         self.desktop_auth_broker = DesktopAuthBroker(vault_path=storage_root / "auth_session.vault")
         self.auth_broker = self.desktop_auth_broker  # Backward compatibility alias
         self.desktop_auth_broker.on_session_synced = self._on_desktop_auth_synced
+        self.desktop_auth_broker.on_focus_window_requested = lambda: self._safe_emit(self.focus_main_window_requested)
         self._restore_user_session()
 
         # Update Manager & Release Trust Chain (Milestone 5)

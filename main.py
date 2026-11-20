@@ -28,24 +28,6 @@ if getattr(sys, "frozen", False) and (SRC_DIR / "voxlocal").exists():
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-if "--print-version" not in sys.argv:
-    from voxlocal.core.config import AppConfig
-
-if "--print-version" not in sys.argv and "--hardware-diagnostics" not in sys.argv:
-    from PyQt6.QtCore import QtMsgType, qInstallMessageHandler
-    from PyQt6.QtWidgets import QApplication, QMessageBox
-
-    from voxlocal.core.controller import AppController
-    from voxlocal.core.logger import get_logger, setup_logging
-    from voxlocal.ui.calendar_prompt import VoxMeetingPromptPopup
-    from voxlocal.ui.floating_pill import DualTierFloatingPill, PillState
-    from voxlocal.ui.main_window import MainWindow
-    from voxlocal.ui.notetaker_drawer import VoxNotetakerDrawer
-    from voxlocal.ui.onboarding_wizard import VoxOnboardingWizard
-    from voxlocal.ui.scratchpad_window import VoxScratchpadWindow
-    from voxlocal.ui.theme import create_app_icon
-    from voxlocal.ui.tray_manager import SystemTrayManager
-
 ERROR_ALREADY_EXISTS = 183
 
 
@@ -66,6 +48,79 @@ def set_windows_app_id() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
             "VoxLocal.AIVoiceAssistant.Desktop.1"
         )
+    except Exception:
+        pass
+
+
+def _run_hardware_diagnostics(out_path: str) -> int:
+    import json
+    from voxlocal.core.config import AppConfig
+    from voxlocal.core.hardware import HardwareProfiler
+
+    cfg = AppConfig.load()
+    diag = HardwareProfiler.run_hardware_diagnostics(run_short_benchmark=False, config=cfg)
+    rendered = json.dumps(diag, indent=2, ensure_ascii=False)
+    if out_path:
+        out_p = Path(out_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)
+    return 0
+
+
+def _focus_existing_instance(auth_url: str = "") -> None:
+    import urllib.parse
+    import urllib.request
+
+    if auth_url:
+        query_str = urllib.parse.urlsplit(auth_url).query or auth_url
+        for port in (8400, 3000):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/sync-session?{query_str}", timeout=1.0)
+                break
+            except Exception:
+                pass
+
+    loopback_focused = False
+    for port in (8400, 3000):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/focus-window", timeout=1.0) as resp:
+                if resp.status == 200:
+                    loopback_focused = True
+                    break
+        except Exception:
+            pass
+
+    try:
+        user32 = ctypes.windll.user32
+        SW_RESTORE = 9
+        hwnd = 0
+        for exact_title in ("VOX", "VoxLocal - Local AI Voice Assistant", "VoxLocal — Local AI Voice Assistant"):
+            hwnd = user32.FindWindowW(None, exact_title)
+            if hwnd:
+                break
+        if not hwnd and not loopback_focused:
+            WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+            found = [0]
+
+            def _enum_win(h, _):
+                if user32.IsWindowVisible(h):
+                    length = user32.GetWindowTextLengthW(h)
+                    if 0 < length <= 120:
+                        buf = ctypes.create_unicode_buffer(length + 1)
+                        user32.GetWindowTextW(h, buf, length + 1)
+                        if buf.value == "VOX" or "VoxLocal" in buf.value:
+                            found[0] = h
+                            return False
+                return True
+
+            user32.EnumWindows(WNDENUMPROC(_enum_win), 0)
+            hwnd = found[0]
+
+        if hwnd:
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
     except Exception:
         pass
 
@@ -119,19 +174,29 @@ def main() -> int:
         return 0
 
     if getattr(args, "hardware_diagnostics", False):
-        import json
-        from voxlocal.core.hardware import HardwareProfiler
+        return _run_hardware_diagnostics(getattr(args, "diagnostics_out", "") or "")
 
-        cfg = AppConfig.load()
-        diag = HardwareProfiler.run_hardware_diagnostics(run_short_benchmark=False, config=cfg)
-        rendered = json.dumps(diag, indent=2, ensure_ascii=False)
-        out_path = getattr(args, "diagnostics_out", "") or ""
-        if out_path:
-            out_p = Path(out_path)
-            out_p.parent.mkdir(parents=True, exist_ok=True)
-            out_p.write_text(rendered + "\n", encoding="utf-8")
-        print(rendered)
+    mutex_handle, already_running = acquire_single_instance_mutex()
+    if already_running and args.smoke_test_ms <= 0:
+        _focus_existing_instance(getattr(args, "auth_url", "") or "")
+        if mutex_handle:
+            ctypes.windll.kernel32.CloseHandle(mutex_handle)
         return 0
+
+    from PyQt6.QtCore import Qt, QtMsgType, QTimer, qInstallMessageHandler
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+
+    from voxlocal.core.config import AppConfig
+    from voxlocal.core.controller import AppController
+    from voxlocal.core.logger import get_logger, setup_logging
+    from voxlocal.ui.calendar_prompt import VoxMeetingPromptPopup
+    from voxlocal.ui.floating_pill import DualTierFloatingPill, PillState
+    from voxlocal.ui.main_window import MainWindow
+    from voxlocal.ui.notetaker_drawer import VoxNotetakerDrawer
+    from voxlocal.ui.onboarding_wizard import VoxOnboardingWizard
+    from voxlocal.ui.scratchpad_window import VoxScratchpadWindow
+    from voxlocal.ui.theme import create_app_icon
+    from voxlocal.ui.tray_manager import SystemTrayManager
 
     setup_logging()
     logger = get_logger("main")
@@ -163,52 +228,11 @@ def main() -> int:
 
     qInstallMessageHandler(_qt_message_handler)
 
-    mutex_handle, already_running = acquire_single_instance_mutex()
     app = QApplication(sys.argv)
     app.setApplicationName("VoxLocal")
     app.setOrganizationName("VoxLocal")
     app.setQuitOnLastWindowClosed(False)
     app.setWindowIcon(create_app_icon("idle"))
-
-    if already_running and args.smoke_test_ms <= 0:
-        logger.info("Another instance of VoxLocal is already running; bringing it to the front...")
-        if getattr(args, "auth_url", None):
-            try:
-                import urllib.parse
-                import urllib.request
-                auth_val = getattr(args, "auth_url", "")
-                query_str = urllib.parse.urlsplit(auth_val).query or auth_val
-                sync_url = f"http://127.0.0.1:8400/sync-session?{query_str}"
-                urllib.request.urlopen(sync_url, timeout=1.5)
-            except Exception as fwd_exc:
-                logger.debug("Could not forward auth-url to running instance: %s", fwd_exc)
-        user32 = ctypes.windll.user32
-        SW_RESTORE = 9
-        hwnd = user32.FindWindowW(None, "VoxLocal - Local AI Voice Assistant")
-        if not hwnd:
-            hwnd = user32.FindWindowW(None, "VoxLocal — Local AI Voice Assistant")
-        if not hwnd:
-            WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-            found = [0]
-
-            def _enum_win(h, _):
-                length = user32.GetWindowTextLengthW(h)
-                if length > 0:
-                    buf = ctypes.create_unicode_buffer(length + 1)
-                    user32.GetWindowTextW(h, buf, length + 1)
-                    if "VoxLocal" in buf.value:
-                        found[0] = h
-                        return False
-                return True
-
-            user32.EnumWindows(WNDENUMPROC(_enum_win), 0)
-            hwnd = found[0]
-
-        if hwnd:
-            user32.ShowWindow(hwnd, SW_RESTORE)
-            user32.BringWindowToTop(hwnd)
-            user32.SetForegroundWindow(hwnd)
-        return 0
 
     config = AppConfig.load()
     controller = AppController(config=config)
@@ -265,6 +289,18 @@ def main() -> int:
         on_exit_app=exit_application,
     )
     main_win_ref.append(main_window)
+    if hasattr(controller, "focus_main_window_requested"):
+        controller.focus_main_window_requested.connect(
+            lambda: open_dashboard_tab(0),
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+    start_hidden = args.minimized or (args.startup and config.start_minimized_to_tray)
+    if not start_hidden:
+        main_window.show()
+        main_window.raise_()
+        main_window.activateWindow()
+        app.processEvents()
 
     # Secondary Wispr-parity floating surfaces & onboarding tour
     scratchpad_win = VoxScratchpadWindow(
@@ -322,7 +358,6 @@ def main() -> int:
         if st == "recording" and getattr(config, "notetaker_notepad_on_start", "open") == "open"
         else None
     )
-    from PyQt6.QtCore import Qt
     controller.meeting_saved_and_transcribed.connect(
         main_window.handle_meeting_saved_and_transcribed,
         Qt.ConnectionType.QueuedConnection,
@@ -348,17 +383,11 @@ def main() -> int:
         floating.show()
         main_window._update_float_btn_text()
 
-    # Show Main Window unless started with --minimized or (--startup and start_minimized_to_tray)
-    start_hidden = args.minimized or (args.startup and config.start_minimized_to_tray)
-    if not start_hidden:
-        main_window.show()
-        if args.smoke_test_ms <= 0 and not getattr(config, "onboarding_completed", False):
-            from PyQt6.QtCore import QTimer
-            QTimer.singleShot(350, _launch_onboarding_tour)
+    # Schedule onboarding tour on first run and optional smoke test exit
+    if not start_hidden and args.smoke_test_ms <= 0 and not getattr(config, "onboarding_completed", False):
+        QTimer.singleShot(350, _launch_onboarding_tour)
 
     if args.smoke_test_ms > 0:
-        from PyQt6.QtCore import QTimer
-
         logger.info("Running smoke test for %d ms...", args.smoke_test_ms)
         QTimer.singleShot(args.smoke_test_ms, exit_application)
 
