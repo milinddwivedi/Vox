@@ -28,11 +28,13 @@ if getattr(sys, "frozen", False) and (SRC_DIR / "voxlocal").exists():
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
+if "--print-version" not in sys.argv:
+    from voxlocal.core.config import AppConfig
+
 if "--print-version" not in sys.argv and "--hardware-diagnostics" not in sys.argv:
     from PyQt6.QtCore import QtMsgType, qInstallMessageHandler
     from PyQt6.QtWidgets import QApplication, QMessageBox
 
-    from voxlocal.core.config import AppConfig
     from voxlocal.core.controller import AppController
     from voxlocal.core.logger import get_logger, setup_logging
     from voxlocal.ui.calendar_prompt import VoxMeetingPromptPopup
@@ -118,7 +120,6 @@ def main() -> int:
 
     if getattr(args, "hardware_diagnostics", False):
         import json
-        from voxlocal.core.config import AppConfig
         from voxlocal.core.hardware import HardwareProfiler
 
         cfg = AppConfig.load()

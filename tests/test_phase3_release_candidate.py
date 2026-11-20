@@ -14,6 +14,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -514,3 +515,44 @@ def test_controller_finalize_enforces_honest_completeness_and_verbatim_split():
                 assert "wfx" in rec_b["cleaned_transcript"].lower()
             finally:
                 ctrl.shutdown()
+
+
+def test_main_gui_smoke_startup_exits_cleanly():
+    with tempfile.TemporaryDirectory(prefix="vox_gui_smoke_") as td:
+        tmp = Path(td)
+        cfg_path = tmp / "smoke_config.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "storage_dir": str(tmp),
+                    "models_dir": str(ROOT_DIR / "data" / "models"),
+                    "onboarding_completed": True,
+                    "auto_record_calls": False,
+                    "prompt_on_call": False,
+                    "llm_enabled": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["VOXLOCAL_CONFIG_PATH"] = str(cfg_path)
+        proc = subprocess.run(
+            [sys.executable, str(ROOT_DIR / "main.py"), "--smoke-test-ms", "1500"],
+            cwd=str(ROOT_DIR),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        assert proc.returncode == 0, f"stderr={proc.stderr!r}\nstdout={proc.stdout[-1500:]!r}"
+        assert "UnboundLocalError" not in proc.stderr
+        assert "Traceback" not in proc.stderr
+        assert "UnboundLocalError" not in proc.stdout
+        assert "Unhandled exception caught by global hook" not in proc.stdout
+        log_path = tmp / "logs" / "voxlocal.log"
+        if log_path.exists():
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+            assert "UnboundLocalError" not in log_text
+            assert "Unhandled exception caught by global hook" not in log_text
+
