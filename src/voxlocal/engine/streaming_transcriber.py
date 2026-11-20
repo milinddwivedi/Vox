@@ -236,23 +236,27 @@ class LiveMeetingStreamingTranscriber:
         with self._lock:
             self._paused = False
 
-    def stop(self) -> None:
+    def stop(self, expected_meeting_id: Optional[int] = None) -> None:
         """Stop streaming transcription and flush any pending speech through EOF."""
         with self._lock:
             if not self._active:
                 return
+            if expected_meeting_id is not None and self._meeting_id not in (None, expected_meeting_id):
+                return
             self._active = False
             self._stop_event.set()
+            rec = self._recorder
 
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=2.5)
             self._worker_thread = None
 
         try:
-            rec = self._recorder
             if rec is not None:
                 now_sec = float(getattr(rec, "elapsed_seconds", 0.0))
-                flush_start = float(self._audio_cursor_sec)
+                # Cap synchronous tail-flush window to at most the trailing 6.0s of audio
+                # so stop() never blocks for 30s on CPU when offline finalization follows immediately.
+                flush_start = max(float(self._audio_cursor_sec), max(0.0, now_sec - 6.0))
                 if self.transcriber is not None and (now_sec - flush_start) >= 0.20:
                     mic_s, sys_s, actual_s = rec.get_audio_window(flush_start, now_sec)
                     m_rms = float(np.sqrt(np.mean(mic_s ** 2))) if mic_s.size else 0.0

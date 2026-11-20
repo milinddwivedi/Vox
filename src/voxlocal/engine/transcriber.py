@@ -62,17 +62,22 @@ def setup_nvidia_dll_paths() -> None:
         return
     import sys
 
+    if getattr(sys, "frozen", False):
+        return
     app_root = get_app_root()
     search_dirs = [
         app_root / ".venv" / "Lib" / "site-packages" / "nvidia" / "cublas" / "bin",
         app_root / ".venv" / "Lib" / "site-packages" / "nvidia" / "cudnn" / "bin",
         app_root / ".venv" / "Lib" / "site-packages" / "nvidia" / "cuda_nvrtc" / "bin",
+        app_root / ".venv" / "Lib" / "site-packages" / "nvidia" / "cuda_runtime" / "bin",
         Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages" / "nvidia" / "cublas" / "bin",
         Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages" / "nvidia" / "cudnn" / "bin",
         Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages" / "nvidia" / "cuda_nvrtc" / "bin",
+        Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages" / "nvidia" / "cuda_runtime" / "bin",
         Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / "cublas" / "bin",
         Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / "cudnn" / "bin",
         Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / "cuda_nvrtc" / "bin",
+        Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / "cuda_runtime" / "bin",
     ]
     for d in search_dirs:
         if d.exists():
@@ -83,6 +88,21 @@ def setup_nvidia_dll_paths() -> None:
             p_str = str(d.resolve())
             if p_str not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = f"{p_str};" + os.environ.get("PATH", "")
+
+
+def is_cuda_runtime_available() -> bool:
+    """Return True only when both a CUDA device and required CUDA 12 cuBLAS DLLs are loadable in this process."""
+    setup_nvidia_dll_paths()
+    try:
+        if ctranslate2.get_cuda_device_count() <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+            ctypes.WinDLL("cublas64_12.dll")
+            ctypes.WinDLL("cublasLt64_12.dll")
+        return True
+    except Exception:
+        return False
 
 
 # Run immediately on module import
@@ -1100,6 +1120,7 @@ class LocalWhisperTranscriber:
         self._interim_model: Optional[WhisperModel] = None
         self._loaded_model_name: str = ""
         self._active_device: str = "cpu"
+        self._cuda_runtime_failed: bool = False
         self._readiness_state: Optional[str] = None
         self._readiness_message: str = ""
         self._last_track_stats: Dict[str, Dict[str, Any]] = {}
@@ -1333,11 +1354,10 @@ class LocalWhisperTranscriber:
 
             t0 = time.perf_counter()
             preferred_dev = self.compute_device.lower()
-            if preferred_dev == "auto":
-                try:
-                    preferred_dev = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
-                except Exception:
-                    preferred_dev = "cpu"
+            if preferred_dev in ("auto", "cuda") and (self._cuda_runtime_failed or not is_cuda_runtime_available()):
+                preferred_dev = "cpu"
+            elif preferred_dev == "auto":
+                preferred_dev = "cuda"
 
             import gc
             gc.collect()
@@ -1358,6 +1378,7 @@ class LocalWhisperTranscriber:
                     self._loaded_model_name = target_model
                     self.model_name = target_model
                     self._active_device = "cuda"
+                    self._cuda_runtime_failed = False
                     elapsed = time.perf_counter() - t0
                     self._readiness_state = ModelReadinessState.READY
                     logger.info("Loaded Whisper '%s' on CUDA (%s) in %.2fs", target_model, cuda_compute, elapsed)
@@ -1376,6 +1397,7 @@ class LocalWhisperTranscriber:
                     return True, msg
                 except Exception as cuda_exc:
                     model = None
+                    self._cuda_runtime_failed = True
                     gc.collect()
                     logger.info(
                         "CUDA runtime libraries not active (%s); using optimized multi-core CPU int8.",

@@ -556,3 +556,76 @@ def test_main_gui_smoke_startup_exits_cleanly():
             assert "UnboundLocalError" not in log_text
             assert "Unhandled exception caught by global hook" not in log_text
 
+
+def test_rapid_call_switch_recorder_isolation_and_retranscribe_path_update():
+    from voxlocal.audio.meeting_recorder import MeetingRecorder
+    from voxlocal.core.controller import AppController
+    from voxlocal.engine.streaming_transcriber import LiveMeetingStreamingTranscriber
+
+    # 1. LiveMeetingStreamingTranscriber.stop(expected_meeting_id=...) must NOT stop a newer meeting
+    db = LocalDatabase(Path(":memory:"))
+    try:
+        st = LiveMeetingStreamingTranscriber(transcriber=None, db=db)
+        st._active = True
+        st._meeting_id = 13
+        st.stop(expected_meeting_id=12)
+        assert st.is_active is True, "stop(expected_meeting_id=12) must not stop active meeting #13"
+        st.stop(expected_meeting_id=13)
+        assert st.is_active is False
+    finally:
+        db.close()
+
+    # 2. stop_meeting_recording() detaches real MeetingRecorder instance and re_transcribe_meeting updates audio_path
+    with tempfile.TemporaryDirectory(prefix="vox_call_switch_") as td:
+        tmp = Path(td)
+        cfg = AppConfig(storage_dir=str(tmp), auto_record_calls=False, prompt_on_call=False)
+        cfg.disable_model_preload = True
+        cfg.disable_hotkeys = True
+        with patch("voxlocal.core.controller.WindowFocusTracker"), \
+             patch("voxlocal.core.controller.TextInserter"), \
+             patch("voxlocal.core.controller.GlobalHotkeyManager"), \
+             patch("voxlocal.core.controller.CallDetector"):
+            ctrl = AppController(cfg)
+            try:
+                old_rec = ctrl.meeting_recorder
+                assert type(old_rec) is MeetingRecorder
+                ctrl._capture_state = "recording"
+                ctrl._active_meeting_id = ctrl.db.create_meeting(title="Call A")
+                ctrl.stop_meeting_recording()
+                assert ctrl.meeting_recorder is not old_rec, "New MeetingRecorder must be allocated on stop"
+
+                # 3. re_transcribe_meeting must update local meeting['audio_path'] when resolving meeting_mixed.wav
+                rec_dir = tmp / "recordings" / "meeting_20261120_194725"
+                rec_dir.mkdir(parents=True, exist_ok=True)
+                mix_wav = rec_dir / "meeting_mixed.wav"
+                mic_wav = rec_dir / "mic_track.wav"
+                sys_wav = rec_dir / "system_track.wav"
+                vid_mp4 = rec_dir / "meeting_screen.mp4"
+                for p in (mix_wav, mic_wav, sys_wav):
+                    _write_wav(p, np.zeros(16000, dtype=np.float32), 16000)
+                vid_mp4.write_bytes(b"fake_mp4")
+
+                mid_b = ctrl.db.create_meeting(
+                    title="Pankaj Kumar",
+                    audio_path=str(rec_dir / "mixed.wav"),  # non-existent planned path
+                    mic_audio_path=str(rec_dir / "mic.wav"),
+                    sys_audio_path=str(rec_dir / "sys.wav"),
+                    video_path=str(vid_mp4),
+                )
+                captured_results = []
+                with patch.object(
+                    ctrl,
+                    "_finalize_meeting_worker",
+                    side_effect=lambda m_id, res, vp: captured_results.append((m_id, res.mixed_wav_path, res.mic_wav_path, res.sys_wav_path)),
+                ):
+                    ctrl.re_transcribe_meeting(mid_b)
+                    if ctrl._finalize_thread:
+                        ctrl._finalize_thread.join(timeout=5.0)
+                assert len(captured_results) == 1
+                assert captured_results[0][1] == str(mix_wav)
+                assert captured_results[0][2] == str(mic_wav)
+                assert captured_results[0][3] == str(sys_wav)
+            finally:
+                ctrl.shutdown()
+
+

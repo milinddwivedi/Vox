@@ -204,11 +204,12 @@ class HardwareProfiler:
         gpu_name = "Integrated / Software Rasterizer"
         gpu_type = "CPU Only"
 
-        # Check CTranslate2 CUDA availability
+        # Check CTranslate2 CUDA availability AND verify cuBLAS runtime DLL is loadable on Windows
         try:
             import ctranslate2
+            from voxlocal.engine.transcriber import is_cuda_runtime_available
             cuda_count = ctranslate2.get_cuda_device_count()
-            if cuda_count > 0:
+            if cuda_count > 0 and is_cuda_runtime_available():
                 cuda_ok = True
         except Exception:
             pass

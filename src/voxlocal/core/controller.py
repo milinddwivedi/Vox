@@ -924,6 +924,24 @@ class AppController(QObject):
             target_model,
             status_callback=self._safe_emit_model_status,
         )
+        # If CUDA runtime failed and fell back to CPU while loading a heavy model (e.g. large-v3-turbo),
+        # switch live ASR to 'small' on CPU so real-time word-by-word streaming stays sub-second.
+        if (
+            ok
+            and getattr(self.config, "enable_hardware_adaptive_asr", True)
+            and str(getattr(self.config, "compute_device", "auto")).lower() == "auto"
+            and isinstance(self.transcriber, LocalWhisperTranscriber)
+            and getattr(self.transcriber, "_active_device", "") == "cpu"
+            and getattr(self.transcriber, "model_name", "") in ("large-v3-turbo", "large-v3", "medium")
+            and self.transcriber.is_model_cached("small")
+        ):
+            logger.info(
+                "CUDA runtime unavailable for live ASR '%s'; switching live streaming model to 'small' on CPU int8.",
+                self.transcriber.model_name,
+            )
+            self.transcriber.model_name = "small"
+            self.transcriber.compute_device = "cpu"
+            ok, msg = self.transcriber.ensure_loaded("small", status_callback=self._safe_emit_model_status)
         self._safe_emit_model_status(msg)
 
     def switch_whisper_model(self, model_name: str, compute_device: str = "auto") -> None:
@@ -3373,6 +3391,15 @@ class AppController(QObject):
             meeting_id = self._active_meeting_id
             clean_title = getattr(self, "_active_meeting_title", "") or f"Meeting {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             st_transcriber = getattr(self, "streaming_transcriber", None)
+            audio_recorder = getattr(self, "meeting_recorder", None)
+            if type(audio_recorder) is MeetingRecorder:
+                audio_recorder.on_status_tick = None
+                new_rec = MeetingRecorder()
+                new_rec.on_status_tick = self._on_meeting_recorder_tick
+                new_rec.on_device_warning = lambda msg: self.notification_requested.emit(
+                    "Audio Device Notice", msg
+                )
+                self.meeting_recorder = new_rec
             vid_recorder = getattr(self, "_meeting_video_recorder", None)
             self._meeting_video_recorder = None
             self._pending_video_bind = False
@@ -3422,18 +3449,34 @@ class AppController(QObject):
 
         def _stop_and_finalize_worker() -> None:
             stream_telemetry: Dict[str, Any] = {}
-            # 1. Stop streaming transcriber in worker thread
+            # 1. Stop streaming transcriber in worker thread (scoped to this meeting_id)
             if st_transcriber:
                 try:
-                    st_transcriber.stop()
-                    if hasattr(st_transcriber, "get_stream_telemetry"):
-                        raw_tel = st_transcriber.get_stream_telemetry()
-                        if isinstance(raw_tel, dict):
-                            stream_telemetry = raw_tel
+                    st_mid = getattr(st_transcriber, "_meeting_id", None)
+                    if st_mid in (None, meeting_id):
+                        try:
+                            st_transcriber.stop(expected_meeting_id=meeting_id)
+                        except TypeError:
+                            st_transcriber.stop()
+                        if hasattr(st_transcriber, "get_stream_telemetry"):
+                            raw_tel = st_transcriber.get_stream_telemetry()
+                            if isinstance(raw_tel, dict):
+                                stream_telemetry = raw_tel
                 except Exception as st_exc:
                     logger.debug("Error stopping streaming transcriber: %s", st_exc)
 
-            # 2. Stop video recorder in worker thread
+            # 2. Stop audio recorder immediately (before potentially slow video encoding stop)
+            try:
+                result = (
+                    audio_recorder.stop(preserve_separate_tracks=preserve_tracks)
+                    if audio_recorder is not None
+                    else None
+                )
+            except Exception as exc:
+                logger.warning("Error stopping MeetingRecorder: %s", exc)
+                result = None
+
+            # 3. Stop video recorder in worker thread
             video_path = ""
             if vid_recorder:
                 try:
@@ -3454,15 +3497,6 @@ class AppController(QObject):
                         diag_path.write_text(json.dumps(diag, indent=2, default=str), encoding="utf-8")
                 except Exception as exc:
                     logger.warning("Error stopping MeetingVideoRecorder: %s", exc)
-
-            # 3. Stop audio recorder in worker thread
-            try:
-                result = self.meeting_recorder.stop(
-                    preserve_separate_tracks=preserve_tracks
-                )
-            except Exception as exc:
-                logger.warning("Error stopping MeetingRecorder: %s", exc)
-                result = None
 
             if not result:
                 if meeting_id is not None:
@@ -4058,15 +4092,18 @@ class AppController(QObject):
                         and exec_profile.offline_backend == "faster_whisper"
                         and self.transcriber.is_model_cached(exec_profile.offline_model)
                     ):
+                        eff_off_dev = (
+                            "cpu"
+                            if getattr(self.transcriber, "_cuda_runtime_failed", False)
+                            else exec_profile.offline_device
+                        )
                         need_swap = (
                             exec_profile.offline_model != self.transcriber.model_name
-                            or exec_profile.offline_device != getattr(self.transcriber, "_active_device", exec_profile.offline_device)
+                            or eff_off_dev != getattr(self.transcriber, "_active_device", eff_off_dev)
                         )
-                        if need_swap and getattr(self.transcriber, "_model", None) is not None:
-                            self.transcriber.unload_model()
                         if need_swap:
                             self.transcriber.model_name = exec_profile.offline_model
-                            self.transcriber.compute_device = exec_profile.offline_device
+                            self.transcriber.compute_device = eff_off_dev
                             self.transcriber.compute_type = exec_profile.offline_compute_type
                             self.transcriber.cpu_threads = exec_profile.safe_cpu_threads
                             self.transcriber.ensure_loaded(exec_profile.offline_model)
@@ -4488,9 +4525,11 @@ class AppController(QObject):
             if parent_dir and (parent_dir / "meeting_mixed.wav").exists():
                 audio_path = str(parent_dir / "meeting_mixed.wav")
                 self.db.update_meeting(meeting_id, audio_path=audio_path)
+                meeting["audio_path"] = audio_path
             elif parent_dir and (parent_dir / "mixed.wav").exists():
                 audio_path = str(parent_dir / "mixed.wav")
                 self.db.update_meeting(meeting_id, audio_path=audio_path)
+                meeting["audio_path"] = audio_path
             else:
                 created_slug = str(meeting.get("created_at", "")).replace("-", "").replace(":", "").replace(" ", "_")
                 for folder in self.config.recordings_dir.glob("meeting_*"):
@@ -4500,6 +4539,7 @@ class AppController(QObject):
                             audio_path = str(target_wav)
                             parent_dir = folder
                             self.db.update_meeting(meeting_id, audio_path=audio_path)
+                            meeting["audio_path"] = audio_path
                             break
 
         if parent_dir and parent_dir.exists():
