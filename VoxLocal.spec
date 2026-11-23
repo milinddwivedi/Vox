@@ -34,6 +34,10 @@ if _av_spec and _av_spec.origin:
 
 binaries += collect_dynamic_libs('ctranslate2')
 binaries += collect_dynamic_libs('onnxruntime')
+try:
+    binaries += collect_dynamic_libs('sherpa_onnx')
+except Exception:
+    pass
 
 a = Analysis(
     ['main.py'],
@@ -76,8 +80,11 @@ a = Analysis(
         'voxlocal.engine.completeness',
         'voxlocal.engine.dictation_processor',
         'voxlocal.engine.streaming_transcriber',
+        'voxlocal.engine.onnx_asr_engines',
+        'voxlocal.engine.selective_verifier',
         'voxlocal.engine.meeting_intelligence',
         'voxlocal.engine.llm_engine',
+        'sherpa_onnx',
         'tokenizers',
         'voxlocal.storage.database',
         'voxlocal.storage.exporter',

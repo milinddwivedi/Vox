@@ -813,6 +813,29 @@ class SettingsWorkspaceWidget(QWidget):
             "Stream live captioned lines while a meeting is in progress.",
             lambda v: self._save_cfg("notetaker_live_transcript", v),
         )
+        self.combo_asr_session_mode = QComboBox()
+        self.combo_asr_session_mode.setAccessibleName("Meeting ASR Mode")
+        self.combo_asr_session_mode.setAccessibleDescription(
+            "Choose Auto (English + Hinglish), English Only (Incremental Live), or Hindi / Hinglish (Guarded ONNX)"
+        )
+        self.combo_asr_session_mode.addItem("Auto (English + Hinglish)", "auto")
+        self.combo_asr_session_mode.addItem("English Only (Incremental Live)", "english")
+        self.combo_asr_session_mode.addItem("Hindi / Hinglish (Guarded ONNX)", "hinglish")
+        self.combo_asr_session_mode.currentIndexChanged.connect(
+            lambda: self._save_cfg("asr_session_mode", str(self.combo_asr_session_mode.currentData() or "auto"))
+        )
+        self._add_control_row(
+            nt_lay,
+            "Meeting ASR Mode",
+            "Select English incremental streaming or Guarded Hinglish ONNX transcription.",
+            self.combo_asr_session_mode,
+        )
+        self.sw_phase2_asr = self._add_toggle_row(
+            nt_lay,
+            "Phase 2 Adaptive ONNX Pipeline",
+            "Enable hardware-aware ONNX streaming and guarded Hinglish recognition (disable to roll back to legacy Whisper).",
+            lambda v: self._save_cfg("enable_phase2_asr_pipeline", bool(v)),
+        )
         self.combo_drawer_start = QComboBox()
         self.combo_drawer_start.setAccessibleName("Notepad on Call Start")
         self.combo_drawer_start.setAccessibleDescription("Drawer behavior when Notetaker begins recording")
@@ -1379,6 +1402,7 @@ class SettingsWorkspaceWidget(QWidget):
             (self.sw_nt_auto_open, "notetaker_auto_open_summary", True),
             (self.sw_nt_speakers, "notetaker_auto_detect_speakers", True),
             (self.sw_nt_live, "notetaker_live_transcript", True),
+            (self.sw_phase2_asr, "enable_phase2_asr_pipeline", True),
             (self.sw_vibe_vars, "vibe_coding_variable_recognition", True),
             (self.sw_vibe_files, "vibe_coding_file_tagging", True),
         ):
@@ -1408,6 +1432,7 @@ class SettingsWorkspaceWidget(QWidget):
         self._set_combo_by_data(self.combo_theme, getattr(cfg, "theme", "light"))
         self._set_combo_by_data(self.combo_edge, getattr(cfg, "flow_bar_edge", "bottom"))
         self._set_combo_by_data(self.combo_rec_mode, getattr(cfg, "meeting_recording_mode", "audio_video"))
+        self._set_combo_by_data(self.combo_asr_session_mode, getattr(cfg, "asr_session_mode", "auto"))
         self._set_combo_by_data(self.combo_drawer_start, getattr(cfg, "notetaker_notepad_on_start", "open"))
         self._set_combo_by_data(self.combo_lead_min, int(getattr(cfg, "calendar_reminder_lead_min", 1)))
         self._set_combo_by_data(self.combo_retention, int(getattr(cfg, "retention_days", 0)))

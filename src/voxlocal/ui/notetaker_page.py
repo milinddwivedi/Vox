@@ -996,7 +996,8 @@ class NotetakerPage(QWidget):
                 self._silent_loopback_since = None
 
         if rec:
-            self.lbl_rec_dot.setText("● Recording Live (Transcript Provisional)")
+            live_badge = self._format_live_engine_badge()
+            self.lbl_rec_dot.setText(f"● {live_badge}")
             self.btn_pause_rec.setVisible(True)
             self.btn_stop_rec.setVisible(True)
             self.btn_pause_rec.setText("Pause")
@@ -1037,17 +1038,52 @@ class NotetakerPage(QWidget):
         active_mid = getattr(self.controller, "active_meeting_id", None)
         return active_mid is not None and int(meeting_id) == int(active_mid)
 
+    def _format_live_engine_badge(self, payload: Optional[dict] = None) -> str:
+        """Honestly display Incremental vs Endpointed mode and active backend/device."""
+        exec_mode = ""
+        backend = ""
+        device = ""
+        if isinstance(payload, dict) and payload:
+            exec_mode = str(payload.get("execution_mode") or "").strip().lower()
+            backend = str(payload.get("asr_backend") or "").strip().lower()
+            device = str(payload.get("asr_device") or "").strip().upper()
+        if not exec_mode and hasattr(self.controller, "streaming_transcriber"):
+            st = getattr(self.controller, "streaming_transcriber", None)
+            if st is not None and hasattr(st, "get_active_live_identity"):
+                try:
+                    info = st.get_active_live_identity()
+                    exec_mode = str(info.get("execution_mode") or "").strip().lower()
+                    backend = str(info.get("asr_backend") or "").strip().lower()
+                    device = str(info.get("asr_device") or "").strip().upper()
+                except Exception:
+                    pass
+        mode_lbl = "Incremental" if exec_mode == "incremental" else "Endpointed"
+        if backend == "nemotron_onnx":
+            eng_lbl = f"Nemotron {device or 'CPU'}"
+        elif backend == "qwen3_onnx":
+            eng_lbl = f"Guarded Qwen3 {device or 'CPU'}"
+        elif backend == "parakeet_onnx":
+            eng_lbl = f"Parakeet {device or 'CPU'}"
+        else:
+            eng_lbl = f"Whisper {device or 'CPU'}"
+        return f"Live · {mode_lbl} ({eng_lbl})"
+
     def _on_live_meeting_partial(self, meeting_id: int, partial_dict: dict) -> None:
         txt = str((partial_dict or {}).get("text", "")).strip()
         spk = str((partial_dict or {}).get("speaker", "Speaker")).strip() or "Speaker"
+        if partial_dict and hasattr(self, "lbl_rec_dot") and getattr(self.controller, "is_meeting_recording", False):
+            self.lbl_rec_dot.setText(f"● {self._format_live_engine_badge(partial_dict)}")
         if getattr(self, "lbl_rec_live", None) is not None and txt:
-            self.lbl_rec_live.setText(f"● {spk}: {txt}")
+            tag = "…" if (partial_dict or {}).get("execution_mode") == "incremental" else "●"
+            self.lbl_rec_live.setText(f"{tag} {spk}: {txt}")
         if hasattr(self, "studio") and self._should_stream_to_active_studio(meeting_id):
             self.studio.tab_transcript.set_live_partial(spk, txt)
 
     def _on_live_meeting_confirmed(self, meeting_id: int, conf_dict: dict) -> None:
         txt = str((conf_dict or {}).get("text", "")).strip()
         spk = str((conf_dict or {}).get("speaker", "Speaker")).strip() or "Speaker"
+        if conf_dict and hasattr(self, "lbl_rec_dot") and getattr(self.controller, "is_meeting_recording", False):
+            self.lbl_rec_dot.setText(f"● {self._format_live_engine_badge(conf_dict)}")
         if getattr(self, "lbl_rec_live", None) is not None and txt:
             self.lbl_rec_live.setText(f"✓ {spk}: {txt}")
         self._on_live_meeting_segment(meeting_id, conf_dict)

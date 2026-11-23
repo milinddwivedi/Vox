@@ -21,8 +21,79 @@ from voxlocal.audio.devices import TARGET_SAMPLE_RATE
 from voxlocal.engine.transcriber import load_wav_as_16k_f32
 
 _SUSPICIOUS_SCRIPT_RE = re.compile(
-    r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u30FF\uAC00-\uD7AF\u0400-\u04FF\ufffd]"
+    r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u30FF\uAC00-\uD7AF\u0400-\u04FF\u0600-\u06FF\u0590-\u05FF\u0E00-\u0E7F\u0980-\u0DFF\ufffd]"
 )
+
+
+def _has_repetition_loop(text: str) -> bool:
+    """Detect repetitive decoder loops (low unique-word ratio or repeated 3-grams)."""
+    words = [w.lower() for w in re.findall(r"[\w\u0900-\u097F']+", text or "")]
+    if len(words) >= 8:
+        uniq_ratio = len(set(words)) / float(len(words))
+        if uniq_ratio < 0.42:
+            return True
+    if len(words) >= 9:
+        trigram_counts: Dict[Tuple[str, str, str], int] = {}
+        for idx in range(len(words) - 2):
+            tg = (words[idx], words[idx + 1], words[idx + 2])
+            trigram_counts[tg] = trigram_counts.get(tg, 0) + 1
+            if trigram_counts[tg] >= 3:
+                return True
+    return False
+
+
+def evaluate_segment_uncertainty(
+    raw_text: str = "",
+    text: str = "",
+    raw_model_score: Optional[float] = None,
+    no_speech_prob: Optional[float] = None,
+    confidence: Optional[float] = None,
+    has_overlap: bool = False,
+    low_score_threshold: float = 0.45,
+) -> Tuple[bool, List[str]]:
+    """
+    Honest, multi-signal segment uncertainty evaluation.
+    Uses raw Whisper log-probability when available (never pretending exp(logprob)
+    is a calibrated probability), falling back to uncalibrated confidence only
+    when `raw_model_score` is absent.
+    """
+    reasons: List[str] = []
+    raw_str = str(raw_text or "")
+    txt_str = str(text or "")
+
+    if raw_model_score is not None:
+        try:
+            if float(raw_model_score) < -0.80:
+                reasons.append("low_raw_model_score")
+        except (TypeError, ValueError):
+            pass
+    elif confidence is not None:
+        try:
+            if float(confidence) < float(low_score_threshold):
+                reasons.append("low_uncalibrated_confidence")
+        except (TypeError, ValueError):
+            pass
+
+    if no_speech_prob is not None:
+        try:
+            if float(no_speech_prob) >= 0.55:
+                reasons.append("high_no_speech_prob")
+        except (TypeError, ValueError):
+            pass
+
+    if "\ufffd" in raw_str or "[?" in txt_str:
+        reasons.append("encoding_or_marker_artifact")
+
+    if _SUSPICIOUS_SCRIPT_RE.search(raw_str) or _SUSPICIOUS_SCRIPT_RE.search(txt_str):
+        reasons.append("unexpected_script")
+
+    if _has_repetition_loop(txt_str) or _has_repetition_loop(raw_str):
+        reasons.append("repetition_collapse")
+
+    if has_overlap:
+        reasons.append("cross_track_overlap")
+
+    return bool(reasons), reasons
 
 
 def inspect_wav_integrity(wav_path: Optional[str | Path]) -> Dict[str, Any]:
@@ -197,24 +268,7 @@ def mark_uncertain_segments(
         e_t = float(seg.get("end_time", seg.get("end", s_t)))
         trk = str(seg.get("source_track") or "").lower()
 
-        conf = seg.get("confidence")
-        if conf is not None and float(conf) < low_score_threshold:
-            if "low_model_score" not in reasons:
-                reasons.append("low_model_score")
-
-        nsp = seg.get("no_speech_prob")
-        if nsp is not None and float(nsp) >= 0.65:
-            if "elevated_no_speech_prob" not in reasons:
-                reasons.append("elevated_no_speech_prob")
-
-        if (round(s_t, 2), round(e_t, 2), trk) in sil_keys:
-            if "possible_silence_hallucination" not in reasons:
-                reasons.append("possible_silence_hallucination")
-
-        if "[?" in txt or _SUSPICIOUS_SCRIPT_RE.search(txt) or "\ufffd" in raw_txt:
-            if "script_or_marker_uncertainty" not in reasons:
-                reasons.append("script_or_marker_uncertainty")
-
+        has_overlap = False
         # Cross-track simultaneous overlap detection (mic vs system overlap >= 0.6s)
         for j in range(max(0, i - 4), min(len(ordered), i + 5)):
             if i == j:
@@ -225,10 +279,27 @@ def mark_uncertain_segments(
                 o_s = float(other.get("start_time", other.get("start", 0.0)))
                 o_e = float(other.get("end_time", other.get("end", o_s)))
                 if (min(e_t, o_e) - max(s_t, o_s)) >= 0.60:
-                    if "cross_track_overlap" not in reasons:
-                        reasons.append("cross_track_overlap")
+                    has_overlap = True
                     break
 
+        _, eval_reasons = evaluate_segment_uncertainty(
+            raw_text=raw_txt,
+            text=txt,
+            raw_model_score=seg.get("raw_model_score"),
+            no_speech_prob=seg.get("no_speech_prob"),
+            confidence=seg.get("confidence"),
+            has_overlap=has_overlap,
+            low_score_threshold=low_score_threshold,
+        )
+        for r in eval_reasons:
+            if r not in reasons:
+                reasons.append(r)
+
+        if (round(s_t, 2), round(e_t, 2), trk) in sil_keys:
+            if "possible_silence_hallucination" not in reasons:
+                reasons.append("possible_silence_hallucination")
+
+        seg["confidence_calibrated"] = False
         seg["uncertainty_reasons"] = reasons
         seg["is_uncertain"] = bool(seg.get("is_uncertain")) or bool(reasons)
     return ordered

@@ -1,0 +1,1162 @@
+{
+  "generated_at_utc": "2026-11-23T08:54:56Z",
+  "db_sha256_verified": "e632521df929d06ce9da552a2015cab96fe6e0a3c1e00200b1673c12ebb57439",
+  "parakeet_onnx_english": {
+    "model": "parakeet-tdt-0.6b-v2-onnx-int8",
+    "backend": "parakeet_onnx",
+    "device": "cpu",
+    "compute_type": "int8",
+    "load_sec": 2.206,
+    "wall_sec": 119.52,
+    "cpu_sec": 526.06,
+    "avg_cpu_pct": 440.2,
+    "peak_rss_mb": 1675.5,
+    "vram_before_mb": 1516,
+    "vram_peak_mb": 1945,
+    "tracks": {
+      "earnings22_us": {
+        "clip_count": 40,
+        "total_audio_sec": 309.88,
+        "total_infer_sec": 23.27,
+        "rtf": 0.0751,
+        "p50_clip_infer_sec": 0.55,
+        "p95_clip_infer_sec": 1.095,
+        "ref_words": 809,
+        "pred_words": 808,
+        "wer": 0.2361,
+        "cer": 0.1754,
+        "sub_rate": 0.1112,
+        "del_rate": 0.063,
+        "ins_rate": 0.0618,
+        "word_retention_ratio": 0.9988,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 0,
+        "duplication_words": 2,
+        "detected_language_counts": {
+          "en": 40
+        },
+        "script_purity": {
+          "devanagari_words": 0,
+          "latin_words": 798,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 798
+        }
+      },
+      "fleurs_en_us": {
+        "clip_count": 40,
+        "total_audio_sec": 391.82,
+        "total_infer_sec": 29.56,
+        "rtf": 0.0754,
+        "p50_clip_infer_sec": 0.724,
+        "p95_clip_infer_sec": 1.165,
+        "ref_words": 875,
+        "pred_words": 874,
+        "wer": 0.0411,
+        "cer": 0.0212,
+        "sub_rate": 0.0263,
+        "del_rate": 0.008,
+        "ins_rate": 0.0069,
+        "word_retention_ratio": 0.9989,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 0,
+        "duplication_words": 0,
+        "detected_language_counts": {
+          "en": 40
+        },
+        "script_purity": {
+          "devanagari_words": 0,
+          "latin_words": 866,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 861
+        }
+      },
+      "ami_meetings_en": {
+        "clip_count": 40,
+        "total_audio_sec": 227.45,
+        "total_infer_sec": 18.43,
+        "rtf": 0.081,
+        "p50_clip_infer_sec": 0.427,
+        "p95_clip_infer_sec": 0.745,
+        "ref_words": 728,
+        "pred_words": 720,
+        "wer": 0.0563,
+        "cer": 0.0291,
+        "sub_rate": 0.0371,
+        "del_rate": 0.0151,
+        "ins_rate": 0.0041,
+        "word_retention_ratio": 0.989,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 0,
+        "duplication_words": 6,
+        "detected_language_counts": {
+          "en": 40
+        },
+        "script_purity": {
+          "devanagari_words": 0,
+          "latin_words": 690,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 690
+        }
+      },
+      "nptel_in_en": {
+        "clip_count": 40,
+        "total_audio_sec": 287.71,
+        "total_infer_sec": 20.69,
+        "rtf": 0.0719,
+        "p50_clip_infer_sec": 0.495,
+        "p95_clip_infer_sec": 0.72,
+        "ref_words": 640,
+        "pred_words": 661,
+        "wer": 0.2313,
+        "cer": 0.1642,
+        "sub_rate": 0.0984,
+        "del_rate": 0.05,
+        "ins_rate": 0.0828,
+        "word_retention_ratio": 1.0328,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 0,
+        "duplication_words": 0,
+        "detected_language_counts": {
+          "en": 40
+        },
+        "script_purity": {
+          "devanagari_words": 0,
+          "latin_words": 660,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 659
+        }
+      },
+      "monsoon_in_en": {
+        "clip_count": 40,
+        "total_audio_sec": 340.44,
+        "total_infer_sec": 24.77,
+        "rtf": 0.0728,
+        "p50_clip_infer_sec": 0.579,
+        "p95_clip_infer_sec": 1.037,
+        "ref_words": 848,
+        "pred_words": 851,
+        "wer": 0.0436,
+        "cer": 0.0186,
+        "sub_rate": 0.0236,
+        "del_rate": 0.0083,
+        "ins_rate": 0.0118,
+        "word_retention_ratio": 1.0035,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 0,
+        "duplication_words": 0,
+        "detected_language_counts": {
+          "en": 40
+        },
+        "script_purity": {
+          "devanagari_words": 0,
+          "latin_words": 832,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 832
+        }
+      }
+    }
+  },
+  "guarded_qwen3_onnx_hinglish": {
+    "model": "qwen3-asr-0.6b-onnx-int8",
+    "backend": "qwen3_onnx",
+    "device": "cpu",
+    "compute_type": "int8",
+    "load_sec": 5.773,
+    "wall_sec": 1082.52,
+    "cpu_sec": 4318.97,
+    "avg_cpu_pct": 399.0,
+    "peak_rss_mb": 3620.0,
+    "vram_before_mb": 1937,
+    "vram_peak_mb": 2551,
+    "tracks": {
+      "monsoon_in_en": {
+        "clip_count": 40,
+        "total_audio_sec": 340.44,
+        "total_infer_sec": 81.67,
+        "rtf": 0.2399,
+        "p50_clip_infer_sec": 1.849,
+        "p95_clip_infer_sec": 3.982,
+        "ref_words": 848,
+        "pred_words": 831,
+        "wer": 0.0507,
+        "cer": 0.0243,
+        "sub_rate": 0.0236,
+        "del_rate": 0.0236,
+        "ins_rate": 0.0035,
+        "word_retention_ratio": 0.98,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 0,
+        "duplication_words": 0,
+        "detected_language_counts": {
+          "en": 40
+        },
+        "script_purity": {
+          "devanagari_words": 0,
+          "latin_words": 814,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 814
+        }
+      },
+      "coshe_hinglish": {
+        "clip_count": 30,
+        "total_audio_sec": 606.26,
+        "total_infer_sec": 488.6,
+        "rtf": 0.8059,
+        "p50_clip_infer_sec": 18.09,
+        "p95_clip_infer_sec": 20.585,
+        "ref_words": 1782,
+        "pred_words": 1625,
+        "wer": 0.4057,
+        "cer": 0.2442,
+        "sub_rate": 0.2907,
+        "del_rate": 0.1016,
+        "ins_rate": 0.0135,
+        "word_retention_ratio": 0.9119,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 0,
+        "duplication_words": 5,
+        "detected_language_counts": {
+          "hi": 29,
+          "en": 1
+        },
+        "script_purity": {
+          "devanagari_words": 1307,
+          "latin_words": 313,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 1610
+        },
+        "devanagari_mixed": {
+          "clip_count": 30,
+          "total_audio_sec": 606.26,
+          "total_infer_sec": 488.6,
+          "rtf": 0.8059,
+          "p50_clip_infer_sec": 18.09,
+          "p95_clip_infer_sec": 20.585,
+          "ref_words": 1782,
+          "pred_words": 1620,
+          "wer": 0.4545,
+          "cer": 0.412,
+          "sub_rate": 0.3423,
+          "del_rate": 0.1016,
+          "ins_rate": 0.0107,
+          "word_retention_ratio": 0.9091,
+          "omitted_clip_count": 0,
+          "omitted_clip_pct": 0.0,
+          "empty_clip_count": 0,
+          "duplication_words": 5,
+          "detected_language_counts": {
+            "hi": 29,
+            "en": 1
+          },
+          "script_purity": {
+            "devanagari_words": 1307,
+            "latin_words": 313,
+            "cjk_segs": 0,
+            "arabic_segs": 0,
+            "kana_hangul_cyrillic_segs": 0,
+            "ufffd_segs": 0,
+            "total_words": 1610
+          }
+        }
+      },
+      "m234_full_90s": {
+        "clip_count": 16,
+        "total_audio_sec": 126.93,
+        "total_infer_sec": 73.4,
+        "rtf": 0.5782,
+        "p50_clip_infer_sec": 2.332,
+        "p95_clip_infer_sec": 13.896,
+        "ref_words": 328,
+        "pred_words": 318,
+        "wer": 0.4878,
+        "cer": 0.3238,
+        "sub_rate": 0.2927,
+        "del_rate": 0.1128,
+        "ins_rate": 0.0823,
+        "word_retention_ratio": 0.9695,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 1,
+        "duplication_words": 2,
+        "detected_language_counts": {
+          "en": 5,
+          "hi": 10,
+          "none": 1
+        },
+        "script_purity": {
+          "devanagari_words": 253,
+          "latin_words": 65,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 318
+        }
+      },
+      "m235_verified_111": {
+        "clip_count": 111,
+        "total_audio_sec": 945.46,
+        "total_infer_sec": 432.05,
+        "rtf": 0.457,
+        "p50_clip_infer_sec": 2.001,
+        "p95_clip_infer_sec": 12.655,
+        "ref_words": 1796,
+        "pred_words": 1746,
+        "wer": 0.4588,
+        "cer": 0.2758,
+        "sub_rate": 0.3007,
+        "del_rate": 0.093,
+        "ins_rate": 0.0651,
+        "word_retention_ratio": 0.9722,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 1,
+        "duplication_words": 12,
+        "detected_language_counts": {
+          "hi": 81,
+          "en": 27,
+          "none": 3
+        },
+        "script_purity": {
+          "devanagari_words": 1343,
+          "latin_words": 399,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 1738
+        }
+      }
+    },
+    "official_meetings": {
+      "m234": {
+        "status": "scored",
+        "meeting_id": 234,
+        "title": "Hemanth Kumar Talathoti",
+        "verified_segment_count": 16,
+        "total_segment_count": 16,
+        "partial_verification_only": false,
+        "english_wer": 0.0,
+        "hinglish_norm_wer": 0.4878,
+        "hinglish_norm_cer": 0.3085,
+        "raw_wer": 0.5549,
+        "raw_cer": 0.3439,
+        "hindi_code_switch_wer": 0.4649,
+        "hindi_code_switch_cer": 0.3029,
+        "technical_entity_recall": 0.3,
+        "technical_entity_precision": 0.6,
+        "technical_entity_details": {
+          "ref_total": 10,
+          "pred_total": 5,
+          "matched": 3
+        },
+        "stream_raw_wer": 0.5427,
+        "stream_hinglish_norm_wer": 0.4756,
+        "stream_hinglish_norm_cer": 0.2904,
+        "stream_norm_ops": {
+          "substitutions": 100,
+          "deletions": 33,
+          "insertions": 23,
+          "ref_words": 328,
+          "pred_words": 318
+        },
+        "stream_raw_ops": {
+          "substitutions": 122,
+          "deletions": 33,
+          "insertions": 23,
+          "ref_words": 328,
+          "pred_words": 318
+        },
+        "stream_technical_entity_recall": 0.3,
+        "stream_technical_entity_precision": 0.6,
+        "stream_technical_entity_details": {
+          "ref_total": 10,
+          "pred_total": 5,
+          "matched": 3
+        },
+        "track_stream_breakdown": {
+          "mic": {
+            "raw_wer": 0.4378,
+            "hinglish_norm_wer": 0.3622,
+            "hinglish_norm_cer": 0.2023,
+            "ref_words": 185,
+            "pred_words": 187,
+            "norm_ops": {
+              "substitutions": 41,
+              "deletions": 12,
+              "insertions": 14,
+              "ref_words": 185,
+              "pred_words": 187
+            }
+          },
+          "system": {
+            "raw_wer": 0.6783,
+            "hinglish_norm_wer": 0.6224,
+            "hinglish_norm_cer": 0.4093,
+            "ref_words": 143,
+            "pred_words": 131,
+            "norm_ops": {
+              "substitutions": 59,
+              "deletions": 21,
+              "insertions": 9,
+              "ref_words": 143,
+              "pred_words": 131
+            }
+          }
+        },
+        "hallucination_and_duplication_rate": 0.0063,
+        "hallucination_breakdown": {
+          "silence_insertion_words": 0,
+          "empty_ref_insertion_words": 0,
+          "duplication_words": 2,
+          "total_pred_words": 318
+        },
+        "uncertain_segment_count": 0,
+        "uncertain_token_count": 0,
+        "primary_masked_uncertain": {
+          "mask_uncertain": true,
+          "scored_segment_count": 16,
+          "masked_whole_segment_indices": [],
+          "uncertain_segment_count": 0,
+          "uncertain_token_count": 0,
+          "empty_ref_segment_count": 0,
+          "empty_ref_indices": [],
+          "empty_ref_insertion_words": 0,
+          "unmatched_silence_insertion_words": 0,
+          "duplication_words": 2,
+          "hallucination_and_duplication_rate": 0.0063,
+          "hallucination_breakdown": {
+            "silence_insertion_words": 0,
+            "empty_ref_insertion_words": 0,
+            "duplication_words": 2,
+            "total_pred_words": 318
+          },
+          "segment_hinglish_norm_wer": 0.4878,
+          "segment_raw_wer": 0.5549,
+          "english_wer": 0.0,
+          "hinglish_norm_wer": 0.4878,
+          "hinglish_norm_cer": 0.3085,
+          "raw_wer": 0.5549,
+          "raw_cer": 0.3439,
+          "hindi_code_switch_wer": 0.4649,
+          "hindi_code_switch_cer": 0.3029,
+          "technical_entity_recall": 0.3,
+          "technical_entity_precision": 0.6,
+          "technical_entity_details": {
+            "ref_total": 10,
+            "pred_total": 5,
+            "matched": 3
+          },
+          "stream_raw_wer": 0.5427,
+          "stream_hinglish_norm_wer": 0.4756,
+          "stream_hinglish_norm_cer": 0.2904,
+          "stream_norm_ops": {
+            "substitutions": 100,
+            "deletions": 33,
+            "insertions": 23,
+            "ref_words": 328,
+            "pred_words": 318
+          },
+          "stream_raw_ops": {
+            "substitutions": 122,
+            "deletions": 33,
+            "insertions": 23,
+            "ref_words": 328,
+            "pred_words": 318
+          },
+          "stream_technical_entity_recall": 0.3,
+          "stream_technical_entity_precision": 0.6,
+          "stream_technical_entity_details": {
+            "ref_total": 10,
+            "pred_total": 5,
+            "matched": 3
+          },
+          "track_stream_breakdown": {
+            "mic": {
+              "raw_wer": 0.4378,
+              "hinglish_norm_wer": 0.3622,
+              "hinglish_norm_cer": 0.2023,
+              "ref_words": 185,
+              "pred_words": 187,
+              "norm_ops": {
+                "substitutions": 41,
+                "deletions": 12,
+                "insertions": 14,
+                "ref_words": 185,
+                "pred_words": 187
+              }
+            },
+            "system": {
+              "raw_wer": 0.6783,
+              "hinglish_norm_wer": 0.6224,
+              "hinglish_norm_cer": 0.4093,
+              "ref_words": 143,
+              "pred_words": 131,
+              "norm_ops": {
+                "substitutions": 59,
+                "deletions": 21,
+                "insertions": 9,
+                "ref_words": 143,
+                "pred_words": 131
+              }
+            }
+          }
+        },
+        "secondary_unmasked_complete": {
+          "mask_uncertain": false,
+          "scored_segment_count": 16,
+          "masked_whole_segment_indices": [],
+          "uncertain_segment_count": 0,
+          "uncertain_token_count": 0,
+          "empty_ref_segment_count": 0,
+          "empty_ref_indices": [],
+          "empty_ref_insertion_words": 0,
+          "unmatched_silence_insertion_words": 0,
+          "duplication_words": 2,
+          "hallucination_and_duplication_rate": 0.0063,
+          "hallucination_breakdown": {
+            "silence_insertion_words": 0,
+            "empty_ref_insertion_words": 0,
+            "duplication_words": 2,
+            "total_pred_words": 318
+          },
+          "segment_hinglish_norm_wer": 0.4878,
+          "segment_raw_wer": 0.5549,
+          "english_wer": 0.0,
+          "hinglish_norm_wer": 0.4878,
+          "hinglish_norm_cer": 0.3085,
+          "raw_wer": 0.5549,
+          "raw_cer": 0.3439,
+          "hindi_code_switch_wer": 0.4649,
+          "hindi_code_switch_cer": 0.3029,
+          "technical_entity_recall": 0.3,
+          "technical_entity_precision": 0.6,
+          "technical_entity_details": {
+            "ref_total": 10,
+            "pred_total": 5,
+            "matched": 3
+          },
+          "stream_raw_wer": 0.5427,
+          "stream_hinglish_norm_wer": 0.4756,
+          "stream_hinglish_norm_cer": 0.2904,
+          "stream_norm_ops": {
+            "substitutions": 100,
+            "deletions": 33,
+            "insertions": 23,
+            "ref_words": 328,
+            "pred_words": 318
+          },
+          "stream_raw_ops": {
+            "substitutions": 122,
+            "deletions": 33,
+            "insertions": 23,
+            "ref_words": 328,
+            "pred_words": 318
+          },
+          "stream_technical_entity_recall": 0.3,
+          "stream_technical_entity_precision": 0.6,
+          "stream_technical_entity_details": {
+            "ref_total": 10,
+            "pred_total": 5,
+            "matched": 3
+          },
+          "track_stream_breakdown": {
+            "mic": {
+              "raw_wer": 0.4378,
+              "hinglish_norm_wer": 0.3622,
+              "hinglish_norm_cer": 0.2023,
+              "ref_words": 185,
+              "pred_words": 187,
+              "norm_ops": {
+                "substitutions": 41,
+                "deletions": 12,
+                "insertions": 14,
+                "ref_words": 185,
+                "pred_words": 187
+              }
+            },
+            "system": {
+              "raw_wer": 0.6783,
+              "hinglish_norm_wer": 0.6224,
+              "hinglish_norm_cer": 0.4093,
+              "ref_words": 143,
+              "pred_words": 131,
+              "norm_ops": {
+                "substitutions": 59,
+                "deletions": 21,
+                "insertions": 9,
+                "ref_words": 143,
+                "pred_words": 131
+              }
+            }
+          }
+        },
+        "empty_reference_audit": {
+          "empty_ref_segment_count": 0,
+          "empty_ref_indices": [],
+          "empty_ref_insertion_words": 0,
+          "unmatched_silence_insertion_words": 0,
+          "handling_policy": "Verified segments with empty reference_text are never masked or ignored: overlapping same-track predictions are penalized as insertions in stream WER, segment WER, and hallucination_and_duplication_rate."
+        },
+        "speaker_der": 0.0,
+        "speaker_jer": 0.0,
+        "speaker_attribution_accuracy": 0.625,
+        "diarization_breakdown": {
+          "missed_sec": 0.0,
+          "false_alarm_sec": 0.0,
+          "confusion_sec": 0.0,
+          "total_ref_speaker_sec": 126.93,
+          "cluster_mapping": {
+            "Hemanth Kumar Talathoti": "Hemanth Kumar Talathoti",
+            "You (Mic)": "You (Mic)"
+          }
+        },
+        "word_timestamp_error_ms": {
+          "median_ms": 176.7,
+          "p95_ms": 1763.1,
+          "matched_words": 192,
+          "segment_boundary_median_ms": 0.0,
+          "segment_boundary_p95_ms": 0.0
+        }
+      },
+      "m235": {
+        "status": "scored",
+        "meeting_id": 235,
+        "title": "Rumjhum.R",
+        "verified_segment_count": 111,
+        "total_segment_count": 111,
+        "partial_verification_only": false,
+        "english_wer": 0.2558,
+        "hinglish_norm_wer": 0.4529,
+        "hinglish_norm_cer": 0.2603,
+        "raw_wer": 0.5312,
+        "raw_cer": 0.2959,
+        "hindi_code_switch_wer": 0.4574,
+        "hindi_code_switch_cer": 0.2619,
+        "technical_entity_recall": 0.4286,
+        "technical_entity_precision": 1.0,
+        "technical_entity_details": {
+          "ref_total": 35,
+          "pred_total": 15,
+          "matched": 15
+        },
+        "stream_raw_wer": 0.5244,
+        "stream_hinglish_norm_wer": 0.4473,
+        "stream_hinglish_norm_cer": 0.2532,
+        "stream_norm_ops": {
+          "substitutions": 528,
+          "deletions": 156,
+          "insertions": 105,
+          "ref_words": 1764,
+          "pred_words": 1713
+        },
+        "stream_raw_ops": {
+          "substitutions": 680,
+          "deletions": 148,
+          "insertions": 97,
+          "ref_words": 1764,
+          "pred_words": 1713
+        },
+        "stream_technical_entity_recall": 0.4286,
+        "stream_technical_entity_precision": 1.0,
+        "stream_technical_entity_details": {
+          "ref_total": 35,
+          "pred_total": 15,
+          "matched": 15
+        },
+        "track_stream_breakdown": {
+          "mic": {
+            "raw_wer": 0.5114,
+            "hinglish_norm_wer": 0.4301,
+            "hinglish_norm_cer": 0.2429,
+            "ref_words": 1488,
+            "pred_words": 1447,
+            "norm_ops": {
+              "substitutions": 423,
+              "deletions": 129,
+              "insertions": 88,
+              "ref_words": 1488,
+              "pred_words": 1447
+            }
+          },
+          "system": {
+            "raw_wer": 0.5942,
+            "hinglish_norm_wer": 0.5399,
+            "hinglish_norm_cer": 0.3107,
+            "ref_words": 276,
+            "pred_words": 266,
+            "norm_ops": {
+              "substitutions": 105,
+              "deletions": 27,
+              "insertions": 17,
+              "ref_words": 276,
+              "pred_words": 266
+            }
+          }
+        },
+        "hallucination_and_duplication_rate": 0.0082,
+        "hallucination_breakdown": {
+          "silence_insertion_words": 0,
+          "empty_ref_insertion_words": 0,
+          "duplication_words": 14,
+          "total_pred_words": 1713
+        },
+        "uncertain_segment_count": 5,
+        "uncertain_token_count": 0,
+        "primary_masked_uncertain": {
+          "mask_uncertain": true,
+          "scored_segment_count": 107,
+          "masked_whole_segment_indices": [
+            9,
+            88,
+            98,
+            107
+          ],
+          "uncertain_segment_count": 5,
+          "uncertain_token_count": 0,
+          "empty_ref_segment_count": 1,
+          "empty_ref_indices": [
+            100
+          ],
+          "empty_ref_insertion_words": 0,
+          "unmatched_silence_insertion_words": 0,
+          "duplication_words": 14,
+          "hallucination_and_duplication_rate": 0.0082,
+          "hallucination_breakdown": {
+            "silence_insertion_words": 0,
+            "empty_ref_insertion_words": 0,
+            "duplication_words": 14,
+            "total_pred_words": 1713
+          },
+          "segment_hinglish_norm_wer": 0.4529,
+          "segment_raw_wer": 0.5312,
+          "english_wer": 0.2558,
+          "hinglish_norm_wer": 0.4529,
+          "hinglish_norm_cer": 0.2603,
+          "raw_wer": 0.5312,
+          "raw_cer": 0.2959,
+          "hindi_code_switch_wer": 0.4574,
+          "hindi_code_switch_cer": 0.2619,
+          "technical_entity_recall": 0.4286,
+          "technical_entity_precision": 1.0,
+          "technical_entity_details": {
+            "ref_total": 35,
+            "pred_total": 15,
+            "matched": 15
+          },
+          "stream_raw_wer": 0.5244,
+          "stream_hinglish_norm_wer": 0.4473,
+          "stream_hinglish_norm_cer": 0.2532,
+          "stream_norm_ops": {
+            "substitutions": 528,
+            "deletions": 156,
+            "insertions": 105,
+            "ref_words": 1764,
+            "pred_words": 1713
+          },
+          "stream_raw_ops": {
+            "substitutions": 680,
+            "deletions": 148,
+            "insertions": 97,
+            "ref_words": 1764,
+            "pred_words": 1713
+          },
+          "stream_technical_entity_recall": 0.4286,
+          "stream_technical_entity_precision": 1.0,
+          "stream_technical_entity_details": {
+            "ref_total": 35,
+            "pred_total": 15,
+            "matched": 15
+          },
+          "track_stream_breakdown": {
+            "mic": {
+              "raw_wer": 0.5114,
+              "hinglish_norm_wer": 0.4301,
+              "hinglish_norm_cer": 0.2429,
+              "ref_words": 1488,
+              "pred_words": 1447,
+              "norm_ops": {
+                "substitutions": 423,
+                "deletions": 129,
+                "insertions": 88,
+                "ref_words": 1488,
+                "pred_words": 1447
+              }
+            },
+            "system": {
+              "raw_wer": 0.5942,
+              "hinglish_norm_wer": 0.5399,
+              "hinglish_norm_cer": 0.3107,
+              "ref_words": 276,
+              "pred_words": 266,
+              "norm_ops": {
+                "substitutions": 105,
+                "deletions": 27,
+                "insertions": 17,
+                "ref_words": 276,
+                "pred_words": 266
+              }
+            }
+          }
+        },
+        "secondary_unmasked_complete": {
+          "mask_uncertain": false,
+          "scored_segment_count": 111,
+          "masked_whole_segment_indices": [],
+          "uncertain_segment_count": 5,
+          "uncertain_token_count": 0,
+          "empty_ref_segment_count": 1,
+          "empty_ref_indices": [
+            100
+          ],
+          "empty_ref_insertion_words": 0,
+          "unmatched_silence_insertion_words": 0,
+          "duplication_words": 14,
+          "hallucination_and_duplication_rate": 0.008,
+          "hallucination_breakdown": {
+            "silence_insertion_words": 0,
+            "empty_ref_insertion_words": 0,
+            "duplication_words": 14,
+            "total_pred_words": 1746
+          },
+          "segment_hinglish_norm_wer": 0.4588,
+          "segment_raw_wer": 0.5356,
+          "english_wer": 0.2558,
+          "hinglish_norm_wer": 0.4588,
+          "hinglish_norm_cer": 0.2646,
+          "raw_wer": 0.5356,
+          "raw_cer": 0.2998,
+          "hindi_code_switch_wer": 0.4625,
+          "hindi_code_switch_cer": 0.2652,
+          "technical_entity_recall": 0.4286,
+          "technical_entity_precision": 1.0,
+          "technical_entity_details": {
+            "ref_total": 35,
+            "pred_total": 15,
+            "matched": 15
+          },
+          "stream_raw_wer": 0.5278,
+          "stream_hinglish_norm_wer": 0.4527,
+          "stream_hinglish_norm_cer": 0.2572,
+          "stream_norm_ops": {
+            "substitutions": 557,
+            "deletions": 153,
+            "insertions": 103,
+            "ref_words": 1796,
+            "pred_words": 1746
+          },
+          "stream_raw_ops": {
+            "substitutions": 704,
+            "deletions": 147,
+            "insertions": 97,
+            "ref_words": 1796,
+            "pred_words": 1746
+          },
+          "stream_technical_entity_recall": 0.4286,
+          "stream_technical_entity_precision": 1.0,
+          "stream_technical_entity_details": {
+            "ref_total": 35,
+            "pred_total": 15,
+            "matched": 15
+          },
+          "track_stream_breakdown": {
+            "mic": {
+              "raw_wer": 0.513,
+              "hinglish_norm_wer": 0.4324,
+              "hinglish_norm_cer": 0.2442,
+              "ref_words": 1501,
+              "pred_words": 1460,
+              "norm_ops": {
+                "substitutions": 432,
+                "deletions": 129,
+                "insertions": 88,
+                "ref_words": 1501,
+                "pred_words": 1460
+              }
+            },
+            "system": {
+              "raw_wer": 0.6034,
+              "hinglish_norm_wer": 0.5559,
+              "hinglish_norm_cer": 0.3259,
+              "ref_words": 295,
+              "pred_words": 286,
+              "norm_ops": {
+                "substitutions": 125,
+                "deletions": 24,
+                "insertions": 15,
+                "ref_words": 295,
+                "pred_words": 286
+              }
+            }
+          }
+        },
+        "empty_reference_audit": {
+          "empty_ref_segment_count": 1,
+          "empty_ref_indices": [
+            100
+          ],
+          "empty_ref_insertion_words": 0,
+          "unmatched_silence_insertion_words": 0,
+          "handling_policy": "Verified segments with empty reference_text are never masked or ignored: overlapping same-track predictions are penalized as insertions in stream WER, segment WER, and hallucination_and_duplication_rate."
+        },
+        "speaker_der": 0.0,
+        "speaker_jer": 0.0,
+        "speaker_attribution_accuracy": 0.7117,
+        "diarization_breakdown": {
+          "missed_sec": 0.0,
+          "false_alarm_sec": 0.0,
+          "confusion_sec": 0.0,
+          "total_ref_speaker_sec": 945.37,
+          "cluster_mapping": {
+            "Rumjhum.R": "Rumjhum.R",
+            "You (Mic)": "You (Mic)"
+          }
+        },
+        "word_timestamp_error_ms": {
+          "median_ms": 171.4,
+          "p95_ms": 1937.4,
+          "matched_words": 1096,
+          "segment_boundary_median_ms": 0.0,
+          "segment_boundary_p95_ms": 0.0
+        }
+      }
+    }
+  },
+  "selective_second_pass": {
+    "skipped": false,
+    "vram_before_mb": 2557,
+    "vram_after_unload_mb": 2639,
+    "tracks": {
+      "m234_full_90s": {
+        "clip_count": 16,
+        "total_audio_sec": 126.93,
+        "total_infer_sec": 73.4,
+        "rtf": 0.5782,
+        "p50_clip_infer_sec": 2.332,
+        "p95_clip_infer_sec": 13.896,
+        "ref_words": 328,
+        "pred_words": 310,
+        "wer": 0.3628,
+        "cer": 0.2523,
+        "sub_rate": 0.1677,
+        "del_rate": 0.125,
+        "ins_rate": 0.0701,
+        "word_retention_ratio": 0.9451,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 1,
+        "duplication_words": 2,
+        "detected_language_counts": {
+          "en": 14,
+          "none": 1,
+          "hi": 1
+        },
+        "script_purity": {
+          "devanagari_words": 253,
+          "latin_words": 65,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 318
+        },
+        "escalated_count": 10,
+        "escalated_pct": 62.5,
+        "accepted_count": 9,
+        "rejected_count": 1,
+        "skipped_guard_count": 2,
+        "verify_wall_sec": 75.6
+      },
+      "m235_verified_111": {
+        "clip_count": 111,
+        "total_audio_sec": 945.46,
+        "total_infer_sec": 432.05,
+        "rtf": 0.457,
+        "p50_clip_infer_sec": 2.001,
+        "p95_clip_infer_sec": 12.655,
+        "ref_words": 1796,
+        "pred_words": 1781,
+        "wer": 0.3625,
+        "cer": 0.2191,
+        "sub_rate": 0.2283,
+        "del_rate": 0.0713,
+        "ins_rate": 0.0629,
+        "word_retention_ratio": 0.9916,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 1,
+        "duplication_words": 12,
+        "detected_language_counts": {
+          "en": 104,
+          "hi": 4,
+          "none": 3
+        },
+        "script_purity": {
+          "devanagari_words": 1343,
+          "latin_words": 399,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 1738
+        },
+        "escalated_count": 81,
+        "escalated_pct": 72.97,
+        "accepted_count": 77,
+        "rejected_count": 4,
+        "skipped_guard_count": 13,
+        "verify_wall_sec": 1257.08
+      },
+      "monsoon_in_en": {
+        "clip_count": 40,
+        "total_audio_sec": 340.44,
+        "total_infer_sec": 81.67,
+        "rtf": 0.2399,
+        "p50_clip_infer_sec": 1.849,
+        "p95_clip_infer_sec": 3.982,
+        "ref_words": 848,
+        "pred_words": 831,
+        "wer": 0.0507,
+        "cer": 0.0243,
+        "sub_rate": 0.0236,
+        "del_rate": 0.0236,
+        "ins_rate": 0.0035,
+        "word_retention_ratio": 0.98,
+        "omitted_clip_count": 0,
+        "omitted_clip_pct": 0.0,
+        "empty_clip_count": 0,
+        "duplication_words": 0,
+        "detected_language_counts": {
+          "en": 40
+        },
+        "script_purity": {
+          "devanagari_words": 0,
+          "latin_words": 814,
+          "cjk_segs": 0,
+          "arabic_segs": 0,
+          "kana_hangul_cyrillic_segs": 0,
+          "ufffd_segs": 0,
+          "total_words": 814
+        },
+        "escalated_count": 0,
+        "escalated_pct": 0.0,
+        "accepted_count": 0,
+        "rejected_count": 0,
+        "skipped_guard_count": 1,
+        "verify_wall_sec": 0.12
+      }
+    }
+  },
+  "live_streaming": {
+    "english_incremental_nemotron_ami": {
+      "execution_mode": "incremental",
+      "is_incremental": true,
+      "live_backend": "nemotron_onnx",
+      "live_model": "nemotron-streaming-en-0.6b-560ms-int8",
+      "live_device": "cpu",
+      "live_compute_type": "int8",
+      "first_partial_latency_ms": 4412.02,
+      "first_stable_latency_ms": 10128.27,
+      "partial_update_count": 209,
+      "partial_updates_per_sec": 3.757,
+      "end_of_turn_latency_p50_ms": 984.89,
+      "end_of_turn_latency_p95_ms": 2634.75,
+      "end_of_turn_samples": 29,
+      "committed_segments": 29,
+      "dropped_segments": 0,
+      "fallback_events": 0,
+      "fallback_reasons": [],
+      "tracks_flushed": [
+        "mic",
+        "system"
+      ],
+      "track_cursors_sec": {
+        "mic": 171.23,
+        "system": 171.23
+      },
+      "audio_cursor_sec": 171.23,
+      "last_flush_cursor_sec": 171.23,
+      "segment_count": 29,
+      "dropped_chunks": 0,
+      "max_backlog_sec": 0.56,
+      "current_backlog_sec": 0.0,
+      "revision_count": 209,
+      "vad_discarded_chunks": 0,
+      "vad_speech_sec": 0.0,
+      "mic_low_level_samples": 0,
+      "wer": 0.3152,
+      "audio_duration_sec": 171.23,
+      "wall_sec": 55.62,
+      "rtf": 0.3248,
+      "partial_emissions_total": 209
+    },
+    "hinglish_endpointed_qwen3_m234": {
+      "execution_mode": "endpointed",
+      "is_incremental": false,
+      "live_backend": "qwen3_onnx",
+      "live_model": "qwen3-asr-0.6b-onnx-int8",
+      "live_device": "cpu",
+      "live_compute_type": "int8",
+      "first_partial_latency_ms": null,
+      "first_stable_latency_ms": 9380.39,
+      "partial_update_count": 0,
+      "partial_updates_per_sec": 0.0,
+      "end_of_turn_latency_p50_ms": 1905.58,
+      "end_of_turn_latency_p95_ms": 14788.84,
+      "end_of_turn_samples": 28,
+      "committed_segments": 24,
+      "dropped_segments": 0,
+      "fallback_events": 0,
+      "fallback_reasons": [],
+      "tracks_flushed": [],
+      "track_cursors_sec": {
+        "mic": 90.15,
+        "system": 90.15
+      },
+      "audio_cursor_sec": 90.15,
+      "last_flush_cursor_sec": 90.15,
+      "segment_count": 24,
+      "dropped_chunks": 0,
+      "max_backlog_sec": 13.95,
+      "current_backlog_sec": 0.0,
+      "revision_count": 0,
+      "vad_discarded_chunks": 0,
+      "vad_speech_sec": 0.0,
+      "mic_low_level_samples": 50400,
+      "m234_official_stream_norm_wer": 0.4695,
+      "m234_official_stream_raw_wer": 0.5457,
+      "audio_duration_sec": 90.15,
+      "wall_sec": 120.51,
+      "rtf": 1.3367,
+      "partial_emissions_total": 0
+    }
+  }
+}

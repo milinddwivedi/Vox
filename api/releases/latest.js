@@ -10,25 +10,25 @@ module.exports = async function handler(req, res) {
   }
 
   const manifest = {
-    "version": "1.0.11",
+    "version": "1.0.12",
     "min_supported_version": "1.0.0",
     "channel": "stable",
     "platform": "win32",
     "arch": "x64",
     "product_name": "VOX \u2014 Local AI Voice Assistant",
-    "release_date": "2026-11-20",
-    "installer_url": "https://raw.githubusercontent.com/milinddwivedi/Vox/v1.0.11/docs/downloads/VoxLocal-Setup.exe",
-    "installer_size_bytes": 31016421,
-    "sha256": "473a78952c3b99f14938b1bbed811e63689a9770aafc298ec7345b241bb4ea03",
+    "release_date": "2026-11-23",
+    "installer_url": "https://raw.githubusercontent.com/milinddwivedi/Vox/v1.0.12/docs/downloads/VoxLocal-Setup.exe",
+    "installer_size_bytes": 31303040,
+    "sha256": "38712f4b2fbd1ef1c14db52d96d18d50dc361044fcdfa3227b98d6c78780289f",
     "min_os_version": "Windows 10 Build 19041 (64-bit)",
     "mandatory": false,
     "release_notes": [
-        "Live In-App Update Progress Bar & Thread-Safe Auto-Restart: Adds a live download/verification progress bar in the sidebar, fixes Qt cross-thread timer scheduling so clicking Update Now always silently installs and relaunches VOX automatically, and displays Current -> Latest versions.",
-        "Instant Window Open & Tray Focus: Moves heavy ML/Qt imports after single-instance checks and adds loopback /focus-window activation so clicking VOX opens or restores the window immediately instead of staying hidden in the system tray.",
-        "Rapid Call-Switch Isolation & Live Tail-Flush Fix: Isolates per-call audio recorders and caps live stop tail-flush to 6.0s so switching calls in Microsoft Teams/Zoom never interrupts or crosses audio tracks between consecutive meetings.",
-        "CUDA Runtime DLL Verification & Fast Live CPU Streaming: Verifies cuBLAS runtime DLL availability before selecting GPU tier so laptops without CUDA toolkit DLLs automatically stream word-by-word with Whisper Small on CPU int8."
+        "Adaptive Zero-Torch ONNX ASR & Honest Streaming Modes: Uses Nemotron 560ms INT8 (CPU, 0 VRAM) for true incremental English live transcription, and Guarded Qwen3-ASR 0.6B ONNX INT8 or Parakeet TDT v2 INT8 (CPU, 0 VRAM) for endpointed live and fast offline transcription, accurately labeled in the UI.",
+        "Selective Second-Pass Verification & Language Guards: Escalates only uncertain Hindi/Hinglish slices (or English low-confidence slices to Parakeet/Whisper) with strict directional routing guards so English audio never routes to Hinglish verifiers and Hinglish never routes to English-only models.",
+        "Capture Health Monitoring & Crash-Safe Atomic Persistence: Tracks live audio device disconnects, zero-byte stalls, silence stalls, and clipping diagnostics; commits finalized transcripts transactionally with immutable raw text before isolated Stage 4 AI notes generation.",
+        "Instant Phase 2 Rollback & Hardware Headroom Gates: Adds Settings -> Meeting ASR Mode selector (Auto/English/Hinglish) and a 1-toggle Phase 2 pipeline rollback switch to revert cleanly to legacy Faster-Whisper behavior."
     ],
-    "signature": "4e8ef18553b14b943d311bb96924fa0787a74abc8d29f2386403fdcdc57770ecbc06081ed68da64e8c3b268cb99e380d32c30b23f0384049ca947b76c14fa302"
+    "signature": "ce8dcb6228094f829e81528313eb53ba17d0ad79314646df3d4431b06a2a19c31ae4e475bb924af6ddb4473bb513cede9ce595280e9745aa22831a7c29867800"
 };
 
   const privateKey = process.env.VOX_ENTITLEMENT_PRIVATE_KEY_ED25519 || process.env.ENTITLEMENT_PRIVATE_KEY_PEM;

@@ -39,6 +39,24 @@ class AppConfig:
     verbatim_transcript_protection: bool = True
     enable_selective_verification: bool = True
 
+    # Phase 2 Adaptive Pipeline & Instant Rollback Controls
+    enable_phase2_asr_pipeline: bool = True  # Set False to roll back to legacy Phase 0 Whisper live + offline pipeline
+    asr_session_mode: str = "auto"           # auto | english | hinglish
+    live_english_backend: str = "auto"       # auto | nemotron | parakeet | faster_whisper
+    live_hinglish_backend: str = "auto"      # auto | qwen3_onnx | faster_whisper
+    offline_english_backend: str = "auto"    # auto | parakeet | faster_whisper
+    offline_hinglish_backend: str = "auto"   # auto | hf_qwen3_asr | qwen3_onnx | faster_whisper
+    selective_second_pass_enabled: bool = True
+    selective_verifier_backend: str = "auto" # auto | oriserve_apex | hf_qwen3_asr | parakeet | faster_whisper | disabled
+    # Provisional configurable thresholds for selective 2nd-pass verification (validated per session language)
+    selective_logprob_threshold: float = -0.45
+    selective_min_wps: float = 0.75
+    selective_max_utterances_per_meeting: int = 40
+    selective_enable_hinglish_cue_routing: bool = True
+    # Live GPU VRAM headroom thresholds (MB) before loading optional CUDA models
+    gpu_min_free_vram_hf_mb: int = 2000
+    gpu_min_free_vram_ct2_mb: int = 1100
+
     # Local LLM Engine (Offline Meeting Intelligence & Q&A)
     llm_model: str = "Llama-3.2-1B-Instruct-ct2-int8"
     llm_enabled: bool = True

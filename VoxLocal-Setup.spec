@@ -1,10 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 
+_vox_exe = os.environ.get('VOXLOCAL_EXE_PATH', 'dist/VoxLocal/VoxLocal.exe')
 
 a = Analysis(
     ['packaging/vox_setup_installer.py'],
     pathex=[],
-    binaries=[('dist/VoxLocal/VoxLocal.exe', 'bundled_bin')],
+    binaries=[(_vox_exe, 'bundled_bin')],
     datas=[('src', 'src'), ('assets', 'assets')],
     hiddenimports=[],
     hookspath=[],

@@ -296,8 +296,24 @@ class LocalDatabase:
                 ("completeness_report_json", "ALTER TABLE meetings ADD COLUMN completeness_report_json TEXT DEFAULT '';"),
                 ("finalization_reason", "ALTER TABLE meetings ADD COLUMN finalization_reason TEXT DEFAULT '';"),
                 ("cleaned_transcript", "ALTER TABLE meetings ADD COLUMN cleaned_transcript TEXT DEFAULT '';"),
+                ("audio_health_json", "ALTER TABLE meetings ADD COLUMN audio_health_json TEXT DEFAULT '{}';"),
                 ("raw_text", "ALTER TABLE transcript_segments ADD COLUMN raw_text TEXT DEFAULT '';"),
                 ("is_uncertain", "ALTER TABLE transcript_segments ADD COLUMN is_uncertain INTEGER DEFAULT 0;"),
+                ("normalized_text", "ALTER TABLE transcript_segments ADD COLUMN normalized_text TEXT DEFAULT '';"),
+                ("corrected_text", "ALTER TABLE transcript_segments ADD COLUMN corrected_text TEXT DEFAULT '';"),
+                ("asr_model", "ALTER TABLE transcript_segments ADD COLUMN asr_model TEXT DEFAULT '';"),
+                ("asr_backend", "ALTER TABLE transcript_segments ADD COLUMN asr_backend TEXT DEFAULT '';"),
+                ("asr_device", "ALTER TABLE transcript_segments ADD COLUMN asr_device TEXT DEFAULT '';"),
+                ("asr_compute_type", "ALTER TABLE transcript_segments ADD COLUMN asr_compute_type TEXT DEFAULT '';"),
+                ("transcript_stage", "ALTER TABLE transcript_segments ADD COLUMN transcript_stage TEXT DEFAULT '';"),
+                ("transcript_state", "ALTER TABLE transcript_segments ADD COLUMN transcript_state TEXT DEFAULT '';"),
+                ("raw_model_score", "ALTER TABLE transcript_segments ADD COLUMN raw_model_score REAL DEFAULT NULL;"),
+                ("no_speech_prob", "ALTER TABLE transcript_segments ADD COLUMN no_speech_prob REAL DEFAULT NULL;"),
+                ("confidence_calibrated", "ALTER TABLE transcript_segments ADD COLUMN confidence_calibrated INTEGER DEFAULT 0;"),
+                ("detected_language", "ALTER TABLE transcript_segments ADD COLUMN detected_language TEXT DEFAULT '';"),
+                ("uncertainty_reasons_json", "ALTER TABLE transcript_segments ADD COLUMN uncertainty_reasons_json TEXT DEFAULT '[]';"),
+                ("recognition_params_json", "ALTER TABLE transcript_segments ADD COLUMN recognition_params_json TEXT DEFAULT '{}';"),
+                ("processing_history_json", "ALTER TABLE transcript_segments ADD COLUMN processing_history_json TEXT DEFAULT '[]';"),
             ]:
                 try:
                     conn.execute(ddl)
@@ -382,6 +398,28 @@ class LocalDatabase:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (user_id, account_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS finalization_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id INTEGER NOT NULL UNIQUE,
+                    state TEXT NOT NULL DEFAULT 'FINALIZATION_QUEUED',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    audio_path TEXT DEFAULT '',
+                    mic_audio_path TEXT DEFAULT '',
+                    sys_audio_path TEXT DEFAULT '',
+                    video_path TEXT DEFAULT '',
+                    duration_sec REAL DEFAULT 0.0,
+                    stream_telemetry_json TEXT DEFAULT '{}',
+                    last_stage TEXT DEFAULT '',
+                    last_error TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    next_retry_at TEXT DEFAULT '',
+                    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_finalization_jobs_state
+                    ON finalization_jobs(state, updated_at);
                 """
             )
             if existing_cal_cols and "user_id" not in existing_cal_cols:
@@ -418,6 +456,7 @@ class LocalDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_decisions_meeting ON decisions(meeting_id, timestamp_sec);",
                 "CREATE INDEX IF NOT EXISTS idx_decisions_supersedes ON decisions(supersedes_id);",
                 "CREATE INDEX IF NOT EXISTS idx_meetings_status ON meetings(status);",
+                "CREATE INDEX IF NOT EXISTS idx_finalization_jobs_state ON finalization_jobs(state, updated_at);",
             ]:
                 try:
                     conn.execute(idx_sql)
@@ -768,6 +807,147 @@ class LocalDatabase:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    # ------------------------------------------------------------------
+    # Persistent Finalization Job Queue (Phase 0 Crash-Safe Recovery)
+    # ------------------------------------------------------------------
+    def enqueue_finalization_job(
+        self,
+        meeting_id: int,
+        *,
+        audio_path: str = "",
+        mic_audio_path: str = "",
+        sys_audio_path: str = "",
+        video_path: str = "",
+        duration_sec: float = 0.0,
+        stream_telemetry: Optional[Dict[str, Any]] = None,
+        max_attempts: int = 3,
+        state: str = "FINALIZATION_QUEUED",
+    ) -> int:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        telem_json = json.dumps(stream_telemetry or {})
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO finalization_jobs (
+                    meeting_id, state, attempts, max_attempts,
+                    audio_path, mic_audio_path, sys_audio_path, video_path,
+                    duration_sec, stream_telemetry_json, last_stage, last_error,
+                    created_at, updated_at, next_retry_at
+                ) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'queued', '', ?, ?, '')
+                ON CONFLICT(meeting_id) DO UPDATE SET
+                    state = excluded.state,
+                    attempts = 0,
+                    max_attempts = excluded.max_attempts,
+                    audio_path = excluded.audio_path,
+                    mic_audio_path = excluded.mic_audio_path,
+                    sys_audio_path = excluded.sys_audio_path,
+                    video_path = excluded.video_path,
+                    duration_sec = excluded.duration_sec,
+                    stream_telemetry_json = excluded.stream_telemetry_json,
+                    last_stage = 'queued',
+                    last_error = '',
+                    updated_at = excluded.updated_at,
+                    next_retry_at = ''
+                """,
+                (
+                    int(meeting_id),
+                    str(state or "FINALIZATION_QUEUED"),
+                    max(1, int(max_attempts)),
+                    str(audio_path or ""),
+                    str(mic_audio_path or ""),
+                    str(sys_audio_path or ""),
+                    str(video_path or ""),
+                    float(duration_sec or 0.0),
+                    telem_json,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM finalization_jobs WHERE meeting_id = ?",
+                (int(meeting_id),),
+            ).fetchone()
+            conn.commit()
+            return int(row["id"]) if row else 0
+
+    def get_finalization_job(self, meeting_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM finalization_jobs WHERE meeting_id = ?",
+                (int(meeting_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_pending_finalization_jobs(self, include_future_retries: bool = False) -> List[Dict[str, Any]]:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock, self._connect() as conn:
+            if include_future_retries:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM finalization_jobs
+                    WHERE state IN ('FINALIZATION_QUEUED', 'RETRY_PENDING')
+                    ORDER BY id ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM finalization_jobs
+                    WHERE state IN ('FINALIZATION_QUEUED', 'RETRY_PENDING')
+                      AND (next_retry_at = '' OR next_retry_at <= ?)
+                    ORDER BY id ASC
+                    """,
+                    (now,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def update_finalization_job(self, meeting_id: int, **kwargs: Any) -> None:
+        if not kwargs:
+            return
+        allowed = {
+            "state",
+            "attempts",
+            "max_attempts",
+            "audio_path",
+            "mic_audio_path",
+            "sys_audio_path",
+            "video_path",
+            "duration_sec",
+            "stream_telemetry_json",
+            "last_stage",
+            "last_error",
+            "next_retry_at",
+        }
+        updates: Dict[str, Any] = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+        updates["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fields = ", ".join(f"{k} = ?" for k in updates.keys())
+        values = list(updates.values()) + [int(meeting_id)]
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"UPDATE finalization_jobs SET {fields} WHERE meeting_id = ?",
+                values,
+            )
+            conn.commit()
+
+    def reset_inflight_finalization_jobs_for_recovery(self) -> int:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE finalization_jobs
+                SET state = 'FINALIZATION_QUEUED',
+                    last_stage = 'recovered_after_restart',
+                    next_retry_at = '',
+                    updated_at = ?
+                WHERE state = 'FINALIZING'
+                """,
+                (now,),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+
     def mark_meeting_user_edited(self, meeting_id: int, is_edited: bool = True) -> None:
         """Mark a meeting report as manually edited by the user to protect from silent AI overwrites."""
         self.update_meeting(meeting_id, user_edited=1 if is_edited else 0)
@@ -809,6 +989,7 @@ class LocalDatabase:
             "completeness_report_json",
             "finalization_reason",
             "cleaned_transcript",
+            "audio_health_json",
         }
         fields = {k: v for k, v in kwargs.items() if k in allowed}
         if not fields:
@@ -818,6 +999,10 @@ class LocalDatabase:
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE meetings SET {cols} WHERE id = ?", vals)
             conn.commit()
+
+    @staticmethod
+    def _norm_dedup_text(value: str) -> str:
+        return re.sub(r"[^\w\u0900-\u097F]+", " ", str(value or "").lower()).strip()
 
     def add_transcript_segment(
         self,
@@ -831,12 +1016,35 @@ class LocalDatabase:
         confidence: float = 1.0,
         raw_text: str = "",
         is_uncertain: bool = False,
+        normalized_text: str = "",
+        corrected_text: str = "",
+        asr_model: str = "",
+        asr_backend: str = "",
+        asr_device: str = "",
+        asr_compute_type: str = "",
+        transcript_stage: str = "",
+        transcript_state: str = "",
+        raw_model_score: Optional[float] = None,
+        no_speech_prob: Optional[float] = None,
+        confidence_calibrated: bool = False,
+        detected_language: str = "",
+        uncertainty_reasons: Optional[List[str]] = None,
+        recognition_params: Optional[Dict[str, Any]] = None,
+        processing_history: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
-        norm_txt = text.strip()
-        if not norm_txt:
+        norm_txt = (normalized_text or text).strip()
+        display_txt = (text or norm_txt).strip()
+        if not display_txt:
             return 0
-        raw_val = (raw_text or norm_txt).strip()
+        raw_val = (raw_text or display_txt).strip()
+        corr_val = (corrected_text or "").strip()
+        eff_state = (transcript_state or transcript_stage or "stable").strip()
         unc_flag = 1 if is_uncertain else 0
+        cal_flag = 1 if confidence_calibrated else 0
+        unc_json = json.dumps(list(uncertainty_reasons or []))
+        rec_json = json.dumps(recognition_params or {})
+        hist_json = json.dumps(list(processing_history or []))
+        norm_disp_cmp = self._norm_dedup_text(display_txt)
         st_round = round(float(start_time), 2)
         et_round = round(float(end_time), 2)
         with self._lock, self._connect() as conn:
@@ -849,7 +1057,7 @@ class LocalDatabase:
             # Query recent segments in this meeting with matching track within +- 1.5s window
             existing = conn.execute(
                 """
-                SELECT id, segment_index, start_time, end_time, text, confidence
+                SELECT id, segment_index, start_time, end_time, text, raw_text, confidence
                 FROM transcript_segments
                 WHERE meeting_id = ? AND source_track = ? AND ABS(start_time - ?) <= 1.5
                 ORDER BY start_time ASC
@@ -860,38 +1068,69 @@ class LocalDatabase:
             for ex_row in existing:
                 ex_id = ex_row["id"]
                 ex_text = str(ex_row["text"]).strip()
-                # 1. Exact match -> duplicate segment, do not insert duplicate
-                if ex_text.lower() == norm_txt.lower():
+                ex_norm_cmp = self._norm_dedup_text(ex_text)
+                # 1. Exact or normalized match -> duplicate segment, do not insert duplicate
+                if ex_text.lower() == display_txt.lower() or (norm_disp_cmp and norm_disp_cmp == ex_norm_cmp):
                     return ex_id
-                # 2. Existing text is prefix or shorter substring -> update with more complete segment
-                if norm_txt.lower().startswith(ex_text.lower()) and len(norm_txt) > len(ex_text):
+                # 2. Existing text is prefix or shorter substring -> update with more complete segment (preserve raw_text)
+                if (
+                    display_txt.lower().startswith(ex_text.lower())
+                    or (ex_norm_cmp and norm_disp_cmp.startswith(ex_norm_cmp))
+                ) and len(display_txt) > len(ex_text):
+                    existing_raw = str(ex_row["raw_text"] or "").strip()
+                    preserved_raw = existing_raw or raw_val
                     conn.execute(
                         """
                         UPDATE transcript_segments
-                        SET text = ?, raw_text = ?, end_time = ?, confidence = ?, is_uncertain = ?
+                        SET text = ?, raw_text = ?, normalized_text = ?, corrected_text = ?,
+                            end_time = ?, confidence = ?, is_uncertain = ?,
+                            asr_model = ?, asr_backend = ?, asr_device = ?, asr_compute_type = ?,
+                            transcript_stage = ?, transcript_state = ?, raw_model_score = ?, no_speech_prob = ?,
+                            confidence_calibrated = ?, detected_language = ?,
+                            uncertainty_reasons_json = ?, recognition_params_json = ?,
+                            processing_history_json = ?
                         WHERE id = ?
                         """,
                         (
+                            display_txt,
+                            preserved_raw,
                             norm_txt,
-                            raw_val,
+                            corr_val,
                             max(et_round, float(ex_row["end_time"])),
                             max(confidence, float(ex_row["confidence"])),
                             unc_flag,
+                            str(asr_model or ""),
+                            str(asr_backend or ""),
+                            str(asr_device or ""),
+                            str(asr_compute_type or ""),
+                            str(transcript_stage or ""),
+                            eff_state,
+                            raw_model_score,
+                            no_speech_prob,
+                            cal_flag,
+                            str(detected_language or ""),
+                            unc_json,
+                            rec_json,
+                            hist_json,
                             ex_id,
                         ),
                     )
                     conn.commit()
                     return ex_id
                 # 3. New text is already contained in existing longer segment -> duplicate fragment, keep existing
-                if ex_text.lower().startswith(norm_txt.lower()):
+                if ex_text.lower().startswith(display_txt.lower()) or (norm_disp_cmp and ex_norm_cmp.startswith(norm_disp_cmp)):
                     return ex_id
 
             cur = conn.execute(
                 """
                 INSERT INTO transcript_segments (
                     meeting_id, segment_index, start_time, end_time,
-                    speaker, source_track, text, confidence, raw_text, is_uncertain
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    speaker, source_track, text, confidence, raw_text, is_uncertain,
+                    normalized_text, corrected_text, asr_model, asr_backend, asr_device,
+                    asr_compute_type, transcript_stage, transcript_state, raw_model_score, no_speech_prob,
+                    confidence_calibrated, detected_language, uncertainty_reasons_json,
+                    recognition_params_json, processing_history_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     meeting_id,
@@ -900,60 +1139,131 @@ class LocalDatabase:
                     et_round,
                     speaker,
                     source_track,
-                    norm_txt,
+                    display_txt,
                     confidence,
                     raw_val,
                     unc_flag,
+                    norm_txt,
+                    corr_val,
+                    str(asr_model or ""),
+                    str(asr_backend or ""),
+                    str(asr_device or ""),
+                    str(asr_compute_type or ""),
+                    str(transcript_stage or ""),
+                    eff_state,
+                    raw_model_score,
+                    no_speech_prob,
+                    cal_flag,
+                    str(detected_language or ""),
+                    unc_json,
+                    rec_json,
+                    hist_json,
                 ),
             )
             conn.commit()
             return int(cur.lastrowid)
 
-    def replace_meeting_segments(self, meeting_id: int, segments: List[Dict[str, Any]]) -> None:
-        """Replace all segments for a meeting and rebuild full_transcript."""
+    def replace_meeting_segments(
+        self,
+        meeting_id: int,
+        segments: List[Dict[str, Any]],
+        *,
+        allow_empty: bool = False,
+    ) -> None:
+        """
+        Transactionally replace all segments for a meeting and rebuild full_transcript.
+        Never wipes existing persisted segments with an empty list unless `allow_empty=True`,
+        and rolls back cleanly if any insert/update raises.
+        """
         with self._lock, self._connect() as conn:
-            conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?", (meeting_id,))
-            lines: List[str] = []
-            for idx, seg in enumerate(segments):
-                start_t = round(float(seg.get("start_time", 0.0)), 2)
-                end_t = round(float(seg.get("end_time", start_t)), 2)
-                speaker = str(seg.get("speaker", "Speaker"))
-                source_track = str(seg.get("source_track", "mixed"))
-                text = str(seg.get("text", "")).strip()
-                if not text:
-                    continue
-                raw_text = str(seg.get("raw_text") or text).strip()
-                is_unc = 1 if bool(seg.get("is_uncertain", False)) else 0
-                conn.execute(
-                    """
-                    INSERT INTO transcript_segments (
-                        meeting_id, segment_index, start_time, end_time,
-                        speaker, source_track, text, confidence, raw_text, is_uncertain
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
+            if not segments and not allow_empty:
+                ex_cnt = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM transcript_segments WHERE meeting_id = ?",
+                    (meeting_id,),
+                ).fetchone()
+                if ex_cnt and int(ex_cnt["cnt"]) > 0:
+                    logger.warning(
+                        "Preserving %d existing transcript segments for meeting #%d (refusing accidental empty replace).",
+                        int(ex_cnt["cnt"]),
                         meeting_id,
-                        idx,
-                        start_t,
-                        end_t,
-                        speaker,
-                        source_track,
-                        text,
-                        float(seg.get("confidence", 1.0)),
-                        raw_text,
-                        is_unc,
-                    ),
-                )
-                mm = int(start_t // 60)
-                ss = int(start_t % 60)
-                lines.append(f"[{mm:02d}:{ss:02d}] {speaker}: {text}")
+                    )
+                    return
 
-            full_text = "\n".join(lines)
-            conn.execute(
-                "UPDATE meetings SET full_transcript = ? WHERE id = ?",
-                (full_text, meeting_id),
-            )
-            conn.commit()
+            if not self._is_memory:
+                conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?", (meeting_id,))
+                lines: List[str] = []
+                for idx, seg in enumerate(segments):
+                    start_t = round(float(seg.get("start_time", 0.0)), 2)
+                    end_t = round(float(seg.get("end_time", start_t)), 2)
+                    speaker = str(seg.get("speaker", "Speaker"))
+                    source_track = str(seg.get("source_track", "mixed"))
+                    text = str(seg.get("text", "")).strip()
+                    if not text:
+                        continue
+                    raw_text = str(seg.get("raw_text") or text).strip()
+                    norm_text = str(seg.get("normalized_text") or text).strip()
+                    corr_text = str(seg.get("corrected_text") or "").strip()
+                    t_stage = str(seg.get("transcript_stage") or "").strip()
+                    t_state = str(seg.get("transcript_state") or t_stage or "final").strip()
+                    is_unc = 1 if bool(seg.get("is_uncertain", False)) else 0
+                    cal_flag = 1 if bool(seg.get("confidence_calibrated", False)) else 0
+                    unc_json = json.dumps(list(seg.get("uncertainty_reasons") or []))
+                    rec_json = json.dumps(seg.get("recognition_params") or {})
+                    hist_json = json.dumps(list(seg.get("processing_history") or []))
+                    conn.execute(
+                        """
+                        INSERT INTO transcript_segments (
+                            meeting_id, segment_index, start_time, end_time,
+                            speaker, source_track, text, confidence, raw_text, is_uncertain,
+                            normalized_text, corrected_text, asr_model, asr_backend, asr_device,
+                            asr_compute_type, transcript_stage, transcript_state, raw_model_score, no_speech_prob,
+                            confidence_calibrated, detected_language, uncertainty_reasons_json,
+                            recognition_params_json, processing_history_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            meeting_id,
+                            idx,
+                            start_t,
+                            end_t,
+                            speaker,
+                            source_track,
+                            text,
+                            float(seg.get("confidence", 1.0)),
+                            raw_text,
+                            is_unc,
+                            norm_text,
+                            corr_text,
+                            str(seg.get("asr_model") or ""),
+                            str(seg.get("asr_backend") or ""),
+                            str(seg.get("asr_device") or ""),
+                            str(seg.get("asr_compute_type") or ""),
+                            t_stage,
+                            t_state,
+                            seg.get("raw_model_score"),
+                            seg.get("no_speech_prob"),
+                            cal_flag,
+                            str(seg.get("detected_language") or ""),
+                            unc_json,
+                            rec_json,
+                            hist_json,
+                        ),
+                    )
+                    mm = int(start_t // 60)
+                    ss = int(start_t % 60)
+                    lines.append(f"[{mm:02d}:{ss:02d}] {speaker}: {text}")
+
+                full_text = "\n".join(lines)
+                conn.execute(
+                    "UPDATE meetings SET full_transcript = ? WHERE id = ?",
+                    (full_text, meeting_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def rename_meeting_speaker(self, meeting_id: int, old_speaker: str, new_speaker: str) -> int:
         """

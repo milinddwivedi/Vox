@@ -60,13 +60,24 @@ class DictationProcessor:
         (r"\bcolon\b", ":"),
     ]
 
-    # Built-in phonetic & Indian-English accent normalization rules
-    ACCENT_CORRECTION_RULES = [
+    # Voice-typing-only accent & command normalization rules (NEVER apply in meeting transcription)
+    VOICE_TYPING_ACCENT_RULES = [
         (r"\bin a cats\b", "in caps"),
         (r"\bin cats\b", "in caps"),
         (r"\ball cats\b", "all caps"),
         (r"\btell you step back\b", "tell you step by step"),
         (r"\bvoice type\b", "voice typing"),
+        # "Hawaii" misheard when user says "how I" (standalone or before verbs/clauses)
+        (
+            r"\bhawaii\b(?=\s+(?:express|speak|say|talk|do|can|will|should|would|could|want|need|am|was|have|think|feel|work|type|write|use|make|get|see|know)\b)",
+            "how I",
+        ),
+        (r"\b(totally|exactly|that is|this is|like|about)\s+hawaii\b", r"\1 how I"),
+        (r"^\s*hawaii[\.\!\?,\s]*$", "how I"),
+    ]
+
+    # Built-in domain & Indian-English phonetic normalization rules shared across meetings and dictation
+    MEETING_DOMAIN_CORRECTION_RULES = [
         (r"\b(?:winchel|vinchil|wind\s+chill)\b", "Windchill"),
         (r"\bventure\s+pl[nm]\b", "Windchill PLM"),
         (r"\bsap\s+erpr\b", "SAP ERP"),
@@ -103,14 +114,63 @@ class DictationProcessor:
         (r"\b(?:s\s*\.?\s*q\s*\.?\s*l|s\.q\.l\.)\b", "SQL"),
         (r"\bv\s*s\s*code\b", "VS Code"),
         (r"\bc\s*i\s*/?\s*c\s*d\b", "CI/CD"),
-        # "Hawaii" misheard when user says "how I" (standalone or before verbs/clauses)
-        (
-            r"\bhawaii\b(?=\s+(?:express|speak|say|talk|do|can|will|should|would|could|want|need|am|was|have|think|feel|work|type|write|use|make|get|see|know)\b)",
-            "how I",
-        ),
-        (r"\b(totally|exactly|that is|this is|like|about)\s+hawaii\b", r"\1 how I"),
-        (r"^\s*hawaii[\.\!\?,\s]*$", "how I"),
     ]
+
+    # Combined default accent correction rules for voice typing / dictation
+    ACCENT_CORRECTION_RULES = VOICE_TYPING_ACCENT_RULES + MEETING_DOMAIN_CORRECTION_RULES
+
+    VOICE_TYPING_ONLY_CATEGORIES = frozenset({
+        "accent & speech",
+        "voice typing",
+        "dictation",
+        "dictation commands",
+        "punctuation",
+    })
+
+    VOICE_TYPING_ONLY_PHRASES = frozenset({
+        "in caps",
+        "all caps",
+        "how i express",
+        "how i speak",
+        "totally how i",
+        "voice typing",
+        "tell you step by step",
+        "new line",
+        "new paragraph",
+        "full stop",
+        "period",
+        "comma",
+        "question mark",
+        "exclamation mark",
+        "scratch that",
+        "delete that",
+        "select all",
+    })
+
+    @classmethod
+    def filter_vocabulary_for_context(
+        cls,
+        vocabulary: Optional[List[Dict[str, Any]]],
+        context: str = "dictation",
+    ) -> List[Dict[str, Any]]:
+        """Filter custom vocabulary rows according to execution context ('dictation' vs 'meeting')."""
+        if not vocabulary:
+            return []
+        ctx = str(context or "dictation").strip().lower()
+        active_items = [item for item in vocabulary if item.get("is_active", 1)]
+        if ctx != "meeting":
+            return active_items
+        filtered: List[Dict[str, Any]] = []
+        for item in active_items:
+            category = str(item.get("category", "") or "").strip().lower()
+            if category in cls.VOICE_TYPING_ONLY_CATEGORIES:
+                continue
+            spoken = str(item.get("spoken_phrase") or item.get("phrase") or "").strip().lower()
+            repl = str(item.get("replacement", "") or "").strip().lower()
+            if spoken in cls.VOICE_TYPING_ONLY_PHRASES or repl in cls.VOICE_TYPING_ONLY_PHRASES:
+                continue
+            filtered.append(item)
+        return filtered
 
     # Words that should remain capitalized even when continuing mid-sentence
     ALWAYS_CAPITALIZE_WORDS = {
@@ -1154,6 +1214,7 @@ class DictationProcessor:
         vocabulary: Optional[List[Dict[str, Any]]] = None,
         capitalize_first: bool = True,
         output_script: str = "auto",
+        context: str = "dictation",
     ) -> str:
         """
         Fast lightweight formatting for live provisional streaming partials.
@@ -1164,22 +1225,23 @@ class DictationProcessor:
             return ""
         # Quick cleanup without aggressive terminal punctuation insertion
         text = re.sub(r"\s+", " ", raw_text).strip()
+        ctx = str(context or "dictation").strip().lower()
+        effective_vocab = cls.filter_vocabulary_for_context(vocabulary, context=ctx)
         # 1. Apply user custom vocabulary definitions first (highest priority)
-        if vocabulary:
+        if effective_vocab:
             for item in sorted(
-                vocabulary,
+                effective_vocab,
                 key=lambda v: len(str(v.get("spoken_phrase", ""))),
                 reverse=True,
             ):
-                if not item.get("is_active", 1):
-                    continue
                 spoken = str(item.get("spoken_phrase", "")).strip()
                 replacement = str(item.get("replacement", "")).strip()
                 if spoken and replacement:
                     text = re.sub(rf"\b{re.escape(spoken)}\b", replacement, text, flags=re.IGNORECASE)
 
-        # 2. Apply built-in accent correction rules
-        for pattern, replacement in cls.ACCENT_CORRECTION_RULES:
+        # 2. Apply built-in accent correction rules (domain-only in meeting context)
+        rules = cls.MEETING_DOMAIN_CORRECTION_RULES if ctx == "meeting" else cls.ACCENT_CORRECTION_RULES
+        for pattern, replacement in rules:
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
         # 3. Apply numeric and currency formatting
@@ -1211,6 +1273,7 @@ class DictationProcessor:
         vocabulary: Optional[List[Dict[str, Any]]] = None,
         language: str = "en",
         participants: Optional[List[str]] = None,
+        context: str = "dictation",
     ) -> str:
         """
         Build a comma-separated hotwords string for Whisper decoder logit biasing
@@ -1218,24 +1281,25 @@ class DictationProcessor:
         """
         terms: List[str] = []
         seen: set[str] = set()
+        ctx = str(context or "dictation").strip().lower()
 
         def _add(term: str) -> None:
             t = re.sub(r"\s+", " ", str(term or "").strip()).strip(",.")
             if not t:
                 return
             k = t.lower()
+            if ctx == "meeting" and k in cls.VOICE_TYPING_ONLY_PHRASES:
+                return
             if k in seen:
                 return
             seen.add(k)
             terms.append(t)
 
-        if vocabulary:
-            for item in vocabulary:
-                if not item.get("is_active", 1):
-                    continue
-                repl = str(item.get("replacement", "")).strip()
-                if repl and len(repl) <= 48:
-                    _add(repl)
+        effective_vocab = cls.filter_vocabulary_for_context(vocabulary, context=ctx)
+        for item in effective_vocab:
+            repl = str(item.get("replacement", "")).strip()
+            if repl and len(repl) <= 48:
+                _add(repl)
 
         if participants:
             for p in participants:
@@ -1783,6 +1847,7 @@ class DictationProcessor:
         window_title: str = "",
         process_name: str = "",
         style_preferences: Dict[str, Any] | None = None,
+        context: str = "dictation",
     ) -> Dict[str, Any]:
         """Full dictation pipeline returning transformed text + metadata for UI Undo AI Edit & metrics."""
         app_category = cls.classify_app_context(window_title, process_name)
@@ -1802,6 +1867,7 @@ class DictationProcessor:
             process_name=process_name,
             snippets=snippets,
             style_preferences=prefs,
+            context=context,
         )
         matched_ids: List[int] = []
         if snippets and final_text:
@@ -1836,10 +1902,12 @@ class DictationProcessor:
         process_name: str = "",
         snippets: List[Dict[str, Any]] | None = None,
         style_preferences: Dict[str, Any] | None = None,
+        context: str = "dictation",
     ) -> str:
         if not raw_text or not raw_text.strip():
             return ""
 
+        ctx = str(context or "dictation").strip().lower()
         mode_str = str(getattr(mode, "value", mode)).lower()
         if mode_str == "verbatim":
             cleanup_enabled = False
@@ -1880,9 +1948,10 @@ class DictationProcessor:
 
         # 2. Apply custom vocabulary replacements from personal database (highest priority)
         custom_replacements_lower = set()
-        if vocabulary:
+        effective_vocab = cls.filter_vocabulary_for_context(vocabulary, context=ctx)
+        if effective_vocab:
             sorted_vocab = sorted(
-                [v for v in vocabulary if v.get("is_active", 1)],
+                effective_vocab,
                 key=lambda x: len(str(x.get("spoken_phrase", ""))),
                 reverse=True,
             )
@@ -1896,7 +1965,8 @@ class DictationProcessor:
                 text = pattern.sub(replacement, text)
 
         # 3. Apply built-in accent & phonetic normalization rules
-        for pattern_str, replacement in cls.ACCENT_CORRECTION_RULES:
+        rules = cls.MEETING_DOMAIN_CORRECTION_RULES if ctx == "meeting" else cls.ACCENT_CORRECTION_RULES
+        for pattern_str, replacement in rules:
             text = re.sub(pattern_str, replacement, text, flags=re.IGNORECASE)
 
         # 4. Convert spoken punctuation commands

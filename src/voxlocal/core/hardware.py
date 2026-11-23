@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -45,6 +45,11 @@ class ExecutionProfile:
     hf_runtime_available: bool
     free_vram_mb: Optional[int]
     fallback_reason: str = ""
+    session_mode: str = "auto"
+    live_execution_mode: str = "endpointed"
+    selective_verifier_backend: str = "disabled"
+    phase2_enabled: bool = False
+    available_phase2_models: Dict[str, bool] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -382,6 +387,21 @@ class HardwareProfiler:
         hf_ckpt_ok = cls._has_local_hf_asr_checkpoint(hf_model_id, models_dir=models_dir) if hf_avail else False
         fallback_reasons: List[str] = []
 
+        # Phase 2 Hardware-Aware Adaptive ONNX / Incremental / Guarded Selector
+        phase2_flag = bool(getattr(config, "enable_phase2_asr_pipeline", False)) if config is not None else False
+        if phase2_flag and adaptive_enabled:
+            phase2_profile = cls._select_phase2_execution_profile(
+                prof=prof,
+                config=config,
+                models_dir=models_dir,
+                free_vram=free_vram,
+                hf_avail=hf_avail,
+                hf_ckpt_ok=hf_ckpt_ok,
+                hf_model_id=hf_model_id,
+            )
+            if phase2_profile is not None:
+                return phase2_profile
+
         # Tier 1: Minimum office laptop (8 GB RAM or <= 4 threads without CUDA)
         if prof.ram_total_gb < 11.5 or (not prof.cuda_available and prof.cpu_threads <= 4):
             threads = max(2, min(4, prof.cpu_threads - 1 if prof.cpu_threads > 2 else prof.cpu_threads))
@@ -499,6 +519,232 @@ class HardwareProfiler:
             hf_runtime_available=hf_avail,
             free_vram_mb=free_vram,
             fallback_reason=" ".join(fallback_reasons),
+        )
+
+    @classmethod
+    def _select_phase2_execution_profile(
+        cls,
+        *,
+        prof: HardwareProfile,
+        config: Any,
+        models_dir: Optional[Path],
+        free_vram: Optional[int],
+        hf_avail: bool,
+        hf_ckpt_ok: bool,
+        hf_model_id: str,
+    ) -> Optional[ExecutionProfile]:
+        """Select Phase 2 hardware-aware live, offline, and selective-verifier backends."""
+        try:
+            from voxlocal.engine.onnx_asr_engines import get_phase2_runtime_capabilities
+
+            caps = get_phase2_runtime_capabilities(models_dir)
+        except Exception as exc:
+            logger.debug("Phase 2 capability discovery unavailable: %s", exc)
+            return None
+
+        avail_models: Dict[str, bool] = dict(caps.get("models_available") or {})
+        has_ort = bool(caps.get("onnxruntime"))
+        has_tok = bool(caps.get("tokenizers"))
+        has_sherpa = bool(caps.get("sherpa_onnx"))
+        has_fw = bool(caps.get("faster_whisper"))
+
+        raw_sess = str(getattr(config, "asr_session_mode", "auto") or "auto").strip().lower()
+        cfg_lang = str(getattr(config, "language", "en+hi") or "en+hi").strip().lower()
+        if raw_sess == "auto" and cfg_lang == "en":
+            session_mode = "english"
+        elif raw_sess in ("english", "hinglish", "auto"):
+            session_mode = raw_sess
+        else:
+            session_mode = "auto"
+
+        min_hf_vram = int(getattr(config, "gpu_min_free_vram_hf_mb", 2000) or 2000)
+        min_ct2_vram = int(getattr(config, "gpu_min_free_vram_ct2_mb", 1100) or 1100)
+        cuda_ok = bool(prof.cuda_available)
+        req_dev = str(getattr(config, "compute_device", "auto") or "auto").strip().lower()
+        if req_dev == "cpu":
+            cuda_ok = False
+
+        safe_threads = max(2, min(4, prof.cpu_threads - 1 if prof.cpu_threads > 2 else prof.cpu_threads))
+        if prof.ram_total_gb < 11.5 or (not cuda_ok and prof.cpu_threads <= 4):
+            tier_id = "tier1_minimum"
+            tier_label = "Tier 1: CPU-Only / Entry Laptop (0 VRAM ONNX Profile)"
+        elif cuda_ok and free_vram is not None and free_vram >= min_hf_vram and prof.ram_total_gb >= 15.0:
+            tier_id = "tier3_performance"
+            tier_label = "Tier 3: CUDA Accelerated Workstation (>= 2.0 GB Free VRAM)"
+        else:
+            tier_id = "tier2_standard"
+            tier_label = "Tier 2: Standard Office Laptop (CPU INT8 / Bounded VRAM)"
+
+        reasons: List[str] = []
+        if not cuda_ok:
+            reasons.append("CPU-only or CUDA disabled; running 0-VRAM CPU INT8 profile.")
+        elif free_vram is not None and free_vram < min_hf_vram:
+            reasons.append(f"Live free VRAM ({free_vram} MB) < {min_hf_vram} MB headroom for HF FP16.")
+
+        sel_enabled = bool(getattr(config, "selective_second_pass_enabled", True))
+        sel_pref = str(getattr(config, "selective_verifier_backend", "auto") or "auto").strip().lower()
+        live_en_pref = str(getattr(config, "live_english_backend", "auto") or "auto").strip().lower()
+        live_hi_pref = str(getattr(config, "live_hinglish_backend", "auto") or "auto").strip().lower()
+        off_en_pref = str(getattr(config, "offline_english_backend", "auto") or "auto").strip().lower()
+        off_hi_pref = str(getattr(config, "offline_hinglish_backend", "auto") or "auto").strip().lower()
+
+        cfg_whisper = str(getattr(config, "whisper_model", "small") or "small").strip()
+        if not has_fw:
+            cfg_whisper = "small"
+
+        # Determine English Session vs Hinglish/Auto Session
+        if session_mode == "english":
+            # Live English: prefer genuine frame-incremental Nemotron 560ms (0 VRAM)
+            if live_en_pref in ("auto", "nemotron") and has_sherpa and avail_models.get("nemotron"):
+                live_backend = "nemotron_onnx"
+                live_model = "nemotron-streaming-en-0.6b-560ms-int8"
+                live_dev, live_ctype = "cpu", "int8"
+                live_exec_mode = "incremental"
+            elif live_en_pref in ("auto", "parakeet", "nemotron") and has_sherpa and avail_models.get("parakeet"):
+                live_backend = "parakeet_onnx"
+                live_model = "parakeet-tdt-0.6b-v2-onnx-int8"
+                live_dev, live_ctype = "cpu", "int8"
+                live_exec_mode = "endpointed"
+                reasons.append("Nemotron unavailable; using endpointed Parakeet ONNX CPU.")
+            else:
+                live_backend = "faster_whisper"
+                if cuda_ok and (free_vram is None or free_vram >= min_ct2_vram):
+                    live_model, live_dev, live_ctype = "large-v3-turbo", "cuda", "int8"
+                else:
+                    live_model = "small" if cfg_whisper in ("large-v3-turbo", "large-v3") else cfg_whisper
+                    live_dev, live_ctype = "cpu", "int8"
+                live_exec_mode = "endpointed"
+                reasons.append("English ONNX models unavailable; using faster_whisper fallback.")
+
+            # Offline English: prefer Parakeet TDT v2 (CPU 0.07x RTF)
+            if off_en_pref in ("auto", "parakeet") and has_sherpa and avail_models.get("parakeet"):
+                off_backend = "parakeet_onnx"
+                off_model = "parakeet-tdt-0.6b-v2-onnx-int8"
+                off_dev, off_ctype = "cpu", "int8"
+            else:
+                off_backend = "faster_whisper"
+                if cuda_ok and (free_vram is None or free_vram >= min_ct2_vram):
+                    off_model, off_dev, off_ctype = "large-v3-turbo", "cuda", "int8"
+                else:
+                    off_model = "large-v3-turbo" if prof.ram_avail_gb >= 4.5 else "small"
+                    off_dev, off_ctype = "cpu", "int8"
+
+            # Selective verifier for English (NEVER route English to Oriserve Apex)
+            if not sel_enabled or sel_pref == "disabled":
+                sel_verifier = "disabled"
+            elif sel_pref in ("auto", "faster_whisper") and cuda_ok and (free_vram is None or free_vram >= min_ct2_vram) and has_fw:
+                sel_verifier = "faster_whisper"
+            elif sel_pref == "parakeet" and has_sherpa and avail_models.get("parakeet"):
+                sel_verifier = "parakeet_onnx"
+            else:
+                sel_verifier = "disabled"
+
+            return ExecutionProfile(
+                tier_id=tier_id,
+                tier_label=tier_label,
+                live_backend=live_backend,
+                live_model=live_model,
+                live_device=live_dev,
+                live_compute_type=live_ctype,
+                offline_backend=off_backend,
+                offline_model=off_model,
+                offline_device=off_dev,
+                offline_compute_type=off_ctype,
+                safe_cpu_threads=safe_threads,
+                live_best_effort=(live_dev == "cpu"),
+                max_concurrent_models=1,
+                hf_runtime_available=hf_avail,
+                free_vram_mb=free_vram,
+                fallback_reason=" ".join(reasons),
+                session_mode=session_mode,
+                live_execution_mode=live_exec_mode,
+                selective_verifier_backend=sel_verifier,
+                phase2_enabled=True,
+                available_phase2_models=avail_models,
+            )
+
+        # Hinglish / Auto Session
+        qwen3_onnx_ready = has_ort and has_tok and bool(avail_models.get("qwen3_onnx"))
+        if live_hi_pref in ("auto", "qwen3_onnx") and qwen3_onnx_ready:
+            live_backend = "qwen3_onnx"
+            live_model = "qwen3-asr-0.6b-onnx-int8"
+            live_dev, live_ctype = "cpu", "int8"
+            live_exec_mode = "endpointed"
+        else:
+            live_backend = "faster_whisper"
+            if cuda_ok and (free_vram is None or free_vram >= min_ct2_vram):
+                live_model, live_dev, live_ctype = "large-v3-turbo", "cuda", "int8"
+            else:
+                live_model = "small" if cfg_whisper in ("large-v3-turbo", "large-v3") else cfg_whisper
+                live_dev, live_ctype = "cpu", "int8"
+            live_exec_mode = "endpointed"
+            if live_hi_pref in ("auto", "qwen3_onnx") and not qwen3_onnx_ready:
+                reasons.append("Guarded Qwen3 ONNX runtime/weights absent; falling back to faster_whisper live.")
+
+        # Offline Hinglish / Auto
+        can_hf_gpu = (
+            cuda_ok
+            and (free_vram is not None and free_vram >= min_hf_vram)
+            and hf_avail
+            and hf_ckpt_ok
+            and prof.ram_total_gb >= 15.0
+        )
+        if off_hi_pref in ("auto", "hf_qwen3_asr") and can_hf_gpu and (
+            off_hi_pref == "hf_qwen3_asr" or bool(getattr(config, "enable_hf_asr_rc", False)) or (free_vram is not None and free_vram >= min_hf_vram)
+        ):
+            off_backend = "hf_qwen3_asr"
+            off_model = hf_model_id
+            off_dev, off_ctype = "cuda", "float16"
+        elif off_hi_pref in ("auto", "qwen3_onnx", "hf_qwen3_asr") and qwen3_onnx_ready:
+            off_backend = "qwen3_onnx"
+            off_model = "qwen3-asr-0.6b-onnx-int8"
+            off_dev, off_ctype = "cpu", "int8"
+        else:
+            off_backend = "faster_whisper"
+            if cuda_ok and (free_vram is None or free_vram >= min_ct2_vram):
+                off_model, off_dev, off_ctype = "large-v3-turbo", "cuda", "int8"
+            else:
+                off_model = "large-v3-turbo" if prof.ram_avail_gb >= 4.5 else "small"
+                off_dev, off_ctype = "cpu", "int8"
+            if not qwen3_onnx_ready:
+                reasons.append("Guarded Qwen3 ONNX unavailable; using faster_whisper offline.")
+
+        # Selective verifier (opportunistic CUDA Oriserve Apex for Hinglish slices only)
+        if not sel_enabled or sel_pref == "disabled":
+            sel_verifier = "disabled"
+        elif sel_pref in ("auto", "oriserve_apex") and cuda_ok and (free_vram is None or free_vram >= min_ct2_vram) and avail_models.get("oriserve_apex") and has_fw:
+            sel_verifier = "oriserve_apex_ct2"
+        elif sel_pref == "hf_qwen3_asr" and can_hf_gpu:
+            sel_verifier = "hf_qwen3_asr"
+        elif sel_pref == "faster_whisper" and cuda_ok and (free_vram is None or free_vram >= min_ct2_vram) and has_fw:
+            sel_verifier = "faster_whisper"
+        else:
+            sel_verifier = "disabled"
+            if cuda_ok and free_vram is not None and free_vram < min_ct2_vram and avail_models.get("oriserve_apex"):
+                reasons.append(f"Free VRAM ({free_vram} MB) < {min_ct2_vram} MB; skipping CUDA 2nd-pass verifier.")
+
+        return ExecutionProfile(
+            tier_id=tier_id,
+            tier_label=tier_label,
+            live_backend=live_backend,
+            live_model=live_model,
+            live_device=live_dev,
+            live_compute_type=live_ctype,
+            offline_backend=off_backend,
+            offline_model=off_model,
+            offline_device=off_dev,
+            offline_compute_type=off_ctype,
+            safe_cpu_threads=safe_threads,
+            live_best_effort=(live_dev == "cpu"),
+            max_concurrent_models=1,
+            hf_runtime_available=hf_avail,
+            free_vram_mb=free_vram,
+            fallback_reason=" ".join(reasons),
+            session_mode=session_mode,
+            live_execution_mode=live_exec_mode,
+            selective_verifier_backend=sel_verifier,
+            phase2_enabled=True,
+            available_phase2_models=avail_models,
         )
 
     @classmethod

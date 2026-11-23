@@ -13,14 +13,15 @@ Design:
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
 import wave
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyaudiowpatch as pyaudio
@@ -51,6 +52,301 @@ class MeetingRecordingResult:
     mic_device_name: str
     loopback_device_name: str
     capture_mode: str
+    audio_health: Dict[str, Any] = field(default_factory=dict)
+
+
+class AudioInputMonitor:
+    """
+    Non-destructive rolling signal-level & integrity monitor for captured audio tracks.
+    Measures active RMS dBFS, noise-floor dBFS, peak dBFS, clipping ratio, silence stalls,
+    device disconnections, stream interruptions, zero-byte stalls, and heartbeats without modifying PCM.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            now_mono = time.monotonic()
+            self._stats: Dict[str, Dict[str, object]] = {
+                trk: {
+                    "enabled": False,
+                    "sample_count": 0,
+                    "samples_captured": 0,
+                    "sum_sq": 0.0,
+                    "peak": 0.0,
+                    "clipped_samples": 0,
+                    "clipping_samples": 0,
+                    "clipping_events": 0,
+                    "callbacks_received": 0,
+                    "last_callback_monotonic": 0.0,
+                    "last_heartbeat_monotonic": now_mono,
+                    "continuous_silence_sec": 0.0,
+                    "silence_stall_count": 0,
+                    "silence_stall_active": False,
+                    "disconnect_events": 0,
+                    "stream_interruptions": 0,
+                    "zero_byte_events": 0,
+                    "_disconnected_latched": False,
+                    "_zero_byte_latched": False,
+                    "_clipping_warned": False,
+                    "_last_silence_warn_ts": 0.0,
+                    "_last_disconnect_warn_ts": 0.0,
+                    "chunk_rms": deque(maxlen=400),
+                }
+                for trk in ("mic", "system")
+            }
+            self._low_mic_warning_fired: bool = False
+            self._warnings: List[Dict[str, Any]] = []
+            self._last_heartbeat_monotonic: float = now_mono
+
+    def configure_tracks(self, *, mic_enabled: bool, system_enabled: bool) -> None:
+        with self._lock:
+            self._stats["mic"]["enabled"] = bool(mic_enabled)
+            self._stats["system"]["enabled"] = bool(system_enabled)
+
+    def record_callback(self, track: str, now_mono: Optional[float] = None) -> None:
+        if track not in ("mic", "system"):
+            return
+        ts = now_mono if now_mono is not None else time.monotonic()
+        with self._lock:
+            st = self._stats[track]
+            st["callbacks_received"] = int(st["callbacks_received"]) + 1
+            st["last_callback_monotonic"] = ts
+            st["_disconnected_latched"] = False
+            st["_zero_byte_latched"] = False
+
+    def observe(self, track: str, samples: np.ndarray, *, dt_sec: Optional[float] = None) -> None:
+        if track not in ("mic", "system") or samples is None or samples.size == 0:
+            return
+        arr = np.asarray(samples, dtype=np.float32)
+        abs_arr = np.abs(arr)
+        chunk_sq = float(np.sum(np.square(arr, dtype=np.float64)))
+        chunk_rms = float(np.sqrt(chunk_sq / float(arr.size)))
+        chunk_peak = float(np.max(abs_arr))
+        clipped_999 = int(np.sum(abs_arr >= 0.999))
+        clipped_980 = int(np.sum(abs_arr >= 0.98))
+        chunk_dur = float(dt_sec) if dt_sec is not None else (float(arr.size) / float(TARGET_SAMPLE_RATE))
+        with self._lock:
+            st = self._stats[track]
+            st["sample_count"] = int(st["sample_count"]) + int(arr.size)
+            st["samples_captured"] = int(st["samples_captured"]) + int(arr.size)
+            st["sum_sq"] = float(st["sum_sq"]) + chunk_sq
+            st["peak"] = max(float(st["peak"]), chunk_peak)
+            st["clipped_samples"] = int(st["clipped_samples"]) + clipped_999
+            st["clipping_samples"] = int(st["clipping_samples"]) + clipped_980
+            if clipped_980 > 0:
+                st["clipping_events"] = int(st["clipping_events"]) + 1
+            if chunk_rms < 1e-4:
+                prev_sil = float(st["continuous_silence_sec"])
+                new_sil = prev_sil + chunk_dur
+                st["continuous_silence_sec"] = new_sil
+                if new_sil >= 12.0 and not bool(st["silence_stall_active"]):
+                    st["silence_stall_active"] = True
+                    st["silence_stall_count"] = int(st["silence_stall_count"]) + 1
+            else:
+                st["continuous_silence_sec"] = 0.0
+                st["silence_stall_active"] = False
+            if chunk_rms > 0.0:
+                rms_deque = st["chunk_rms"]
+                assert isinstance(rms_deque, deque)
+                rms_deque.append(chunk_rms)
+
+    def _append_warning_locked(self, code: str, track: str, message: str, elapsed_sec: float) -> None:
+        self._warnings.append(
+            {
+                "code": code,
+                "track": track,
+                "elapsed_sec": round(float(elapsed_sec), 2),
+                "message": message,
+            }
+        )
+        if len(self._warnings) > 64:
+            self._warnings = self._warnings[-64:]
+
+    def heartbeat_tick(
+        self,
+        *,
+        elapsed_sec: float,
+        mic_active: bool,
+        sys_active: bool,
+        is_paused: bool = False,
+        now_mono: Optional[float] = None,
+    ) -> List[str]:
+        """
+        Update heartbeat & evaluate disconnect, zero-byte, silence-stall, and clipping health.
+        Returns newly triggered warning messages (throttled to avoid spamming UI).
+        """
+        ts = now_mono if now_mono is not None else time.monotonic()
+        emitted: List[str] = []
+        with self._lock:
+            self._last_heartbeat_monotonic = ts
+            for trk, is_act in (("mic", mic_active), ("system", sys_active)):
+                st = self._stats[trk]
+                st["last_heartbeat_monotonic"] = ts
+                if is_paused or not bool(st["enabled"]):
+                    continue
+
+                cb_n = int(st["callbacks_received"])
+                last_cb = float(st["last_callback_monotonic"])
+                n_samp = int(st["samples_captured"])
+
+                # 1. Disconnect / stream stall detection
+                cb_stalled = cb_n > 0 and last_cb > 0.0 and (ts - last_cb) > 3.0
+                if (not is_act) or (trk == "mic" and cb_stalled):
+                    if not bool(st["_disconnected_latched"]):
+                        st["_disconnected_latched"] = True
+                        st["disconnect_events"] = int(st["disconnect_events"]) + 1
+                        st["stream_interruptions"] = int(st["stream_interruptions"]) + 1
+                        if (ts - float(st["_last_disconnect_warn_ts"])) >= 15.0:
+                            st["_last_disconnect_warn_ts"] = ts
+                            label = "Microphone" if trk == "mic" else "System audio"
+                            msg = (
+                                f"{label} stream disconnected or stalled during recording; "
+                                "surviving audio track continues uninterrupted."
+                            )
+                            self._append_warning_locked("stream_disconnected", trk, msg, elapsed_sec)
+                            emitted.append(msg)
+
+                # 2. Zero-byte stream check (>4s elapsed with zero captured samples & zero callbacks)
+                if float(elapsed_sec) >= 4.0 and n_samp == 0 and cb_n == 0 and trk == "mic":
+                    if not bool(st["_zero_byte_latched"]):
+                        st["_zero_byte_latched"] = True
+                        st["zero_byte_events"] = int(st["zero_byte_events"]) + 1
+                        msg = "Microphone produced 0 bytes of audio after 4 seconds. Check mute switch or input permission."
+                        self._append_warning_locked("zero_byte_stream", trk, msg, elapsed_sec)
+                        emitted.append(msg)
+
+                # 3. Persistent silence stall alert
+                if trk == "mic" and bool(st["silence_stall_active"]) and float(st["continuous_silence_sec"]) >= 12.0:
+                    if (ts - float(st["_last_silence_warn_ts"])) >= 45.0:
+                        st["_last_silence_warn_ts"] = ts
+                        msg = (
+                            f"Microphone input has been silent for {float(st['continuous_silence_sec']):.0f}s "
+                            "(hardware mute or disconnected headset?)."
+                        )
+                        self._append_warning_locked("silence_stall", trk, msg, elapsed_sec)
+                        emitted.append(msg)
+
+                # 4. Sustained clipping alert
+                if n_samp >= 2 * TARGET_SAMPLE_RATE:
+                    clip_ratio = float(st["clipping_samples"]) / float(max(1, n_samp))
+                    if clip_ratio > 0.02 and not bool(st["_clipping_warned"]):
+                        st["_clipping_warned"] = True
+                        msg = (
+                            f"{'Microphone' if trk == 'mic' else 'System audio'} clipping detected "
+                            f"({clip_ratio * 100.0:.1f}% of samples >= -0.17 dBFS). Reduce input gain."
+                        )
+                        self._append_warning_locked("clipping_detected", trk, msg, elapsed_sec)
+                        emitted.append(msg)
+
+        return emitted
+
+    @staticmethod
+    def _to_dbfs(amp: float) -> float:
+        return round(float(20.0 * np.log10(max(float(amp), 1e-9))), 2)
+
+    def _track_snapshot_locked(self, track: str) -> Dict[str, Any]:
+        st = self._stats[track]
+        n = int(st["sample_count"])
+        sum_sq = float(st["sum_sq"])
+        peak = float(st["peak"])
+        clipped = int(st["clipped_samples"])
+        clipping_980 = int(st["clipping_samples"])
+        clip_ratio = round(float(clipping_980) / float(max(1, n)), 6) if n > 0 else 0.0
+        rms_list = list(st["chunk_rms"])  # type: ignore[arg-type]
+        overall_rms = float(np.sqrt(sum_sq / float(max(1, n)))) if n > 0 else 0.0
+        if rms_list:
+            arr_r = np.asarray(rms_list, dtype=np.float64)
+            noise_floor = float(np.percentile(arr_r, 20))
+            p90_rms = float(np.percentile(arr_r, 90))
+            top20 = float(np.mean(np.sort(arr_r)[int(0.8 * len(arr_r)) :])) if len(arr_r) >= 5 else float(np.mean(arr_r))
+        else:
+            noise_floor = 0.0
+            p90_rms = 0.0
+            top20 = overall_rms
+
+        if not bool(st["enabled"]) and n == 0:
+            trk_status = "inactive"
+        elif bool(st["_disconnected_latched"]) or int(st["disconnect_events"]) > 0 and n == 0:
+            trk_status = "disconnected"
+        elif clip_ratio > 0.02 and n >= 2 * TARGET_SAMPLE_RATE:
+            trk_status = "degraded_clipping"
+        elif bool(st["silence_stall_active"]):
+            trk_status = "degraded_silence"
+        else:
+            trk_status = "healthy"
+
+        return {
+            "enabled": bool(st["enabled"]),
+            "status": trk_status,
+            "sample_count": n,
+            "samples_captured": int(st["samples_captured"]),
+            "callbacks_received": int(st["callbacks_received"]),
+            "last_callback_monotonic": round(float(st["last_callback_monotonic"]), 3),
+            "last_heartbeat_monotonic": round(float(st["last_heartbeat_monotonic"]), 3),
+            "overall_rms_dbfs": self._to_dbfs(overall_rms),
+            "active_rms_dbfs": self._to_dbfs(top20),
+            "peak_dbfs": self._to_dbfs(peak),
+            "noise_floor_dbfs": self._to_dbfs(noise_floor),
+            "p90_rms": round(p90_rms, 6),
+            "noise_floor_amp": round(noise_floor, 6),
+            "clipped_samples": clipped,
+            "clipping_samples": clipping_980,
+            "clipping_events": int(st["clipping_events"]),
+            "clipping_ratio": clip_ratio,
+            "continuous_silence_sec": round(float(st["continuous_silence_sec"]), 2),
+            "silence_stall_count": int(st["silence_stall_count"]),
+            "silence_stall_active": bool(st["silence_stall_active"]),
+            "disconnect_events": int(st["disconnect_events"]),
+            "stream_interruptions": int(st["stream_interruptions"]),
+            "zero_byte_events": int(st["zero_byte_events"]),
+        }
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            mic_snap = self._track_snapshot_locked("mic")
+            sys_snap = self._track_snapshot_locked("system")
+            statuses = [s["status"] for s in (mic_snap, sys_snap) if s["status"] != "inactive"]
+            if any(st == "disconnected" for st in statuses):
+                overall = "disconnected"
+            elif any(st.startswith("degraded") for st in statuses):
+                overall = "degraded"
+            elif statuses:
+                overall = "healthy"
+            else:
+                overall = "inactive"
+            return {
+                "overall_status": overall,
+                "heartbeat_monotonic": round(float(self._last_heartbeat_monotonic), 3),
+                "mic": mic_snap,
+                "system": sys_snap,
+                "low_mic_warning_fired": self._low_mic_warning_fired,
+                "warnings": list(self._warnings),
+            }
+
+    def evaluate_low_mic_warning(self, elapsed_sec: float) -> Optional[str]:
+        """Fire a single warning if microphone captures speech-like modulation at very low gain."""
+        if float(elapsed_sec) < 12.0:
+            return None
+        with self._lock:
+            if self._low_mic_warning_fired:
+                return None
+            mic = self._track_snapshot_locked("mic")
+            if int(mic["sample_count"]) < int(6.0 * TARGET_SAMPLE_RATE):
+                return None
+            noise_floor = float(mic["noise_floor_amp"])
+            p90_rms = float(mic["p90_rms"])
+            peak_db = float(mic["peak_dbfs"])
+            active_db = float(mic["active_rms_dbfs"])
+            if p90_rms > max(noise_floor * 2.5, 1e-4) and (peak_db < -24.0 or active_db < -35.0):
+                self._low_mic_warning_fired = True
+                return (
+                    f"Microphone input level is very low (active RMS {active_db:.1f} dBFS, "
+                    f"peak {peak_db:.1f} dBFS). Check mic positioning or Windows input volume."
+                )
+            return None
 
 
 class _Track:
@@ -131,9 +427,29 @@ class MeetingRecorder:
         self._mic_sos: Optional[np.ndarray] = None
         self._mic_zi: Optional[np.ndarray] = None
         self._mic_noise_floor: float = 0.001
+        self._input_monitor = AudioInputMonitor()
 
         self.on_status_tick: Optional[Callable[[float, float, float, bool, bool], None]] = None
         self.on_device_warning: Optional[Callable[[str], None]] = None
+
+    def get_audio_diagnostics(self) -> Dict[str, object]:
+        """Return non-destructive per-track signal diagnostics (RMS dBFS, peak dBFS, noise floor, clipping)."""
+        return self._input_monitor.snapshot()
+
+    def get_audio_health_snapshot(self) -> Dict[str, Any]:
+        """Return full audio capture integrity & health snapshot (heartbeats, stalls, disconnects, WAV byte sizes)."""
+        snap = self._input_monitor.snapshot()
+        with self._lock:
+            snap["recorder_state"] = self._state
+            snap["elapsed_sec"] = round(float(self.elapsed_seconds), 3)
+            snap["capture_mode"] = self._mode
+            mic_p = self._mic.path if self._mic else (self._out_dir / "mic_track.wav" if self._out_dir else None)
+            sys_p = self._sys.path if self._sys else (self._out_dir / "system_track.wav" if self._out_dir else None)
+            snap["wav_sizes_bytes"] = {
+                "mic": mic_p.stat().st_size if (mic_p and mic_p.exists()) else 0,
+                "system": sys_p.stat().st_size if (sys_p and sys_p.exists()) else 0,
+            }
+        return snap
 
     @property
     def state(self) -> str:
@@ -198,6 +514,7 @@ class MeetingRecorder:
                 self._mic_sos = None
                 self._mic_zi = None
             self._mic_noise_floor = 0.001
+            self._input_monitor.reset()
             open_err = None
             try:
                 self._pa = pyaudio.PyAudio()
@@ -212,6 +529,10 @@ class MeetingRecorder:
         with self._lock:
             self._mic = _Track(self._out_dir / "mic_track.wav") if self._mic_stream else None
             self._sys = _Track(self._out_dir / "system_track.wav") if self._loop_streams else None
+            self._input_monitor.configure_tracks(
+                mic_enabled=self._mic_stream is not None,
+                system_enabled=bool(self._loop_streams),
+            )
             self._resume_ts = time.perf_counter()
             self._state = "recording"
             self._thread = threading.Thread(target=self._sync_loop, name="MeetingSync", daemon=True)
@@ -229,6 +550,7 @@ class MeetingRecorder:
 
             def mic_cb(data, *_):
                 if self._state == "recording" and data:
+                    self._input_monitor.record_callback("mic")
                     pcm = np.frombuffer(data, dtype=np.int16).copy()
                     with self._lock:
                         if len(self._mic_q) < 200:
@@ -264,6 +586,7 @@ class MeetingRecorder:
                 def make_cb(i: int):
                     def cb(data, *_):
                         if self._state == "recording" and data:
+                            self._input_monitor.record_callback("system")
                             pcm = np.frombuffer(data, dtype=np.int16).copy()
                             with self._lock:
                                 q = self._sys_q.get(i)
@@ -348,6 +671,27 @@ class MeetingRecorder:
             except Exception as stub_exc:
                 logger.debug("Failed initializing stub mixed WAV: %s", stub_exc)
 
+        health_snap = self._input_monitor.snapshot()
+        health_snap["elapsed_sec"] = round(float(duration), 3)
+        health_snap["capture_mode"] = self._mode
+        health_snap["wav_sizes_bytes"] = {
+            "mic": mic_path.stat().st_size if (mic_path and mic_path.exists()) else 0,
+            "system": sys_path.stat().st_size if (sys_path and sys_path.exists()) else 0,
+            "mixed": mixed_path.stat().st_size if mixed_path.exists() else 0,
+        }
+        try:
+            diag_path = self._out_dir / "capture_diagnostics.json"
+            existing_diag: Dict[str, Any] = {}
+            if diag_path.exists():
+                try:
+                    existing_diag = json.loads(diag_path.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    existing_diag = {}
+            existing_diag["audio_health"] = health_snap
+            diag_path.write_text(json.dumps(existing_diag, indent=2, default=str), encoding="utf-8")
+        except Exception as diag_exc:
+            logger.debug("Failed writing audio_health capture_diagnostics.json: %s", diag_exc)
+
         res = MeetingRecordingResult(
             duration_sec=duration,
             mixed_wav_path=str(mixed_path),
@@ -356,6 +700,7 @@ class MeetingRecorder:
             mic_device_name=self._mic_dev.name if self._mic_dev else "",
             loopback_device_name=", ".join(loop_names[:3]),
             capture_mode=self._mode,
+            audio_health=health_snap,
         )
         logger.info("Meeting saved: %s (%.1fs)", mixed_path, duration)
         return res
@@ -407,6 +752,7 @@ class MeetingRecorder:
                     )
                 chunk = np.clip(chunk, -0.68, 0.68)
             self._mic.append(chunk)
+            self._input_monitor.observe("mic", chunk)
             self._mic.level = compute_rms_level(chunk[-1600:]) if chunk.size else self._mic.level * 0.5
 
         if self._sys:
@@ -425,7 +771,9 @@ class MeetingRecorder:
                 mix = np.zeros(n, dtype=np.float32)
                 for p in parts:
                     mix[: p.size] += p
-                self._sys.append(np.clip(mix, -1, 1))
+                clipped_mix = np.clip(mix, -1, 1)
+                self._sys.append(clipped_mix)
+                self._input_monitor.observe("system", clipped_mix)
                 self._sys.level = compute_rms_level(mix[-1600:])
             else:
                 self._sys.level *= 0.5
@@ -442,7 +790,8 @@ class MeetingRecorder:
             with self._lock:
                 if self._state == "idle":
                     break
-                if self._state == "recording":
+                is_paused = self._state != "recording"
+                if not is_paused:
                     self._drain_locked()
                     elapsed = self._elapsed + (time.perf_counter() - self._resume_ts)
                     self._pad_locked(elapsed)
@@ -452,6 +801,23 @@ class MeetingRecorder:
                 sys_ok = any(st.is_active() for _, st in self._loop_streams)
                 ml = self._mic.level if self._mic else 0.0
                 sl = self._sys.level if self._sys else 0.0
+
+            health_warnings = self._input_monitor.heartbeat_tick(
+                elapsed_sec=elapsed,
+                mic_active=mic_ok,
+                sys_active=sys_ok,
+                is_paused=is_paused,
+            )
+            low_mic_msg = self._input_monitor.evaluate_low_mic_warning(elapsed)
+            if low_mic_msg:
+                health_warnings.append(low_mic_msg)
+            for warn_msg in health_warnings:
+                logger.warning("%s", warn_msg)
+                if self.on_device_warning:
+                    try:
+                        self.on_device_warning(warn_msg)
+                    except Exception:
+                        pass
             if self.on_status_tick:
                 try:
                     self.on_status_tick(elapsed, ml, sl, mic_ok, sys_ok)

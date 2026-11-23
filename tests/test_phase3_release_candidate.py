@@ -86,7 +86,11 @@ def _fake_hw_profile(
 
 
 def test_hardware_tier_selection_across_tiers_and_fallbacks():
-    cfg = AppConfig(enable_hf_asr_rc=True, hf_asr_model_id="Qwen/Qwen3-ASR-0.6B-hf")
+    cfg = AppConfig(
+        enable_phase2_asr_pipeline=False,
+        enable_hf_asr_rc=True,
+        hf_asr_model_id="Qwen/Qwen3-ASR-0.6B-hf",
+    )
 
     # Tier 1: 8 GB / 4 threads CPU-only laptop -> base live, small offline, CPU int8
     t1_prof = _fake_hw_profile(ram_total_gb=8.0, ram_avail_gb=3.2, cpu_cores=4, cpu_threads=4, cuda_available=False)
