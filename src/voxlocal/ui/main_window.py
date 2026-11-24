@@ -214,6 +214,7 @@ class MainWindow(QMainWindow):
         )
         if hasattr(self.controller, "model_status_changed"):
             self.controller.model_status_changed.connect(self._on_model_status_changed)
+        QTimer.singleShot(800, self._check_post_update_status)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -1060,6 +1061,78 @@ class MainWindow(QMainWindow):
         elif "downloading" in m_lower or "bootstrapping" in m_lower or "loading" in m_lower:
             self.show_toast("AI Speech Engine", msg)
 
+    def _style_message_box(self, box: Any) -> None:
+        """Apply readable theme styling to native QMessageBox dialogs."""
+        t = get_theme_tokens(self._theme)
+        box.setStyleSheet(
+            f"QMessageBox {{ background-color: {t['bg']}; color: {t['text']}; }}"
+            f"QMessageBox QLabel {{ color: {t['text']}; font-size: 13px; background: transparent; }}"
+            f"QMessageBox QPushButton {{ background: {t['primary_btn_bg']}; color: {t['primary_btn_text']}; "
+            f"border: 1px solid {t['border']}; border-radius: 6px; padding: 6px 14px; font-weight: 600; min-width: 82px; }}"
+            f"QMessageBox QPushButton:hover {{ background: {t['primary_btn_hover']}; }}"
+        )
+
+    def _check_post_update_status(self) -> None:
+        """Verify pending update status marker on startup and notify user cleanly."""
+        import json
+        import shutil
+        import sys
+        from voxlocal.core.logger import get_app_root
+
+        candidates: List[Path] = []
+        if getattr(sys, "frozen", False):
+            candidates.append(Path(sys.executable).resolve().parent / "data" / "logs" / "update_status.json")
+        cfg = getattr(self.controller, "config", None)
+        if cfg is not None and getattr(cfg, "logs_dir", None):
+            candidates.append(Path(cfg.logs_dir) / "update_status.json")
+        if cfg is not None and getattr(cfg, "storage_dir", None):
+            candidates.append(Path(cfg.storage_dir) / "logs" / "update_status.json")
+        candidates.append(get_app_root() / "data" / "logs" / "update_status.json")
+
+        seen: set[str] = set()
+        for status_p in candidates:
+            key = str(status_p).lower()
+            if key in seen or not status_p.exists():
+                continue
+            seen.add(key)
+            try:
+                data = json.loads(status_p.read_text(encoding="utf-8"))
+                st = str(data.get("status") or "").strip().lower()
+                if st == "pending_startup_verify":
+                    to_ver = str(data.get("to_version") or "").strip()
+                    from_ver = str(data.get("from_version") or "").strip()
+                    if not to_ver or str(__version__).strip() == to_ver:
+                        data["status"] = "verified_success"
+                        data["verified_version"] = str(__version__)
+                        status_p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                        backup_dir = status_p.parent.parent.parent / ".update_backup"
+                        if backup_dir.exists():
+                            shutil.rmtree(backup_dir, ignore_errors=True)
+                        msg = (
+                            f"Updated from v{from_ver} to v{__version__}."
+                            if from_ver and from_ver != str(__version__)
+                            else f"VOX v{__version__} is installed and running."
+                        )
+                        self.show_toast(f"Update Complete (v{__version__})", msg)
+                    else:
+                        data["status"] = "version_mismatch_on_launch"
+                        data["actual_version"] = str(__version__)
+                        status_p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                        self.show_toast(
+                            "Update Verification Warning",
+                            f"Expected v{to_ver}, but v{__version__} launched. Check updater logs.",
+                        )
+                elif st == "rolled_back":
+                    err_detail = str(data.get("error") or "Startup verification failed.")
+                    data["status"] = "rolled_back_notified"
+                    status_p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                    self.show_toast(
+                        "Update Rolled Back Safely",
+                        f"Restored v{__version__} because the update failed verification: {err_detail}",
+                    )
+            except Exception as exc:
+                logger.debug("Post-update status check skipped (%s): %s", status_p, exc)
+
     def _on_update_available(self, is_avail: bool, manifest: Dict[str, Any], msg: str) -> None:
         """Display an in-app update notification when a new version is detected."""
         if not is_avail or not manifest or self._update_in_progress:
@@ -1086,6 +1159,7 @@ class MainWindow(QMainWindow):
         btn_update = box.addButton("⚡ Update Now", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(btn_update)
+        self._style_message_box(box)
         box.exec()
         if box.clickedButton() == btn_update:
             self._start_in_app_update(manifest)
@@ -1102,7 +1176,12 @@ class MainWindow(QMainWindow):
             )
             self.show_toast("Update Deferred", defer_msg)
             from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Meeting Recording in Progress", defer_msg)
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Meeting Recording in Progress")
+            box.setText(defer_msg)
+            self._style_message_box(box)
+            box.exec()
             self.btn_check_updates.setEnabled(True)
             self.btn_check_updates.setText("Updates")
             return
@@ -1181,10 +1260,39 @@ class MainWindow(QMainWindow):
         self.show_toast("Update Notice", f"Auto-update could not complete: {err_msg}")
 
     def _on_update_ready_to_install(self, installer_path: str, ver: str) -> None:
-        """Launch silent installer handoff, close current app cleanly, and relaunch updated build."""
+        """Launch direct installer handoff without PowerShell, close cleanly, and let installer relaunch."""
         import os
         import subprocess
         import sys
+
+        installer_dest = Path(installer_path)
+        if not installer_dest.exists():
+            self._on_update_download_failed(f"Installer missing at {installer_dest}")
+            return
+
+        if getattr(sys, "frozen", False) and Path(sys.executable).name.lower() == "voxlocal.exe":
+            target_install_dir = Path(sys.executable).resolve().parent
+        else:
+            local_app_data = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            target_install_dir = Path(local_app_data) / "Programs" / "VOX"
+
+        cmd_args = [
+            str(installer_dest),
+            "--silent",
+            "--wait-pid",
+            str(os.getpid()),
+            "--install-dir",
+            str(target_install_dir),
+            "--relaunch",
+            "--expected-version",
+            str(ver),
+            "--from-version",
+            str(__version__),
+        ]
+        # Never combine CREATE_NO_WINDOW | DETACHED_PROCESS (they conflict on Windows).
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+        )
 
         self.update_progress_card.setVisible(True)
         self.bar_update_progress.setRange(0, 0)
@@ -1192,26 +1300,12 @@ class MainWindow(QMainWindow):
         self.btn_check_updates.setText("Restarting...")
         self.show_toast("Installing Update", f"Installing VOX v{ver} and restarting...")
 
-        installer_dest = Path(installer_path)
-        if getattr(sys, "frozen", False) and Path(sys.executable).name.lower() == "voxlocal.exe":
-            target_install_dir = Path(sys.executable).resolve().parent
-        else:
-            local_app_data = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-            target_install_dir = Path(local_app_data) / "Programs" / "VOX"
-        relaunch_exe = target_install_dir / "VoxLocal.exe"
-
-        cmd = (
-            f'Start-Sleep -Milliseconds 900; '
-            f'Start-Process -FilePath "{installer_dest}" -ArgumentList @("--silent", "--no-launch", "--install-dir", "{target_install_dir}") -Wait; '
-            f'if (Test-Path "{relaunch_exe}") {{ Start-Process -FilePath "{relaunch_exe}" -WorkingDirectory "{target_install_dir}" }}'
-        )
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
-            subprocess, "DETACHED_PROCESS", 0x00000008
-        )
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
-            creationflags=creation_flags,
-        )
+        try:
+            subprocess.Popen(cmd_args, creationflags=creation_flags, close_fds=True)
+        except Exception as exc:
+            logger.error("Failed launching installer %s: %s", installer_dest, exc)
+            self._on_update_download_failed(f"Could not start installer: {exc}")
+            return
 
         def _quit_cleanly() -> None:
             try:

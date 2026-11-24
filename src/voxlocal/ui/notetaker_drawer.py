@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMenu,
     QPushButton,
     QScrollArea,
@@ -205,7 +206,7 @@ class VoxNotetakerDrawer(QWidget):
         meta_row.addStretch()
 
         # Telemetry indicator (Audio active)
-        self.lbl_tele_status = QLabel("● Live Recording")
+        self.lbl_tele_status = QLabel("● Recording · Live Preview")
         self.lbl_tele_status.setObjectName("teleStatusLabel")
         self.lbl_tele_status.setStyleSheet("color: #10B981; font-size: 11px; font-weight: 600;")
         meta_row.addWidget(self.lbl_tele_status)
@@ -313,6 +314,12 @@ class VoxNotetakerDrawer(QWidget):
         if self.tx_browser.verticalScrollBar():
             self.tx_browser.verticalScrollBar().valueChanged.connect(self._on_tx_scrolled)
         lay_tx.addWidget(self.tx_browser, 1)
+
+        # Synchronized chronological QListWidget backing store for transcript feed
+        self.list_transcript = QListWidget(self)
+        self.list_transcript.setObjectName("drawerTranscriptListCompat")
+        self.list_transcript.setVisible(False)
+        lay_tx.addWidget(self.list_transcript)
 
         self.btn_jump_live = QPushButton("↓ Jump to Live")
         self.btn_jump_live.setObjectName("quickChipBtn")
@@ -485,14 +492,35 @@ class VoxNotetakerDrawer(QWidget):
         self._display_meeting(m_id)
         self._sync_controls_state(self.controller.meeting_state if self.controller else "idle")
 
+    def _clear_live_transcript(self, meeting_id: Optional[int] = None) -> None:
+        """Reset live transcript state cleanly so prior meetings never leak into a new recording."""
+        if (
+            self._active_displayed_meeting_id is not None
+            and meeting_id is not None
+            and int(self._active_displayed_meeting_id) != int(meeting_id)
+        ):
+            self.flush_pending_notes()
+        self._live_segments = []
+        self._active_displayed_meeting_id = int(meeting_id) if meeting_id is not None else None
+        if hasattr(self, "list_transcript"):
+            self.list_transcript.clear()
+        if hasattr(self, "lbl_live_partial"):
+            self.lbl_live_partial.setText("")
+            self.lbl_live_partial.setVisible(False)
+        self._render_conversational_transcript()
+
     def _display_meeting(self, meeting_id: Optional[int]) -> None:
         if meeting_id is None:
             return
         if self._active_displayed_meeting_id is not None and self._active_displayed_meeting_id != int(meeting_id):
             self.flush_pending_notes()
         self._active_displayed_meeting_id = int(meeting_id)
-        m = self.controller.db.get_meeting(int(meeting_id))
+        m = self.controller.db.get_meeting(int(meeting_id)) if (self.controller and getattr(self.controller, "db", None)) else None
         if not m:
+            self._live_segments = []
+            if hasattr(self, "list_transcript"):
+                self.list_transcript.clear()
+            self._render_conversational_transcript()
             return
 
         title = str(m.get("title") or "Untitled Meeting")
@@ -564,11 +592,23 @@ class VoxNotetakerDrawer(QWidget):
         time_str = format_seconds_hms(max(total_dur, self._elapsed_sec))
         self.lbl_tx_stats.setText(f"🕒 {spk_count} SPEAKER{'S' if spk_count > 1 else ''} · {time_str}")
 
+        if hasattr(self, "list_transcript"):
+            self.list_transcript.clear()
+            for s in segs:
+                txt_item = str(s.get("text") or "").strip()
+                if not txt_item:
+                    continue
+                spk_item = str(s.get("speaker") or "Speaker 1").strip() or "Speaker 1"
+                st_sec = max(0.0, float(s.get("start_time", 0.0) or 0.0))
+                mm = int(st_sec // 60)
+                ss = int(st_sec % 60)
+                self.list_transcript.addItem(f"[{mm:02d}:{ss:02d}] {spk_item}: {txt_item}")
+
         muted_hex = t.get("text_muted", "#94A3B8" if is_dark else "#64748B")
         if not segs:
             self.tx_browser.setHtml(
                 f"<div style='color:{muted_hex}; text-align:center; padding:40px 10px; font-size:13px; font-style:italic;'>"
-                "Listening for speech... Words will appear here live."
+                "Recording audio reliably... Provisional live preview will appear here while full transcription runs after the call."
                 "</div>"
             )
             if hasattr(self, "btn_jump_live"):
@@ -741,7 +781,7 @@ class VoxNotetakerDrawer(QWidget):
         s = (state or "idle").lower()
         t = get_theme_tokens(self._theme)
         if s == "recording":
-            self.lbl_tele_status.setText("● Live Recording")
+            self.lbl_tele_status.setText("● Recording · Live Preview (Provisional)")
             self.lbl_tele_status.setStyleSheet(
                 f"color: {t['status_success_text']}; font-weight: 600; font-size: 11px;"
             )
@@ -820,6 +860,7 @@ class VoxNotetakerDrawer(QWidget):
         s = (state or "").lower()
         if s == "recording":
             m_id = self.controller.active_meeting_id if self.controller else None
+            self._clear_live_transcript(m_id)
             self._display_meeting(m_id)
 
     def _on_meeting_tick(
@@ -836,17 +877,17 @@ class VoxNotetakerDrawer(QWidget):
         self.lbl_tx_stats.setText(f"🕒 {spk_count} SPEAKER{'S' if spk_count > 1 else ''} · {time_str}")
         t = get_theme_tokens(self._theme)
         if not mic_ok:
-            self.lbl_tele_status.setText("● Live · ⚠ Check Mic")
+            self.lbl_tele_status.setText("● Recording · ⚠ Check Mic (Live Preview)")
             self.lbl_tele_status.setStyleSheet(
                 f"color: {t['status_warning_text']}; font-weight: 600; font-size: 11px;"
             )
         elif not sys_ok:
-            self.lbl_tele_status.setText("● Live · ⚠ Check Loopback")
+            self.lbl_tele_status.setText("● Recording · ⚠ Check Loopback (Live Preview)")
             self.lbl_tele_status.setStyleSheet(
                 f"color: {t['status_warning_text']}; font-weight: 600; font-size: 11px;"
             )
         else:
-            self.lbl_tele_status.setText("● Live · Mic OK · Sys OK")
+            self.lbl_tele_status.setText("● Recording · Mic OK · Sys OK (Live Preview)")
             self.lbl_tele_status.setStyleSheet(
                 f"color: {t['status_success_text']}; font-weight: 600; font-size: 11px;"
             )
@@ -857,7 +898,7 @@ class VoxNotetakerDrawer(QWidget):
         txt = partial_dict.get("text", "").strip()
         spk = partial_dict.get("speaker", "Speaker")
         if txt:
-            self.lbl_live_partial.setText(f"● {spk}: {txt}...")
+            self.lbl_live_partial.setText(f"◌ Live Preview (Provisional) · {spk}: {txt}...")
             self.lbl_live_partial.setVisible(True)
         else:
             self.lbl_live_partial.setVisible(False)

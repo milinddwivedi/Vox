@@ -790,7 +790,7 @@ class TestEntitlementsAndReleasesApi:
         with urllib.request.urlopen(req) as resp:
             assert resp.status == 200
             manifest = json.loads(resp.read().decode("utf-8"))
-            assert manifest["version"] == "1.0.12"
+            assert manifest["version"] == "1.0.13"
             assert "installer_url" in manifest
             assert len(manifest["sha256"]) == 64
             assert all(c in "0123456789abcdef" for c in manifest["sha256"])

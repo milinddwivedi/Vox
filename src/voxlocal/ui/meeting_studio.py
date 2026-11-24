@@ -849,6 +849,11 @@ class VoxInteractiveTranscriptTab(QWidget):
         elif kwargs.get("db"):
             self.db = kwargs.get("db")
         self._segments: List[Dict[str, Any]] = []
+        self._final_segments_cache: List[Dict[str, Any]] = []
+        self._provisional_segments: List[Dict[str, Any]] = []
+        self._showing_provisional: bool = False
+        self._active_engine_summary: str = ""
+        self._active_meeting_status: str = ""
         self._current_highlight_idx: int = -1
         self._match_count: int = 0
         self._segment_widgets = _SegmentWidgetCompatProxy(self)
@@ -857,15 +862,27 @@ class VoxInteractiveTranscriptTab(QWidget):
         self._search_input = self.search_input
 
     def load_meeting(self, meeting_id: int) -> None:
-        """Load segments for a given meeting ID."""
+        """Load segments for a given meeting ID and optional archived provisional preview."""
         self.meeting_id = meeting_id
+        self._showing_provisional = False
         segs: List[Dict[str, Any]] = []
+        prov_segs: List[Dict[str, Any]] = []
+        m_row: Dict[str, Any] = {}
         if self.db:
+            if hasattr(self.db, "get_meeting"):
+                m_row = self.db.get_meeting(meeting_id) or {}
             if hasattr(self.db, "get_transcript_segments"):
                 segs = self.db.get_transcript_segments(meeting_id)
             elif hasattr(self.db, "get_meeting_segments"):
                 segs = self.db.get_meeting_segments(meeting_id)
+            if hasattr(self.db, "get_provisional_transcript_segments"):
+                prov_segs = self.db.get_provisional_transcript_segments(meeting_id)
+        self._final_segments_cache = list(segs)
+        self._provisional_segments = list(prov_segs)
+        self._active_engine_summary = str(m_row.get("post_call_engine_summary") or "").strip()
+        self._active_meeting_status = str(m_row.get("status") or "").strip().lower()
         self.load_segments(segs)
+        self._refresh_provenance_bar()
 
     def _on_search_changed(self, text: str) -> None:
         """Handler for transcript search text changed."""
@@ -914,6 +931,23 @@ class VoxInteractiveTranscriptTab(QWidget):
         b_layout.addWidget(btn_reset)
 
         layout.addWidget(bar)
+
+        # Provenance & Provisional Preview Comparison Banner
+        self.provenance_bar = QFrame()
+        self.provenance_bar.setObjectName("transcriptProvenanceBar")
+        p_lay = QHBoxLayout(self.provenance_bar)
+        p_lay.setContentsMargins(10, 4, 10, 4)
+        p_lay.setSpacing(8)
+        self.lbl_transcript_provenance = QLabel("")
+        self.lbl_transcript_provenance.setObjectName("transcriptProvenanceLabel")
+        p_lay.addWidget(self.lbl_transcript_provenance, 1)
+        self.btn_toggle_provisional = AnimatedPushButton("View Provisional Preview")
+        self.btn_toggle_provisional.setObjectName("transcriptToggleProvisionalBtn")
+        self.btn_toggle_provisional.setVisible(False)
+        self.btn_toggle_provisional.clicked.connect(self._toggle_provisional_view)
+        p_lay.addWidget(self.btn_toggle_provisional)
+        self.provenance_bar.setVisible(False)
+        layout.addWidget(self.provenance_bar)
 
         # Virtualized Transcript View
         self._model = TranscriptListModel(self)
@@ -1003,7 +1037,52 @@ class VoxInteractiveTranscriptTab(QWidget):
         elif act_rename is not None and chosen == act_rename:
             self._prompt_rename_speaker(speaker)
 
+    def _refresh_provenance_bar(self) -> None:
+        if not hasattr(self, "provenance_bar"):
+            return
+        has_segs = bool(self._segments)
+        has_prov = bool(self._provisional_segments)
+        self.provenance_bar.setVisible(has_segs or has_prov)
+        self.btn_toggle_provisional.setVisible(has_prov)
+        if self._showing_provisional:
+            self.lbl_transcript_provenance.setText(
+                f"● Provisional Live Preview (Archived · {len(self._provisional_segments)} segments)"
+            )
+            self.btn_toggle_provisional.setText("Back to Final Transcript")
+        else:
+            st = self._active_meeting_status
+            if st == "recording":
+                self.lbl_transcript_provenance.setText(
+                    "● Live Preview (Provisional — Full high-accuracy transcription runs after call ends)"
+                )
+            elif st in ("transcribing", "processing", "finalizing"):
+                self.lbl_transcript_provenance.setText(
+                    "⏳ Post-call high-accuracy transcription in progress (original audio preserved)..."
+                )
+            elif self._active_engine_summary:
+                self.lbl_transcript_provenance.setText(f"✓ Final Verified Transcript · {self._active_engine_summary}")
+            else:
+                self.lbl_transcript_provenance.setText("✓ Final Transcript")
+            self.btn_toggle_provisional.setText("View Provisional Preview")
+
+    def _toggle_provisional_view(self) -> None:
+        if not self._provisional_segments:
+            return
+        self._showing_provisional = not self._showing_provisional
+        target = self._provisional_segments if self._showing_provisional else self._final_segments_cache
+        self.load_segments(target)
+        self._refresh_provenance_bar()
+
     def _apply_live_overlay_styles(self, t: Dict[str, Any]) -> None:
+        if hasattr(self, "provenance_bar"):
+            self.provenance_bar.setStyleSheet(
+                f"QFrame#transcriptProvenanceBar {{ background-color: {t.get('surface_alt', '#1E293B')}; "
+                f"border: 1px solid {t.get('border', '#334155')}; border-radius: 6px; }}"
+            )
+        if hasattr(self, "lbl_transcript_provenance"):
+            self.lbl_transcript_provenance.setStyleSheet(
+                f"color: {t.get('text_secondary', '#94A3B8')}; font-size: 11px; font-weight: 600;"
+            )
         if hasattr(self, "btn_jump_live"):
             self.btn_jump_live.setStyleSheet(
                 f"QPushButton#transcriptJumpLiveBtn {{ background-color: {t.get('surface_secondary', t.get('surface_alt', '#1E293B'))}; "
@@ -2524,8 +2603,16 @@ class VoxMeetingStudioWorkspace(QWidget):
         if hasattr(self, "lbl_studio_metrics"):
             metric_parts: List[str] = []
             raw_status = str(m.get("status") or "").strip().lower()
+            post_stage = str(m.get("post_call_stage") or "").strip().lower()
+            stage_map = {
+                "recording_saved": "Recording Saved",
+                "preparing_audio": "Preparing Audio",
+                "transcribing": "Transcribing Full Audio",
+                "verifying": "Verifying Transcript",
+                "finalizing": "Finalizing",
+            }
             status_map = {
-                "recording": "Live (Provisional)",
+                "recording": "Live Preview (Provisional)",
                 "transcribing": "Finalizing",
                 "processing": "Finalizing",
                 "finalizing": "Finalizing",
@@ -2536,7 +2623,9 @@ class VoxMeetingStudioWorkspace(QWidget):
                 "error": "Finalization Failed",
                 "failed": "Finalization Failed",
             }
-            if raw_status in status_map:
+            if raw_status in ("transcribing", "processing", "finalizing") and post_stage in stage_map:
+                metric_parts.append(stage_map[post_stage])
+            elif raw_status in status_map:
                 metric_parts.append(status_map[raw_status])
             if dur_sec > 0:
                 mins = int(round(dur_sec / 60.0))

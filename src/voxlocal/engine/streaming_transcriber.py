@@ -150,6 +150,7 @@ class LiveMeetingStreamingTranscriber:
         self._is_incremental: bool = False
         self._phase2_engine: Any = None
         self._phase2_load_failed: bool = False
+        self._live_preview_unavailable: bool = False
         self._fallback_events: int = 0
         self._fallback_reasons: List[str] = []
 
@@ -186,6 +187,7 @@ class LiveMeetingStreamingTranscriber:
 
         self._dropped_chunks: int = 0
         self._dropped_segments: int = 0
+        self._dropped_backlog_windows: int = 0
         self._max_backlog_sec: float = 0.0
         self._current_backlog_sec: float = 0.0
         self._revision_count: int = 0
@@ -261,6 +263,8 @@ class LiveMeetingStreamingTranscriber:
                 "last_flush_cursor_sec": round(float(self._last_flush_cursor_sec), 3),
                 "segment_count": int(self._segment_index),
                 "dropped_chunks": int(self._dropped_chunks),
+                "dropped_backlog_windows": int(self._dropped_backlog_windows),
+                "live_preview_unavailable": bool(self._live_preview_unavailable),
                 "max_backlog_sec": round(float(self._max_backlog_sec), 3),
                 "current_backlog_sec": round(float(self._current_backlog_sec), 3),
                 "revision_count": int(self._revision_count),
@@ -317,9 +321,11 @@ class LiveMeetingStreamingTranscriber:
             self._fallback_events = 0
             self._fallback_reasons = []
             self._phase2_load_failed = False
+            self._live_preview_unavailable = False
 
             self._dropped_chunks = 0
             self._dropped_segments = 0
+            self._dropped_backlog_windows = 0
             self._max_backlog_sec = 0.0
             self._current_backlog_sec = 0.0
             self._revision_count = 0
@@ -398,6 +404,8 @@ class LiveMeetingStreamingTranscriber:
                 float(self._track_states["system"]["cursor_sec"]),
             )
             self._audio_cursor_sec = max(self._audio_cursor_sec, min_cursor)
+            if self.transcriber is None:
+                self._live_preview_unavailable = True
 
     def _ensure_phase2_engine_loaded(self) -> Any:
         with self._lock:
@@ -408,6 +416,7 @@ class LiveMeetingStreamingTranscriber:
 
             models_dir = getattr(self.config, "models_dir", None) if self.config is not None else getattr(self.transcriber, "models_dir", None)
             threads = int(getattr(self._execution_profile, "safe_cpu_threads", 4) or 4)
+            live_threads = min(3, max(2, threads // 2))
             try:
                 from voxlocal.engine.onnx_asr_engines import (
                     GuardedQwen3OnnxEngine,
@@ -416,11 +425,11 @@ class LiveMeetingStreamingTranscriber:
                 )
 
                 if self._live_backend == "nemotron_onnx":
-                    eng = NemotronStreamingEngine(models_dir=models_dir, num_threads=threads)
+                    eng = NemotronStreamingEngine(models_dir=models_dir, num_threads=live_threads)
                 elif self._live_backend == "qwen3_onnx":
-                    eng = GuardedQwen3OnnxEngine(models_dir=models_dir, num_threads=threads)
+                    eng = GuardedQwen3OnnxEngine(models_dir=models_dir, num_threads=live_threads)
                 elif self._live_backend == "parakeet_onnx":
-                    eng = ParakeetOnnxEngine(models_dir=models_dir, num_threads=threads)
+                    eng = ParakeetOnnxEngine(models_dir=models_dir, num_threads=live_threads)
                 else:
                     return None
 
@@ -549,7 +558,7 @@ class LiveMeetingStreamingTranscriber:
         ):
             st = self._track_states[trk]
             c_sec = float(st["cursor_sec"])
-            if now_sec <= c_sec + (0.05 if is_flush else 0.25):
+            if now_sec <= c_sec + (0.05 if is_flush else 0.15):
                 continue
 
             mic_s, sys_s, actual_s = self._recorder.get_audio_window(c_sec, now_sec)
@@ -692,16 +701,32 @@ class LiveMeetingStreamingTranscriber:
             if now_sec <= c_sec + 0.35:
                 continue
 
+            backlog = max(0.0, now_sec - c_sec)
+            self._current_backlog_sec = backlog
+            if backlog > self._max_backlog_sec:
+                self._max_backlog_sec = backlog
+
+            max_backlog = float(getattr(self.config, "live_preview_max_backlog_sec", 8.0) or 8.0)
+            if backlog > max_backlog:
+                st["cursor_sec"] = max(c_sec, now_sec - 2.0)
+                st["speech_active"] = False
+                st["turn_start_sec"] = st["cursor_sec"]
+                st["active_partial_mono"] = None
+                self._dropped_backlog_windows += 1
+                self._audio_cursor_sec = max(self._audio_cursor_sec, float(st["cursor_sec"]))
+                logger.debug(
+                    "Skipped stale live preview window on %s (backlog=%.2fs > %.2fs); full WAV intact.",
+                    trk,
+                    backlog,
+                    max_backlog,
+                )
+                continue
+
             mic_s, sys_s, actual_s = self._recorder.get_audio_window(c_sec, now_sec)
             sl = mic_s if trk == "mic" else sys_s
             win_dur = now_sec - actual_s
             if sl.size < int(0.35 * TARGET_SAMPLE_RATE):
                 continue
-
-            backlog = max(0.0, now_sec - c_sec)
-            self._current_backlog_sec = backlog
-            if backlog > self._max_backlog_sec:
-                self._max_backlog_sec = backlog
 
             tail_n = max(1, int(TARGET_SAMPLE_RATE * 0.45))
             tail = sl[-tail_n:] if sl.size > tail_n else sl
@@ -1325,6 +1350,7 @@ class LiveMeetingStreamingTranscriber:
                 "speech_boundary": True,
                 "execution_mode": self._live_execution_mode,
                 "is_incremental": bool(self._is_incremental),
+                "preview_mode": "provisional_live",
             }
             history = [
                 {
@@ -1408,6 +1434,7 @@ class LiveMeetingStreamingTranscriber:
                 "recognition_params": rec_params,
                 "processing_history": history,
                 "provisional": True,
+                "is_provisional_preview": True,
                 "transcript_stage": "live",
                 "transcript_state": "stable",
                 "execution_mode": self._live_execution_mode,

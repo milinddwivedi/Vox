@@ -50,6 +50,7 @@ class ExecutionProfile:
     selective_verifier_backend: str = "disabled"
     phase2_enabled: bool = False
     available_phase2_models: Dict[str, bool] = field(default_factory=dict)
+    post_call_verifier_backend: str = "disabled"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -661,6 +662,7 @@ class HardwareProfiler:
                 selective_verifier_backend=sel_verifier,
                 phase2_enabled=True,
                 available_phase2_models=avail_models,
+                post_call_verifier_backend=sel_verifier,
             )
 
         # Hinglish / Auto Session
@@ -723,6 +725,21 @@ class HardwareProfiler:
             if cuda_ok and free_vram is not None and free_vram < min_ct2_vram and avail_models.get("oriserve_apex"):
                 reasons.append(f"Free VRAM ({free_vram} MB) < {min_ct2_vram} MB; skipping CUDA 2nd-pass verifier.")
 
+        allow_cpu_verifier = bool(getattr(config, "post_call_allow_cpu_verifier", True))
+        if sel_verifier != "disabled":
+            post_call_verifier = sel_verifier
+        elif (
+            sel_enabled
+            and sel_pref in ("auto", "oriserve_apex")
+            and allow_cpu_verifier
+            and avail_models.get("oriserve_apex")
+            and has_fw
+        ):
+            post_call_verifier = "oriserve_apex_ct2"
+            reasons.append("Post-call Hinglish verifier (Oriserve Apex) enabled on CPU INT8.")
+        else:
+            post_call_verifier = "disabled"
+
         return ExecutionProfile(
             tier_id=tier_id,
             tier_label=tier_label,
@@ -745,6 +762,7 @@ class HardwareProfiler:
             selective_verifier_backend=sel_verifier,
             phase2_enabled=True,
             available_phase2_models=avail_models,
+            post_call_verifier_backend=post_call_verifier,
         )
 
     @classmethod

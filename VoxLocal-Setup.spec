@@ -1,13 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+from pathlib import Path
 
 _vox_exe = os.environ.get('VOXLOCAL_EXE_PATH', 'dist/VoxLocal/VoxLocal.exe')
+_vox_internal = Path(os.environ.get('VOXLOCAL_INTERNAL_DIR', str(Path(_vox_exe).resolve().parent / '_internal')))
+
+_setup_datas = [('src', 'src'), ('assets', 'assets')]
+if _vox_internal.exists():
+    for _pkg_dir in ('sherpa_onnx', 'pydantic', 'pydantic_core', 'safetensors', 'markupsafe', 'tokenizers'):
+        _cand = _vox_internal / _pkg_dir
+        if _cand.is_dir():
+            _setup_datas.append((str(_cand), f'bundled_internal/{_pkg_dir}'))
+    for _di in _vox_internal.glob('*.dist-info'):
+        if any(_di.name.lower().startswith(p) for p in ('pydantic', 'markupsafe', 'sherpa', 'safetensors', 'tokenizers')):
+            _setup_datas.append((str(_di), f'bundled_internal/{_di.name}'))
+    _base_zip = _vox_internal / 'base_library.zip'
+    if _base_zip.is_file():
+        _setup_datas.append((str(_base_zip), 'bundled_internal'))
 
 a = Analysis(
     ['packaging/vox_setup_installer.py'],
     pathex=[],
     binaries=[(_vox_exe, 'bundled_bin')],
-    datas=[('src', 'src'), ('assets', 'assets')],
+    datas=_setup_datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

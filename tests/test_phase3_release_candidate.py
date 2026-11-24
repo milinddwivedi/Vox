@@ -672,10 +672,13 @@ def test_in_app_updater_progress_bar_and_install_handoff():
             with patch("subprocess.Popen", side_effect=lambda *a, **kw: popen_calls.append((a, kw)) or MagicMock()):
                 win._on_update_ready_to_install(str(installer_stub), "1.0.11")
                 assert len(popen_calls) == 1
-                cmd_str = popen_calls[0][0][0][-1]
-                assert "--silent" in cmd_str
-                assert "--no-launch" in cmd_str
-                assert "--install-dir" in cmd_str
+                cmd_args = popen_calls[0][0][0]
+                assert "powershell" not in str(cmd_args[0]).lower()
+                assert "--silent" in cmd_args
+                assert "--wait-pid" in cmd_args
+                assert "--install-dir" in cmd_args
+                assert "--relaunch" in cmd_args
+                assert "--expected-version" in cmd_args
                 deadline = time.monotonic() + 2.0
                 while not exit_calls and time.monotonic() < deadline:
                     app.processEvents()

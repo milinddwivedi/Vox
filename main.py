@@ -68,6 +68,51 @@ def _run_hardware_diagnostics(out_path: str) -> int:
     return 0
 
 
+def _run_verify_runtime(expected_version: str = "") -> int:
+    import importlib
+    import json
+    from voxlocal import __file__ as vox_init_file, __version__
+
+    checks: dict[str, bool] = {}
+    errors: list[str] = []
+    required_modules = (
+        "voxlocal.core.controller",
+        "voxlocal.engine.onnx_asr_engines",
+        "voxlocal.engine.selective_verifier",
+        "onnxruntime",
+        "tokenizers",
+        "sherpa_onnx",
+        "faster_whisper",
+    )
+    for mod in required_modules:
+        try:
+            importlib.import_module(mod)
+            checks[mod] = True
+        except Exception as exc:
+            checks[mod] = False
+            errors.append(f"{mod}: {type(exc).__name__}: {exc}")
+
+    exp = (expected_version or "").strip()
+    version_match = (not exp) or (str(__version__).strip() == exp)
+    if not version_match:
+        errors.append(f"version_mismatch: running={__version__} expected={exp}")
+
+    ok = version_match and all(checks.values())
+    payload = {
+        "ok": ok,
+        "version": str(__version__),
+        "expected_version": exp,
+        "version_match": version_match,
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "root_dir": str(ROOT_DIR),
+        "voxlocal_file": str(vox_init_file),
+        "modules": checks,
+        "errors": errors,
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if ok else 2
+
+
 def _focus_existing_instance(auth_url: str = "") -> None:
     import urllib.parse
     import urllib.request
@@ -165,6 +210,17 @@ def main() -> int:
         default="",
         help="Optional output file path when running with --hardware-diagnostics",
     )
+    parser.add_argument(
+        "--verify-runtime",
+        action="store_true",
+        help="Verify installed version and runtime modules without starting the GUI or modifying user data",
+    )
+    parser.add_argument(
+        "--expected-version",
+        type=str,
+        default="",
+        help="Expected application version string for --verify-runtime",
+    )
     args = parser.parse_args()
 
     if getattr(args, "print_version", False):
@@ -172,6 +228,9 @@ def main() -> int:
 
         print(__version__)
         return 0
+
+    if getattr(args, "verify_runtime", False):
+        return _run_verify_runtime(getattr(args, "expected_version", "") or "")
 
     if getattr(args, "hardware_diagnostics", False):
         return _run_hardware_diagnostics(getattr(args, "diagnostics_out", "") or "")

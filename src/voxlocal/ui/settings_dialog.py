@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -275,6 +276,7 @@ class SettingsWorkspaceWidget(QWidget):
     status_toast = pyqtSignal(str, str)
     mic_level_updated = pyqtSignal(float)
     open_calendar_requested = pyqtSignal()
+    _model_download_finished = pyqtSignal(str, bool, str)
 
     SECTIONS = [
         ("General", "Hotkeys, microphone & local AI engine", "group1"),
@@ -301,6 +303,7 @@ class SettingsWorkspaceWidget(QWidget):
 
         self._build_ui()
         self.mic_level_updated.connect(lambda lvl: self.mic_level_bar.set_level(lvl) if hasattr(self, "mic_level_bar") else None)
+        self._model_download_finished.connect(self._on_model_download_finished)
         if hasattr(self.controller, "auth_state_changed"):
             self.controller.auth_state_changed.connect(lambda _: self._update_account_ui())
         if hasattr(self.controller, "entitlement_changed"):
@@ -836,6 +839,18 @@ class SettingsWorkspaceWidget(QWidget):
             "Enable hardware-aware ONNX streaming and guarded Hinglish recognition (disable to roll back to legacy Whisper).",
             lambda v: self._save_cfg("enable_phase2_asr_pipeline", bool(v)),
         )
+        self.sw_live_preview = self._add_toggle_row(
+            nt_lay,
+            "Live Preview During Calls",
+            "Show bounded provisional live captions during meetings while full audio is saved for post-call transcription.",
+            lambda v: self._save_cfg("live_preview_enabled", bool(v)),
+        )
+        self.sw_cpu_verifier = self._add_toggle_row(
+            nt_lay,
+            "CPU Post-Call Hinglish Verifier",
+            "Allow second-pass Hinglish verification using Oriserve Apex on CPU INT8 when no discrete GPU is available.",
+            lambda v: self._save_cfg("post_call_allow_cpu_verifier", bool(v)),
+        )
         self.combo_drawer_start = QComboBox()
         self.combo_drawer_start.setAccessibleName("Notepad on Call Start")
         self.combo_drawer_start.setAccessibleDescription("Drawer behavior when Notetaker begins recording")
@@ -867,6 +882,52 @@ class SettingsWorkspaceWidget(QWidget):
         self._add_control_row(nt_lay, "Calendar Reminder Lead Time", "When to surface upcoming meeting reminder cards.", self.combo_lead_min)
 
         lay.addWidget(card_nt)
+
+        card_models, mod_lay = self._make_card()
+        lbl_mod_hdr = QLabel("Local ASR Models (100% Offline)")
+        lbl_mod_hdr.setStyleSheet("font-size: 13px; font-weight: 700;")
+        lbl_mod_sub = QLabel(
+            "Download local ONNX models on demand for English incremental preview, high-accuracy English, and Hinglish post-call transcription."
+        )
+        lbl_mod_sub.setObjectName("settingsMuted")
+        lbl_mod_sub.setWordWrap(True)
+        mod_lay.addWidget(lbl_mod_hdr)
+        mod_lay.addWidget(lbl_mod_sub)
+
+        self._phase2_model_rows: Dict[str, tuple[QLabel, QPushButton, bool]] = {}
+        model_defs = (
+            ("qwen3_onnx", "Guarded Qwen3 ASR 0.6B (ONNX INT8 · ~942 MB)", "Primary Hinglish, Hindi & Multilingual local model", False),
+            ("parakeet", "Parakeet TDT 0.6B v2 (ONNX INT8 · ~631 MB)", "High-accuracy English post-call & adaptive upgrade", False),
+            ("nemotron", "Nemotron Streaming EN 0.6B (ONNX INT8 · ~632 MB)", "Incremental word-by-word English live preview", False),
+            ("oriserve_apex", "Oriserve Apex Hinglish Verifier (CT2 INT8 · ~782 MB)", "Selective post-call Hinglish refinement model", True),
+        )
+        for m_key, m_title, m_desc, needs_conv in model_defs:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            lt = QLabel(m_title)
+            lt.setStyleSheet("font-size: 12px; font-weight: 600;")
+            ld = QLabel(m_desc)
+            ld.setObjectName("settingsMuted")
+            ld.setWordWrap(True)
+            col.addWidget(lt)
+            col.addWidget(ld)
+            row.addLayout(col, 1)
+
+            lbl_st = QLabel("Checking...")
+            lbl_st.setStyleSheet("font-size: 11px; font-weight: 600;")
+            row.addWidget(lbl_st)
+
+            btn_dl = QPushButton("Download")
+            btn_dl.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_dl.setFixedWidth(104)
+            btn_dl.clicked.connect(lambda _=False, k=m_key: self._start_phase2_model_download(k))
+            row.addWidget(btn_dl)
+            mod_lay.addLayout(row)
+            self._phase2_model_rows[m_key] = (lbl_st, btn_dl, needs_conv)
+
+        lay.addWidget(card_models)
         lay.addStretch(1)
         return page
 
@@ -1403,6 +1464,8 @@ class SettingsWorkspaceWidget(QWidget):
             (self.sw_nt_speakers, "notetaker_auto_detect_speakers", True),
             (self.sw_nt_live, "notetaker_live_transcript", True),
             (self.sw_phase2_asr, "enable_phase2_asr_pipeline", True),
+            (self.sw_live_preview, "live_preview_enabled", True),
+            (self.sw_cpu_verifier, "post_call_allow_cpu_verifier", True),
             (self.sw_vibe_vars, "vibe_coding_variable_recognition", True),
             (self.sw_vibe_files, "vibe_coding_file_tagging", True),
         ):
@@ -1445,6 +1508,64 @@ class SettingsWorkspaceWidget(QWidget):
         self.spin_max_len.setValue(int(getattr(cfg, "notetaker_max_length_min", 120)))
         self.spin_max_len.blockSignals(False)
         self._refresh_calendar_status()
+        self._refresh_phase2_model_rows()
+
+    def _refresh_phase2_model_rows(self) -> None:
+        if not hasattr(self, "_phase2_model_rows"):
+            return
+        try:
+            from voxlocal.engine.onnx_asr_engines import get_phase2_runtime_capabilities
+
+            models_dir = getattr(getattr(self.controller, "config", None), "models_dir", None)
+            caps = get_phase2_runtime_capabilities(models_dir)
+            avail = dict(caps.get("models_available") or {})
+        except Exception:
+            avail = {}
+        for m_key, (lbl_st, btn_dl, needs_conv) in self._phase2_model_rows.items():
+            is_ok = bool(avail.get(m_key, False))
+            if is_ok:
+                lbl_st.setText("Installed")
+                btn_dl.setText("Installed")
+                btn_dl.setEnabled(False)
+            elif needs_conv:
+                lbl_st.setText("Not Installed")
+                btn_dl.setText("Setup")
+                btn_dl.setEnabled(True)
+            else:
+                lbl_st.setText("Not Downloaded")
+                btn_dl.setText("Download")
+                btn_dl.setEnabled(True)
+
+    def _start_phase2_model_download(self, model_key: str) -> None:
+        if not hasattr(self, "_phase2_model_rows") or model_key not in self._phase2_model_rows:
+            return
+        lbl_st, btn_dl, _ = self._phase2_model_rows[model_key]
+        btn_dl.setEnabled(False)
+        btn_dl.setText("Working...")
+        lbl_st.setText("Downloading...")
+        models_dir = getattr(getattr(self.controller, "config", None), "models_dir", None)
+
+        def _worker() -> None:
+            try:
+                from voxlocal.engine.onnx_asr_engines import download_phase2_model
+
+                ok, msg = download_phase2_model(model_key, models_dir=models_dir)
+            except Exception as exc:
+                ok, msg = False, str(exc)
+            self._model_download_finished.emit(model_key, ok, msg)
+
+        threading.Thread(target=_worker, name=f"DownloadModel-{model_key}", daemon=True).start()
+
+    def _on_model_download_finished(self, model_key: str, ok: bool, msg: str) -> None:
+        self._refresh_phase2_model_rows()
+        if ok:
+            self.status_toast.emit("Model Ready", msg)
+        else:
+            if hasattr(self, "_phase2_model_rows") and model_key in self._phase2_model_rows:
+                lbl_st, btn_dl, needs_conv = self._phase2_model_rows[model_key]
+                lbl_st.setText("Unavailable" if needs_conv else "Failed")
+                btn_dl.setEnabled(True)
+            self.status_toast.emit("Model Setup", msg)
 
     @staticmethod
     def _set_combo_by_data(combo: QComboBox, target: Any) -> None:

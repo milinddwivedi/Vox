@@ -53,6 +53,12 @@ class AppConfig:
     selective_min_wps: float = 0.75
     selective_max_utterances_per_meeting: int = 40
     selective_enable_hinglish_cue_routing: bool = True
+    # Recording-first post-call transcription + bounded provisional live preview
+    live_preview_enabled: bool = True
+    live_preview_max_backlog_sec: float = 8.0
+    post_call_allow_cpu_verifier: bool = True
+    post_call_adaptive_english_parakeet: bool = True
+    post_call_punctuation_polish: bool = True
     # Live GPU VRAM headroom thresholds (MB) before loading optional CUDA models
     gpu_min_free_vram_hf_mb: int = 2000
     gpu_min_free_vram_ct2_mb: int = 1100

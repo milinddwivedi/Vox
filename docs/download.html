@@ -374,9 +374,9 @@
         <div>
           <div style="font-weight:700; font-size:20px; margin-bottom:4px; display:flex; align-items:center; gap:8px;">
             <span>VoxLocal-Setup.exe</span>
-            <span style="font-size:12px; background:rgba(16,185,129,0.15); color:#10B981; border:1px solid rgba(16,185,129,0.3); border-radius:999px; padding:2px 8px; font-weight:700;">Latest v1.0.12</span>
+            <span style="font-size:12px; background:rgba(16,185,129,0.15); color:#10B981; border:1px solid rgba(16,185,129,0.3); border-radius:999px; padding:2px 8px; font-weight:700;">Latest v1.0.13</span>
           </div>
-          <div style="font-size:13px; color:var(--text-muted);">Windows 10/11 (64-bit) · 29.9 MB · Cryptographically Verified</div>
+          <div style="font-size:13px; color:var(--text-muted);">Windows 10/11 (64-bit) · 53.8 MB · Cryptographically Verified</div>
         </div>
         <button class="btn-download-primary" id="btnDownload" onclick="triggerAuthorizedDownload()">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -389,7 +389,7 @@
       </div>
 
       <div class="checksum-bar" style="margin-top:16px;">
-        <span>SHA-256 Digest:</span>38712f4b2fbd1ef1c14db52d96d18d50dc361044fcdfa3227b98d6c78780289f
+        <span>SHA-256 Digest:</span>1a64e568805c718bd2b825b430a3488a08c38db8ef1a43b799f2a9f8d940cde7
       </div>
 
       <!-- Account & Desktop Sync Section -->
@@ -543,7 +543,7 @@
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + _currentUserSession.access_token,
           },
-          body: JSON.stringify({ artifact: 'releases/1.0.12/VoxLocal-Setup.exe' })
+          body: JSON.stringify({ artifact: 'releases/1.0.13/VoxLocal-Setup.exe' })
         }).catch(() => {});
       }
 

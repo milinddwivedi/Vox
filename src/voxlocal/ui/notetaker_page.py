@@ -1066,7 +1066,7 @@ class NotetakerPage(QWidget):
             eng_lbl = f"Parakeet {device or 'CPU'}"
         else:
             eng_lbl = f"Whisper {device or 'CPU'}"
-        return f"Live · {mode_lbl} ({eng_lbl})"
+        return f"Live Preview (Provisional) · {mode_lbl} ({eng_lbl})"
 
     def _on_live_meeting_partial(self, meeting_id: int, partial_dict: dict) -> None:
         txt = str((partial_dict or {}).get("text", "")).strip()
@@ -1229,7 +1229,7 @@ class NotetakerPage(QWidget):
             raw_status = str(m.get("status") or "").strip().lower()
             is_recoverable = raw_status in ("interrupted", "incomplete", "finalization_failed", "error", "failed")
             badge = " · Video" if has_vid else ""
-            status_badge = self._format_status_badge(raw_status)
+            status_badge = self._format_status_badge(raw_status, str(m.get("post_call_stage") or ""))
             if status_badge and raw_status not in ("completed", ""):
                 badge += f" · {status_badge}"
             if is_recoverable and self._resolve_audio_path(m) is not None:
@@ -1351,10 +1351,21 @@ class NotetakerPage(QWidget):
             self.select_meeting(int(mid))
 
     @staticmethod
-    def _format_status_badge(raw_status: str) -> str:
+    def _format_status_badge(raw_status: str, post_call_stage: str = "") -> str:
         st = str(raw_status or "").strip().lower()
+        pc = str(post_call_stage or "").strip().lower()
+        if st in ("transcribing", "processing", "finalizing") and pc:
+            pc_map = {
+                "recording_saved": "● Recording Saved · Queued",
+                "preparing_audio": "⏳ Preparing Audio...",
+                "transcribing": "⏳ Transcribing Full Audio...",
+                "verifying": "⏳ Verifying Transcript...",
+                "finalizing": "⏳ Finalizing Notes...",
+            }
+            if pc in pc_map:
+                return pc_map[pc]
         mapping = {
-            "recording": "● Live (Provisional)",
+            "recording": "● Live Preview (Provisional)",
             "transcribing": "⏳ Finalizing...",
             "processing": "⏳ Finalizing...",
             "finalizing": "⏳ Finalizing...",
@@ -1392,9 +1403,16 @@ class NotetakerPage(QWidget):
         self.lbl_sel_title.blockSignals(False)
 
         meta_text = f"{date_str} · Duration {dur} · {plat}"
-        status_badge = self._format_status_badge(raw_status)
+        post_stage = str(m.get("post_call_stage") or "").strip().lower()
+        status_badge = self._format_status_badge(raw_status, post_stage)
         if status_badge:
             meta_text += f" · {status_badge}"
+        eng_summary = str(m.get("post_call_engine_summary") or "").strip()
+        post_msg = str(m.get("post_call_status_message") or "").strip()
+        if raw_status == "completed" and eng_summary:
+            meta_text += f" · {eng_summary}"
+        elif raw_status in ("transcribing", "processing", "finalizing") and post_msg:
+            meta_text += f" · {post_msg}"
         comp_raw = str(m.get("completeness_report_json") or "").strip()
         if comp_raw:
             try:

@@ -21,6 +21,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -56,6 +57,45 @@ MODEL_SLUGS: Dict[str, Tuple[str, ...]] = {
     "nemotron": ("sherpa-onnx-nemotron-streaming-en-0.6b-560ms-int8",),
     "parakeet": ("sherpa-onnx-parakeet-tdt-0.6b-v2-int8",),
     "oriserve_apex": ("oriserve-apex-ct2-int8",),
+}
+
+PHASE2_MODEL_SPECS: Dict[str, Dict[str, Any]] = {
+    "qwen3_onnx": {
+        "slug": "sherpa-onnx-qwen3-asr-0.6b-int8",
+        "repo_id": "csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25",
+        "allow_patterns": ["*.onnx", "tokenizer/*", "README.md", "*.txt"],
+        "ignore_patterns": ["test_wavs/*", "*.wav", "*.flac"],
+        "size_mb_approx": 942,
+        "description": "Guarded Qwen3 ASR 0.6B (ONNX INT8, Hinglish + EN + HI)",
+        "requires_ct2_conversion": False,
+    },
+    "parakeet": {
+        "slug": "sherpa-onnx-parakeet-tdt-0.6b-v2-int8",
+        "repo_id": "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+        "allow_patterns": ["*.onnx", "*.txt", "*.json", "README.md"],
+        "ignore_patterns": ["test_wavs/*", "*.wav", "*.flac"],
+        "size_mb_approx": 631,
+        "description": "Parakeet TDT 0.6B v2 (ONNX INT8, High-Accuracy English)",
+        "requires_ct2_conversion": False,
+    },
+    "nemotron": {
+        "slug": "sherpa-onnx-nemotron-streaming-en-0.6b-560ms-int8",
+        "repo_id": "csukuangfj2/sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25",
+        "allow_patterns": ["*.onnx", "*.txt", "*.json", "README.md"],
+        "ignore_patterns": ["test_wavs/*", "*.wav", "*.flac"],
+        "size_mb_approx": 632,
+        "description": "Nemotron Speech Streaming EN 0.6B (ONNX INT8, Live Preview)",
+        "requires_ct2_conversion": False,
+    },
+    "oriserve_apex": {
+        "slug": "oriserve-apex-ct2-int8",
+        "repo_id": "Oriserve/Whisper-Hindi2Hinglish-Apex",
+        "allow_patterns": ["*"],
+        "ignore_patterns": [],
+        "size_mb_approx": 782,
+        "description": "Oriserve Whisper-Hindi2Hinglish-Apex (CT2 INT8 Verifier)",
+        "requires_ct2_conversion": True,
+    },
 }
 
 _QWEN2_SPLIT_PATTERN = (
@@ -177,7 +217,114 @@ def get_phase2_runtime_capabilities(models_dir: Optional[str | Path] = None) -> 
         "faster_whisper": _has_mod("faster_whisper"),
         "models": {k: (str(v) if v is not None else None) for k, v in discovered.items()},
         "models_available": {k: (v is not None) for k, v in discovered.items()},
+        "specs": {
+            k: {
+                "slug": str(v["slug"]),
+                "repo_id": str(v["repo_id"]),
+                "size_mb_approx": int(v["size_mb_approx"]),
+                "description": str(v["description"]),
+                "requires_ct2_conversion": bool(v.get("requires_ct2_conversion", False)),
+            }
+            for k, v in PHASE2_MODEL_SPECS.items()
+        },
     }
+
+
+def download_phase2_model(
+    model_key: str,
+    models_dir: Optional[str | Path] = None,
+    min_free_disk_mb: int = 2500,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
+    """Download and validate a local Phase 2 ONNX or CT2 model with disk-space safeguards."""
+    spec = PHASE2_MODEL_SPECS.get(str(model_key or "").strip())
+    if spec is None:
+        return False, f"Unknown Phase 2 model key: {model_key}"
+
+    def _notify(msg: str) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(msg)
+            except Exception:
+                pass
+
+    discovered = discover_phase2_models(models_dir)
+    if discovered.get(model_key) is not None:
+        return True, f"{spec['slug']} already installed and verified."
+
+    base_models_dir = Path(models_dir) if models_dir else (get_app_root() / "data" / "models")
+    challengers_dir = base_models_dir / "challengers"
+    challengers_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        usage = shutil.disk_usage(challengers_dir)
+        free_mb = int(usage.free // (1024 * 1024))
+    except Exception as exc:
+        return False, f"Unable to check free disk space for {challengers_dir}: {exc}"
+
+    if free_mb < int(min_free_disk_mb):
+        return False, f"Insufficient free disk space ({free_mb} MB < {int(min_free_disk_mb)} MB required)."
+
+    target_dir = challengers_dir / str(spec["slug"])
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as exc:
+        return False, f"huggingface_hub unavailable: {exc}"
+
+    if bool(spec.get("requires_ct2_conversion", False)):
+        if importlib.util.find_spec("transformers") is None or importlib.util.find_spec("ctranslate2") is None:
+            return (
+                False,
+                "Oriserve Apex CT2 INT8 requires local HuggingFace->CTranslate2 conversion (`transformers`) "
+                "or pre-converted `oriserve-apex-ct2-int8` in `data/models/challengers/`.",
+            )
+        hf_dir = challengers_dir / "oriserve-apex-hf"
+        hf_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            _notify(f"Downloading {spec['repo_id']}...")
+            snapshot_download(repo_id=str(spec["repo_id"]), local_dir=str(hf_dir))
+            _notify("Converting Oriserve Apex to CTranslate2 INT8...")
+            from ctranslate2.converters import TransformersConverter
+
+            copy_files = [
+                f
+                for f in (
+                    "tokenizer.json",
+                    "preprocessor_config.json",
+                    "tokenizer_config.json",
+                    "special_tokens_map.json",
+                    "generation_config.json",
+                )
+                if (hf_dir / f).exists()
+            ]
+            target_dir.mkdir(parents=True, exist_ok=True)
+            conv = TransformersConverter(str(hf_dir), copy_files=copy_files or None)
+            conv.convert(str(target_dir), quantization="int8", force=True)
+            for fname in copy_files:
+                src = hf_dir / fname
+                dst = target_dir / fname
+                if src.exists() and not dst.exists():
+                    shutil.copy2(src, dst)
+        except Exception as exc:
+            return False, f"Failed downloading/converting {spec['slug']}: {exc}"
+    else:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            _notify(f"Downloading {spec['slug']} ({spec['size_mb_approx']} MB)...")
+            snapshot_download(
+                repo_id=str(spec["repo_id"]),
+                local_dir=str(target_dir),
+                allow_patterns=list(spec.get("allow_patterns") or ["*"]),
+                ignore_patterns=list(spec.get("ignore_patterns") or []),
+            )
+        except Exception as exc:
+            return False, f"Failed downloading {spec['slug']}: {exc}"
+
+    if not _is_valid_model_dir(model_key, target_dir):
+        return False, f"Downloaded files for {spec['slug']} failed directory validation."
+
+    _notify(f"Verified {spec['slug']}")
+    return True, f"Downloaded and verified {spec['slug']}."
 
 
 # ---------------------------------------------------------------------------
@@ -1449,12 +1596,17 @@ class OriserveApexVerifierEngine:
         model_dir: Optional[str | Path] = None,
         models_dir: Optional[str | Path] = None,
         min_free_vram_mb: int = 1100,
+        allow_cpu: bool = True,
+        cpu_threads: int = 4,
     ) -> None:
         self._explicit_dir = Path(model_dir) if model_dir else None
         self.models_dir = Path(models_dir) if models_dir else (get_app_root() / "data" / "models")
         self.min_free_vram_mb = max(400, int(min_free_vram_mb))
+        self.allow_cpu = bool(allow_cpu)
+        self.cpu_threads = max(2, min(8, int(cpu_threads or 4)))
         self._lock = threading.RLock()
         self._model: Any = None
+        self.asr_device: str = ""
         self.load_sec: float = 0.0
 
     @property
@@ -1469,31 +1621,62 @@ class OriserveApexVerifierEngine:
     def ensure_loaded(self) -> Tuple[bool, str]:
         with self._lock:
             if self._model is not None:
-                return True, f"Loaded {self.model_label} on CUDA INT8"
+                dev_lbl = (self.asr_device or "cuda").upper()
+                return True, f"Loaded {self.model_label} on {dev_lbl} INT8"
             target_dir = self._resolve_dir()
             if target_dir is None:
                 return False, "Local oriserve-apex-ct2-int8 directory not found."
-            if not is_cuda_runtime_available():
-                return False, "CUDA runtime/cuBLAS unavailable; skipping GPU verifier."
-            _, free_mb = HardwareProfiler._query_live_gpu_vram_mb()
-            if free_mb is not None and free_mb < self.min_free_vram_mb:
+
+            cuda_ready = is_cuda_runtime_available()
+            free_mb: Optional[int] = None
+            if cuda_ready:
+                _, free_mb = HardwareProfiler._query_live_gpu_vram_mb()
+            can_cuda = cuda_ready and (free_mb is None or free_mb >= self.min_free_vram_mb)
+
+            if not can_cuda and not self.allow_cpu:
+                if not cuda_ready:
+                    return False, "CUDA runtime/cuBLAS unavailable; skipping GPU verifier."
                 return False, f"Free VRAM ({free_mb} MB) < {self.min_free_vram_mb} MB required for {self.model_label}."
+
             t0 = time.perf_counter()
             try:
                 from faster_whisper import WhisperModel
+            except Exception as exc:
+                return False, f"Failed importing faster_whisper for {self.model_label}: {exc}"
 
+            if can_cuda:
+                try:
+                    self._model = WhisperModel(
+                        str(target_dir),
+                        device="cuda",
+                        compute_type="int8",
+                        local_files_only=True,
+                    )
+                    self.asr_device = "cuda"
+                    self.load_sec = round(time.perf_counter() - t0, 3)
+                    logger.info("Loaded %s on CUDA INT8 in %.2fs", self.model_label, self.load_sec)
+                    return True, f"Loaded {self.model_label} on CUDA INT8"
+                except Exception as exc:
+                    self.unload_model()
+                    if not self.allow_cpu:
+                        return False, f"Failed loading {self.model_label}: {exc}"
+                    logger.warning("CUDA load failed for %s (%s); falling back to CPU INT8", self.model_label, exc)
+
+            try:
                 self._model = WhisperModel(
                     str(target_dir),
-                    device="cuda",
+                    device="cpu",
                     compute_type="int8",
+                    cpu_threads=self.cpu_threads,
                     local_files_only=True,
                 )
+                self.asr_device = "cpu"
                 self.load_sec = round(time.perf_counter() - t0, 3)
-                logger.info("Loaded %s on CUDA INT8 in %.2fs", self.model_label, self.load_sec)
-                return True, f"Loaded {self.model_label} on CUDA INT8"
+                logger.info("Loaded %s on CPU INT8 (threads=%d) in %.2fs", self.model_label, self.cpu_threads, self.load_sec)
+                return True, f"Loaded {self.model_label} on CPU INT8"
             except Exception as exc:
                 self.unload_model()
-                return False, f"Failed loading {self.model_label}: {exc}"
+                return False, f"Failed loading {self.model_label} on CPU INT8: {exc}"
 
     def unload_model(self) -> None:
         with self._lock:
@@ -1503,6 +1686,7 @@ class OriserveApexVerifierEngine:
                 except Exception:
                     pass
                 self._model = None
+            self.asr_device = ""
             gc.collect()
             try:
                 if "torch" in sys.modules:

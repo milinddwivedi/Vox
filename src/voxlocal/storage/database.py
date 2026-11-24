@@ -297,6 +297,11 @@ class LocalDatabase:
                 ("finalization_reason", "ALTER TABLE meetings ADD COLUMN finalization_reason TEXT DEFAULT '';"),
                 ("cleaned_transcript", "ALTER TABLE meetings ADD COLUMN cleaned_transcript TEXT DEFAULT '';"),
                 ("audio_health_json", "ALTER TABLE meetings ADD COLUMN audio_health_json TEXT DEFAULT '{}';"),
+                ("provisional_transcript", "ALTER TABLE meetings ADD COLUMN provisional_transcript TEXT DEFAULT '';"),
+                ("provisional_transcript_json", "ALTER TABLE meetings ADD COLUMN provisional_transcript_json TEXT DEFAULT '';"),
+                ("post_call_stage", "ALTER TABLE meetings ADD COLUMN post_call_stage TEXT DEFAULT '';"),
+                ("post_call_status_message", "ALTER TABLE meetings ADD COLUMN post_call_status_message TEXT DEFAULT '';"),
+                ("post_call_engine_summary", "ALTER TABLE meetings ADD COLUMN post_call_engine_summary TEXT DEFAULT '';"),
                 ("raw_text", "ALTER TABLE transcript_segments ADD COLUMN raw_text TEXT DEFAULT '';"),
                 ("is_uncertain", "ALTER TABLE transcript_segments ADD COLUMN is_uncertain INTEGER DEFAULT 0;"),
                 ("normalized_text", "ALTER TABLE transcript_segments ADD COLUMN normalized_text TEXT DEFAULT '';"),
@@ -990,6 +995,11 @@ class LocalDatabase:
             "finalization_reason",
             "cleaned_transcript",
             "audio_health_json",
+            "provisional_transcript",
+            "provisional_transcript_json",
+            "post_call_stage",
+            "post_call_status_message",
+            "post_call_engine_summary",
         }
         fields = {k: v for k, v in kwargs.items() if k in allowed}
         if not fields:
@@ -1394,6 +1404,62 @@ class LocalDatabase:
     def get_transcript_segments(self, meeting_id: int) -> List[Dict[str, Any]]:
         """Alias for get_meeting_segments conforming to e2e test specification."""
         return self.get_meeting_segments(meeting_id)
+
+    def archive_provisional_transcript(self, meeting_id: int) -> int:
+        """Idempotently snapshot live provisional segments before full-audio post-call replacement."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT provisional_transcript_json FROM meetings WHERE id = ?",
+                (meeting_id,),
+            ).fetchone()
+            if not row:
+                return 0
+            existing_json = str(row["provisional_transcript_json"] or "").strip()
+            if existing_json and existing_json != "[]":
+                return 0
+            segs = conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? ORDER BY start_time ASC, end_time ASC, segment_index ASC",
+                (meeting_id,),
+            ).fetchall()
+            seg_dicts = [dict(s) for s in segs]
+            if not seg_dicts:
+                return 0
+            lines: List[str] = []
+            for s in seg_dicts:
+                st = float(s.get("start_time") or 0.0)
+                mm, ss = int(st // 60), int(st % 60)
+                spk = str(s.get("speaker") or "Speaker")
+                txt = str(s.get("text") or "").strip()
+                if txt:
+                    lines.append(f"[{mm:02d}:{ss:02d}] {spk}: {txt}")
+            prov_json = json.dumps(seg_dicts, default=str)
+            prov_txt = "\n".join(lines)
+            conn.execute(
+                "UPDATE meetings SET provisional_transcript_json = ?, provisional_transcript = ? WHERE id = ?",
+                (prov_json, prov_txt, meeting_id),
+            )
+            conn.commit()
+            return len(seg_dicts)
+
+    def get_provisional_transcript_segments(self, meeting_id: int) -> List[Dict[str, Any]]:
+        """Return archived provisional live-preview segments for comparison, if any."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT provisional_transcript_json FROM meetings WHERE id = ?",
+                (meeting_id,),
+            ).fetchone()
+        if not row:
+            return []
+        raw_json = str(row["provisional_transcript_json"] or "").strip()
+        if not raw_json:
+            return []
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, list):
+                return [dict(item) for item in parsed if isinstance(item, dict)]
+        except Exception:
+            pass
+        return []
 
     def list_meetings(
         self,

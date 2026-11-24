@@ -198,9 +198,14 @@ class SelectiveSecondPassVerifier:
         vocabulary: Optional[List[Dict[str, Any]]] = None,
         output_script: str = "roman",
         cancel_check: Optional[Callable[[], bool]] = None,
+        verifier_backend_override: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         t0 = time.perf_counter()
-        verifier_backend = str(getattr(execution_profile, "selective_verifier_backend", "disabled") or "disabled").strip().lower()
+        verifier_backend = str(
+            verifier_backend_override
+            or getattr(execution_profile, "selective_verifier_backend", "disabled")
+            or "disabled"
+        ).strip().lower()
         session_mode = str(getattr(execution_profile, "session_mode", "auto") or "auto").strip().lower()
         max_utts = int(getattr(config, "selective_max_utterances_per_meeting", 40) or 40)
 
@@ -281,7 +286,12 @@ class SelectiveSecondPassVerifier:
         try:
             min_vram = int(getattr(config, "gpu_min_free_vram_ct2_mb", 1100) or 1100)
             if verifier_backend == "oriserve_apex_ct2":
-                engine = OriserveApexVerifierEngine(models_dir=self.models_dir, min_free_vram_mb=min_vram)
+                engine = OriserveApexVerifierEngine(
+                    models_dir=self.models_dir,
+                    min_free_vram_mb=min_vram,
+                    allow_cpu=bool(getattr(config, "post_call_allow_cpu_verifier", True)),
+                    cpu_threads=int(getattr(execution_profile, "safe_cpu_threads", 4) or 4),
+                )
             elif verifier_backend == "parakeet_onnx":
                 engine = ParakeetOnnxEngine(models_dir=self.models_dir)
             else:
@@ -294,6 +304,7 @@ class SelectiveSecondPassVerifier:
                 stats["errors"].append(load_msg)
                 stats["duration_sec"] = round(time.perf_counter() - t0, 3)
                 return updated, stats
+            stats["verifier_device"] = str(getattr(engine, "asr_device", "") or "cpu")
 
             for idx, trig_reasons, utt_profile in candidates:
                 if cancel_check and cancel_check():
