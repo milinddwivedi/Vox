@@ -296,7 +296,7 @@ class TestPhase4HomeSidebarAndStudio(unittest.TestCase):
                 # Legacy placeholder 8-tab dropdown is hidden from visible UI while live tools are integrated
                 self.assertTrue(page.studio.combo_mode_switcher.isHidden())
                 self.assertTrue(page.studio.lbl_view_mode.isHidden())
-                self.assertTrue(page.studio.lbl_studio_metrics.isVisible())
+                self.assertFalse(page.studio.lbl_studio_metrics.isHidden())
                 self.assertIn("Mic ", page.studio.lbl_studio_metrics.text())
                 self.assertIn("1 Decisions", page.studio.lbl_studio_metrics.text())
 

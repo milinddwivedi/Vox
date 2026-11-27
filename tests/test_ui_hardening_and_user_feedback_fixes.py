@@ -121,27 +121,27 @@ class TestUIHardeningAndUserFeedbackFixes(unittest.TestCase):
         floating.show()
         app.processEvents()
 
-        # 1. Idle state: Notetaker chip hidden
+        # 1. Idle state: Notetaker capsule hidden
         self.assertEqual(floating.pill_state, PillState.IDLE)
         self.assertFalse(floating._meeting_active)
-        self.assertFalse(floating.meeting_chip.isVisible())
+        self.assertIsNot(floating._p0_stack.currentWidget(), floating.active_recording_capsule)
 
-        # 2. Recording state: companion chip visible & enabled
+        # 2. Recording state: companion emerald capsule visible & enabled
         floating._on_controller_meeting_state("recording", "Recording started")
         app.processEvents()
         self.assertTrue(floating._meeting_active)
-        self.assertTrue(floating.meeting_chip.isVisible())
-        self.assertTrue(floating.meeting_chip.isEnabled())
+        self.assertIs(floating._p0_stack.currentWidget(), floating.active_recording_capsule)
+        self.assertTrue(floating.active_recording_capsule.isEnabled())
 
         # 3. Tick updates elapsed timer text
         floating._on_controller_meeting_tick(15.0, 0.2, 0.2, True, True)
         self.assertIn("00:15", floating.meeting_chip.text())
 
-        # 4. Return to idle hides companion chip
+        # 4. Return to idle hides companion capsule
         floating._on_controller_meeting_state("idle", "Idle")
         app.processEvents()
         self.assertFalse(floating._meeting_active)
-        self.assertFalse(floating.meeting_chip.isVisible())
+        self.assertIsNot(floating._p0_stack.currentWidget(), floating.active_recording_capsule)
         floating.close()
 
 if __name__ == "__main__":

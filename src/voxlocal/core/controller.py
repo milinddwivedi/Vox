@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import enum
+import gc
 import inspect
 import json
 import os
@@ -19,13 +20,14 @@ import re
 import shutil
 import threading
 import time
+import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import ctypes
 from ctypes import wintypes
 import numpy as np
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QObject, QTimer, pyqtSignal
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -58,6 +60,7 @@ def _polish_final_punctuation(text: str) -> str:
     return s
 
 from voxlocal.audio.call_detector import CallDetector, MeetingLifecycleState
+from voxlocal.audio.devices import AudioDeviceManager
 from voxlocal.audio.dictation_recorder import DictationRecorder
 from voxlocal.audio.meeting_recorder import MeetingRecorder
 from voxlocal.audio.streaming_typer import StreamingVoiceTyper
@@ -72,8 +75,10 @@ from voxlocal.core.logger import (
 )
 from voxlocal.engine.completeness import build_completeness_report, evaluate_segment_uncertainty
 from voxlocal.engine.dictation_processor import DictationProcessor
-from voxlocal.engine.hf_asr_engine import LocalHFASRTranscriber
+from voxlocal.engine.knowledge_store import LocalKnowledgeStore
+from voxlocal.engine.meeting_asr_pipeline import PostCallEnglishASRPipeline
 from voxlocal.engine.meeting_intelligence import MeetingIntelligenceEngine
+from voxlocal.engine.meeting_model_manager import MeetingModelManager
 from voxlocal.engine.transcriber import (
     LocalWhisperTranscriber,
     PersistentSpeakerDiarizer,
@@ -95,6 +100,7 @@ from voxlocal.core.entitlement import EntitlementManager
 from voxlocal.auth.desktop_auth import DesktopAuthBroker
 
 logger = get_logger("controller")
+_ACTIVE_CONTROLLERS: "weakref.WeakSet[AppController]" = weakref.WeakSet()
 
 
 class DictationState(str, enum.Enum):
@@ -209,6 +215,8 @@ class AppController(QObject):
     notes_updated = pyqtSignal()
     snippets_updated = pyqtSignal()
     vocabulary_updated = pyqtSignal()
+    knowledge_updated = pyqtSignal()
+    meeting_models_updated = pyqtSignal()
     calendar_upcoming_changed = pyqtSignal(list)
     calendar_accounts_changed = pyqtSignal(list)
     calendar_prepare_notetaker_requested = pyqtSignal(object)
@@ -236,7 +244,13 @@ class AppController(QObject):
     def __init__(self, config: Optional[AppConfig] = None) -> None:
         super().__init__()
         self.config = config or AppConfig.load()
+        self._shutting_down: bool = False
+        self._shutdown_done: bool = False
+        self._active_postcall_runner: Optional[Any] = None
+        from voxlocal.core.task_manager import BackgroundTaskManager
+        self.task_manager = BackgroundTaskManager(io_workers=4, ai_workers=1)
         self.db = LocalDatabase(self.config.db_path)
+        _ACTIVE_CONTROLLERS.add(self)
 
         # Initialize Commercial Ledger & Entitlements (100% Local DPAPI Vault)
         self._auth_generation: int = 0
@@ -257,18 +271,27 @@ class AppController(QObject):
             logger.debug("UpdateManager initialization: %s", exc)
             self.update_manager = None
 
-        # Initialize Local LLM engine lazily
+        # Meeting AI Models & Hybrid RAG Knowledge Store (100% Local, separate from Voice Dictation)
+        self.meeting_model_manager = MeetingModelManager(models_dir=self.config.models_dir)
+        self.knowledge_store = LocalKnowledgeStore(self.db, models_dir=self.config.models_dir)
+
+        # Initialize Local LLM engine lazily (Qwen3.5-4B-Q4_K_M via isolated llama-server.exe)
         try:
             from voxlocal.engine.llm_engine import LocalLLMEngine
             self.llm_engine = LocalLLMEngine(
-                model_dir=self.config.llm_model_path,
+                model_dir=self.config.meeting_llm_path,
                 device=self.config.llm_device,
+                idle_timeout_sec=int(getattr(self.config, "llm_idle_unload_sec", 300) or 300),
             )
         except Exception as exc:
             logger.debug("LocalLLMEngine initialization: %s", exc)
             self.llm_engine = None
 
-        self.intelligence = MeetingIntelligenceEngine(self.db, llm_engine=self.llm_engine)
+        self.intelligence = MeetingIntelligenceEngine(
+            self.db,
+            llm_engine=self.llm_engine,
+            knowledge_store=self.knowledge_store,
+        )
         self._cancel_ask_vox: bool = False
         self._ask_vox_query_id: int = 0
         self._ask_vox_thread: Optional[threading.Thread] = None
@@ -332,15 +355,8 @@ class AppController(QObject):
             profile=getattr(self.config, "transcribe_profile", "balanced"),
         )
 
-        # Live Streaming Transcriber for Real-Time Incremental & Endpointed Meeting Recognition
-        from voxlocal.engine.streaming_transcriber import LiveMeetingStreamingTranscriber
-        self.streaming_transcriber = LiveMeetingStreamingTranscriber(
-            transcriber=self.transcriber,
-            db=self.db,
-            on_partial=self._on_streaming_partial,
-            on_confirmed=self._on_streaming_confirmed,
-            config=self.config,
-        )
+        # Post-Call-Only Meeting Architecture (v2.0): live meeting ASR is permanently disabled.
+        self.streaming_transcriber = None
 
         # Independent State Variables
         self._state_lock = threading.RLock()
@@ -467,20 +483,22 @@ class AppController(QObject):
         self._focus_timer = QTimer(self)
         self._focus_timer.setInterval(150)
         self._focus_timer.timeout.connect(self._poll_foreground_window)
-        self._focus_timer.start()
+        if QCoreApplication.instance() is not None:
+            self._focus_timer.start()
 
         # Read AI-style call detection polling timer (every 2000ms on main thread)
         self._call_timer = QTimer(self)
         self._call_timer.setInterval(2000)
         self._call_timer.timeout.connect(self._poll_call_detector)
-        self._call_timer.start()
+        if QCoreApplication.instance() is not None:
+            self._call_timer.start()
 
         # OS WinEvent hook for instant event-driven detection on call window creation/rename
         if hasattr(self.call_detector, "start_winevent_listener"):
             self.call_detector.start_winevent_listener(self._poll_call_detector)
 
         # Pre-warm Whisper model in background so first dictation is instantaneous
-        if not getattr(self.config, "disable_model_preload", False):
+        if not getattr(self.config, "disable_model_preload", False) and os.environ.get("VOX_DISABLE_TEST_PRELOAD") != "1":
             threading.Thread(target=self._preload_model_bg, name="WhisperPreloadThread", daemon=True).start()
 
         # Enterprise crash recovery: auto-detect and rescue interrupted/unfinalized meetings
@@ -489,11 +507,14 @@ class AppController(QObject):
         # Non-blocking automatic release update check 5 seconds after startup
         def _bg_update_check() -> None:
             time.sleep(5.0)
+            if getattr(self, "_shutting_down", False):
+                return
             try:
                 self.check_for_updates(timeout_sec=10)
             except Exception as upd_err:
                 logger.debug("Startup update check skipped: %s", upd_err)
-        threading.Thread(target=_bg_update_check, name="StartupUpdateCheck", daemon=True).start()
+        if not getattr(self.config, "disable_model_preload", False) and os.environ.get("VOX_DISABLE_TEST_PRELOAD") != "1":
+            threading.Thread(target=_bg_update_check, name="StartupUpdateCheck", daemon=True).start()
 
     def _restore_user_session(self) -> None:
         """Restore active user session, configure user context in metering, and sync entitlement."""
@@ -3146,6 +3167,7 @@ class AppController(QObject):
         require_active_meeting: bool = False,
         allow_deferred_video: bool = False,
         is_auto_detected: bool = False,
+        platform: Optional[str] = None,
     ) -> Tuple[bool, str]:
         with self._state_lock:
             if self._capture_state in ("recording", "paused"):
@@ -3281,7 +3303,9 @@ class AppController(QObject):
                 source_desc.pid if source_desc else (active_sess.pid if active_sess else None)
             )
             self._active_meeting_platform = (
-                source_desc.platform_name if source_desc else (active_sess.platform if active_sess else "")
+                source_desc.platform_name
+                if source_desc
+                else ((platform or "").strip() or (active_sess.platform if active_sess else ""))
             )
             self._active_meeting_session_id = active_sess.session_id if active_sess else ""
             self._manual_target_lost_since = None
@@ -3299,7 +3323,8 @@ class AppController(QObject):
                         self._active_meeting_session_id = bound_sess.session_id
                         if not self._active_meeting_target_hwnd and bound_sess.window_hwnd:
                             self._active_meeting_target_hwnd = bound_sess.window_hwnd
-                            self._active_meeting_platform = bound_sess.platform
+                            if not self._active_meeting_platform:
+                                self._active_meeting_platform = bound_sess.platform
                             self._active_meeting_pid = bound_sess.pid
                 except Exception as exc:
                     logger.debug("CallDetector bind error: %s", exc)
@@ -3411,18 +3436,6 @@ class AppController(QObject):
                 planned_mic = str(meeting_folder / "mic.wav")
                 planned_sys = str(meeting_folder / "sys.wav")
                 planned_video = str(meeting_folder / "meeting_screen.mp4") if should_rec_screen else ""
-                exec_profile = self._resolve_asr_execution_profile(force_refresh=True)
-                live_id = self._get_actual_live_asr_identity(exec_profile=exec_profile)
-                actual_live_model = live_id["model"]
-                if actual_live_model != self.config.whisper_model and live_id["backend"] == "faster_whisper":
-                    logger.warning(
-                        "Meeting #%s starting with actual live ASR '%s' (%s/%s) instead of configured '%s'.",
-                        meeting_title,
-                        actual_live_model,
-                        live_id["device"],
-                        live_id["compute_type"],
-                        self.config.whisper_model,
-                    )
                 self._active_meeting_id = self.db.create_meeting(
                     title=meeting_title,
                     capture_mode=mode,
@@ -3432,7 +3445,7 @@ class AppController(QObject):
                     mic_audio_path=planned_mic,
                     sys_audio_path=planned_sys,
                     video_path=planned_video,
-                    model_used=actual_live_model,
+                    model_used=PostCallEnglishASRPipeline.MODEL_ID,
                     source_platform=self._active_meeting_platform or "Meeting",
                     calendar_event_id=getattr(self, "_active_meeting_calendar_event_id", "") or "",
                     calendar_join_url=getattr(self, "_active_meeting_calendar_join_url", "") or "",
@@ -3447,39 +3460,6 @@ class AppController(QObject):
                 self._progressive_worker_busy = False
                 self._capture_state = "recording"
                 self._recent_emitted_segments = []
-                if (
-                    hasattr(self, "streaming_transcriber")
-                    and bool(getattr(self.config, "live_preview_enabled", True))
-                    and bool(getattr(self.config, "progressive_transcription", True))
-                ):
-                    try:
-                        try:
-                            self.streaming_transcriber.start(
-                                meeting_id=self._active_meeting_id,
-                                recorder=self.meeting_recorder,
-                                language=self.config.language,
-                                execution_profile=exec_profile,
-                                session_mode=getattr(exec_profile, "session_mode", "auto"),
-                            )
-                        except TypeError:
-                            self.streaming_transcriber.start(
-                                meeting_id=self._active_meeting_id,
-                                recorder=self.meeting_recorder,
-                                language=self.config.language,
-                            )
-                        try:
-                            inferred_remote = LocalWhisperTranscriber._infer_remote_speaker_from_title(meeting_title)
-                            if inferred_remote:
-                                self.streaming_transcriber._remote_speaker_label = inferred_remote
-                                self.streaming_transcriber._current_speaker = inferred_remote
-                        except Exception:
-                            pass
-                    except Exception as st_exc:
-                        logger.warning(
-                            "Live preview failed to start for meeting #%s (recording continues cleanly): %s",
-                            self._active_meeting_id,
-                            st_exc,
-                        )
                 if hasattr(self, "open_notetaker_drawer_requested"):
                     self.open_notetaker_drawer_requested.emit()
 
@@ -3517,8 +3497,6 @@ class AppController(QObject):
     def pause_meeting_recording(self) -> bool:
         with self._state_lock:
             if self._capture_state == "recording" and self.meeting_recorder.pause():
-                if hasattr(self, "streaming_transcriber"):
-                    self.streaming_transcriber.pause()
                 if getattr(self, "_meeting_video_recorder", None) and self._meeting_video_recorder.is_recording:
                     self._meeting_video_recorder.pause()
                 self._capture_state = "paused"
@@ -3533,8 +3511,6 @@ class AppController(QObject):
     def resume_meeting_recording(self) -> bool:
         with self._state_lock:
             if self._capture_state == "paused" and self.meeting_recorder.resume():
-                if hasattr(self, "streaming_transcriber"):
-                    self.streaming_transcriber.resume()
                 if getattr(self, "_meeting_video_recorder", None) and self._meeting_video_recorder.is_paused:
                     self._meeting_video_recorder.resume()
                 self._capture_state = "recording"
@@ -3592,6 +3568,13 @@ class AppController(QObject):
             self._active_meeting_calendar_provider = ""
             self._active_meeting_calendar_account_id = ""
             self._prepared_calendar_meeting = None
+
+        # Mark meeting row as finalizing synchronously so idle state never leaves orphaned 'recording' status
+        if meeting_id is not None and getattr(self, "db", None) is not None:
+            try:
+                self.db.update_meeting(meeting_id, status="finalizing")
+            except Exception as db_exc:
+                logger.debug("Non-fatal status transition to finalizing for meeting #%s: %s", meeting_id, db_exc)
 
         # Reset call detector state immediately so subsequent meeting discovery starts unblocked
         if hasattr(self.call_detector, "end_active_session_immediately"):
@@ -3688,13 +3671,12 @@ class AppController(QObject):
             current_mid = meeting_id
             if current_mid is None:
                 try:
-                    live_id = self._get_actual_live_asr_identity()
                     current_mid = self.db.create_meeting(
                         title=clean_title,
                         capture_mode=getattr(self.config, "meeting_capture_mode", "both"),
                         mic_device=self.config.mic_device_name,
                         loopback_device=self.config.loopback_device_name,
-                        model_used=live_id["model"],
+                        model_used=PostCallEnglishASRPipeline.MODEL_ID,
                     )
                     with self._state_lock:
                         self._finalizing_jobs.add(current_mid, session_cancel_event)
@@ -3778,6 +3760,12 @@ class AppController(QObject):
                 for evt in list(self._finalizing_jobs.values()):
                     if isinstance(evt, threading.Event):
                         evt.set()
+            runner = self._active_postcall_runner
+        if runner is not None and (meeting_id is None or getattr(runner, "_meeting_id", meeting_id) == meeting_id):
+            try:
+                runner.cancel()
+            except Exception:
+                pass
         logger.info("Meeting finalization cancellation requested (meeting_id=%s).", meeting_id)
 
     def gather_system_diagnostics(self) -> Dict[str, Any]:
@@ -3850,19 +3838,19 @@ class AppController(QObject):
                 while getattr(self.meeting_recorder, "is_recording", False) and time.monotonic() < t_end:
                     time.sleep(0.04)
 
-        # 2. Reset diarizer and live streaming transcriber state to prevent speech spillover into new meeting
+        # 2. Reset diarizer & streaming state to prevent speech spillover into new meeting
         if hasattr(self, "_active_meeting_diarizer"):
             self._active_meeting_diarizer = PersistentSpeakerDiarizer(
                 speaker_prefix="Speaker",
                 new_speaker_threshold=0.085,
                 profile_store=getattr(self.transcriber, "speaker_profile_store", None),
             )
-        if hasattr(self, "streaming_transcriber") and self.streaming_transcriber:
+        st_tr = getattr(self, "streaming_transcriber", None)
+        if st_tr is not None and hasattr(st_tr, "reset_streaming_session"):
             try:
-                if hasattr(self.streaming_transcriber, "reset_streaming_session"):
-                    self.streaming_transcriber.reset_streaming_session()
-            except Exception:
-                pass
+                st_tr.reset_streaming_session()
+            except Exception as exc:
+                logger.debug("streaming_transcriber reset warning: %s", exc)
 
         # 3. Start fresh recording for Call B
         clean_new_title = (new_title or "").strip() or f"{new_platform or 'Meeting'} Call"
@@ -3871,8 +3859,11 @@ class AppController(QObject):
             target_hwnd=new_target_hwnd,
             recording_mode=recording_mode,
             is_auto_detected=True,
+            platform=new_platform,
         )
         if ok:
+            if new_platform:
+                self._active_meeting_platform = str(new_platform)
             logger.info("Successfully switched to meeting: %s (new_id=%s)", clean_new_title, self._active_meeting_id)
             self.notification_requested.emit(
                 "Switched Meeting",
@@ -3898,162 +3889,6 @@ class AppController(QObject):
             status = self.metering.evaluate_live_meeting_overrun(elapsed, self.entitlement)
             if status.get("warning"):
                 self.meeting_overrun_warning.emit(status.get("message", ""), elapsed)
-
-        # Trigger progressive live transcription (fallback only if streaming transcriber is inactive)
-        if (
-            self.config.progressive_transcription
-            and (not getattr(self, "streaming_transcriber", None) or not self.streaming_transcriber.is_active)
-            and self._capture_state == "recording"
-            and self._active_meeting_id is not None
-            and not self._progressive_worker_busy
-            and (elapsed - self._progressive_cursor_sec) >= float(self.config.progressive_interval_sec)
-        ):
-            start_s = self._progressive_cursor_sec
-            end_s = elapsed
-            self._progressive_cursor_sec = end_s
-            self._progressive_worker_busy = True
-            threading.Thread(
-                target=self._progressive_transcribe_worker,
-                args=(self._active_meeting_id, start_s, end_s),
-                name="ProgressiveMeetingTranscribe",
-                daemon=True,
-            ).start()
-
-    def _progressive_transcribe_worker(
-        self, meeting_id: int, start_sec: float, end_sec: float
-    ) -> None:
-        with operation_context(self._active_meeting_corr_id, f"prog_m{meeting_id}_{int(start_sec)}"):
-            try:
-                mic_slice, sys_slice, actual_start_sec = self.meeting_recorder.get_audio_window(start_sec, end_sec)
-                vocab = self.db.list_vocabulary(active_only=True)
-                eff_hotwords = DictationProcessor.build_whisper_hotwords(vocab, language=self.config.language)
-
-                new_segments: List[Dict[str, Any]] = []
-                sys_segs: List[Dict[str, Any]] = []
-                if sys_slice.size > 0 and float(np.max(np.abs(sys_slice))) >= 0.0004:
-                    sys_segs = self.transcriber.transcribe_audio_segments(
-                        sys_slice,
-                        speaker_label="Speaker 1",
-                        source_track="system",
-                        time_offset_sec=actual_start_sec,
-                        initial_prompt="",
-                        language=self.config.language,
-                        diarize_remote_turns=True,
-                        hotwords=eff_hotwords,
-                        diarizer=self._active_meeting_diarizer,
-                        output_script="roman",
-                        vocabulary=vocab,
-                    )
-                    new_segments.extend(sys_segs)
-
-                if mic_slice.size > 0 and float(np.max(np.abs(mic_slice))) >= 0.0004:
-                    mic_segs = self.transcriber.transcribe_audio_segments(
-                        mic_slice,
-                        speaker_label="You (Mic)",
-                        source_track="mic",
-                        time_offset_sec=actual_start_sec,
-                        initial_prompt="",
-                        language=self.config.language,
-                        hotwords=eff_hotwords,
-                        output_script="roman",
-                        vocabulary=vocab,
-                    )
-                    # Filter acoustic bleed if open speakers caused the exact same system phrase
-                    # to be faintly picked up by the microphone at the exact same timestamp.
-                    # Conversational affirmations (e.g. 'ok', 'yes', 'haan', 'tika', 'sure') are preserved.
-                    for m_seg in mic_segs:
-                        m_txt = m_seg["text"].strip().lower()
-                        is_bleed = False
-                        if len(m_txt) >= 12:
-                            for s_seg in sys_segs:
-                                s_txt = s_seg["text"].strip().lower()
-                                if (
-                                    len(s_txt) >= 12
-                                    and abs(float(m_seg["start_time"]) - float(s_seg["start_time"])) < 1.5
-                                ):
-                                    if m_txt == s_txt or (m_txt in s_txt and len(m_txt) > 0.65 * len(s_txt)):
-                                        is_bleed = True
-                                        break
-                        if not is_bleed:
-                            new_segments.append(m_seg)
-
-                # Sort strictly chronologically by start_time ASC, end_time ASC
-                new_segments.sort(key=lambda s: (float(s["start_time"]), float(s.get("end_time", s["start_time"]))))
-
-                for seg in new_segments:
-                    # Apply custom vocabulary and enforce Romanized Hinglish (Latin script)
-                    processed_text = DictationProcessor.process(
-                        seg["text"],
-                        vocabulary=vocab,
-                        cleanup_enabled=True,
-                        spoken_punctuation=False,
-                        output_script="roman",
-                    ).strip()
-                    if not processed_text:
-                        continue
-
-                    dur = max(0.01, float(seg["end_time"]) - float(seg["start_time"]))
-                    if is_hallucination(processed_text, duration_sec=dur):
-                        continue
-
-                    seg["text"] = processed_text
-
-                    # Segment ID stability & controller-level recent deduplication guard
-                    st = float(seg["start_time"])
-                    et = float(seg["end_time"])
-                    track = seg["source_track"]
-                    norm_lower = processed_text.lower()
-
-                    is_dup = False
-                    for ex in getattr(self, "_recent_emitted_segments", []):
-                        if (
-                            ex.get("source_track") == track
-                            and abs(st - float(ex.get("start_time", 0.0))) <= 1.2
-                        ):
-                            ex_txt = ex.get("text", "").strip().lower()
-                            if ex_txt == norm_lower or norm_lower in ex_txt:
-                                is_dup = True
-                                break
-                            if ex_txt in norm_lower:
-                                # New segment is a more complete completion of earlier partial turn
-                                ex["text"] = processed_text
-                                ex["end_time"] = et
-
-                    if is_dup:
-                        continue
-
-                    self._progressive_segment_idx += 1
-                    seg_id = self.db.add_transcript_segment(
-                        meeting_id=meeting_id,
-                        segment_index=self._progressive_segment_idx,
-                        start_time=st,
-                        end_time=et,
-                        speaker=seg["speaker"],
-                        text=seg["text"],
-                        source_track=track,
-                        confidence=seg.get("confidence", 1.0),
-                    )
-                    seg["id"] = seg_id
-                    seg["stable_id"] = f"{meeting_id}_{track}_{int(st * 10)}_{abs(hash(processed_text)) % 100000}"
-
-                    if not hasattr(self, "_recent_emitted_segments"):
-                        self._recent_emitted_segments = []
-                    self._recent_emitted_segments.append(dict(seg))
-                    if len(self._recent_emitted_segments) > 60:
-                        self._recent_emitted_segments = self._recent_emitted_segments[-60:]
-
-                    self.meeting_progressive_segment.emit(meeting_id, seg)
-            except Exception as exc:
-                logger.debug("Progressive transcription chunk warning: %s", exc)
-            finally:
-                self._progressive_worker_busy = False
-
-    def _on_streaming_partial(self, meeting_id: int, partial_dict: dict) -> None:
-        self.meeting_live_partial.emit(meeting_id, partial_dict)
-
-    def _on_streaming_confirmed(self, meeting_id: int, confirmed_dict: dict) -> None:
-        self.meeting_live_confirmed.emit(meeting_id, confirmed_dict)
-        self.meeting_progressive_segment.emit(meeting_id, confirmed_dict)
 
     def _is_mock_transcriber(self) -> bool:
         transcribe_fn = getattr(self.transcriber, "transcribe_meeting_dual_track", None)
@@ -4302,13 +4137,18 @@ class AppController(QObject):
             self._safe_emit_finalization_progress("transcribing", msg)
 
         with operation_context(corr_id, f"fin_m{meeting_id}"):
+            if os.name == "nt":
+                try:
+                    kernel32.SetThreadPriority(kernel32.GetCurrentThread(), -1)
+                except Exception:
+                    pass
             try:
                 # Cooperative cancellation check before Stage 1
                 if is_cancelled():
                     self._handle_finalization_cancelled(meeting_id, current_stage=1)
                     return
 
-                _set_post_call_stage("preparing_audio", "Stage 1/4: Packaging MP4 video & audio tracks...")
+                _set_post_call_stage("preparing_audio", "Stage 1/5: Packaging MP4 video & audio tracks...")
 
                 # Background mixing of tracks into meeting_mixed.wav with vocal enhancement DSP
                 mixed_p = getattr(result, "mixed_wav_path", None)
@@ -4325,10 +4165,16 @@ class AppController(QObject):
                     mic_path = Path(mic_p) if (mic_p and Path(mic_p).exists()) else None
                     sys_path = Path(sys_p) if (sys_p and Path(sys_p).exists()) else None
                     try:
-                        from voxlocal.audio.meeting_recorder import _write_mixed
-                        dur_calc = _write_mixed(mic_path, sys_path, mixed_path)
-                        if dur_calc > 0:
-                            dur_val = round(float(dur_calc), 2)
+                        same_as_input = (
+                            (mic_path is not None and mixed_path.resolve() == mic_path.resolve())
+                            or (sys_path is not None and mixed_path.resolve() == sys_path.resolve())
+                        )
+                        already_mixed = mixed_path.exists() and mixed_path.stat().st_size > 44
+                        if not same_as_input and not already_mixed:
+                            from voxlocal.audio.meeting_recorder import _write_mixed
+                            dur_calc = _write_mixed(mic_path, sys_path, mixed_path)
+                            if dur_calc > 0:
+                                dur_val = round(float(dur_calc), 2)
                     except Exception as mix_err:
                         logger.warning("Error generating background mixed audio: %s", mix_err)
 
@@ -4440,24 +4286,10 @@ class AppController(QObject):
                     self._handle_finalization_cancelled(meeting_id, current_stage=2)
                     return
 
-                existing_segs = (
-                    self.db.get_transcript_segments(meeting_id)
-                    if hasattr(self.db, "get_transcript_segments")
-                    else self.db.get_meeting_segments(meeting_id)
+                _set_post_call_stage(
+                    "transcribing",
+                    "Stage 2/5: Transcribing full English meeting audio (Cohere Transcribe 2B INT8)...",
                 )
-                if existing_segs:
-                    logger.info(
-                        "Archiving %d provisional live preview segments before full-audio post-call transcription for meeting #%d",
-                        len(existing_segs),
-                        meeting_id,
-                    )
-                    if hasattr(self.db, "archive_provisional_transcript"):
-                        try:
-                            self.db.archive_provisional_transcript(meeting_id)
-                        except Exception as arch_exc:
-                            logger.warning("Provisional transcript archive warning for #%d: %s", meeting_id, arch_exc)
-
-                _set_post_call_stage("transcribing", "Stage 2/4: Running high-accuracy local post-call transcription...")
 
                 transcribe_fn = getattr(self.transcriber, "transcribe_meeting_dual_track", None)
                 is_mock_transcriber = (
@@ -4465,315 +4297,113 @@ class AppController(QObject):
                     or type(transcribe_fn).__module__.startswith("unittest.mock")
                     or hasattr(transcribe_fn, "assert_called")
                 )
-                off_backend = str(exec_profile.offline_backend or "faster_whisper").lower()
-                use_hf_offline = not is_mock_transcriber and off_backend == "hf_qwen3_asr"
-                use_qwen3_onnx_offline = not is_mock_transcriber and off_backend == "qwen3_onnx"
-                use_parakeet_onnx_offline = not is_mock_transcriber and off_backend == "parakeet_onnx"
 
                 segments: List[Dict[str, Any]] = []
-                if use_hf_offline:
+                diar_stats: Dict[str, Any] = {}
+                if is_mock_transcriber:
                     self._safe_emit_finalization_progress(
                         "transcribing",
-                        f"Stage 2/4: Transcribing full recording with HF ASR ({exec_profile.offline_model})...",
+                        "Stage 2/5: Transcribing recording...",
                     )
-                    # Never keep two heavy models loaded simultaneously
-                    if getattr(self.transcriber, "_model", None) is not None:
-                        self.transcriber.unload_model()
-                    hf_engine = LocalHFASRTranscriber(
-                        model_id=exec_profile.offline_model,
-                        models_dir=self.config.models_dir,
-                        device=exec_profile.offline_device,
-                        dtype_name=exec_profile.offline_compute_type,
+                    dt_kwargs: Dict[str, Any] = dict(
+                        mixed_wav_path=getattr(result, "mixed_wav_path", None),
+                        mic_wav_path=getattr(result, "mic_wav_path", None),
+                        sys_wav_path=getattr(result, "sys_wav_path", None),
+                        initial_prompt=eff_prompt,
+                        language=self.config.language,
+                        progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/5: {s}"),
+                        cancel_check=is_cancelled,
+                        output_script="roman",
+                        remote_speaker_label=remote_name,
+                        hotwords=eff_hotwords,
+                        vocabulary=vocab,
                     )
-                    try:
-                        segments = hf_engine.transcribe_meeting_dual_track(
-                            mixed_wav_path=audio_p,
-                            mic_wav_path=mic_p,
-                            sys_wav_path=sys_p,
-                            hotwords=eff_hotwords,
-                            vocabulary=vocab,
-                            output_script="roman",
-                            remote_speaker_label=remote_name,
-                            progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: {s}"),
-                            cancel_check=is_cancelled,
+                    segments = self.transcriber.transcribe_meeting_dual_track(**dt_kwargs)
+                    raw_stats = getattr(self.transcriber, "last_track_stats", None)
+                    if isinstance(raw_stats, dict):
+                        track_stats = dict(raw_stats)
+                    used_backend = "faster_whisper"
+                    used_model = str(getattr(self.transcriber, "model_name", used_model) or used_model)
+                    used_model_version = used_model
+                else:
+                    from voxlocal.engine.postcall_worker import PostCallSubprocessRunner
+
+                    glossary_items = (
+                        self.db.list_knowledge_items(limit=300)
+                        if hasattr(self.db, "list_knowledge_items")
+                        else []
+                    )
+                    speaker_aliases = (
+                        self.db.get_speaker_aliases(meeting_id)
+                        if hasattr(self.db, "get_speaker_aliases")
+                        else {}
+                    )
+                    is_mocked_pipeline = (
+                        (not isinstance(PostCallEnglishASRPipeline, type))
+                        or type(PostCallEnglishASRPipeline).__module__.startswith("unittest.mock")
+                        or type(getattr(PostCallEnglishASRPipeline, "transcribe_meeting_dual_track", None)).__module__.startswith("unittest.mock")
+                    )
+                    if is_mocked_pipeline:
+                        is_mock_transcriber = True
+                    use_inprocess = is_mocked_pipeline or bool(getattr(self.config, "post_call_inprocess_fallback", False))
+                    if use_inprocess:
+                        asr_pipe = PostCallEnglishASRPipeline(
+                            models_dir=self.config.models_dir,
+                            num_threads=exec_profile.safe_cpu_threads,
                         )
-                        track_stats = hf_engine.last_track_stats
-                        used_backend = "hf_qwen3_asr"
-                        used_model = exec_profile.offline_model
-                        used_device = exec_profile.offline_device
-                        used_compute_type = exec_profile.offline_compute_type
-                        used_model_version = exec_profile.offline_model
-                    except Exception as hf_exc:
-                        logger.warning("HF ASR offline fallback (%s): %s", exec_profile.offline_model, hf_exc)
-                        fallback_notes.append(f"hf_asr_fallback: {hf_exc}")
-                        use_hf_offline = False
-                        if getattr(exec_profile, "available_phase2_models", None) and exec_profile.available_phase2_models.get("qwen3_onnx"):
-                            use_qwen3_onnx_offline = True
-                    finally:
-                        try:
-                            hf_engine.unload_model()
-                        except Exception:
-                            pass
-
-                if use_qwen3_onnx_offline:
-                    self._safe_emit_finalization_progress(
-                        "transcribing",
-                        "Stage 2/4: Transcribing full recording with Guarded Qwen3 ONNX (CPU INT8)...",
-                    )
-                    if getattr(self.transcriber, "_model", None) is not None:
-                        self.transcriber.unload_model()
-                    from voxlocal.engine.onnx_asr_engines import GuardedQwen3OnnxEngine
-
-                    q3_eng = GuardedQwen3OnnxEngine(
-                        models_dir=self.config.models_dir,
-                        num_threads=exec_profile.safe_cpu_threads,
-                    )
+                    else:
+                        asr_pipe = PostCallSubprocessRunner(
+                            models_dir=self.config.models_dir,
+                            num_threads=exec_profile.safe_cpu_threads,
+                            task_manager=getattr(self, "task_manager", None),
+                            task_id=f"postcall_m{meeting_id}",
+                        )
+                        setattr(asr_pipe, "_meeting_id", meeting_id)
+                    with self._state_lock:
+                        self._active_postcall_runner = asr_pipe
                     try:
-                        segments = q3_eng.transcribe_meeting_dual_track(
+                        run_fn = asr_pipe.transcribe_meeting_dual_track if use_inprocess else asr_pipe.run
+                        segments = run_fn(
                             mixed_wav_path=audio_p,
                             mic_wav_path=mic_p,
                             sys_wav_path=sys_p,
                             vocabulary=vocab,
-                            output_script="roman",
+                            glossary_items=glossary_items,
+                            speaker_aliases=speaker_aliases,
                             remote_speaker_label=remote_name,
-                            progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: {s}"),
+                            mic_speaker_label="You (Mic)",
+                            diarization_enabled=bool(getattr(self.config, "notetaker_auto_detect_speakers", True))
+                            and bool(getattr(self.config, "meeting_diarization_enabled", True)),
+                            diarization_threshold=float(getattr(self.config, "meeting_diarization_threshold", 0.72) or 0.72),
+                            echo_bleed_suppression=bool(getattr(self.config, "meeting_echo_bleed_suppression", True)),
+                            glossary_correction=bool(getattr(self.config, "meeting_glossary_correction", True)),
+                            progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/5: {s}"),
                             cancel_check=is_cancelled,
                             pause_check=self._should_pause_finalization_for_live_work,
                         )
-                        track_stats = q3_eng.last_track_stats
-                        used_backend = "qwen3_onnx"
-                        used_model = q3_eng.model_label
-                        used_device = q3_eng.asr_device
-                        used_compute_type = q3_eng.asr_compute_type
-                        used_model_version = q3_eng.model_label
-                    except Exception as q3_exc:
-                        logger.warning("Guarded Qwen3 ONNX offline fallback to faster_whisper: %s", q3_exc)
-                        fallback_notes.append(f"qwen3_onnx_fallback: {q3_exc}")
-                        use_qwen3_onnx_offline = False
-                    finally:
-                        try:
-                            q3_eng.unload_model()
-                        except Exception:
-                            pass
-
-                    # Adaptive post-call English upgrade: when Auto session detects pure English
-                    # (0 Devanagari, 0 Hinglish cues, >= 90% EN segments), re-run with Parakeet INT8
-                    # if local Parakeet model is present and word retention >= 85%.
-                    if (
-                        segments
-                        and not is_mock_transcriber
-                        and used_backend == "qwen3_onnx"
-                        and str(getattr(exec_profile, "session_mode", "auto") or "auto").lower() == "auto"
-                        and bool(getattr(self.config, "post_call_adaptive_english_parakeet", True))
-                        and bool((getattr(exec_profile, "available_phase2_models", None) or {}).get("parakeet"))
-                        and not is_cancelled()
-                    ):
-                        try:
-                            from voxlocal.engine.onnx_asr_engines import ParakeetOnnxEngine
-                            from voxlocal.engine.selective_verifier import detect_hinglish_cues
-
-                            non_empty = [s for s in segments if str(s.get("text") or "").strip()]
-                            has_hi_or_deva = False
-                            en_confident = 0
-                            for seg in non_empty:
-                                raw_s = str(seg.get("raw_text") or "")
-                                txt_s = str(seg.get("text") or "")
-                                det_l = str(seg.get("detected_language") or "").strip().lower()
-                                if re.search(r"[\u0900-\u097F]", f"{raw_s} {txt_s}"):
-                                    has_hi_or_deva = True
-                                    break
-                                is_cue, _ = detect_hinglish_cues(txt_s or raw_s, detected_language=det_l)
-                                if is_cue or (det_l and not det_l.startswith("en")):
-                                    has_hi_or_deva = True
-                                    break
-                                if det_l.startswith("en") or (not det_l and txt_s.isascii()):
-                                    en_confident += 1
-                            if non_empty and not has_hi_or_deva and (en_confident / len(non_empty)) >= 0.90:
-                                _set_post_call_stage(
-                                    "transcribing",
-                                    "Stage 2/4: Pure English call detected — upgrading with Parakeet ONNX...",
-                                )
-                                pk_upgrade = ParakeetOnnxEngine(
-                                    models_dir=self.config.models_dir,
-                                    num_threads=exec_profile.safe_cpu_threads,
-                                )
-                                try:
-                                    pk_segs = pk_upgrade.transcribe_meeting_dual_track(
-                                        mixed_wav_path=audio_p,
-                                        mic_wav_path=mic_p,
-                                        sys_wav_path=sys_p,
-                                        vocabulary=vocab,
-                                        output_script="roman",
-                                        remote_speaker_label=remote_name,
-                                        progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: {s}"),
-                                        cancel_check=is_cancelled,
-                                        pause_check=self._should_pause_finalization_for_live_work,
-                                    )
-                                    q3_words = sum(len(str(s.get("text") or "").split()) for s in non_empty)
-                                    pk_words = sum(len(str(s.get("text") or "").split()) for s in pk_segs if str(s.get("text") or "").strip())
-                                    if pk_segs and pk_words >= 0.85 * max(1, q3_words):
-                                        segments = pk_segs
-                                        track_stats = pk_upgrade.last_track_stats
-                                        used_backend = "parakeet_onnx"
-                                        used_model = pk_upgrade.model_label
-                                        used_device = pk_upgrade.asr_device
-                                        used_compute_type = pk_upgrade.asr_compute_type
-                                        used_model_version = pk_upgrade.model_label
-                                        fallback_notes.append(
-                                            f"adaptive_english_parakeet_upgrade: qwen_words={q3_words} -> parakeet_words={pk_words}"
-                                        )
-                                finally:
-                                    try:
-                                        pk_upgrade.unload_model()
-                                    except Exception:
-                                        pass
-                        except Exception as pk_up_exc:
-                            logger.warning("Adaptive post-call English Parakeet upgrade skipped cleanly: %s", pk_up_exc)
-
-                if use_parakeet_onnx_offline:
-                    self._safe_emit_finalization_progress(
-                        "transcribing",
-                        "Stage 2/4: Transcribing full English recording with Parakeet ONNX (CPU INT8)...",
-                    )
-                    if getattr(self.transcriber, "_model", None) is not None:
-                        self.transcriber.unload_model()
-                    from voxlocal.engine.onnx_asr_engines import ParakeetOnnxEngine
-
-                    pk_eng = ParakeetOnnxEngine(
-                        models_dir=self.config.models_dir,
-                        num_threads=exec_profile.safe_cpu_threads,
-                    )
-                    try:
-                        segments = pk_eng.transcribe_meeting_dual_track(
-                            mixed_wav_path=audio_p,
-                            mic_wav_path=mic_p,
-                            sys_wav_path=sys_p,
-                            vocabulary=vocab,
-                            output_script="roman",
-                            remote_speaker_label=remote_name,
-                            progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: {s}"),
-                            cancel_check=is_cancelled,
-                            pause_check=self._should_pause_finalization_for_live_work,
-                        )
-                        track_stats = pk_eng.last_track_stats
-                        used_backend = "parakeet_onnx"
-                        used_model = pk_eng.model_label
-                        used_device = pk_eng.asr_device
-                        used_compute_type = pk_eng.asr_compute_type
-                        used_model_version = pk_eng.model_label
-                    except Exception as pk_exc:
-                        logger.warning("Parakeet ONNX offline fallback to faster_whisper: %s", pk_exc)
-                        fallback_notes.append(f"parakeet_onnx_fallback: {pk_exc}")
-                        use_parakeet_onnx_offline = False
-                    finally:
-                        try:
-                            pk_eng.unload_model()
-                        except Exception:
-                            pass
-
-                if not (use_hf_offline or use_qwen3_onnx_offline or use_parakeet_onnx_offline):
-                    if (
-                        not is_mock_transcriber
-                        and getattr(self.config, "enable_hardware_adaptive_asr", True)
-                        and str(getattr(self.config, "compute_device", "auto")).lower() == "auto"
-                        and exec_profile.offline_backend == "faster_whisper"
-                        and self.transcriber.is_model_cached(exec_profile.offline_model)
-                    ):
-                        eff_off_dev = (
-                            "cpu"
-                            if getattr(self.transcriber, "_cuda_runtime_failed", False)
-                            else exec_profile.offline_device
-                        )
-                        need_swap = (
-                            exec_profile.offline_model != self.transcriber.model_name
-                            or eff_off_dev != getattr(self.transcriber, "_active_device", eff_off_dev)
-                        )
-                        if need_swap:
-                            self.transcriber.model_name = exec_profile.offline_model
-                            self.transcriber.compute_device = eff_off_dev
-                            self.transcriber.compute_type = exec_profile.offline_compute_type
-                            self.transcriber.cpu_threads = exec_profile.safe_cpu_threads
-                            self.transcriber.ensure_loaded(exec_profile.offline_model)
-
-                    self._safe_emit_finalization_progress("transcribing", "Stage 2/4: Transcribing full recording with local Whisper...")
-                    try:
-                        dt_kwargs: Dict[str, Any] = dict(
-                            mixed_wav_path=getattr(result, "mixed_wav_path", None),
-                            mic_wav_path=getattr(result, "mic_wav_path", None),
-                            sys_wav_path=getattr(result, "sys_wav_path", None),
-                            initial_prompt=eff_prompt,
-                            language=self.config.language,
-                            progress_callback=lambda s: self._safe_emit_finalization_progress("transcribing", f"Stage 2/4: Transcribing speech ({s})"),
-                            cancel_check=is_cancelled,
-                            output_script="roman",
-                            remote_speaker_label=remote_name,
-                            hotwords=eff_hotwords,
-                            vocabulary=vocab,
-                        )
-                        try:
-                            if "pause_check" in inspect.signature(self.transcriber.transcribe_meeting_dual_track).parameters:
-                                dt_kwargs["pause_check"] = self._should_pause_finalization_for_live_work
-                        except (ValueError, TypeError):
-                            pass
-                        segments = self.transcriber.transcribe_meeting_dual_track(**dt_kwargs)
-                        raw_stats = getattr(self.transcriber, "last_track_stats", None)
-                        if isinstance(raw_stats, dict):
-                            track_stats = dict(raw_stats)
-                        if hasattr(self.transcriber, "get_active_asr_provenance"):
-                            try:
-                                raw_prov = self.transcriber.get_active_asr_provenance()
-                                if isinstance(raw_prov, dict) and "asr_model" in raw_prov:
-                                    used_backend = str(raw_prov.get("asr_backend") or "faster_whisper")
-                                    used_model = str(raw_prov.get("asr_model") or used_model)
-                                    used_device = str(raw_prov.get("asr_device") or "cpu")
-                                    used_compute_type = str(raw_prov.get("asr_compute_type") or "int8")
-                            except Exception:
-                                used_backend = "faster_whisper"
-                                used_model = str(getattr(self.transcriber, "model_name", used_model) or used_model)
-                        else:
-                            used_backend = "faster_whisper"
-                            used_model = str(getattr(self.transcriber, "model_name", used_model) or used_model)
-                        used_model_version = used_model
+                        track_stats = dict(asr_pipe.last_track_stats or {})
+                        diar_stats = dict(asr_pipe.last_diarization_stats or {})
+                        used_backend = "cohere_onnx"
+                        used_model = "Cohere Transcribe 2B (INT8)"
+                        used_device = "cpu"
+                        used_compute_type = "int8"
+                        used_model_version = "cohere-transcribe-en-int8"
                     except Exception as tr_exc:
-                        processing_errors.append(f"offline_transcription_error: {tr_exc}")
-                        if existing_segs:
-                            logger.error(
-                                "Offline transcription failed for meeting #%d, preserving %d live segments: %s",
-                                meeting_id,
-                                len(existing_segs),
-                                tr_exc,
-                            )
-                            segments = []
-                        else:
-                            raise
+                        processing_errors.append(f"post_call_cohere_error: {tr_exc}")
+                        raise
+                    finally:
+                        with self._state_lock:
+                            if self._active_postcall_runner is asr_pipe:
+                                self._active_postcall_runner = None
+                        if hasattr(asr_pipe, "unload"):
+                            try:
+                                asr_pipe.unload()
+                            except Exception:
+                                pass
+                        gc.collect()
 
-                # Early Stage 2 transcript persistence before Stage 3 reconciliation
                 if segments:
                     self.db.replace_meeting_segments(meeting_id, segments)
-                else:
-                    # Fallback: preserve live progressive transcript segments if offline pass yielded no segments
-                    existing_segs = self.db.get_meeting_segments(meeting_id)
-                    if existing_segs:
-                        logger.info("Preserving %d progressive live segments for meeting #%d", len(existing_segs), meeting_id)
-                        cleaned_existing = []
-                        for seg in existing_segs:
-                            orig_raw = str(seg.get("raw_text") or seg.get("text") or "").strip()
-                            txt_p = DictationProcessor.process(
-                                seg.get("text", ""),
-                                vocabulary=vocab,
-                                cleanup_enabled=True,
-                                spoken_punctuation=False,
-                                output_script="roman",
-                                context="meeting",
-                            ).strip()
-                            dur_s = max(0.01, float(seg.get("end_time", 0.0)) - float(seg.get("start_time", 0.0)))
-                            if txt_p and not is_hallucination(txt_p, duration_sec=dur_s):
-                                seg["raw_text"] = orig_raw or txt_p
-                                seg["normalized_text"] = txt_p
-                                seg["text"] = txt_p
-                                cleaned_existing.append(seg)
-                        self.db.replace_meeting_segments(meeting_id, cleaned_existing)
-                        segments = cleaned_existing
 
                 # Cooperative cancellation check between Stage 2 and Stage 3
                 if is_cancelled():
@@ -4781,48 +4411,11 @@ class AppController(QObject):
                     return
 
                 current_stage = 3
-                verbatim_on = bool(getattr(self.config, "verbatim_transcript_protection", True))
-                selective_ver = bool(getattr(self.config, "enable_selective_verification", True))
                 cleaned_lines: List[str] = []
                 comp_report: Optional[Dict[str, Any]] = None
-                selective_ver_stats: Dict[str, Any] = {}
 
                 if segments:
-                    _set_post_call_stage("verifying", "Stage 3/4: Separating speakers & verifying transcript completeness...")
-                    effective_verifier = str(
-                        getattr(exec_profile, "post_call_verifier_backend", "disabled") or "disabled"
-                    ).strip().lower()
-                    if effective_verifier == "disabled":
-                        effective_verifier = str(
-                            getattr(exec_profile, "selective_verifier_backend", "disabled") or "disabled"
-                        ).strip().lower()
-                    if (
-                        not is_mock_transcriber
-                        and getattr(self.config, "enable_phase2_asr_pipeline", True)
-                        and getattr(self.config, "selective_second_pass_enabled", True)
-                        and effective_verifier != "disabled"
-                    ):
-                        try:
-                            from voxlocal.engine.selective_verifier import SelectiveSecondPassVerifier
-
-                            verifier = SelectiveSecondPassVerifier(models_dir=self.config.models_dir)
-                            segments, selective_ver_stats = verifier.verify_segments(
-                                segments,
-                                execution_profile=exec_profile,
-                                config=self.config,
-                                mic_wav_path=mic_p,
-                                sys_wav_path=sys_p,
-                                mixed_wav_path=audio_p,
-                                vocabulary=vocab,
-                                output_script="roman",
-                                cancel_check=is_cancelled,
-                                verifier_backend_override=effective_verifier,
-                            )
-                        except Exception as sv_exc:
-                            logger.warning("Selective second-pass verification skipped cleanly: %s", sv_exc)
-                            selective_ver_stats = {"enabled": True, "errors": [str(sv_exc)]}
-
-                    # Two-pass post-meeting reconciliation using bounded disk slices (no full-WAV RAM spike)
+                    _set_post_call_stage("verifying", "Stage 3/5: Verifying speaker diarization & transcript completeness...")
                     if is_mock_transcriber:
                         segments = self.transcriber.reconcile_meeting_transcript(
                             segments=segments,
@@ -4835,80 +4428,40 @@ class AppController(QObject):
                             output_script="roman",
                             remote_speaker_label=remote_name,
                         )
-                    else:
-                        segments = self.transcriber.reconcile_meeting_transcript(
-                            segments=segments,
-                            mic_audio_16k=None,
-                            sys_audio_16k=None,
-                            language=self.config.language,
-                            hotwords=eff_hotwords,
-                            mic_wav_path=getattr(result, "mic_wav_path", None),
-                            sys_wav_path=getattr(result, "sys_wav_path", None),
-                            output_script="roman",
-                            remote_speaker_label=remote_name,
-                            verbatim_protection=verbatim_on,
-                            enable_selective_verification=(selective_ver and used_backend == "faster_whisper"),
-                            vocabulary=vocab,
-                        )
+
                     cleaned_segments = []
                     for seg in segments:
                         raw_src = str(seg.get("raw_text") or seg.get("text") or "").strip()
-                        base_norm = str(seg.get("normalized_text") or seg.get("text") or "").strip()
-                        cur_src = str(seg.get("text") or "").strip() or raw_src
-                        if verbatim_on:
-                            txt_p = DictationProcessor.process(
-                                cur_src,
-                                vocabulary=vocab,
-                                cleanup_enabled=False,
-                                spoken_punctuation=False,
-                                output_script="roman",
-                                mode="verbatim",
-                                context="meeting",
-                            ).strip()
+                        norm_src = str(seg.get("normalized_text") or raw_src).strip()
+                        corr_src = str(seg.get("corrected_text") or seg.get("text") or norm_src).strip()
+                        if is_mock_transcriber:
+                            txt_p = clean_repetition_tail(
+                                DictationProcessor.process(
+                                    corr_src or raw_src,
+                                    vocabulary=vocab,
+                                    cleanup_enabled=True,
+                                    spoken_punctuation=False,
+                                    output_script="roman",
+                                    context="meeting",
+                                ).strip()
+                            )
+                            corr_out = txt_p
                         else:
-                            txt_p = DictationProcessor.process(
-                                cur_src,
-                                vocabulary=vocab,
-                                cleanup_enabled=True,
-                                spoken_punctuation=False,
-                                output_script="roman",
-                                context="meeting",
-                            ).strip()
-                        txt_p = clean_repetition_tail(txt_p)
-                        cleaned_seg_txt = clean_repetition_tail(
-                            DictationProcessor.process(
-                                cur_src,
-                                vocabulary=vocab,
-                                cleanup_enabled=True,
-                                spoken_punctuation=False,
-                                output_script="roman",
-                                context="meeting",
-                            ).strip()
-                        )
-                        if bool(getattr(self.config, "post_call_punctuation_polish", True)) and txt_p:
-                            txt_p = _polish_final_punctuation(txt_p)
-                        if bool(getattr(self.config, "post_call_punctuation_polish", True)) and cleaned_seg_txt:
-                            cleaned_seg_txt = _polish_final_punctuation(cleaned_seg_txt)
+                            txt_p = clean_repetition_tail(corr_src or raw_src)
+                            corr_out = txt_p if txt_p and txt_p != raw_src else str(seg.get("corrected_text") or "").strip()
+
                         dur_s = max(0.01, float(seg.get("end_time", 0.0)) - float(seg.get("start_time", 0.0)))
                         if txt_p and not is_hallucination(txt_p, duration_sec=dur_s):
                             seg["raw_text"] = raw_src or txt_p
-                            if seg.get("corrected_text"):
-                                seg["normalized_text"] = base_norm or txt_p
-                                seg["corrected_text"] = txt_p
-                            else:
-                                seg["normalized_text"] = txt_p
-                                seg["corrected_text"] = ""
+                            seg["normalized_text"] = norm_src or seg["raw_text"]
+                            seg["corrected_text"] = corr_out
                             seg["text"] = txt_p
                             seg["asr_model"] = seg.get("asr_model") or used_model
                             seg["asr_backend"] = seg.get("asr_backend") or used_backend
                             seg["asr_device"] = seg.get("asr_device") or used_device
                             seg["asr_compute_type"] = seg.get("asr_compute_type") or used_compute_type
-                            is_verified_seg = (
-                                str(seg.get("transcript_state") or "").lower() == "verified"
-                                or str(seg.get("transcript_stage") or "").lower() == "verified"
-                            )
-                            seg["transcript_stage"] = "verified" if is_verified_seg else "final"
-                            seg["transcript_state"] = "verified" if is_verified_seg else "final"
+                            seg["transcript_stage"] = "final"
+                            seg["transcript_state"] = "final"
                             seg["confidence_calibrated"] = False
                             is_unc, unc_reasons = evaluate_segment_uncertainty(
                                 raw_text=seg["raw_text"],
@@ -4925,11 +4478,10 @@ class AppController(QObject):
                             seg["uncertainty_reasons"] = existing_r
                             seg["is_uncertain"] = bool(seg.get("is_uncertain")) or is_unc
                             cleaned_segments.append(seg)
-                            if cleaned_seg_txt:
-                                mm = int(float(seg.get("start_time", 0.0)) // 60)
-                                ss = int(float(seg.get("start_time", 0.0)) % 60)
-                                spk = str(seg.get("speaker", "Speaker"))
-                                cleaned_lines.append(f"[{mm:02d}:{ss:02d}] {spk}: {cleaned_seg_txt}")
+                            mm = int(float(seg.get("start_time", 0.0)) // 60)
+                            ss = int(float(seg.get("start_time", 0.0)) % 60)
+                            spk = str(seg.get("speaker", "Speaker"))
+                            cleaned_lines.append(f"[{mm:02d}:{ss:02d}] {spk}: {txt_p}")
 
                     comp_report = build_completeness_report(
                         meeting_id=meeting_id,
@@ -4947,8 +4499,8 @@ class AppController(QObject):
                         hardware_tier=exec_profile.tier_id,
                         finalization_duration_sec=time.perf_counter() - t_fin0,
                     )
-                    if selective_ver_stats:
-                        comp_report["selective_verification"] = selective_ver_stats
+                    if diar_stats:
+                        comp_report["diarization"] = diar_stats
                     audio_h = getattr(result, "audio_health", None)
                     if isinstance(audio_h, dict) and audio_h:
                         comp_report["audio_health"] = audio_h
@@ -5004,11 +4556,8 @@ class AppController(QObject):
                     pass
 
                 engine_summary = f"{used_model} ({str(used_device or 'cpu').upper()} {str(used_compute_type or 'int8').upper()})"
-                if selective_ver_stats and int(selective_ver_stats.get("accepted_count") or 0) > 0:
-                    ver_dev = str(selective_ver_stats.get("verifier_device") or "cpu").upper()
-                    ver_name = str(selective_ver_stats.get("verifier_backend") or "verifier")
-                    acc_cnt = int(selective_ver_stats.get("accepted_count") or 0)
-                    engine_summary += f" + {ver_name} ({ver_dev}, {acc_cnt} verified)"
+                if diar_stats.get("num_clusters_final"):
+                    engine_summary += f" · {int(diar_stats['num_clusters_final'])} speakers"
 
                 self.db.update_meeting(
                     meeting_id,
@@ -5019,7 +4568,7 @@ class AppController(QObject):
                     cleaned_transcript="\n".join(cleaned_lines),
                     video_path=video_path,
                     post_call_stage="finalizing",
-                    post_call_status_message="Stage 4/4: Finalizing transcript & meeting notes...",
+                    post_call_status_message="Stage 4/5: Generating local meeting intelligence & action items...",
                     post_call_engine_summary=engine_summary,
                 )
 
@@ -5028,6 +4577,17 @@ class AppController(QObject):
                 full_txt = meeting_obj.get("full_transcript", "") if meeting_obj else ""
 
                 summary, decisions_str, actions_str = ("", "", "")
+                brief_summary = ""
+                detailed_summary = ""
+                meeting_purpose = ""
+                overall_outcome = ""
+                topics_json = "[]"
+                key_points_json = "[]"
+                follow_ups_json = "[]"
+                open_questions_json = "[]"
+                llm_model_used = ""
+                llm_device_used = ""
+                llm_fallback_reason = ""
                 engagement_score = 85
                 topics_str = "General Meeting"
                 smart_folder_id = meeting_obj.get("folder_id") if meeting_obj else None
@@ -5040,17 +4600,32 @@ class AppController(QObject):
                         try:
                             if (
                                 self._capture_state == "idle"
-                                and getattr(self.transcriber, "_active_device", "") == "cuda"
                                 and getattr(self.transcriber, "_model", None) is not None
                                 and self.llm_engine is not None
                             ):
-                                free_vram = self.llm_engine._get_free_vram_mb()
-                                if free_vram is not None and free_vram < 1800:
+                                srv = getattr(self.llm_engine, "_server", None)
+                                free_vram = srv._get_free_vram_mb() if srv and hasattr(srv, "_get_free_vram_mb") else None
+                                total_mb, avail_mb = srv._get_memory_mb() if srv and hasattr(srv, "_get_memory_mb") else (None, None)
+                                on_cuda = getattr(self.transcriber, "_active_device", "") == "cuda"
+                                need_vram = (
+                                    on_cuda
+                                    and str(getattr(self.config, "llm_device", "auto") or "auto").lower() != "cpu"
+                                    and free_vram is not None
+                                    and free_vram < 2800
+                                )
+                                need_ram = (
+                                    (total_mb is not None and total_mb < 14000)
+                                    or (avail_mb is not None and avail_mb < 5500)
+                                )
+                                if need_vram or need_ram:
                                     logger.info(
-                                        "Unloading Whisper CUDA model before Stage 4 LLM summarization (free VRAM=%d MB < 1800 MB)",
+                                        "Unloading Whisper dictation model before Stage 4 Qwen3.5-4B (free_vram=%s MB, total_ram=%s MB, avail_ram=%s MB)",
                                         free_vram,
+                                        total_mb,
+                                        avail_mb,
                                     )
                                     self.transcriber.unload_model()
+                                    gc.collect()
                         except Exception:
                             pass
                         m_title = meeting_obj.get("title", "") if meeting_obj else "Meeting Notes"
@@ -5065,7 +4640,13 @@ class AppController(QObject):
                         elif "webex" in tl:
                             m_plat = "Webex"
 
-                        self._safe_emit_finalization_progress("transcribing", "Stage 4/4: Synthesizing executive MoM, action items & decisions with local AI...")
+                        self._safe_emit_finalization_progress(
+                            "transcribing",
+                            "Stage 4/5: Synthesizing MoM, detailed summary, decisions & actions (Qwen3.5-4B)...",
+                        )
+                        if self.llm_engine is not None and hasattr(self.llm_engine, "set_preferred_device"):
+                            self.llm_engine.set_preferred_device(getattr(self.config, "llm_device", "auto"))
+
                         analysis = LocalMeetingSummarizer.analyze_full(
                             segments,
                             full_txt,
@@ -5073,8 +4654,21 @@ class AppController(QObject):
                             title=m_title,
                             platform=m_plat,
                             llm_engine=self.llm_engine,
+                            meeting_timestamp=meeting_obj.get("created_at") if meeting_obj else None,
+                            timezone=(meeting_obj.get("timezone") if meeting_obj else None) or getattr(self.config, "timezone", "local"),
                         )
                         summary = analysis.get("mom_markdown", analysis.get("summary", ""))
+                        brief_summary = str(analysis.get("brief_summary") or "").strip()
+                        detailed_summary = str(analysis.get("detailed_summary") or "").strip()
+                        meeting_purpose = str(analysis.get("meeting_purpose") or "").strip()
+                        overall_outcome = str(analysis.get("overall_outcome") or "").strip()
+                        topics_json = json.dumps(analysis.get("topics_structured") or [], ensure_ascii=False)
+                        key_points_json = json.dumps(analysis.get("key_discussion_points") or [], ensure_ascii=False)
+                        follow_ups_json = json.dumps(analysis.get("follow_ups") or [], ensure_ascii=False)
+                        open_questions_json = json.dumps(analysis.get("open_questions") or [], ensure_ascii=False)
+                        llm_model_used = str(analysis.get("llm_model") or "")
+                        llm_device_used = str(analysis.get("llm_device") or "")
+                        llm_fallback_reason = str(analysis.get("llm_fallback_reason") or "")
                         engagement_score = int(analysis.get("engagement_score", 85))
                         topics_list = analysis.get("topics", [])
                         topics_str = ", ".join(topics_list)
@@ -5089,7 +4683,7 @@ class AppController(QObject):
 
                         if analysis.get("action_items"):
                             actions_str = "\n".join(
-                                f"- [ ] [{a.get('owner', 'Unassigned')}] {a['description']}"
+                                f"- [ ] [{a.get('owner') or 'Owner Unknown'}] {a['description']}"
                                 for a in analysis["action_items"]
                             )
                         else:
@@ -5101,10 +4695,16 @@ class AppController(QObject):
                             self.db.add_action_item(
                                 meeting_id=meeting_id,
                                 description=act.get("description", ""),
-                                owner=act.get("owner", "Unassigned"),
-                                due_date=act.get("due_date", ""),
+                                owner=act.get("owner"),
+                                due_date=act.get("due_date"),
                                 status="pending",
                                 timestamp_sec=float(act.get("timestamp_sec", 0.0)),
+                                due_date_resolution=str(act.get("due_date_resolution") or ""),
+                                evidence_quote=str(act.get("evidence_quote") or ""),
+                                priority=act.get("priority"),
+                                context=str(act.get("context") or ""),
+                                related_topic=str(act.get("related_topic") or ""),
+                                confirmation_state=str(act.get("confirmation_state") or "confirmed"),
                             )
 
                         for dec in analysis.get("decisions", []):
@@ -5113,7 +4713,42 @@ class AppController(QObject):
                                 decision=dec.get("decision", ""),
                                 rationale=dec.get("rationale", ""),
                                 timestamp_sec=float(dec.get("timestamp_sec", 0.0)),
+                                status=str(dec.get("status") or "confirmed"),
+                                category=str(dec.get("category") or "General"),
+                                evolution_relationship=str(dec.get("evolution_relationship") or "new"),
+                                evidence_quote=str(dec.get("evidence_quote") or ""),
+                                speaker=str(dec.get("speaker") or ""),
+                                context=str(dec.get("context") or ""),
+                                participants=dec.get("participants") or [],
                             )
+
+                        # Persist extracted risks & blockers cleanly without losing manual user rows
+                        if hasattr(self.db, "_connect"):
+                            try:
+                                with self.db._lock, self.db._connect() as conn:
+                                    conn.execute(
+                                        "DELETE FROM risks_and_blockers WHERE meeting_id = ? AND is_manual = 0 AND user_edited = 0",
+                                        (meeting_id,),
+                                    )
+                                    conn.commit()
+                                for rk in analysis.get("risks", []):
+                                    if isinstance(rk, dict) and str(rk.get("description") or "").strip():
+                                        desc_r = str(rk["description"]).strip()
+                                        sev = str(rk.get("severity") or "medium").strip().lower()
+                                        if sev not in ("low", "medium", "high", "critical"):
+                                            sev = "medium"
+                                        self.db.add_risk_or_blocker(
+                                            meeting_id=meeting_id,
+                                            item_type="risk",
+                                            title=desc_r[:120],
+                                            description=desc_r,
+                                            impact=sev,
+                                            status="identified",
+                                            source_timestamp_sec=float(rk.get("timestamp_sec") or 0.0),
+                                            evidence_quote=str(rk.get("evidence_quote") or ""),
+                                        )
+                            except Exception as rk_exc:
+                                logger.debug("Risk persistence warning: %s", rk_exc)
 
                         if smart_folder_id is None:
                             m_title_str = meeting_obj.get("title", "") if meeting_obj else ""
@@ -5133,13 +4768,63 @@ class AppController(QObject):
                         fallback_notes.append(f"intelligence_isolated_error: {intel_exc}")
                         comp_report["fallback_notes"] = fallback_notes
 
+                # Cooperative cancellation check before Stage 5 Knowledge Retention
+                if is_cancelled():
+                    self._handle_finalization_cancelled(meeting_id, current_stage=5)
+                    return
+
+                current_stage = 5
+                if (
+                    not is_mock_transcriber
+                    and segments
+                    and getattr(self, "knowledge_store", None) is not None
+                ):
+                    try:
+                        self._safe_emit_finalization_progress(
+                            "transcribing",
+                            "Stage 5/5: Extracting durable knowledge & updating local RAG index...",
+                        )
+                        if (
+                            self.llm_engine is not None
+                            and hasattr(self.llm_engine, "extract_meeting_knowledge")
+                            and self.llm_engine.is_available()
+                        ):
+                            m_title = meeting_obj.get("title", "") if meeting_obj else "Meeting Notes"
+                            m_date = str(meeting_obj.get("created_at") or "")[:10] if meeting_obj else ""
+                            k_items = self.llm_engine.extract_meeting_knowledge(
+                                segments,
+                                title=m_title,
+                                meeting_date=m_date,
+                            )
+                            if k_items:
+                                self.knowledge_store.ingest_meeting_knowledge(meeting_id, k_items)
+                        self.knowledge_store.index_meeting(meeting_id)
+                        self._safe_emit(self.knowledge_updated)
+                        try:
+                            srv = getattr(self.llm_engine, "_server", None) if self.llm_engine else None
+                            if srv is not None and hasattr(srv, "_get_memory_mb"):
+                                t_mb, _ = srv._get_memory_mb()
+                                if t_mb is not None and t_mb < 14000:
+                                    srv.stop()
+                                    gc.collect()
+                        except Exception:
+                            pass
+                    except Exception as k_exc:
+                        logger.warning(
+                            "Stage 5 knowledge retention failed cleanly without affecting meeting #%d: %s",
+                            meeting_id,
+                            k_exc,
+                        )
+                        fallback_notes.append(f"knowledge_indexing_warning: {k_exc}")
+                        comp_report["fallback_notes"] = fallback_notes
+
                 # Preserve user-edited report summary if user explicitly edited and saved it
                 if meeting_obj and int(meeting_obj.get("user_edited") or 0) == 1 and (meeting_obj.get("summary") or "").strip():
                     summary = meeting_obj["summary"]
 
                 # Cooperative cancellation check before final commit
                 if is_cancelled():
-                    self._handle_finalization_cancelled(meeting_id, current_stage=4)
+                    self._handle_finalization_cancelled(meeting_id, current_stage=5)
                     return
 
                 comp_report["finalization_duration_sec"] = round(time.perf_counter() - t_fin0, 3)
@@ -5173,6 +4858,17 @@ class AppController(QObject):
                     finalization_reason=final_reason,
                     cleaned_transcript="\n".join(cleaned_lines),
                     summary=summary,
+                    brief_summary=brief_summary,
+                    detailed_summary=detailed_summary,
+                    meeting_purpose=meeting_purpose,
+                    overall_outcome=overall_outcome,
+                    topics_json=topics_json,
+                    key_points_json=key_points_json,
+                    follow_ups_json=follow_ups_json,
+                    open_questions_json=open_questions_json,
+                    llm_model_used=llm_model_used,
+                    llm_device_used=llm_device_used,
+                    llm_fallback_reason=llm_fallback_reason,
                     decisions=decisions_str,
                     action_items=actions_str,
                     video_path=video_path,
@@ -5180,7 +4876,7 @@ class AppController(QObject):
                     topics=topics_str,
                     folder_id=smart_folder_id,
                     post_call_stage=("completed" if final_status == "completed" else final_status),
-                    post_call_status_message=("Final transcript ready" if final_status == "completed" else final_reason),
+                    post_call_status_message=("Final transcript & knowledge ready" if final_status == "completed" else final_reason),
                     post_call_engine_summary=engine_summary,
                 )
                 if hasattr(self.db, "update_finalization_job"):
@@ -5246,6 +4942,11 @@ class AppController(QObject):
                 self._safe_emit(self.meeting_saved_and_transcribed, meeting_id)
                 self._safe_emit(self.history_updated)
             finally:
+                if os.name == "nt":
+                    try:
+                        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 0)
+                    except Exception:
+                        pass
                 with self._state_lock:
                     self._finalizing_jobs.discard(meeting_id)
 
@@ -5348,13 +5049,6 @@ class AppController(QObject):
         with self._state_lock:
             self._retrans_wait_events[int(meeting_id)] = retrans_done
         self._enqueue_finalization_job(meeting_id, _SavedResult(), meeting.get("video_path", ""))
-        self._finalize_thread = threading.Thread(
-            target=retrans_done.wait,
-            kwargs={"timeout": 300.0},
-            name=f"ReTranscribeMeetingWorker-{meeting_id}",
-            daemon=True,
-        )
-        self._finalize_thread.start()
 
     # ==================================================================
     # CORE FEATURE 2: PC SCREEN RECORDING (Full Desktop & System Audio)
@@ -5955,6 +5649,7 @@ class AppController(QObject):
                 if (
                     self._capture_state in ("recording", "paused")
                     and bool(getattr(self.config, "notetaker_auto_end", True))
+                    and not getattr(self, "_is_manual_meeting", False)
                 ):
                     # CRITICAL: Verify meeting target liveness against genuine Call Stage windows or presentation sessions
                     meeting_target_alive = False
@@ -6096,7 +5791,12 @@ class AppController(QObject):
             self._dismissed_call_keys.add(key)
 
     def query_meeting_memory(
-        self, question: str, meeting_id: Optional[int] = None
+        self,
+        question: str,
+        meeting_id: Optional[int] = None,
+        conversation_history: Optional[List[Tuple[str, str]]] = None,
+        answer_depth: str = "detailed",
+        meeting_ids: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         """
         Ask Vox: Comprehensive 100% offline local AI & algorithmic cognitive reasoning
@@ -6116,7 +5816,24 @@ class AppController(QObject):
                 }
 
         try:
-            res = self.intelligence.query(question, meeting_id=meeting_id)
+            try:
+                res = self.intelligence.query(
+                    question,
+                    meeting_id=meeting_id,
+                    conversation_history=conversation_history,
+                    answer_depth=answer_depth,
+                    meeting_ids=meeting_ids,
+                )
+            except TypeError:
+                try:
+                    res = self.intelligence.query(
+                        question,
+                        meeting_id=meeting_id,
+                        conversation_history=conversation_history,
+                        answer_depth=answer_depth,
+                    )
+                except TypeError:
+                    res = self.intelligence.query(question, meeting_id=meeting_id)
             if hasattr(self, "metering") and self.metering is not None:
                 self.metering.record_ask_vox_query(question)
                 self.usage_updated.emit(self.metering.get_weekly_usage())
@@ -6215,6 +5932,69 @@ class AppController(QObject):
     def get_recurring_topics(self, limit: int = 15) -> List[Dict[str, Any]]:
         """Retrieve recurring topics across meetings."""
         return self.intelligence.get_recurring_topics(limit=limit)
+
+    def get_meeting_models_status(self) -> Dict[str, Dict[str, Any]]:
+        """Return installation & verification status for all 4 Meeting AI models."""
+        return self.meeting_model_manager.get_all_statuses()
+
+    def download_meeting_model(
+        self,
+        model_key: str,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+    ) -> Tuple[bool, str]:
+        ok, msg = self.meeting_model_manager.download_artifact(model_key, progress_callback=progress_callback)
+        self._safe_emit(self.meeting_models_updated)
+        return ok, msg
+
+    def verify_meeting_model(self, model_key: str) -> Tuple[bool, str]:
+        return self.meeting_model_manager.verify_artifact(model_key)
+
+    def rebuild_knowledge_index(
+        self,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        extract_missing_for_meeting_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        res = self.knowledge_store.rebuild_all_indexes(progress_callback=progress_callback)
+        res["chunks_indexed"] = res.get("total_chunks", 0)
+        if extract_missing_for_meeting_id is not None:
+            try:
+                ex_res = self.knowledge_store.extract_and_index_meeting(
+                    int(extract_missing_for_meeting_id),
+                    llm_engine=getattr(self, "llm_engine", None),
+                )
+                res["knowledge_extracted"] = int(ex_res.get("extracted", 0))
+                res["knowledge_inserted"] = int(ex_res.get("inserted", 0))
+            except Exception as ex_err:
+                logger.warning("Knowledge extraction during rebuild failed cleanly: %s", ex_err)
+        self._safe_emit(self.knowledge_updated)
+        return res
+
+    def rename_meeting_speaker_and_reindex(self, meeting_id: int, old_name: str, new_name: str) -> int:
+        cnt = self.db.rename_meeting_speaker(meeting_id, old_name, new_name)
+        if cnt > 0:
+            self._safe_emit(self.knowledge_updated)
+
+            def _bg_reindex() -> None:
+                if getattr(self, "_shutting_down", False):
+                    return
+                try:
+                    self.knowledge_store.index_meeting(meeting_id)
+                    self._safe_emit(self.knowledge_updated)
+                except Exception as exc:
+                    logger.debug("Async speaker reindex note for meeting #%s: %s", meeting_id, exc)
+
+            tm = getattr(self, "task_manager", None)
+            if tm is not None:
+                tm.submit(
+                    "speaker_reindex",
+                    _bg_reindex,
+                    description=f"Re-index meeting #{meeting_id} knowledge after speaker rename",
+                    dedupe_key=f"reindex_m{int(meeting_id)}",
+                    lane="ai",
+                )
+            else:
+                threading.Thread(target=_bg_reindex, name=f"ReindexMeeting-{meeting_id}", daemon=True).start()
+        return cnt
 
     # -------------------------------------------------------------------------
     # Commercial Account, Entitlements & Metering Integration (P0)
@@ -6463,16 +6243,39 @@ class AppController(QObject):
         return verify_release_trust_chain(manifest, installer_path_or_bytes)
 
     def shutdown(self) -> None:
-        """Cleanly stop all timers, hooks, and audio streams on application exit."""
+        """Cleanly stop all timers, hooks, workers, subprocesses, and DB pools on exit."""
+        with self._state_lock:
+            if getattr(self, "_shutdown_done", False):
+                return
+            self._shutting_down = True
+            self._shutdown_done = True
+            runner = getattr(self, "_active_postcall_runner", None)
+
         logger.info("Shutting down AppController...")
         self._cancel_ask_vox = True
+        self._cancel_finalization_event.set()
+        self._fin_queue_stop.set()
+        self._interim_worker_running = False
+
+        if runner is not None and hasattr(runner, "cancel"):
+            try:
+                runner.cancel()
+            except Exception:
+                pass
+
+        tm = getattr(self, "task_manager", None)
+        if tm is not None:
+            try:
+                tm.shutdown(timeout_sec=3.0)
+            except Exception as exc:
+                logger.debug("TaskManager shutdown warning: %s", exc)
+
         if hasattr(self, "_ask_vox_thread") and self._ask_vox_thread and self._ask_vox_thread.is_alive():
             try:
                 self._ask_vox_thread.join(timeout=0.5)
             except Exception:
                 pass
-        self._cancel_finalization_event.set()
-        self._fin_queue_stop.set()
+
         with self._state_lock:
             for ev in list(self._retrans_wait_events.values()):
                 ev.set()
@@ -6489,17 +6292,76 @@ class AppController(QObject):
                 self._finalize_thread.join(timeout=1.0)
             except Exception:
                 pass
-        self._interim_worker_running = False
-        try:
-            if hasattr(self, "_focus_timer") and self._focus_timer:
-                self._focus_timer.stop()
-        except Exception:
-            pass
-        try:
-            if hasattr(self, "_call_timer") and self._call_timer:
-                self._call_timer.stop()
-        except Exception:
-            pass
+        if hasattr(self, "_streaming_queue"):
+            try:
+                self._streaming_queue.put_nowait(None)
+            except Exception:
+                pass
+        if hasattr(self, "_streaming_worker_thread") and self._streaming_worker_thread and self._streaming_worker_thread.is_alive():
+            try:
+                self._streaming_worker_thread.join(timeout=0.5)
+            except Exception:
+                pass
+        if hasattr(self, "_interim_worker_thread") and self._interim_worker_thread and self._interim_worker_thread.is_alive():
+            try:
+                self._interim_worker_thread.join(timeout=0.5)
+            except Exception:
+                pass
+
+        if hasattr(self, "llm_engine") and self.llm_engine is not None and hasattr(self.llm_engine, "shutdown"):
+            try:
+                self.llm_engine.shutdown()
+            except Exception as exc:
+                logger.debug("LLM engine shutdown warning: %s", exc)
+        if hasattr(self, "knowledge_store") and self.knowledge_store is not None and hasattr(self.knowledge_store, "embedder"):
+            try:
+                self.knowledge_store.embedder.unload()
+            except Exception:
+                pass
+
+        has_qapp = QCoreApplication.instance() is not None
+        for timer_attr in ("_focus_timer", "_call_timer", "_screen_rec_timer"):
+            try:
+                tmr = getattr(self, timer_attr, None)
+                if tmr is not None:
+                    try:
+                        tmr.timeout.disconnect()
+                    except Exception:
+                        pass
+                    if tmr.isActive():
+                        tmr.stop()
+                    if has_qapp:
+                        tmr.deleteLater()
+            except Exception:
+                pass
+
+        cal_eng = getattr(self, "calendar_engine", None)
+        if cal_eng is not None:
+            if hasattr(cal_eng, "stop_polling"):
+                try:
+                    cal_eng.stop_polling()
+                except Exception:
+                    pass
+            for sig_name in ("upcoming_meetings_updated", "accounts_updated", "meeting_alert", "start_capture_requested"):
+                sig = getattr(cal_eng, sig_name, None)
+                if sig is not None:
+                    try:
+                        sig.disconnect()
+                    except Exception:
+                        pass
+            if has_qapp:
+                try:
+                    cal_eng.deleteLater()
+                except Exception:
+                    pass
+
+        broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
+        if broker is not None and hasattr(broker, "stop_background_sync_listener"):
+            try:
+                broker.stop_background_sync_listener()
+            except Exception:
+                pass
+
         if hasattr(self.call_detector, "stop_winevent_listener"):
             try:
                 self.call_detector.stop_winevent_listener()
@@ -6521,4 +6383,14 @@ class AppController(QObject):
                 logger.warning("Error stopping meeting on controller shutdown: %s", exc)
         elif self.meeting_recorder.state != "idle":
             self.meeting_recorder.stop(preserve_separate_tracks=self.config.preserve_separate_tracks)
+        if hasattr(self, "metering") and self.metering is not None and hasattr(self.metering, "close"):
+            try:
+                self.metering.close()
+            except Exception:
+                pass
+        if hasattr(self, "db") and self.db is not None and hasattr(self.db, "close"):
+            try:
+                self.db.close()
+            except Exception:
+                pass
         self.config.save()

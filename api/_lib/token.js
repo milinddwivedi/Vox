@@ -167,6 +167,20 @@ function verifyEntitlement(token, publicKeyInput = process.env.VOX_ENTITLEMENT_P
   }
 }
 
+function sortNestedKeys(val) {
+  if (Array.isArray(val)) {
+    return val.map(sortNestedKeys);
+  }
+  if (val && typeof val === 'object') {
+    const out = {};
+    for (const k of Object.keys(val).sort()) {
+      out[k] = sortNestedKeys(val[k]);
+    }
+    return out;
+  }
+  return val;
+}
+
 function canonicalizeManifest(manifest) {
   if (!manifest || typeof manifest !== 'object') {
     throw new Error('Manifest must be a valid object');
@@ -174,7 +188,7 @@ function canonicalizeManifest(manifest) {
   const cleanManifest = {};
   const keys = Object.keys(manifest).filter(k => k !== 'signature').sort();
   for (const k of keys) {
-    cleanManifest[k] = manifest[k];
+    cleanManifest[k] = sortNestedKeys(manifest[k]);
   }
   return Buffer.from(JSON.stringify(cleanManifest), 'utf-8');
 }
@@ -213,11 +227,66 @@ function verifyManifest(manifest, publicKeyInput = process.env.VOX_ENTITLEMENT_P
   }
 }
 
+function getDownloadTicketSecret(secretOverride) {
+  const secret =
+    secretOverride ||
+    process.env.VOX_DOWNLOAD_TICKET_SECRET ||
+    process.env.VOX_ENTITLEMENT_PRIVATE_KEY_ED25519 ||
+    process.env.ENTITLEMENT_PRIVATE_KEY_PEM ||
+    process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!secret) {
+    throw new Error('Download ticket secret is required (set VOX_DOWNLOAD_TICKET_SECRET)');
+  }
+  return crypto.createHash('sha256').update(String(secret), 'utf-8').digest();
+}
+
+function signDownloadTicket(payload, secretOverride) {
+  const key = getDownloadTicketSecret(secretOverride);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const claims = {
+    ...payload,
+    iat: payload.iat || nowSec,
+    exp: payload.exp || nowSec + 120,
+    jti: payload.jti || crypto.randomBytes(8).toString('hex'),
+  };
+  const payloadB64 = base64UrlEncode(Buffer.from(JSON.stringify(claims), 'utf-8'));
+  const sig = crypto.createHmac('sha256', key).update(payloadB64, 'utf-8').digest();
+  return `${payloadB64}.${base64UrlEncode(sig)}`;
+}
+
+function verifyDownloadTicket(ticket, secretOverride) {
+  if (!ticket || typeof ticket !== 'string') return null;
+  const parts = ticket.trim().split('.');
+  if (parts.length !== 2) return null;
+  const [payloadB64, sigB64] = parts;
+  try {
+    const key = getDownloadTicketSecret(secretOverride);
+    const expectedSig = crypto.createHmac('sha256', key).update(payloadB64, 'utf-8').digest();
+    const gotSig = base64UrlDecode(sigB64);
+    if (gotSig.length !== expectedSig.length || !crypto.timingSafeEqual(gotSig, expectedSig)) {
+      return null;
+    }
+    const claims = JSON.parse(base64UrlDecode(payloadB64).toString('utf-8'));
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!claims || typeof claims !== 'object' || !claims.exp || Number(claims.exp) < nowSec) {
+      return null;
+    }
+    if (!claims.user_id || !claims.artifact) {
+      return null;
+    }
+    return claims;
+  } catch (err) {
+    return null;
+  }
+}
+
 module.exports = {
   signEntitlement,
   verifyEntitlement,
   signManifest,
   verifyManifest,
+  signDownloadTicket,
+  verifyDownloadTicket,
   canonicalizeManifest,
   parsePrivateKey,
   parsePublicKey,

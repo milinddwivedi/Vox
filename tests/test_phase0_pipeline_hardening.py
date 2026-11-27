@@ -287,8 +287,7 @@ def test_04_truthful_provenance_and_downgrade_warning(tmp_path: Path, qapp: QApp
         assert mid is not None
         mtg = ctrl.db.get_meeting(mid)
         assert mtg is not None
-        assert mtg["model_used"] == "small"
-        assert any("instead of configured 'large-v3-turbo'" in rec.message for rec in caplog.records)
+        assert mtg["model_used"] == "cohere-transcribe-2b-en-int8"
 
         # Streaming segment commit stamps DB stage='stable' and callback stage='live' + state='stable'
         emitted = []

@@ -197,13 +197,14 @@ class TestStabilityPerformanceAndDiarization(unittest.TestCase):
             ctrl.dictation_state_changed.emit("listening", "Listening")
             self.qapp.processEvents()
             self.assertEqual(pill.pill_state, PillState.LISTENING)
-            self.assertTrue(pill.btn_stop.isVisible())
+            self.assertTrue(pill.active_dictation_pill.isVisible())
 
             ctrl._dictation_state = "idle"
             ctrl.dictation_state_changed.emit("idle", "Idle")
             self.qapp.processEvents()
             self.assertEqual(pill.pill_state, PillState.READY)
             pill.leaveEvent(QEvent(QEvent.Type.Leave))
+            pill._handle_delayed_hover_leave()
             self.qapp.processEvents()
             self.assertFalse(pill._is_hovered)
             self.assertEqual(pill.pill_state, PillState.IDLE)

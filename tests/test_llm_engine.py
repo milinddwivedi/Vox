@@ -26,10 +26,17 @@ class TestLocalLLMEngine(unittest.TestCase):
             device="auto",
         )
 
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.engine.shutdown()
+        except Exception:
+            pass
+
     def test_model_availability_and_info(self):
         info = self.engine.get_model_info()
         self.assertIn("name", info)
-        self.assertIn("Llama-3.2", info["name"])
+        self.assertIn("Qwen3.5-4B", info["name"])
         self.assertTrue(self.engine.is_available(), "Local LLM weights must be available on disk")
 
     def test_json_safe_parser(self):

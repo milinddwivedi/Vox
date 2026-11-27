@@ -154,6 +154,8 @@ class TestMilestone2RemediationChallenger(unittest.TestCase):
     # Target 1 & Win32 HWND Extended Styles
     # -------------------------------------------------------------------------
     def test_win32_floating_pill_and_bubble_hwnd_styles(self):
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            self.skipTest("Win32 HWND extended styles require native Windows QPA platform.")
         pill = DualTierFloatingPill()
         bubble = LiveSpeechPreviewBubble()
         try:

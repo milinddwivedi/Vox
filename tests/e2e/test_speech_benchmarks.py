@@ -351,8 +351,27 @@ class TestFeature24AutomatedBenchmarkingSuite:
             assert teardown_ms < 300.0, f"Teardown {teardown_ms:.1f}ms violated 300ms SLA"
 
     def test_f24_idle_resource_footprint_sla(self):
-        """Verify memory and handle stability at idle (Physical RAM < 200MB)."""
-        snap = get_system_resource_snapshot()
+        """Verify memory and handle stability at idle (Working set < 250MB in clean process)."""
+        import subprocess
+        # If heavy GUI/ML frameworks are already loaded by prior test modules in this process,
+        # measure true cold-idle footprint in an isolated process.
+        heavy_loaded = any(m in sys.modules for m in ("PyQt6", "torch", "onnxruntime", "ctranslate2"))
+        if heavy_loaded:
+            out = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-c",
+                    "import json; from voxlocal.core.logger import get_system_resource_snapshot; "
+                    "print(json.dumps(get_system_resource_snapshot()))",
+                ],
+                cwd=str(ROOT_DIR),
+                env={**os.environ, "PYTHONPATH": str(SRC_DIR)},
+                text=True,
+                timeout=15,
+            )
+            snap = json.loads(out.strip().splitlines()[-1])
+        else:
+            snap = get_system_resource_snapshot()
         assert snap["working_set_mb"] < 250.0, f"Idle working set {snap['working_set_mb']}MB exceeded 250MB"
         assert snap["handle_count"] < 1000, f"Idle handle count {snap['handle_count']} abnormally high"
 
@@ -366,12 +385,15 @@ class TestFeature24AutomatedBenchmarkingSuite:
         test_audio = np.zeros(16000 * 2, dtype=np.float32)
 
         snap_before = get_system_resource_snapshot()
-        for _ in range(3):
-            # Run interim and dictation without exception
-            _res_int, _conf = transcriber.transcribe_interim(test_audio)
-            _res_dict = transcriber.transcribe_dictation(test_audio, profile=TranscribeProfile.FAST)
+        try:
+            for _ in range(3):
+                # Run interim and dictation without exception
+                _res_int, _conf = transcriber.transcribe_interim(test_audio)
+                _res_dict = transcriber.transcribe_dictation(test_audio, profile=TranscribeProfile.FAST)
 
-        snap_after = get_system_resource_snapshot()
-        ram_delta = snap_after["working_set_mb"] - snap_before["working_set_mb"]
-        # Allow at most 30MB growth during active inference buffer allocations
-        assert ram_delta < 50.0, f"Working set grew unexpectedly by {ram_delta:.1f}MB during inference"
+            snap_after = get_system_resource_snapshot()
+            ram_delta = snap_after["working_set_mb"] - snap_before["working_set_mb"]
+            # Allow at most 30MB growth during active inference buffer allocations
+            assert ram_delta < 50.0, f"Working set grew unexpectedly by {ram_delta:.1f}MB during inference"
+        finally:
+            transcriber.unload_model()

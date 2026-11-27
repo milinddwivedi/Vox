@@ -1,0 +1,274 @@
+{
+  "schema_version": 1,
+  "manifest_version": "2.1.0",
+  "min_app_version": "2.0.0",
+  "updated_at": "2026-11-27",
+  "models": [
+    {
+      "id": "meeting_asr",
+      "display_name": "Cohere Transcribe 2B (English Post-Call ASR)",
+      "revision": "156a470cf08eefe706a0004f3c52d9ee567ca7a0",
+      "version": "cohere-transcribe-03-2026-int8",
+      "license": "Apache-2.0",
+      "runtime": "sherpa_onnx",
+      "feature": "meeting_transcription",
+      "required": true,
+      "required_condition": "always",
+      "hardware_compatibility": {
+        "cpu": true,
+        "min_ram_gb": 6.5,
+        "notes": "Runs on multi-threaded CPU INT8 via sherpa-onnx."
+      },
+      "install_rel_dir": "meeting_asr/cohere-transcribe-en-int8",
+      "hf_repo_id": "csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01",
+      "expected_size_bytes": 2888052036,
+      "min_disk_space_mb": 3400,
+      "files": [
+        {
+          "rel_path": "encoder.int8.onnx",
+          "size": 3090822,
+          "sha256": "cf704f8cfa90e3f0a76f9ffc05998bdf00ba9ae983192c14a85a3a5eb008b367",
+          "url": "https://huggingface.co/csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01/resolve/156a470cf08eefe706a0004f3c52d9ee567ca7a0/encoder.int8.onnx"
+        },
+        {
+          "rel_path": "encoder.int8.onnx.data",
+          "size": 2731503072,
+          "sha256": "bcf1b7148c8518ae52df1ad2d2fc2b4e89261ea23e6c874eef1d9f55bcbaa4a3",
+          "url": "https://huggingface.co/csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01/resolve/156a470cf08eefe706a0004f3c52d9ee567ca7a0/encoder.int8.onnx.data"
+        },
+        {
+          "rel_path": "decoder.int8.onnx",
+          "size": 153250705,
+          "sha256": "8372ca6c8ff4db8b916ca3592f5c757a715e691b9edec751ba19b29fc854baf9",
+          "url": "https://huggingface.co/csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01/resolve/156a470cf08eefe706a0004f3c52d9ee567ca7a0/decoder.int8.onnx"
+        },
+        {
+          "rel_path": "tokens.txt",
+          "size": 207437,
+          "sha256": "013ede043ae2480e3a9205cc34550d9686100cc682bacc90f702facdfbb93035",
+          "url": "https://huggingface.co/csukuangfj2/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01/resolve/156a470cf08eefe706a0004f3c52d9ee567ca7a0/tokens.txt"
+        }
+      ]
+    },
+    {
+      "id": "meeting_diarization",
+      "display_name": "Sherpa Neural Diarization (PyAnnote 3.0 + WeSpeaker)",
+      "revision": "9403a6902bb58e3d5ae8c7e77c3422de279db2e0",
+      "version": "pyannote-3.0+wespeaker-resnet34-lm",
+      "license": "MIT / Apache-2.0",
+      "runtime": "sherpa_onnx",
+      "feature": "speaker_diarization",
+      "required": true,
+      "required_condition": "always",
+      "hardware_compatibility": {
+        "cpu": true,
+        "min_ram_gb": 4.0,
+        "notes": "Lightweight CPU neural segmentation and speaker embedding clustering."
+      },
+      "install_rel_dir": "meeting_diarization/sherpa-diarization",
+      "hf_repo_id": "csukuangfj/sherpa-onnx-pyannote-segmentation-3-0",
+      "expected_size_bytes": 32523463,
+      "min_disk_space_mb": 120,
+      "files": [
+        {
+          "rel_path": "pyannote-seg-3-0/model.onnx",
+          "size": 5992913,
+          "sha256": "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/9403a6902bb58e3d5ae8c7e77c3422de279db2e0/model.onnx"
+        },
+        {
+          "rel_path": "wespeaker_en_voxceleb_resnet34_LM.onnx",
+          "size": 26530550,
+          "sha256": "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012",
+          "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx"
+        }
+      ]
+    },
+    {
+      "id": "meeting_llm",
+      "display_name": "Qwen3.5-4B (Q4_K_M GGUF)",
+      "revision": "e87f176479d0855a907a41277aca2f8ee7a09523",
+      "version": "Qwen3.5-4B-Q4_K_M",
+      "license": "Apache-2.0",
+      "runtime": "llama_cpp",
+      "feature": "meeting_intelligence",
+      "required": true,
+      "required_condition": "always",
+      "hardware_compatibility": {
+        "cpu": true,
+        "vulkan_gpu": true,
+        "min_ram_gb": 6.5,
+        "vulkan_min_free_vram_mb": 1600,
+        "notes": "Uses Vulkan GPU offload when available and falls back automatically to CPU."
+      },
+      "install_rel_dir": "meeting_llm",
+      "hf_repo_id": "unsloth/Qwen3.5-4B-GGUF",
+      "expected_size_bytes": 2740937888,
+      "min_disk_space_mb": 3200,
+      "files": [
+        {
+          "rel_path": "Qwen3.5-4B-Q4_K_M.gguf",
+          "size": 2740937888,
+          "sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+          "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf"
+        }
+      ]
+    },
+    {
+      "id": "meeting_embeddings",
+      "display_name": "BGE-Small-EN v1.5 (ONNX INT8)",
+      "revision": "aa8f8b060edb00e03bfdd08813a2949946c8ba55",
+      "version": "bge-small-en-v1.5-onnx-Q",
+      "license": "MIT",
+      "runtime": "onnxruntime",
+      "feature": "knowledge_search",
+      "required": true,
+      "required_condition": "always",
+      "hardware_compatibility": {
+        "cpu": true,
+        "min_ram_gb": 4.0,
+        "notes": "384-d semantic vectors for local FTS5 + RAG Knowledge Store."
+      },
+      "install_rel_dir": "meeting_embeddings/bge-small-en-v1.5-onnx-Q",
+      "hf_repo_id": "Qdrant/bge-small-en-v1.5-onnx-Q",
+      "expected_size_bytes": 67179163,
+      "min_disk_space_mb": 120,
+      "files": [
+        {
+          "rel_path": "model_optimized.onnx",
+          "size": 66465124,
+          "sha256": "51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431",
+          "url": "https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q/resolve/aa8f8b060edb00e03bfdd08813a2949946c8ba55/model_optimized.onnx"
+        },
+        {
+          "rel_path": "tokenizer.json",
+          "size": 711396,
+          "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+          "url": "https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q/resolve/aa8f8b060edb00e03bfdd08813a2949946c8ba55/tokenizer.json"
+        },
+        {
+          "rel_path": "config.json",
+          "size": 706,
+          "sha256": "13582bcf2effc85b7bf3d3f5532e686bc1c9ce86bb009d10f0ec33cbe92299dd",
+          "url": "https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q/resolve/aa8f8b060edb00e03bfdd08813a2949946c8ba55/config.json"
+        },
+        {
+          "rel_path": "tokenizer_config.json",
+          "size": 1242,
+          "sha256": "0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53",
+          "url": "https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q/resolve/aa8f8b060edb00e03bfdd08813a2949946c8ba55/tokenizer_config.json"
+        },
+        {
+          "rel_path": "special_tokens_map.json",
+          "size": 695,
+          "sha256": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+          "url": "https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q/resolve/aa8f8b060edb00e03bfdd08813a2949946c8ba55/special_tokens_map.json"
+        }
+      ]
+    },
+    {
+      "id": "dictation_whisper_turbo",
+      "display_name": "Whisper Large-v3-Turbo (CTranslate2 INT8 — Voice Dictation)",
+      "revision": "4df90f75321148c3a29a9e2351b7ddf8f5b115a8",
+      "version": "1.0.0",
+      "license": "MIT",
+      "runtime": "faster_whisper",
+      "feature": "voice_dictation",
+      "required": false,
+      "required_condition": "ram_gte_12gb",
+      "mutually_exclusive_group": "voice_dictation",
+      "hardware_compatibility": {
+        "cpu": true,
+        "cuda": true,
+        "min_ram_gb": 12.0,
+        "notes": "Primary Voice Dictation model for systems with >=12 GB RAM supporting English and Hinglish code-switching."
+      },
+      "install_rel_dir": "models--deepdml--faster-whisper-large-v3-turbo-ct2/snapshots/4df90f75321148c3a29a9e2351b7ddf8f5b115a8",
+      "hf_cache_slug": "models--deepdml--faster-whisper-large-v3-turbo-ct2",
+      "hf_repo_id": "deepdml/faster-whisper-large-v3-turbo-ct2",
+      "expected_size_bytes": 1621665983,
+      "min_disk_space_mb": 2000,
+      "files": [
+        {
+          "rel_path": "model.bin",
+          "size": 1617884929,
+          "sha256": "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da",
+          "url": "https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2/resolve/4df90f75321148c3a29a9e2351b7ddf8f5b115a8/model.bin"
+        },
+        {
+          "rel_path": "config.json",
+          "size": 2263,
+          "sha256": "b0253ea6c0d3bea6b1e19e91a02acfd3b53f4467362efcb5a3e6b16c9b3a9b7e",
+          "url": "https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2/resolve/4df90f75321148c3a29a9e2351b7ddf8f5b115a8/config.json"
+        },
+        {
+          "rel_path": "tokenizer.json",
+          "size": 2710337,
+          "sha256": "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd",
+          "url": "https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2/resolve/4df90f75321148c3a29a9e2351b7ddf8f5b115a8/tokenizer.json"
+        },
+        {
+          "rel_path": "vocabulary.json",
+          "size": 1068114,
+          "sha256": "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1",
+          "url": "https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2/resolve/4df90f75321148c3a29a9e2351b7ddf8f5b115a8/vocabulary.json"
+        },
+        {
+          "rel_path": "preprocessor_config.json",
+          "size": 340,
+          "sha256": "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711",
+          "url": "https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2/resolve/4df90f75321148c3a29a9e2351b7ddf8f5b115a8/preprocessor_config.json"
+        }
+      ]
+    },
+    {
+      "id": "dictation_whisper_small",
+      "display_name": "Whisper Small (CTranslate2 INT8 — Lightweight Fallback)",
+      "revision": "536b0662742c02347bc0e980a01041f333bce120",
+      "version": "1.0.0",
+      "license": "MIT",
+      "runtime": "faster_whisper",
+      "feature": "voice_dictation_fallback",
+      "required": false,
+      "required_condition": "ram_lt_12gb_or_low_vram",
+      "mutually_exclusive_group": "voice_dictation",
+      "hardware_compatibility": {
+        "cpu": true,
+        "cuda": true,
+        "min_ram_gb": 4.0,
+        "notes": "Lightweight fallback dictation model for lower-memory (8 GB) laptops."
+      },
+      "install_rel_dir": "models--Systran--faster-whisper-small/snapshots/536b0662742c02347bc0e980a01041f333bce120",
+      "hf_cache_slug": "models--Systran--faster-whisper-small",
+      "hf_repo_id": "Systran/faster-whisper-small",
+      "expected_size_bytes": 486212372,
+      "min_disk_space_mb": 700,
+      "files": [
+        {
+          "rel_path": "model.bin",
+          "size": 483546902,
+          "sha256": "3e305921506d8872816023e4c273e75d2419fb89b24da97b4fe7bce14170d671",
+          "url": "https://huggingface.co/Systran/faster-whisper-small/resolve/536b0662742c02347bc0e980a01041f333bce120/model.bin"
+        },
+        {
+          "rel_path": "config.json",
+          "size": 2370,
+          "sha256": "b55496ac7940a7ae47d2c01eab40edfd8701feec1229d9cce3b40014383fb828",
+          "url": "https://huggingface.co/Systran/faster-whisper-small/resolve/536b0662742c02347bc0e980a01041f333bce120/config.json"
+        },
+        {
+          "rel_path": "tokenizer.json",
+          "size": 2203239,
+          "sha256": "fb7b63191e9bb045082c79fd742a3106a12c99513ab30df4a0d47fa6cb6fd0ab",
+          "url": "https://huggingface.co/Systran/faster-whisper-small/resolve/536b0662742c02347bc0e980a01041f333bce120/tokenizer.json"
+        },
+        {
+          "rel_path": "vocabulary.txt",
+          "size": 459861,
+          "sha256": "34ce3fe1c5041027b3f8d42912270993f986dbc4bb34cf27f951e34a1e453913",
+          "url": "https://huggingface.co/Systran/faster-whisper-small/resolve/536b0662742c02347bc0e980a01041f333bce120/vocabulary.txt"
+        }
+      ]
+    }
+  ]
+}

@@ -5,11 +5,38 @@ Transcript Exporters (TXT, Markdown, SRT, VTT) and Local Offline Meeting Intelli
 
 from __future__ import annotations
 
+from datetime import datetime
 import html
 import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+
+def format_meeting_local_datetime(created_at: Any, tz_label: str = "") -> str:
+    """Format a persisted meeting timestamp cleanly in local display form with timezone hint."""
+    raw = str(created_at or "").strip()
+    if not raw:
+        return ""
+    parsed: Optional[datetime] = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(raw[:19], fmt)
+            break
+        except Exception:
+            continue
+    local_tz = ""
+    try:
+        local_tz = datetime.now().astimezone().tzname() or ""
+    except Exception:
+        pass
+    eff_tz = str(tz_label or "").strip()
+    if not eff_tz or eff_tz.upper() in ("UTC", "LOCAL"):
+        eff_tz = local_tz
+    if parsed is not None:
+        base = parsed.strftime("%b %d, %Y · %I:%M %p").replace(" 0", " ")
+        return f"{base} ({eff_tz})" if eff_tz else base
+    return f"{raw[:16].replace('T', ' ')} ({eff_tz})" if eff_tz else raw[:16].replace("T", " ")
 
 
 DEFAULT_SENSITIVE_KEYWORDS: Tuple[str, ...] = (
@@ -198,11 +225,12 @@ class TranscriptExporter:
             for a in raw_actions:
                 if isinstance(a, dict):
                     desc = a.get("description", "").strip()
-                    owner = a.get("owner") or "Unassigned"
+                    owner = (a.get("owner") or "").strip()
                     status = a.get("status", "pending")
                     due_str = f" (Due: {a.get('due_date')})" if a.get("due_date") else ""
                     if desc:
-                        line = f"• [{owner}] {desc}{due_str}"
+                        prefix = f"[{owner}] " if owner else ""
+                        line = f"• {prefix}{desc}{due_str}"
                         action_lines.append(line)
                         if status != "completed":
                             pending_action_lines.append(line)
@@ -384,8 +412,12 @@ class TranscriptExporter:
                         )
                 lines.extend([t_summary.strip(), ""])
         else:
+            if meeting.get("brief_summary"):
+                lines.extend(["EXECUTIVE BRIEF:", str(meeting["brief_summary"]).strip(), ""])
             if meeting.get("summary"):
                 lines.extend(["SUMMARY:", str(meeting["summary"]).strip(), ""])
+            if meeting.get("detailed_summary"):
+                lines.extend(["DETAILED SUMMARY:", str(meeting["detailed_summary"]).strip(), ""])
             if meeting.get("decisions"):
                 dec_val = meeting["decisions"]
                 if isinstance(dec_val, list):
@@ -396,10 +428,30 @@ class TranscriptExporter:
             if meeting.get("action_items"):
                 act_val = meeting["action_items"]
                 if isinstance(act_val, list):
-                    act_str = "\n".join(f"- [ ] [{a.get('owner', 'Unassigned')}] {a.get('description', '')}" if isinstance(a, dict) else str(a) for a in act_val)
+                    act_str = "\n".join(
+                        f"- [ ] [{a.get('owner') or 'Owner Unknown'}] {a.get('description', '')}" + (f" (Due: {a.get('due_date')})" if a.get("due_date") else "")
+                        if isinstance(a, dict) else str(a)
+                        for a in act_val
+                    )
                 else:
                     act_str = str(act_val).strip()
                 lines.extend(["ACTION ITEMS:", act_str, ""])
+            fu_raw = meeting.get("follow_ups_json") or meeting.get("follow_ups") or []
+            if isinstance(fu_raw, str):
+                try:
+                    fu_raw = json.loads(fu_raw) if fu_raw.strip().startswith("[") else []
+                except Exception:
+                    fu_raw = []
+            if isinstance(fu_raw, list) and fu_raw:
+                fu_lines = []
+                for f_it in fu_raw:
+                    if isinstance(f_it, dict) and str(f_it.get("item") or "").strip():
+                        own = str(f_it.get("owner") or "").strip()
+                        fu_lines.append(f"• {f'[{own}] ' if own else ''}{str(f_it['item']).strip()}")
+                    elif str(f_it).strip():
+                        fu_lines.append(f"• {str(f_it).strip()}")
+                if fu_lines:
+                    lines.extend(["FOLLOW-UPS:", "\n".join(fu_lines), ""])
             if meeting.get("notes") and not is_client_review:
                 lines.extend(["USER NOTES:", str(meeting["notes"]).strip(), ""])
 
@@ -459,8 +511,13 @@ class TranscriptExporter:
                         )
                 lines.extend([t_summary.strip(), ""])
         else:
+            brief_txt = str(meeting.get("brief_summary") or "").strip()
+            if brief_txt:
+                lines.extend(["## Executive Brief", "", brief_txt, ""])
             if meeting.get("summary"):
                 lines.extend(["## Executive Summary", "", str(meeting["summary"]).strip(), ""])
+            if meeting.get("detailed_summary"):
+                lines.extend(["## Detailed Summary", "", str(meeting["detailed_summary"]).strip(), ""])
             if meeting.get("decisions"):
                 dec_val = meeting["decisions"]
                 if isinstance(dec_val, list):
@@ -471,10 +528,30 @@ class TranscriptExporter:
             if meeting.get("action_items"):
                 act_val = meeting["action_items"]
                 if isinstance(act_val, list):
-                    act_str = "\n".join(f"- [ ] [{a.get('owner', 'Unassigned')}] {a.get('description', '')}" if isinstance(a, dict) else str(a) for a in act_val)
+                    act_str = "\n".join(
+                        f"- [ ] [{a.get('owner') or 'Owner Unknown'}] {a.get('description', '')}" + (f" (Due: {a.get('due_date')})" if a.get("due_date") else "")
+                        if isinstance(a, dict) else str(a)
+                        for a in act_val
+                    )
                 else:
                     act_str = str(act_val).strip()
                 lines.extend(["## Action Items", "", act_str, ""])
+            fu_raw = meeting.get("follow_ups_json") or meeting.get("follow_ups") or []
+            if isinstance(fu_raw, str):
+                try:
+                    fu_raw = json.loads(fu_raw) if fu_raw.strip().startswith("[") else []
+                except Exception:
+                    fu_raw = []
+            if isinstance(fu_raw, list) and fu_raw:
+                fu_lines = []
+                for f_it in fu_raw:
+                    if isinstance(f_it, dict) and str(f_it.get("item") or "").strip():
+                        own = str(f_it.get("owner") or "").strip()
+                        fu_lines.append(f"- {f'[{own}] ' if own else ''}{str(f_it['item']).strip()}")
+                    elif str(f_it).strip():
+                        fu_lines.append(f"- {str(f_it).strip()}")
+                if fu_lines:
+                    lines.extend(["## Follow-Ups", "", "\n".join(fu_lines), ""])
             if meeting.get("notes") and not is_client_review:
                 lines.extend(["## Notes", "", str(meeting["notes"]).strip(), ""])
 
@@ -561,7 +638,7 @@ class TranscriptExporter:
             ]
 
         # Normalized decisions
-        decisions_raw = meeting.get("decisions") or []
+        decisions_raw = meeting.get("decisions_list") or meeting.get("decisions") or []
         decisions_list: List[Dict[str, Any]] = []
         if isinstance(decisions_raw, list):
             for d in decisions_raw:
@@ -573,22 +650,24 @@ class TranscriptExporter:
             decisions_list.append({"decision": decisions_raw.strip(), "status": "approved"})
 
         # Normalized action items
-        actions_raw = meeting.get("action_items") or []
+        actions_raw = meeting.get("actions_list") or meeting.get("action_items") or []
         actions_list: List[Dict[str, Any]] = []
         if isinstance(actions_raw, list):
             for a in actions_raw:
                 if isinstance(a, dict):
                     actions_list.append(a)
                 elif isinstance(a, str):
-                    actions_list.append({"description": a, "owner": "Unassigned", "status": "open"})
+                    actions_list.append({"description": a, "owner": None, "due_date": None, "status": "open"})
         elif isinstance(actions_raw, str) and actions_raw.strip():
-            actions_list.append({"description": actions_raw.strip(), "owner": "Unassigned", "status": "open"})
+            actions_list.append({"description": actions_raw.strip(), "owner": None, "due_date": None, "status": "open"})
 
         payload = {
             "version": "1.0",
             "id": meeting.get("id"),
             "title": meeting.get("title", "Untitled Meeting"),
             "created_at": meeting.get("created_at", ""),
+            "created_at_local": format_meeting_local_datetime(meeting.get("created_at", ""), str(meeting.get("timezone") or "")),
+            "timezone": str(meeting.get("timezone") or "") or None,
             "duration_sec": float(meeting.get("duration_sec", 0.0)),
             "duration_formatted": format_seconds_hms(float(meeting.get("duration_sec", 0.0))),
             "capture_mode": meeting.get("capture_mode", "both"),
@@ -596,7 +675,16 @@ class TranscriptExporter:
             "loopback_device": meeting.get("loopback_device", "N/A"),
             "audio_path": meeting.get("audio_path", "N/A"),
             "video_path": meeting.get("video_path", ""),
+            "meeting_purpose": str(meeting.get("meeting_purpose") or "").strip(),
+            "overall_outcome": str(meeting.get("overall_outcome") or "").strip(),
+            "brief_summary": str(meeting.get("brief_summary") or "").strip(),
             "executive_summary": str(meeting.get("summary") or "").strip(),
+            "detailed_summary": str(meeting.get("detailed_summary") or "").strip(),
+            "topics": json.loads(meeting["topics_json"]) if isinstance(meeting.get("topics_json"), str) and meeting.get("topics_json", "").strip().startswith("[") else (meeting.get("topics_structured") or []),
+            "key_discussion_points": json.loads(meeting["key_points_json"]) if isinstance(meeting.get("key_points_json"), str) and meeting.get("key_points_json", "").strip().startswith("[") else (meeting.get("key_discussion_points") or []),
+            "follow_ups": json.loads(meeting["follow_ups_json"]) if isinstance(meeting.get("follow_ups_json"), str) and meeting.get("follow_ups_json", "").strip().startswith("[") else (meeting.get("follow_ups") or []),
+            "open_questions": json.loads(meeting["open_questions_json"]) if isinstance(meeting.get("open_questions_json"), str) and meeting.get("open_questions_json", "").strip().startswith("[") else (meeting.get("open_questions") or []),
+            "risks_and_blockers": meeting.get("risks_and_blockers_list") or meeting.get("risks") or [],
             "decisions": decisions_list,
             "action_items": actions_list,
             "notes": str(meeting.get("notes") or "").strip(),
@@ -631,6 +719,24 @@ class TranscriptExporter:
         if not summary_text:
             summary_text = str(meeting.get("summary") or "").strip()
 
+        detailed_summary = str(meeting.get("detailed_summary") or "").strip()
+
+        kp_raw = meeting.get("key_points_json") or meeting.get("key_discussion_points") or []
+        if isinstance(kp_raw, str):
+            try:
+                kp_raw = json.loads(kp_raw) if kp_raw.strip().startswith("[") else []
+            except Exception:
+                kp_raw = []
+        key_points = [str(k).strip() for k in (kp_raw if isinstance(kp_raw, list) else []) if str(k).strip()]
+
+        fu_raw = meeting.get("follow_ups_json") or meeting.get("follow_ups") or []
+        if isinstance(fu_raw, str):
+            try:
+                fu_raw = json.loads(fu_raw) if fu_raw.strip().startswith("[") else []
+            except Exception:
+                fu_raw = []
+        follow_ups = [str(f).strip() for f in (fu_raw if isinstance(fu_raw, list) else []) if str(f).strip()]
+
         # Decisions
         decisions_raw = meeting.get("decisions") or []
         decisions: List[Dict[str, Any]] = []
@@ -651,9 +757,9 @@ class TranscriptExporter:
                 if isinstance(a, dict):
                     actions.append(a)
                 elif isinstance(a, str):
-                    actions.append({"description": a, "owner": "Unassigned", "status": "open", "due_date": ""})
+                    actions.append({"description": a, "owner": None, "status": "open", "due_date": ""})
         elif isinstance(actions_raw, str) and actions_raw.strip():
-            actions.append({"description": actions_raw.strip(), "owner": "Unassigned", "status": "open", "due_date": ""})
+            actions.append({"description": actions_raw.strip(), "owner": None, "status": "open", "due_date": ""})
 
         # Segments
         segments = meeting.get("segments") or []
@@ -690,7 +796,7 @@ class TranscriptExporter:
         if actions:
             rows = []
             for a in actions:
-                owner = html.escape(str(a.get("owner") or "Unassigned"))
+                owner = html.escape(str(a.get("owner") or "—"))
                 desc = html.escape(str(a.get("description") or ""))
                 due = html.escape(str(a.get("due_date") or a.get("deadline") or "—"))
                 status = html.escape(str(a.get("status") or "open")).lower()
@@ -719,6 +825,36 @@ class TranscriptExporter:
             <section class='section'>
                 <h2>Executive Summary</h2>
                 <div class='summary-box'>{esc_sum}</div>
+            </section>
+            """
+
+        detailed_html = ""
+        if detailed_summary:
+            esc_det = html.escape(detailed_summary).replace("\n", "<br>")
+            detailed_html = f"""
+            <section class='section'>
+                <h2>Detailed Summary</h2>
+                <div class='summary-box'>{esc_det}</div>
+            </section>
+            """
+
+        key_points_html = ""
+        if key_points:
+            kp_li = "".join(f"<li>{html.escape(kp)}</li>" for kp in key_points)
+            key_points_html = f"""
+            <section class='section'>
+                <h2>Key Discussion Points</h2>
+                <ul class='decisions-list'>{kp_li}</ul>
+            </section>
+            """
+
+        follow_ups_html = ""
+        if follow_ups:
+            fu_li = "".join(f"<li>{html.escape(fu)}</li>" for fu in follow_ups)
+            follow_ups_html = f"""
+            <section class='section'>
+                <h2>Follow-ups</h2>
+                <ul class='decisions-list'>{fu_li}</ul>
             </section>
             """
 
@@ -910,8 +1046,11 @@ class TranscriptExporter:
         </div>
     </header>
     {summary_html}
+    {detailed_html}
+    {key_points_html}
     {decisions_html}
     {actions_html}
+    {follow_ups_html}
     {notes_html}
     {transcript_html}
     <footer>
@@ -1031,6 +1170,8 @@ class LocalMeetingSummarizer:
         platform: str = "Microsoft Teams",
         session_id: str = "",
         llm_engine: Optional[Any] = None,
+        meeting_timestamp: Optional[str] = None,
+        timezone: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Comprehensive 7-stage Minutes of Meeting (MoM) intelligence pipeline.
@@ -1046,6 +1187,8 @@ class LocalMeetingSummarizer:
             platform=platform,
             session_id=session_id,
             llm_engine=llm_engine,
+            meeting_timestamp=meeting_timestamp,
+            timezone=timezone,
         )
 
         # 1. Speaker word counts & talk times

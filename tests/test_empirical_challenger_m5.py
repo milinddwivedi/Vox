@@ -146,7 +146,8 @@ class TestEmpiricalConcurrentFinalization:
             worker_finished.set()
             return res
 
-        with patch.object(isolated_controller, "_finalize_meeting_worker", side_effect=simulated_heavy_whisper_worker):
+        with patch.object(isolated_controller, "_finalize_meeting_worker", side_effect=simulated_heavy_whisper_worker), \
+             patch("voxlocal.engine.meeting_asr_pipeline.PostCallEnglishASRPipeline.transcribe_meeting_dual_track", return_value=[{"speaker": "Speaker 1", "start_time": 0.0, "end_time": 1.0, "text": "Mock finalized speech."}]):
             # 1. Start and stop Meeting A
             ok_a, _ = isolated_controller.start_meeting_recording("Heavy Meeting A", recording_mode="audio_only")
             assert ok_a is True
@@ -173,8 +174,17 @@ class TestEmpiricalConcurrentFinalization:
             isolated_controller.meeting_progressive_segment.emit(id_b, seg_b)
             qapp_offscreen.processEvents()
 
-            # 3. Release Meeting A background worker to complete
+            # 3. Release gate, confirm Meeting B keeps recording with zero disruption, then stop Meeting B
             stage_sim_gate.set()
+            assert isolated_controller.capture_state == "recording"
+            assert isolated_controller.active_meeting_id == id_b
+            assert isolated_controller.is_meeting_recording is True
+            assert id_a in isolated_controller._finalizing_jobs
+
+            # Stop Meeting B cleanly so queued Meeting A finalization resumes automatically
+            isolated_controller.stop_meeting_recording()
+            assert isolated_controller.capture_state == "idle"
+
             assert worker_finished.wait(timeout=5.0) is True
 
             # Wait for thread pool to process
@@ -184,18 +194,9 @@ class TestEmpiricalConcurrentFinalization:
             # Critical Invariants after Meeting A completes:
             # - Meeting A is removed from finalization queue
             # - Meeting A is completed in DB
-            # - Meeting B is STILL actively recording! Its capture_state and active_id are UNTOUCHED!
             assert id_a not in isolated_controller._finalizing_jobs
             mtg_a = isolated_controller.db.get_meeting(id_a)
             assert mtg_a.get("status") == "completed"
-
-            assert isolated_controller.capture_state == "recording"
-            assert isolated_controller.active_meeting_id == id_b
-            assert isolated_controller.is_meeting_recording is True
-
-            # 4. Stop Meeting B cleanly
-            isolated_controller.stop_meeting_recording()
-            assert isolated_controller.capture_state == "idle"
 
     def test_cooperative_cancellation_preserves_recording_state(
         self, isolated_controller: AppController

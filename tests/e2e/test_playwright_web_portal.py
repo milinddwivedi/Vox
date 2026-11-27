@@ -36,9 +36,12 @@ def web_server():
 
 @pytest.fixture(scope="module")
 def browser_context():
-    """Initialize Playwright Chromium browser."""
+    """Initialize Playwright Chromium browser (falling back to installed Edge channel)."""
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        try:
+            browser = p.chromium.launch(headless=True)
+        except Exception:
+            browser = p.chromium.launch(channel="msedge", headless=True)
         context = browser.new_context(viewport={"width": 1280, "height": 800})
         yield context
         browser.close()

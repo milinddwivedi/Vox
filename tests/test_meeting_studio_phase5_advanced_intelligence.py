@@ -243,6 +243,7 @@ class TestMeetingStudioPhase5AdvancedIntelligence(unittest.TestCase):
         self.assertIn("Agreed on direct CSV export architecture", txt_mom)
 
         # Verify studio export formats and participant checklists/follow-up templates
+        nt.studio._populate_advanced_tabs()
         export_info = nt.studio.adv_export_page.toPlainText()
         self.assertIn("Standard MoM", export_info)
         self.assertIn("Client Review MoM", export_info)

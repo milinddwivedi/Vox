@@ -202,7 +202,7 @@ class TestMeetingStudioPhase5EnterpriseUX(unittest.TestCase):
         dec_widget: VoxStructuredDecisionsWidget = nt.studio.tab_summary.decisions_widget
 
         self.assertEqual(len(dec_widget._decisions), 1)
-        self.assertIn("1 confirmed", dec_widget.lbl_count.text())
+        self.assertIn("1 decisions", dec_widget.lbl_count.text().lower())
 
         seek_spy = []
         dec_widget.timestamp_clicked.connect(lambda sec: seek_spy.append(sec))

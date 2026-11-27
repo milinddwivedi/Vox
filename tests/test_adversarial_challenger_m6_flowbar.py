@@ -90,17 +90,18 @@ class TestEmpiricalRapidStateTransitions:
 
     def test_interrupted_morph_converges_cleanly(self, flowbar: VoxFlowBar, qapp: QApplication) -> None:
         """Interrupting an in-flight morph at 100ms smoothly redirects geometry to the new target."""
+        flowbar.set_dock_edge("bottom")
         flowbar.set_pill_state("RESTING", animated=False)
-        assert flowbar.size() == QSize(30, 6)
+        assert flowbar.size() == QSize(40, 8)
 
         # Start 420ms morph to L4_PREVIEW (416, 322)
         flowbar.set_pill_state("L4_PREVIEW", animated=True)
         _drain_events(qapp, 0.10)  # Stop mid-flight at ~100ms
 
         mid_size = flowbar.size()
-        # Must be between start (30, 6) and target (416, 322)
-        assert 30 < mid_size.width() < 416
-        assert 6 < mid_size.height() < 322
+        # Must be between start (40, 8) and target (416, 322)
+        assert 40 < mid_size.width() < 416
+        assert 8 < mid_size.height() < 322
 
         # Interrupt with MINI_MEETING (416, 48)
         flowbar.set_pill_state("MINI_MEETING", animated=True)
@@ -132,7 +133,11 @@ class TestEmpiricalRapidStateTransitions:
 
     def test_zero_duration_or_sync_morph(self, flowbar: VoxFlowBar, qapp: QApplication) -> None:
         """When animated=False, geometry transitions synchronously and immediately without timer."""
-        for name, (ew, eh) in DIMENSION_SPECS.items():
+        flowbar.set_dock_edge("bottom")
+        specs = dict(DIMENSION_SPECS)
+        specs["RESTING"] = (40, 8)
+        specs["ACTIVE_RECORDING"] = (72, 30)
+        for name, (ew, eh) in specs.items():
             flowbar.set_pill_state(name, animated=False)
             qapp.processEvents()
             assert flowbar.width() == ew, f"{name} width expected {ew}, got {flowbar.width()}"

@@ -5,17 +5,29 @@ Only settings a user actually needs are exposed.
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict
 
-from voxlocal.core.logger import get_app_root, get_logger
+from voxlocal.core.logger import get_app_root, get_logger, get_user_data_root, get_user_models_root
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 logger = get_logger("config")
+
+
+def get_local_timezone_name() -> str:
+    """Resolve the current OS local timezone display name cleanly."""
+    try:
+        tz = datetime.now().astimezone().tzname()
+        if tz and tz.strip():
+            return tz.strip()
+    except Exception:
+        pass
+    return "Local"
 
 
 @dataclass
@@ -39,34 +51,40 @@ class AppConfig:
     verbatim_transcript_protection: bool = True
     enable_selective_verification: bool = True
 
-    # Phase 2 Adaptive Pipeline & Instant Rollback Controls
-    enable_phase2_asr_pipeline: bool = True  # Set False to roll back to legacy Phase 0 Whisper live + offline pipeline
-    asr_session_mode: str = "auto"           # auto | english | hinglish
-    live_english_backend: str = "auto"       # auto | nemotron | parakeet | faster_whisper
-    live_hinglish_backend: str = "auto"      # auto | qwen3_onnx | faster_whisper
-    offline_english_backend: str = "auto"    # auto | parakeet | faster_whisper
-    offline_hinglish_backend: str = "auto"   # auto | hf_qwen3_asr | qwen3_onnx | faster_whisper
-    selective_second_pass_enabled: bool = True
-    selective_verifier_backend: str = "auto" # auto | oriserve_apex | hf_qwen3_asr | parakeet | faster_whisper | disabled
-    # Provisional configurable thresholds for selective 2nd-pass verification (validated per session language)
+    # Local Post-Call English Meeting ASR + Diarization Pipeline (v2.0 Single-Winner)
+    meeting_asr_model: str = "cohere-transcribe-en-int8"
+    meeting_diarization_enabled: bool = True
+    meeting_diarization_threshold: float = 0.72
+    meeting_echo_bleed_suppression: bool = True
+    meeting_glossary_correction: bool = True
+
+    # Phase 2 Adaptive Pipeline & Live Meeting Flags (retired for meetings; retained on schema for backward-compatible config loading)
+    enable_phase2_asr_pipeline: bool = False
+    asr_session_mode: str = "english"
+    live_english_backend: str = "disabled"
+    live_hinglish_backend: str = "disabled"
+    offline_english_backend: str = "cohere_transcribe"
+    offline_hinglish_backend: str = "disabled"
+    selective_second_pass_enabled: bool = False
+    selective_verifier_backend: str = "disabled"
     selective_logprob_threshold: float = -0.45
     selective_min_wps: float = 0.75
     selective_max_utterances_per_meeting: int = 40
-    selective_enable_hinglish_cue_routing: bool = True
-    # Recording-first post-call transcription + bounded provisional live preview
-    live_preview_enabled: bool = True
+    selective_enable_hinglish_cue_routing: bool = False
+    live_preview_enabled: bool = False
     live_preview_max_backlog_sec: float = 8.0
-    post_call_allow_cpu_verifier: bool = True
-    post_call_adaptive_english_parakeet: bool = True
+    post_call_allow_cpu_verifier: bool = False
+    post_call_adaptive_english_parakeet: bool = False
     post_call_punctuation_polish: bool = True
     # Live GPU VRAM headroom thresholds (MB) before loading optional CUDA models
     gpu_min_free_vram_hf_mb: int = 2000
     gpu_min_free_vram_ct2_mb: int = 1100
 
-    # Local LLM Engine (Offline Meeting Intelligence & Q&A)
-    llm_model: str = "Llama-3.2-1B-Instruct-ct2-int8"
+    # Local LLM Engine (Offline Meeting Intelligence, Knowledge & Ask VOX)
+    llm_model: str = "Qwen3.5-4B-Q4_K_M.gguf"
     llm_enabled: bool = True
-    llm_device: str = "auto"         # auto | cuda | cpu
+    llm_device: str = "auto"         # auto | gpu | cpu
+    llm_idle_unload_sec: int = 300
 
     # Live voice typing (hands-free)
     typing_hotkey: str = "ctrl+shift+space"
@@ -90,8 +108,8 @@ class AppConfig:
     meeting_mic_device_name: str = ""
     meeting_mic_gain: float = 1.0    # Meeting capture gain (1.0 = pristine unity gain; studio DSP AGC normalizes speech to broadcast target)
     loopback_device_index: int | None = None  # None = all outputs
-    live_meeting_transcript: bool = True
-    timezone: str = "UTC"
+    live_meeting_transcript: bool = False
+    timezone: str = "local"
 
     # Desktop & Flow Bar
     launch_at_login: bool = True
@@ -143,7 +161,12 @@ class AppConfig:
     notetaker_notepad_on_start: str = "open"     # "open" | "split" | "hidden"
     notetaker_max_length_min: int = 120
     notetaker_auto_detect_speakers: bool = True
-    notetaker_live_transcript: bool = True
+    notetaker_live_transcript: bool = False
+    notetaker_library_width: int = 290
+    notetaker_library_collapsed: bool = False
+    notetaker_library_compact: bool = False
+    notetaker_ask_rail_open: bool = False
+    notetaker_split_mode: str = "off"
     calendar_reminder_lead_min: int = 1
     calendar_provider: str = "none"
     calendar_account_email: str = ""
@@ -182,7 +205,7 @@ class AppConfig:
     vad_filter: bool = True
     meeting_capture_mode: str = "mixed"
     preserve_separate_tracks: bool = True
-    progressive_transcription: bool = True
+    progressive_transcription: bool = False
     progressive_interval_sec: int = 15
     auto_summarize_meeting: bool = True
     compute_type: str = "default"
@@ -239,16 +262,18 @@ class AppConfig:
         self.icon_y = val
 
     def __post_init__(self) -> None:
-        root = get_app_root()
         if not self.storage_dir:
-            self.storage_dir = str(root / "data")
+            self.storage_dir = str(get_user_data_root())
         if not self.models_dir:
-            self.models_dir = str(Path(self.storage_dir) / "models")
+            if self.storage_dir == str(get_user_data_root()):
+                self.models_dir = str(get_user_models_root())
+            else:
+                self.models_dir = str(Path(self.storage_dir) / "models")
         self.ensure_directories()
 
     def ensure_directories(self) -> None:
         base = Path(self.storage_dir)
-        for sub in ("recordings", "exports", "logs"):
+        for sub in ("recordings", "exports", "logs", "crash_reports", "backups", "updates", "temp"):
             os.makedirs(base / sub, exist_ok=True)
         os.makedirs(self.models_dir, exist_ok=True)
 
@@ -266,18 +291,34 @@ class AppConfig:
 
     @property
     def llm_models_dir(self) -> Path:
-        return Path(self.models_dir) / "llm"
+        return Path(self.models_dir) / "meeting_llm"
 
     @property
     def llm_model_path(self) -> Path:
         return self.llm_models_dir / self.llm_model
+
+    @property
+    def meeting_asr_dir(self) -> Path:
+        return Path(self.models_dir) / "meeting_asr" / self.meeting_asr_model
+
+    @property
+    def meeting_diarization_dir(self) -> Path:
+        return Path(self.models_dir) / "meeting_diarization" / "sherpa-diarization"
+
+    @property
+    def meeting_llm_path(self) -> Path:
+        return self.llm_models_dir / self.llm_model
+
+    @property
+    def meeting_embeddings_dir(self) -> Path:
+        return Path(self.models_dir) / "meeting_embeddings" / "bge-small-en-v1.5-onnx-Q"
 
     @classmethod
     def default_config_path(cls) -> Path:
         custom_env = os.environ.get("VOXLOCAL_CONFIG_PATH")
         if custom_env:
             return Path(custom_env)
-        return get_app_root() / "data" / "config.json"
+        return get_user_data_root() / "config.json"
 
     def config_file_path(self) -> Path:
         custom_env = os.environ.get("VOXLOCAL_CONFIG_PATH")
@@ -288,18 +329,22 @@ class AppConfig:
             for tok in ("temp", "tmp", "test_", "pytest", "scratch")
         ):
             return Path(self.storage_dir) / "config.json"
-        return get_app_root() / "data" / "config.json"
+        return get_user_data_root() / "config.json"
 
     def save(self) -> None:
         try:
             path = self.config_file_path()
             os.makedirs(path.parent, exist_ok=True)
             data = asdict(self)
+            # Ensure Path instances are serialized cleanly as strings
+            for k, v in list(data.items()):
+                if isinstance(v, Path):
+                    data[k] = str(v)
             # Never serialize client secrets to plaintext config.json
             data["google_calendar_client_secret"] = ""
             data["zoom_client_secret"] = ""
             tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
             os.replace(tmp, path)  # atomic: never leaves a half-written config
         except Exception as exc:
             logger.error("Failed to save config: %s", exc)
@@ -312,11 +357,29 @@ class AppConfig:
                 data: Dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
                 valid = set(cls.__dataclass_fields__)
                 cfg = cls(**{k: v for k, v in data.items() if k in valid})
+                # Enforce v2.0 single-winner post-call architecture on migrated configs
+                if not cfg.llm_model or "Llama-3.2-1B" in cfg.llm_model:
+                    cfg.llm_model = "Qwen3.5-4B-Q4_K_M.gguf"
+                if not cfg.meeting_asr_model:
+                    cfg.meeting_asr_model = "cohere-transcribe-en-int8"
+                cfg.live_meeting_transcript = False
+                cfg.notetaker_live_transcript = False
+                cfg.live_preview_enabled = False
+                cfg.progressive_transcription = False
+                cfg.enable_phase2_asr_pipeline = False
+                cfg.asr_session_mode = "english"
+                cfg.live_english_backend = "disabled"
+                cfg.live_hinglish_backend = "disabled"
+                cfg.offline_english_backend = "cohere_transcribe"
+                cfg.offline_hinglish_backend = "disabled"
+                cfg.selective_enable_hinglish_cue_routing = False
+                if not cfg.timezone or str(cfg.timezone).strip().upper() == "UTC":
+                    cfg.timezone = "local"
                 # Self-heal if primary data/config.json was previously polluted by a test_mtg_* storage_dir
                 if not os.environ.get("VOXLOCAL_CONFIG_PATH") and cfg.storage_dir:
                     s_low = str(cfg.storage_dir).lower()
                     if any(tok in s_low for tok in ("temp", "tmp", "test_", "pytest", "scratch")):
-                        cfg.storage_dir = str(get_app_root() / "data")
+                        cfg.storage_dir = str(get_user_data_root())
                         cfg.save()
                 return cfg
             except Exception as exc:

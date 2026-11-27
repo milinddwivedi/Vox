@@ -200,7 +200,8 @@ class TestTier1Feature06Polymorphic8StateEngine:
         long_dim, short_dim = max(w, h), min(w, h)
         assert 70 <= long_dim <= 160, f"Active recording long dimension {long_dim} ({w}x{h}) out of bounds"
         assert 28 <= short_dim <= 45, f"Active recording short dimension {short_dim} ({w}x{h}) out of bounds"
-        assert not pill.waveform_capsule.isHidden()
+        assert not pill.active_recording_capsule.isHidden()
+        assert not pill.active_recording_capsule.equalizer.isHidden()
 
     def test_05_flowbar_l4_preview_state_dimensions(self, offscreen_widgets: Dict[str, Any]) -> None:
         """Verify L4 Preview state target dimensions conform to 416x322 layout."""
@@ -689,7 +690,8 @@ class TestTier3PairwiseToggleBar:
         for level in [0.1, 0.4, 0.8, 0.3]:
             pill.set_audio_level(level)
             assert pill.waveform_capsule._target_level == pytest.approx(level)
-        assert not pill.waveform_capsule.isHidden()
+        assert not pill.active_recording_capsule.isHidden()
+        assert not pill.active_recording_capsule.equalizer.isHidden()
 
     def test_02_calendar_alert_triggers_mini_then_card_on_hover(
         self, offscreen_widgets: Dict[str, Any]
@@ -763,7 +765,8 @@ class TestTier4ToggleBarScenarios:
         _safe_transition_state(pill, "ACTIVE_RECORDING")
         w, h = _get_flowbar_size(pill)
         assert 70 <= max(w, h) <= 160
-        assert not pill.waveform_capsule.isHidden()
+        assert not pill.active_recording_capsule.isHidden()
+        assert not pill.active_recording_capsule.equalizer.isHidden()
 
     def test_scenario_2_mini_toggle_hover_expansion_and_split_join(
         self, offscreen_widgets: Dict[str, Any], isolated_controller: AppController
@@ -778,7 +781,8 @@ class TestTier4ToggleBarScenarios:
         # 3. User clicks Join button
         pill.meeting_toggle_requested.emit()
         _safe_transition_state(pill, "ACTIVE_RECORDING")
-        assert not pill.waveform_capsule.isHidden()
+        assert not pill.active_recording_capsule.isHidden()
+        assert not pill.active_recording_capsule.equalizer.isHidden()
 
     def test_scenario_3_overlapping_multi_meeting_stack_discovery(
         self, offscreen_widgets: Dict[str, Any], isolated_controller: AppController

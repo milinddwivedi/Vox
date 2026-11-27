@@ -127,14 +127,14 @@ class TestHandsFreeAndCalls(unittest.TestCase):
         import tempfile
         from voxlocal.storage.database import LocalDatabase
         with tempfile.TemporaryDirectory() as td:
-            db = LocalDatabase(Path(td) / "test.db")
-            db.add_dictation_entry("hello test", "Hello test.", 1.2, "VSCode", "Code.exe")
-            hist = db.list_dictation_history(limit=5)
-            self.assertEqual(len(hist), 1)
-            # Verify alias works identically
-            alias_hist = db.list_dictations(limit=5)
-            self.assertEqual(len(alias_hist), 1)
-            self.assertEqual(alias_hist[0]["final_text"], "Hello test.")
+            with LocalDatabase(Path(td) / "test.db") as db:
+                db.add_dictation_entry("hello test", "Hello test.", 1.2, "VSCode", "Code.exe")
+                hist = db.list_dictation_history(limit=5)
+                self.assertEqual(len(hist), 1)
+                # Verify alias works identically
+                alias_hist = db.list_dictations(limit=5)
+                self.assertEqual(len(alias_hist), 1)
+                self.assertEqual(alias_hist[0]["final_text"], "Hello test.")
 
 
 if __name__ == "__main__":

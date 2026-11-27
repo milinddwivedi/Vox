@@ -190,7 +190,7 @@ class TestPhase6MigrationAndCompatibility(unittest.TestCase):
         with db._connect() as conn:
             # 1. Version check
             user_ver = conn.execute("PRAGMA user_version;").fetchone()[0]
-            self.assertEqual(user_ver, 6, "Database user_version must be 6 after v6 migration")
+            self.assertEqual(user_ver, 7, "Database user_version must be 7 after v7 migration")
 
             # 2. Meetings table columns
             meeting_cols = {r["name"]: dict(r) for r in conn.execute("PRAGMA table_info(meetings);").fetchall()}
@@ -564,14 +564,14 @@ class TestPhase6MigrationAndCompatibility(unittest.TestCase):
         # Part 1: Idempotency
         db = LocalDatabase(self.db_path)
         with db._connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version;").fetchone()[0], 6)
+            self.assertEqual(conn.execute("PRAGMA user_version;").fetchone()[0], 7)
 
         # Execute _migrate_v6 repeatedly
         for _ in range(3):
             db._migrate_v6()
 
         with db._connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version;").fetchone()[0], 6)
+            self.assertEqual(conn.execute("PRAGMA user_version;").fetchone()[0], 7)
             chk = conn.execute("PRAGMA integrity_check;").fetchall()
             self.assertEqual([r[0] for r in chk], ["ok"])
 

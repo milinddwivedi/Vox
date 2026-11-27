@@ -44,6 +44,14 @@ class TestAskVoxStreamingAndBranding(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        try:
+            cls.llm_engine.unload()
+        except Exception:
+            pass
+        try:
+            cls.db.close()
+        except Exception:
+            pass
         if cls.test_db_path.exists():
             try:
                 cls.test_db_path.unlink()
@@ -192,16 +200,21 @@ class TestAskVoxStreamingAndBranding(unittest.TestCase):
         ctrl.ask_vox_citations_ready.connect(lambda qid, cits: cits_emitted.extend(cits))
         ctrl.ask_vox_stream_finished.connect(lambda qid, res: finished_emitted.append(res))
 
-        ctrl.query_meeting_memory_stream("What was decided?", meeting_id=m_id)
+        try:
+            ctrl.query_meeting_memory_stream("In one brief sentence, what brand mark was decided?", meeting_id=m_id)
 
-        # Wait up to 30 seconds for background worker thread to finish
-        t_start = time.time()
-        while not finished_emitted and (time.time() - t_start < 30.0):
-            app.processEvents()
-            time.sleep(0.05)
+            # Wait up to 90 seconds (accommodates CPU fallback) for background worker thread to finish
+            t_start = time.time()
+            while not finished_emitted and (time.time() - t_start < 90.0):
+                app.processEvents()
+                time.sleep(0.05)
 
-        self.assertTrue(len(finished_emitted) > 0, "ask_vox_stream_finished signal must fire")
-        ctrl.shutdown()
+            self.assertTrue(len(finished_emitted) > 0, "ask_vox_stream_finished signal must fire")
+            self.assertTrue(len(token_emitted) > 0, "ask_vox_token_streamed signal must fire")
+        finally:
+            ctrl.llm_engine = None
+            ctrl.intelligence.llm_engine = None
+            ctrl.shutdown()
 
 
 if __name__ == "__main__":

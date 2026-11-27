@@ -49,6 +49,9 @@ if not os.environ.get("VOX_ENTITLEMENT_PRIVATE_KEY_ED25519"):
 
 def get_backend_manifest() -> Dict[str, Any]:
     """Evaluates api/releases/latest.js via Node.js to retrieve the live signed manifest."""
+    env = dict(os.environ)
+    if not env.get("VOX_ENTITLEMENT_PRIVATE_KEY_ED25519") and not env.get("ENTITLEMENT_PRIVATE_KEY_PEM"):
+        env["VOX_ENTITLEMENT_PRIVATE_KEY_ED25519"] = DEV_FALLBACK_PRIVATE_KEY_HEX
     script = (
         "const handler = require('./api/releases/latest.js');"
         "const res = { setHeader: () => {}, status: () => ({ json: (d) => console.log(JSON.stringify(d)) }) };"
@@ -57,6 +60,7 @@ def get_backend_manifest() -> Dict[str, Any]:
     result = subprocess.run(
         ["node", "-e", script],
         cwd=str(ROOT_DIR),
+        env=env,
         capture_output=True,
         text=True,
         check=True,

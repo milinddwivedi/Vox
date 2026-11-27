@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import weakref
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
@@ -83,8 +84,13 @@ class HomePage(QWidget):
         super().__init__(parent)
         self.controller = controller
         self._theme = getattr(controller, "theme", "light")
+        self._theme_applied_once: bool = False
+        self._dirty: bool = False
         self._kpi_cards: List[QFrame] = []
         self._next_meeting: Optional[Any] = None
+        self._last_feed_sig: Optional[Any] = None
+        self._last_recent_meetings_sig: Optional[Any] = None
+        self._feed_render_limit: int = 30
         self._feed_search_timer = QTimer(self)
         self._feed_search_timer.setSingleShot(True)
         self._feed_search_timer.setInterval(200)
@@ -92,16 +98,28 @@ class HomePage(QWidget):
         self._build_ui()
         self.apply_theme(self._theme)
 
-        self.controller.history_updated.connect(self.refresh_all)
-        self.controller.dictation_completed.connect(lambda *_: self.refresh_all())
+        self.controller.history_updated.connect(self._on_background_refresh_signal)
+        self.controller.dictation_completed.connect(lambda *_: self._on_background_refresh_signal())
         if hasattr(self.controller, "calendar_upcoming_changed"):
             self.controller.calendar_upcoming_changed.connect(lambda *_: self._refresh_upcoming())
         if hasattr(self.controller, "meeting_saved_and_transcribed"):
-            self.controller.meeting_saved_and_transcribed.connect(lambda *_: self.refresh_all())
+            self.controller.meeting_saved_and_transcribed.connect(lambda *_: self._on_background_refresh_signal())
         if hasattr(self.controller, "meeting_saved"):
-            self.controller.meeting_saved.connect(lambda *_: self.refresh_all())
+            self.controller.meeting_saved.connect(lambda *_: self._on_background_refresh_signal())
 
         self.refresh_all()
+
+    def _on_background_refresh_signal(self) -> None:
+        if self.isVisible():
+            self.refresh_all()
+        else:
+            self._dirty = True
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self.refresh_all()
 
     def closeEvent(self, event: Any) -> None:
         if hasattr(self, "_feed_search_timer") and self._feed_search_timer.isActive():
@@ -468,24 +486,24 @@ class HomePage(QWidget):
             self.recent_meetings_section.setVisible(False)
             return
 
-        self._clear_layout_widgets(self.recent_meetings_lay)
         try:
             meetings = list(db.list_meetings(limit=3) or [])
         except Exception:
             meetings = []
 
         if not meetings:
+            empty_sig = (self._theme, ())
+            if self._last_recent_meetings_sig == empty_sig:
+                self.recent_meetings_section.setVisible(False)
+                return
+            self._last_recent_meetings_sig = empty_sig
+            self._clear_layout_widgets(self.recent_meetings_lay)
             self.recent_meetings_section.setVisible(False)
             return
 
-        t = get_theme_tokens(self._theme)
+        meeting_rows: List[tuple] = []
         for m in meetings[:3]:
             mid = int(m["id"])
-            title = str(m.get("title") or "Untitled Meeting").strip()
-            status = str(m.get("status") or "completed").lower()
-            platform = str(m.get("source_platform") or m.get("platform") or "Local").strip()
-            snippet = self._clean_meeting_snippet(str(m.get("summary") or ""))
-
             open_actions = 0
             if hasattr(db, "list_action_items"):
                 try:
@@ -493,6 +511,34 @@ class HomePage(QWidget):
                     open_actions = sum(1 for a in actions if str(a.get("status") or "").lower() != "completed")
                 except Exception:
                     open_actions = 0
+            meeting_rows.append((m, open_actions))
+
+        sig = (
+            self._theme,
+            tuple(
+                (
+                    int(m["id"]),
+                    str(m.get("title") or ""),
+                    str(m.get("status") or ""),
+                    str(m.get("summary") or "")[:120],
+                    oa,
+                )
+                for m, oa in meeting_rows
+            ),
+        )
+        if self._last_recent_meetings_sig == sig and self.recent_meetings_lay.count() > 0:
+            self.recent_meetings_section.setVisible(True)
+            return
+        self._last_recent_meetings_sig = sig
+        self._clear_layout_widgets(self.recent_meetings_lay)
+
+        t = get_theme_tokens(self._theme)
+        for m, open_actions in meeting_rows:
+            mid = int(m["id"])
+            title = str(m.get("title") or "Untitled Meeting").strip()
+            status = str(m.get("status") or "completed").lower()
+            platform = str(m.get("source_platform") or m.get("platform") or "Local").strip()
+            snippet = self._clean_meeting_snippet(str(m.get("summary") or ""))
 
             card = QFrame()
             card.setObjectName("hubMeetingCard")
@@ -548,13 +594,36 @@ class HomePage(QWidget):
 
         self.recent_meetings_section.setVisible(True)
 
-    def refresh_feed(self) -> None:
+    def refresh_feed(self, force: bool = False) -> None:
         if getattr(self.controller, "_cancel_ask_vox", False):
             return
         db = getattr(self.controller, "db", None)
         db_path = getattr(db, "db_path", None) if db is not None else None
         if db is None or (db_path and ":memory:" not in str(db_path).lower() and not Path(str(db_path)).exists()):
             return
+        q = self.txt_feed_search.text().strip()
+        rows = self.controller.db.list_dictation_history(search_query=q, limit=120)
+        limit_now = len(rows) if q else max(30, int(getattr(self, "_feed_render_limit", 30) or 30))
+        sig = (
+            self._theme,
+            q,
+            min(len(rows), limit_now),
+            tuple(
+                (
+                    int(r["id"]),
+                    str(r.get("edited_text") or ""),
+                    str(r.get("final_text") or ""),
+                    str(r.get("raw_text") or ""),
+                    bool(r.get("undone")),
+                    str(r.get("created_at") or ""),
+                )
+                for r in rows
+            ),
+        )
+        if not force and self._last_feed_sig == sig and self.feed_layout.count() > 0:
+            return
+        self._last_feed_sig = sig
+
         while self.feed_layout.count():
             it = self.feed_layout.takeAt(0)
             w = it.widget()
@@ -562,9 +631,6 @@ class HomePage(QWidget):
                 w.hide()
                 w.setParent(None)
                 w.deleteLater()
-
-        q = self.txt_feed_search.text().strip()
-        rows = self.controller.db.list_dictation_history(search_query=q, limit=120)
         if not rows:
             empty = QFrame()
             empty.setObjectName("hubCard")
@@ -585,7 +651,8 @@ class HomePage(QWidget):
             return
 
         current_bucket = None
-        for row in rows:
+        visible_rows = rows[:limit_now]
+        for row in visible_rows:
             bucket = _safe_date_bucket(str(row.get("created_at") or ""))
             if bucket != current_bucket:
                 current_bucket = bucket
@@ -594,6 +661,18 @@ class HomePage(QWidget):
                 hdr.setObjectName("hubMuted")
                 self.feed_layout.addWidget(hdr)
             self.feed_layout.addWidget(self._build_feed_card(row))
+        if len(rows) > len(visible_rows):
+            remaining = len(rows) - len(visible_rows)
+            btn_more = QPushButton(f"Show more dictations ({remaining} more)")
+            btn_more.setObjectName("hubSecondaryBtn")
+            btn_more.setCursor(Qt.CursorShape.PointingHandCursor)
+
+            def _load_more() -> None:
+                self._feed_render_limit = int(getattr(self, "_feed_render_limit", 30) or 30) + 30
+                self.refresh_feed(force=True)
+
+            btn_more.clicked.connect(_load_more)
+            self.feed_layout.addWidget(btn_more)
         self.feed_layout.addStretch(1)
 
     def _build_feed_card(self, row: Dict[str, Any]) -> QFrame:
@@ -658,7 +737,8 @@ class HomePage(QWidget):
 
         btn_ai = QPushButton("AI Polish")
         btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_ai.clicked.connect(lambda _=False, eid=entry_id, txt=final_text: self._transform_entry_menu(eid, txt, btn_ai))
+        btn_ai_ref = weakref.ref(btn_ai)
+        btn_ai.clicked.connect(lambda _=False, eid=entry_id, txt=final_text, bref=btn_ai_ref: self._transform_entry_menu(eid, txt, bref() or self))
         top.addWidget(btn_ai)
 
         if not undone and row.get("raw_text") and row.get("raw_text") != final_text:
@@ -791,7 +871,12 @@ class HomePage(QWidget):
             """
         )
         self._refresh_recent_meetings()
-        self.refresh_feed()
+        if not self._theme_applied_once:
+            self._theme_applied_once = True
+        elif self.isVisible():
+            self.refresh_feed()
+        else:
+            self._dirty = True
 
     set_theme = apply_theme
 

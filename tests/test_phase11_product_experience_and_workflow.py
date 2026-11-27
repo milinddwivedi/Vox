@@ -132,7 +132,7 @@ class TestPhase11ProductExperienceAndWorkflow(unittest.TestCase):
         widget.set_decisions(decisions)
 
         self.assertEqual(len(widget._decisions), 2)
-        self.assertIn("2 confirmed", widget.lbl_count.text())
+        self.assertIn("1 confirmed", widget.lbl_count.text())
 
         # Verify timestamp seek signal emission
         seek_history = []

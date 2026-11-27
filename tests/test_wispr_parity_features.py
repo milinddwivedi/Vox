@@ -275,6 +275,7 @@ def test_notetaker_drawer_live_segments_filter_and_ask_ai(isolated_controller, q
     ctrl.db.update_meeting(
         mid,
         summary="Agreed to launch VOX 2.0 FlowBar next Friday.",
+        action_items="- [ ] [Lauren] Complete FlowBar QA checklist (Friday)",
         notes="Initial kickoff notes",
     )
     ctrl.db.add_transcript_segment(mid, 0, 2.0, 6.0, "Milind", "Let's finalize the FlowBar polish before Friday.")
@@ -287,27 +288,29 @@ def test_notetaker_drawer_live_segments_filter_and_ask_ai(isolated_controller, q
 
     assert "Q4 Product Roadmap" in drawer.txt_title.text()
     assert drawer.list_transcript.count() == 2
-    assert drawer.list_tasks.count() == 1
-    assert "VOX 2.0 FlowBar" in drawer.summary_view.toPlainText()
+    assert len(ctrl.db.list_action_items(mid)) == 1
+    assert "VOX 2.0 FlowBar" in drawer.summary_browser.toPlainText()
+    assert "Complete FlowBar QA checklist" in drawer.summary_browser.toPlainText()
 
     # Live timer & progressive transcript segment
     ctrl._active_meeting_id = mid
     drawer._on_meeting_tick(125.0, 0.5, 0.25, True, True)
-    assert drawer.lbl_timer.text() == "02:05"
-    assert "Live" in drawer.lbl_mic_badge.text()
+    assert "02:05" in drawer.lbl_tx_stats.text()
+    assert "Recording" in drawer.lbl_tele_status.text()
 
     drawer._on_progressive_segment(mid, {"start_time": 14.0, "speaker": "Abhilash", "text": "Confirmed telemetry is green."})
     assert drawer.list_transcript.count() == 3
 
     # Filter transcript rows
-    drawer._filter_transcript_list("telemetry")
-    hidden_flags = [drawer.list_transcript.item(i).isHidden() for i in range(drawer.list_transcript.count())]
-    assert hidden_flags == [True, True, False]
-    drawer._filter_transcript_list("")
+    drawer._on_search_query_changed("telemetry")
+    assert "Confirmed telemetry is green." in drawer.tx_browser.toPlainText()
+    assert "FlowBar polish" not in drawer.tx_browser.toPlainText()
+    drawer._on_search_query_changed("")
 
     # Save edits to meeting notes
     drawer.notes_editor.setPlainText("Updated agenda + Friday launch confirmed.")
     drawer._save_meeting_notes()
+    drawer.flush_pending_notes()
     assert "Friday launch confirmed" in ctrl.db.get_meeting(mid)["notes"]
 
     # Expand/compact geometry toggle & Ask AI
@@ -315,9 +318,14 @@ def test_notetaker_drawer_live_segments_filter_and_ask_ai(isolated_controller, q
     drawer._toggle_expand()
     assert drawer._is_expanded is True and drawer.width() >= 900
 
-    drawer.txt_question.setText("Who owns the QA checklist?")
-    drawer._ask_ai()
-    assert "VOX:" in drawer.qa_output.toPlainText()
+    import time
+    drawer.txt_ask_anything.setText("Who owns the QA checklist?")
+    drawer._on_ask_anything_submitted()
+    t_end = time.monotonic() + 8.0
+    while "Q: Who owns the QA checklist?" not in drawer.summary_browser.toPlainText() and time.monotonic() < t_end:
+        qapp.processEvents()
+        time.sleep(0.05)
+    assert "Q: Who owns the QA checklist?" in drawer.summary_browser.toPlainText()
     drawer.close()
 
 

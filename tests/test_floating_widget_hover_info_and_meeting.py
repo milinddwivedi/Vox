@@ -70,24 +70,31 @@ class TestFloatingWidgetHoverInfoAndMeeting(unittest.TestCase):
             on_exit_app=lambda: None,
         )
         floating.show()
+        floating.set_dock_edge("bottom")
         QApplication.processEvents()
         self.assertEqual(floating.pill_state, PillState.IDLE)
         self.assertEqual(floating.upper_pill.width(), 40)
         self.assertEqual(floating.upper_pill.height(), 8)
         self.assertFalse(floating.btn_scratchpad.isVisible())
 
-        # Hover expands Resting 40x8 pill -> Ready 50x30 + hover tooltip + Scratchpad button
+        # Hover expands Resting 40x8 pill -> Ready dual-button capsule + hover tooltip
         enter_ev = QEnterEvent(QPointF(10, 4), QPointF(10, 4), QPointF(500, 500))
         floating.enterEvent(enter_ev)
         self.assertTrue(floating._is_hovered)
-        self.assertEqual(floating.upper_pill.width(), 50)
-        self.assertEqual(floating.upper_pill.height(), 30)
+        self.assertEqual(floating.pill_state, PillState.READY)
+        rw, rh = floating._ready_dims()
+        self.assertEqual(floating.upper_pill.width(), rw)
+        self.assertEqual(floating.upper_pill.height(), rh)
+        self.assertTrue(floating.btn_dictate.isVisible())
+        self.assertTrue(floating.btn_notetaker.isVisible())
+        floating._on_dictate_hover(True, floating.btn_dictate.geometry())
+        floating._do_show_tooltip()
         self.assertTrue(floating.hover_tooltip.isVisible())
-        self.assertIn("Click or hold", floating.hover_tooltip.lbl_text.text())
-        self.assertTrue(floating.btn_scratchpad.isVisible())
+        self.assertTrue(len(floating.hover_tooltip.lbl_text.text().strip()) > 0)
 
         # Leaving restores Resting bar and hides tooltip
         floating.leaveEvent(QEvent(QEvent.Type.Leave))
+        floating._handle_delayed_hover_leave()
         self.assertFalse(floating._is_hovered)
         self.assertFalse(floating.hover_tooltip.isVisible())
         self.assertEqual(floating.upper_pill.width(), 40)
@@ -115,31 +122,31 @@ class TestFloatingWidgetHoverInfoAndMeeting(unittest.TestCase):
         floating.show()
         QApplication.processEvents()
 
-        # 1. Idle state: Notetaker companion chip hidden
+        # 1. Idle state: Active recording capsule hidden
         floating._on_controller_meeting_state("idle", "")
         self.assertFalse(floating._meeting_active)
-        self.assertFalse(floating.meeting_chip.isVisible())
+        self.assertFalse(floating.active_recording_capsule.isVisible())
 
-        # 2. Recording state: shows Notetaker pill chip with timer (not a bare dot)
+        # 2. Recording state: shows active recording capsule
         floating._on_controller_meeting_state("recording", "")
         self.assertTrue(floating._meeting_active)
-        self.assertTrue(floating.meeting_chip.isVisible())
-        self.assertIn("Notetaker", floating.meeting_chip.text())
-        self.assertNotEqual(floating.meeting_chip.text().strip(), "⏺")
+        self.assertEqual(floating.pill_state, PillState.ACTIVE_RECORDING)
+        self.assertTrue(floating.active_recording_capsule.isVisible())
 
-        # 3. Meeting tick updates formatted elapsed clock on chip
+        # 3. Meeting tick updates formatted elapsed clock
         floating._on_controller_meeting_tick(65.0)
+        self.assertEqual(floating._meeting_elapsed_str, "01:05")
         self.assertIn("01:05", floating.meeting_chip.text())
 
-        # 4. Paused state keeps Notetaker chip accessible
+        # 4. Paused state keeps active recording capsule visible
         floating._on_controller_meeting_state("paused", "")
         self.assertTrue(floating._meeting_active)
-        self.assertTrue(floating.meeting_chip.isVisible())
+        self.assertTrue(floating.active_recording_capsule.isVisible())
 
-        # 5. Return to idle hides chip cleanly
+        # 5. Return to idle hides active recording capsule cleanly
         floating._on_controller_meeting_state("idle", "")
         self.assertFalse(floating._meeting_active)
-        self.assertFalse(floating.meeting_chip.isVisible())
+        self.assertFalse(floating.active_recording_capsule.isVisible())
 
         floating.close()
 

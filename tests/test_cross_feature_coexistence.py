@@ -89,54 +89,68 @@ class TestCrossFeatureCoexistenceAndLowVRAM(unittest.TestCase):
     def test_llm_engine_vram_aware_cpu_selection_under_low_memory(self):
         dummy_model_dir = Path(self.temp_dir) / "dummy_model"
         dummy_model_dir.mkdir(parents=True, exist_ok=True)
-        (dummy_model_dir / "model.bin").write_bytes(b"dummy")
-        (dummy_model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+        model_file = dummy_model_dir / LocalLLMEngine.DEFAULT_MODEL
+        model_file.write_bytes(b"GGUF" + b"\x00" * 1024)
 
-        engine = LocalLLMEngine(model_dir=dummy_model_dir, device="auto")
+        engine = LocalLLMEngine(model_dir=model_file, device="auto")
+        variants_called = []
 
-        # Mock nvidia-smi returning 800 MB free (which is < 1400 MB)
-        with patch.object(LocalLLMEngine, "_get_free_vram_mb", return_value=800):
-            with patch("ctranslate2.get_cuda_device_count", return_value=1):
-                with patch("ctranslate2.Generator") as mock_gen:
-                    with patch("tokenizers.Tokenizer.from_file") as mock_tok:
-                        loaded = engine._ensure_loaded()
-                        self.assertTrue(loaded)
-                        # Verify it selected cpu because VRAM was 800MB (< 1400MB threshold)
-                        mock_gen.assert_called_once()
-                        _, kwargs = mock_gen.call_args
-                        self.assertEqual(kwargs.get("device"), "cpu")
-                        self.assertEqual(engine._active_device, "cpu")
+        def _fake_launch(bin_path, variant):
+            variants_called.append(variant)
+            engine._server._active_device = "cpu" if variant == "cpu" else "vulkan_gpu"
+            fake_proc = MagicMock()
+            fake_proc.poll.return_value = None
+            engine._server._proc = fake_proc
+            return True, f"Started {variant}"
+
+        # Mock nvidia-smi returning 800 MB free (which is < 1600 MB VRAM floor)
+        try:
+            with patch.object(engine._server, "_get_free_vram_mb", return_value=800), \
+                 patch.object(engine._server, "_get_memory_mb", return_value=(16384, 8192)), \
+                 patch("voxlocal.engine.llama_server_engine.resolve_llama_server_bin", return_value=(Path("fake_llama.exe"), "cpu")), \
+                 patch.object(engine._server, "_launch_variant", side_effect=_fake_launch):
+                loaded = engine._server.ensure_started()
+                self.assertTrue(loaded)
+                self.assertEqual(variants_called, ["cpu"])
+                self.assertEqual(engine._server.active_device, "cpu")
+                self.assertIn("1600 MB", engine._server.fallback_reason)
+        finally:
+            engine._server._proc = None
 
     def test_llm_engine_cuda_oom_automatic_fallback(self):
         dummy_model_dir = Path(self.temp_dir) / "dummy_model"
         dummy_model_dir.mkdir(parents=True, exist_ok=True)
-        (dummy_model_dir / "model.bin").write_bytes(b"dummy")
-        (dummy_model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+        model_file = dummy_model_dir / LocalLLMEngine.DEFAULT_MODEL
+        model_file.write_bytes(b"GGUF" + b"\x00" * 1024)
 
-        engine = LocalLLMEngine(model_dir=dummy_model_dir, device="cuda")
-        engine._tokenizer = MagicMock()
-        mock_tok_res = MagicMock()
-        mock_tok_res.tokens = ["test"]
-        engine._tokenizer.encode.return_value = mock_tok_res
-        engine._tokenizer.token_to_id.return_value = 1
-        engine._tokenizer.decode.return_value = "Recovered on CPU"
+        engine = LocalLLMEngine(model_dir=model_file, device="auto")
 
-        # Simulate CUDA Generator throwing CUDA OOM
-        mock_cuda_gen = MagicMock()
-        mock_cuda_gen.generate_batch.side_effect = RuntimeError("CUDA failed with error out of memory")
-        engine._generator = mock_cuda_gen
-        engine._active_device = "cuda"
+        def _fake_resolve(prefer_gpu: bool = True):
+            return (Path("fake_vulkan.exe"), "vulkan") if prefer_gpu else (Path("fake_cpu.exe"), "cpu")
 
-        # When fallback_to_cpu is called, replace with cpu generator that succeeds
-        mock_cpu_gen = MagicMock()
-        mock_seq = MagicMock()
-        mock_seq.sequences = [["test"]]
-        mock_cpu_gen.generate_batch.return_value = [mock_seq]
+        def _fake_launch(bin_path, variant):
+            if variant == "vulkan":
+                return False, "Vulkan out of memory"
+            engine._server._active_device = "cpu"
+            fake_proc = MagicMock()
+            fake_proc.poll.return_value = None
+            engine._server._proc = fake_proc
+            return True, "Started cpu"
 
-        with patch("ctranslate2.Generator", return_value=mock_cpu_gen):
-            out = engine.generate("Summarize meeting")
-            self.assertEqual(out, "Recovered on CPU")
-            self.assertEqual(engine._active_device, "cpu")
+        try:
+            with patch.object(engine._server, "_get_free_vram_mb", return_value=3200), \
+                 patch.object(engine._server, "_get_memory_mb", return_value=(16384, 8192)), \
+                 patch("voxlocal.engine.llama_server_engine.resolve_llama_server_bin", side_effect=_fake_resolve), \
+                 patch.object(engine._server, "_launch_variant", side_effect=_fake_launch), \
+                 patch.object(engine._server, "chat", return_value="Recovered on CPU"):
+                started = engine._server.ensure_started()
+                self.assertTrue(started)
+                self.assertEqual(engine._server.active_device, "cpu")
+                self.assertIn("Vulkan GPU failed", engine._server.fallback_reason)
+                out = engine.generate("Summarize meeting")
+                self.assertEqual(out, "Recovered on CPU")
+        finally:
+            engine._server._proc = None
 
 
 if __name__ == "__main__":

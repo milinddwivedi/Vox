@@ -50,6 +50,13 @@ DEFAULT_MEETING_SPECS: Dict[int, Dict[str, Any]] = {
         "audio_dir": REC_DIR / "meeting_20261119_200840",
         "default_speakers": ["You (Mic)", "Rumjhum.R", "Speaker 2", "Speaker 3"],
     },
+    240: {
+        "meeting_id": 240,
+        "title": "US + Indian PLM/WFX Call (5m Slice 19:00-24:00)",
+        "draft_path": BENCH_DIR / "M240_us_in_5m_reference_draft.json",
+        "audio_dir": REC_DIR / "meeting_20261119_223231",
+        "default_speakers": ["Speaker 1", "Speaker 2", "You (Mic)"],
+    },
 }
 
 

@@ -71,18 +71,18 @@ class TestE2EComprehensiveAudit(unittest.TestCase):
     # SUITE 1: WORKSPACE NAVIGATION, SWITCHING & THEMES
     # =========================================================================
     def test_01_all_tabs_navigation_and_rapid_switching(self):
-        """Verify all 8 Hub workspaces exist, switch cleanly, and handle rapid switching."""
-        self.assertEqual(self.main_window.workspace_stack.count(), 8)
-        self.assertEqual(self.main_window.tab_widget.count(), 8)
+        """Verify all 9 Hub workspaces exist, switch cleanly, and handle rapid switching."""
+        self.assertEqual(self.main_window.workspace_stack.count(), 9)
+        self.assertEqual(self.main_window.tab_widget.count(), 9)
 
         # Sequential workspace switching
-        for i in range(8):
+        for i in range(9):
             self.main_window.navigate_to_workspace(i)
             self.assertEqual(self.main_window.workspace_stack.currentIndex(), i)
             self.app.processEvents()
 
         # Route string navigation & rapid switching stress test
-        for route in ["settings", "home", "dictionary", "notetaker", "insights", "style", "scratchpad", "snippets"]:
+        for route in ["settings", "home", "dictionary", "notetaker", "calendar", "insights", "style", "scratchpad", "snippets"]:
             self.main_window.navigate_to_workspace(route)
             self.app.processEvents()
 

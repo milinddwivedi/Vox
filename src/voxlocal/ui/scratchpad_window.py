@@ -238,7 +238,8 @@ class VoxScratchpadWindow(QWidget):
     def _toggle_mono(self) -> None:
         fmt = QTextCharFormat()
         curr_fam = self.editor.currentFont().family().lower()
-        fmt.setFontFamily("Figtree" if "consolas" in curr_fam or "mono" in curr_fam else "Consolas")
+        from voxlocal.ui.theme import get_mono_font_family, get_primary_font_family
+        fmt.setFontFamily(get_primary_font_family() if ("consolas" in curr_fam or "mono" in curr_fam or "code" in curr_fam) else get_mono_font_family())
         self.editor.mergeCurrentCharFormat(fmt)
 
     def _insert_list(self, style: QTextListFormat.Style) -> None:

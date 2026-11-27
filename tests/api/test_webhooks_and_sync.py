@@ -790,10 +790,102 @@ class TestEntitlementsAndReleasesApi:
         with urllib.request.urlopen(req) as resp:
             assert resp.status == 200
             manifest = json.loads(resp.read().decode("utf-8"))
-            assert manifest["version"] == "1.0.13"
+            assert manifest["version"] == "2.1.0"
             assert "installer_url" in manifest
             assert len(manifest["sha256"]) == 64
             assert all(c in "0123456789abcdef" for c in manifest["sha256"])
+
+    def test_download_authorization_requires_google_auth(self, api_server):
+        req_unauth = urllib.request.Request(
+            f"{api_server}/api/download/authorize",
+            data=json.dumps({"artifact": "releases/2.1.0/VoxLocal-Setup.exe"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req_unauth)
+        assert exc_info.value.code == 401
+
+        req_auth = urllib.request.Request(
+            f"{api_server}/api/download/authorize",
+            data=json.dumps({"artifact": "releases/2.1.0/VoxLocal-Setup.exe"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer token_user_1"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_auth) as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read().decode("utf-8"))
+            assert body["ok"] is True
+            assert body["version"] == "2.1.0"
+            assert "/api/download/file?ticket=" in body["download_url"]
+            dl_url = body["download_url"]
+
+        # Unauthenticated /api/download/file is rejected (401)
+        req_file_unauth = urllib.request.Request(f"{api_server}/api/download/file", method="GET")
+        with pytest.raises(urllib.error.HTTPError) as exc_unauth:
+            urllib.request.urlopen(req_file_unauth)
+        assert exc_unauth.value.code == 401
+
+        # Tampered ticket on /api/download/file is rejected (401)
+        tampered_url = f"{api_server}{dl_url}x" if dl_url.startswith("/") else dl_url + "x"
+        req_file_tampered = urllib.request.Request(tampered_url, method="GET")
+        with pytest.raises(urllib.error.HTTPError) as exc_tamp:
+            urllib.request.urlopen(req_file_tampered)
+        assert exc_tamp.value.code == 401
+
+        # Valid ticket redirects (302) without following external GitHub redirect
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect)
+        full_dl_url = f"{api_server}{dl_url}" if dl_url.startswith("/") else dl_url
+        with pytest.raises(urllib.error.HTTPError) as redir_resp:
+            opener.open(urllib.request.Request(full_dl_url, method="GET"))
+        assert redir_resp.value.code == 302
+        assert "VoxLocal-Setup.exe" in (redir_resp.value.headers.get("Location") or "")
+
+    def test_download_ticket_scope_user_isolation_and_ineligible_account(self, api_server):
+        # 1. Authenticated user_1 gets a ticket scoped to 2.1.0 for usr_1
+        req_auth = urllib.request.Request(
+            f"{api_server}/api/download/authorize",
+            data=json.dumps({"artifact": "releases/2.1.0/VoxLocal-Setup.exe"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer token_user_1"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_auth) as resp:
+            dl_url = json.loads(resp.read().decode("utf-8"))["download_url"]
+        full_dl_url = f"{api_server}{dl_url}" if dl_url.startswith("/") else dl_url
+
+        # 2. Cross-artifact reuse of that ticket is blocked (HTTP 403)
+        cross_art_url = f"{full_dl_url}&artifact=releases/2.0.0/VoxLocal-Setup.exe"
+        with pytest.raises(urllib.error.HTTPError) as exc_scope:
+            urllib.request.urlopen(urllib.request.Request(cross_art_url, method="GET"))
+        assert exc_scope.value.code == 403
+
+        # 3. Cross-user reuse (usr_2 Bearer + usr_1 ticket) is blocked (HTTP 403)
+        with pytest.raises(urllib.error.HTTPError) as exc_user:
+            urllib.request.urlopen(
+                urllib.request.Request(full_dl_url, headers={"Authorization": "Bearer token_user_2"}, method="GET")
+            )
+        assert exc_user.value.code == 403
+
+        # 4. Ineligible / suspended account is rejected at /api/download/authorize (HTTP 403 ACCOUNT_INELIGIBLE)
+        seed_db_state(
+            api_server,
+            {"profiles": [{"id": "usr_suspended", "email": "susp@example.com", "account_status": "suspended"}]},
+        )
+        req_susp = urllib.request.Request(
+            f"{api_server}/api/download/authorize",
+            data=json.dumps({"artifact": "releases/2.1.0/VoxLocal-Setup.exe"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer token_suspended"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_susp:
+            urllib.request.urlopen(req_susp)
+        assert exc_susp.value.code == 403
+        body_susp = json.loads(exc_susp.value.read().decode("utf-8"))
+        assert body_susp.get("code") == "ACCOUNT_INELIGIBLE"
 
 
 # =============================================================================

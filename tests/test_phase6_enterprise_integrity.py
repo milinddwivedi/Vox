@@ -335,7 +335,7 @@ class TestPhase6EnterpriseIntegrity(unittest.TestCase):
         """
         cfg = AppConfig()
         self.assertTrue(hasattr(cfg, "timezone"))
-        self.assertEqual(cfg.timezone, "UTC")
+        self.assertEqual(cfg.timezone, "local")
 
         mid = self.make_meeting(title="Timezone Meeting", timezone="America/New_York", utc_offset_min=-300)
         m = self.db.get_meeting(mid)

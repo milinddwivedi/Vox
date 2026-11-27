@@ -286,7 +286,58 @@ class VoxOnboardingWizard(QDialog):
             cl.addWidget(dl, 1)
             cards.addWidget(card, 1)
         lay.addLayout(cards, 1)
+
+        # Truthful Local System & AI Readiness Summary Banner (first-run health check)
+        readiness_card = QFrame()
+        readiness_card.setObjectName("voxWellCard")
+        rd_lay = QVBoxLayout(readiness_card)
+        rd_lay.setContentsMargins(14, 10, 14, 10)
+        rd_lay.setSpacing(4)
+        self.lbl_readiness_title = QLabel("Local System & AI Readiness")
+        self.lbl_readiness_title.setFont(get_ui_font(12, 700))
+        rd_lay.addWidget(self.lbl_readiness_title)
+        self.lbl_readiness_items = QLabel("Checking local runtime & AI models...")
+        self.lbl_readiness_items.setObjectName("mutedLabel")
+        self.lbl_readiness_items.setWordWrap(True)
+        self.lbl_readiness_items.setTextFormat(Qt.TextFormat.RichText)
+        rd_lay.addWidget(self.lbl_readiness_items)
+        lay.addWidget(readiness_card)
+        QTimer.singleShot(40, self._refresh_first_run_readiness)
         return page
+
+    def _refresh_first_run_readiness(self) -> None:
+        """Populate truthful readiness status on Step 1 using local model/runtime checks only."""
+        if not hasattr(self, "lbl_readiness_items"):
+            return
+        try:
+            from voxlocal.core.first_run_health import run_first_run_health_check
+
+            cfg = getattr(self.controller, "config", None)
+            report = run_first_run_health_check(config=cfg, verify_hashes=False)
+            feats = report.get("features") or {}
+            checks = [
+                ("VOX Runtime", bool(feats.get("vox_installed"))),
+                ("Voice Dictation", bool(feats.get("voice_dictation_ready"))),
+                ("Meeting Transcription", bool(feats.get("meeting_transcription_ready"))),
+                ("Speaker Identification", bool(feats.get("speaker_identification_ready"))),
+                ("Meeting Intelligence", bool(feats.get("meeting_intelligence_ready"))),
+                ("Knowledge Search", bool(feats.get("knowledge_ready"))),
+            ]
+            chips = []
+            for label, ok in checks:
+                dot = "<span style='color:#137333;'>●</span>" if ok else "<span style='color:#B06000;'>○</span>"
+                state_txt = "Ready" if ok else "Setup needed"
+                chips.append(f"{dot} <b>{label}</b>: {state_txt}")
+            self.lbl_readiness_items.setText(" &nbsp;·&nbsp; ".join(chips))
+            if report.get("overall_ready"):
+                self.lbl_readiness_title.setText("System Check Complete — 100% Local AI Ready")
+            else:
+                missing = ", ".join(report.get("missing_components") or [])
+                self.lbl_readiness_title.setText(
+                    f"System Check — Optional/Missing Components: {missing or 'Check Settings → Models'}"
+                )
+        except Exception as exc:
+            self.lbl_readiness_items.setText(f"Readiness check unavailable: {exc}")
 
     def _build_step_setup(self) -> QWidget:
         page = QWidget()

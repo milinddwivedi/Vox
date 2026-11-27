@@ -129,29 +129,28 @@ def test_database_video_path() -> None:
     print("\n--- Test 3: Local Database Video Path Persistence ---")
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test_voxlocal.db"
-        db = LocalDatabase(db_path)
-        
-        # Create meeting with video_path
-        sample_video = str(Path(tmpdir) / "sample_screen.mp4")
-        m_id = db.create_meeting(
-            title="Design Review with Video",
-            capture_mode="both",
-            audio_path="audio.wav",
-            video_path=sample_video,
-        )
-        assert m_id > 0, "Failed to create meeting in DB!"
-        
-        meeting = db.get_meeting(m_id)
-        assert meeting is not None, "Meeting not found in DB!"
-        assert meeting["video_path"] == sample_video, f"Expected video_path {sample_video}, got {meeting['video_path']}"
-        print(f"Stored meeting: id={meeting['id']}, title={meeting['title']}, video_path={meeting['video_path']}")
-        
-        # Update video_path
-        updated_video = str(Path(tmpdir) / "updated_screen.mp4")
-        db.update_meeting(m_id, video_path=updated_video)
-        meeting_updated = db.get_meeting(m_id)
-        assert meeting_updated["video_path"] == updated_video, "Failed to update video_path in DB!"
-        print("Meeting video_path successfully updated in database.")
+        with LocalDatabase(db_path) as db:
+            # Create meeting with video_path
+            sample_video = str(Path(tmpdir) / "sample_screen.mp4")
+            m_id = db.create_meeting(
+                title="Design Review with Video",
+                capture_mode="both",
+                audio_path="audio.wav",
+                video_path=sample_video,
+            )
+            assert m_id > 0, "Failed to create meeting in DB!"
+
+            meeting = db.get_meeting(m_id)
+            assert meeting is not None, "Meeting not found in DB!"
+            assert meeting["video_path"] == sample_video, f"Expected video_path {sample_video}, got {meeting['video_path']}"
+            print(f"Stored meeting: id={meeting['id']}, title={meeting['title']}, video_path={meeting['video_path']}")
+
+            # Update video_path
+            updated_video = str(Path(tmpdir) / "updated_screen.mp4")
+            db.update_meeting(m_id, video_path=updated_video)
+            meeting_updated = db.get_meeting(m_id)
+            assert meeting_updated["video_path"] == updated_video, "Failed to update video_path in DB!"
+            print("Meeting video_path successfully updated in database.")
 
     print("✅ Database video path test PASSED!")
 
@@ -177,34 +176,36 @@ def test_call_detector() -> None:
         assert is_browser == expected_browser, f"Expected browser={expected_browser}, got {is_browser}"
         print(f"  ✓ {key} -> {name} (browser={is_browser})")
 
-    # Test state transitions:
+    # Test state transitions (isolated from live host desktop windows):
+    from unittest.mock import patch
     now = 1000.0
-    # 1. Native app Zoom appears -> should not trigger before 3.0s threshold
-    ev1 = detector.update([r"c:\zoom\zoom.exe"], now=now)
-    assert ev1 is None, f"Expected None on first frame, got {ev1}"
-    assert detector.active is None
-    
-    # 2. Advance time by 2.0s (< 3.0s) -> still None
-    ev2 = detector.update([r"c:\zoom\zoom.exe"], now=now + 2.0)
-    assert ev2 is None
-    assert detector.active is None
-    
-    # 3. Advance time to 3.5s (>= 3.0s) -> should trigger "started"
-    ev3 = detector.update([r"c:\zoom\zoom.exe"], now=now + 3.5)
-    assert ev3 == "started", f"Expected 'started', got {ev3}"
-    assert detector.active is not None
-    assert detector.active.app_name == "Zoom"
-    print("  ✓ Call detection successfully triggered 'started' after threshold!")
-    
-    # 4. App releases mic -> grace period 8.0s
-    ev4 = detector.update([], now=now + 5.0)
-    assert ev4 is None, "Should not end immediately (within grace period)"
-    
-    # 5. After 8.5s grace period -> should trigger "ended"
-    ev5 = detector.update([], now=now + 14.0)
-    assert ev5 == "ended", f"Expected 'ended', got {ev5}"
-    assert detector.active is None
-    print("  ✓ Call detection successfully triggered 'ended' after release grace period!")
+    with patch("voxlocal.audio.call_detector.list_all_meeting_windows", return_value=[]):
+        # 1. Native app Zoom appears -> should not trigger before 3.0s threshold
+        ev1 = detector.update([r"c:\zoom\zoom.exe"], now=now)
+        assert ev1 is None, f"Expected None on first frame, got {ev1}"
+        assert detector.active is None
+
+        # 2. Advance time by 2.0s (< 3.0s) -> still None
+        ev2 = detector.update([r"c:\zoom\zoom.exe"], now=now + 2.0)
+        assert ev2 is None
+        assert detector.active is None
+
+        # 3. Advance time to 3.5s (>= 3.0s) -> should trigger "started"
+        ev3 = detector.update([r"c:\zoom\zoom.exe"], now=now + 3.5)
+        assert ev3 == "started", f"Expected 'started', got {ev3}"
+        assert detector.active is not None
+        assert detector.active.app_name == "Zoom"
+        print("  ✓ Call detection successfully triggered 'started' after threshold!")
+
+        # 4. App releases mic -> grace period 8.0s
+        ev4 = detector.update([], now=now + 5.0)
+        assert ev4 is None, "Should not end immediately (within grace period)"
+
+        # 5. After 8.5s grace period -> should trigger "ended"
+        ev5 = detector.update([], now=now + 14.0)
+        assert ev5 == "ended", f"Expected 'ended', got {ev5}"
+        assert detector.active is None
+        print("  ✓ Call detection successfully triggered 'ended' after release grace period!")
 
     print("✅ CallDetector test PASSED!")
 

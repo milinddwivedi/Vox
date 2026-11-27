@@ -52,6 +52,8 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLayout,
+    QLayoutItem,
     QLineEdit,
     QMessageBox,
     QProgressBar,
@@ -72,6 +74,77 @@ from voxlocal.ui.theme import get_theme_tokens, get_ui_font
 from voxlocal.storage.exporter import format_seconds_hms
 
 logger = get_logger("ui.components")
+
+
+class VoxFlowLayout(QLayout):
+    """Lightweight wrapping horizontal flow layout (zero QScrollArea nesting, tiny minSizeHint)."""
+
+    def __init__(self, parent: Optional[QWidget] = None, margin: int = 0, h_spacing: int = 6, v_spacing: int = 6) -> None:
+        super().__init__(parent)
+        self._items: List[QLayoutItem] = []
+        self._h_space = h_spacing
+        self._v_space = v_spacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item: QLayoutItem) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> Optional[QLayoutItem]:
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int) -> Optional[QLayoutItem]:
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self) -> Qt.Orientation:
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, max(1, width), 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        sz = QSize(0, 0)
+        for item in self._items:
+            sz = sz.expandedTo(item.minimumSize())
+        l, t, r, b = self.getContentsMargins()
+        sz += QSize(l + r, t + b)
+        return sz
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        l, t, r, b = self.getContentsMargins()
+        eff = rect.adjusted(l, t, -r, -b)
+        x = eff.x()
+        y = eff.y()
+        line_h = 0
+        for item in self._items:
+            w_hint = item.sizeHint()
+            next_x = x + w_hint.width() + self._h_space
+            if next_x - self._h_space > eff.right() and line_h > 0:
+                x = eff.x()
+                y = y + line_h + self._v_space
+                next_x = x + w_hint.width() + self._h_space
+                line_h = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), w_hint))
+            x = next_x
+            line_h = max(line_h, w_hint.height())
+        return y + line_h - rect.y() + b
 
 # ----------------------------------------------------------------------
 # Accessible Keyboard Navigation Support (Enter / Space activation on QPushButton)
@@ -423,7 +496,7 @@ class VoxStatusPill(QFrame):
 # ======================================================================
 class VoxSearchField(QLineEdit):
     """
-    Modern search input with search glyph, placeholder styling,
+    Modern search input with leading vector search icon, placeholder styling,
     and single-click clear button.
     """
 
@@ -433,12 +506,17 @@ class VoxSearchField(QLineEdit):
         self.setClearButtonEnabled(True)
         self.setFixedHeight(34)
         self.setObjectName("voxSearchField")
+        try:
+            from voxlocal.ui.icons import get_icon
+            self._search_action = self.addAction(get_icon("search", "#64748B", 14), QLineEdit.ActionPosition.LeadingPosition)
+        except Exception:
+            self._search_action = None
         self.setStyleSheet(
             """
             QLineEdit#voxSearchField {
-                border-radius: 8px;
-                padding: 6px 12px;
-                font-size: 12px;
+                border-radius: 9px;
+                padding: 5px 10px;
+                font-size: 12.5px;
             }
             """
         )
@@ -1300,86 +1378,289 @@ class VoxResizableSplitter(QSplitter):
 # ======================================================================
 class VoxActionItemMatrixWidget(QFrame):
     """
-    Enterprise interactive action items matrix with status checkboxes,
-    owner badges, due date tags, clickable timestamp chips, and one-click Slack copy.
+    Modern 2026 Action Items & Commitments list designed to scale cleanly to 60+ items:
+    - Zero nested scrollbars (flows cleanly inside parent scroll canvas with responsive pagination)
+    - Filters: All / Pending / Completed + Participant + Priority + live text search
+    - Clear distinction of Confirmed Commitments vs Suggested/Needs Confirmation, Owner Unknown, No Due Date
+    - Inline edit (description, owner, due date, priority, status, notes), expandable evidence, copy & export
     """
     timestamp_clicked = pyqtSignal(float)
     status_toggled = pyqtSignal(int, str)  # (item_id, new_status)
+    action_edited = pyqtSignal(int, dict)  # (item_id, updated_fields)
+    toast_requested = pyqtSignal(str, str)  # (title, message)
+
+    PAGE_SIZE = 20
 
     def __init__(self, parent: Optional[QWidget] = None, theme: str = "dark") -> None:
         super().__init__(parent)
         self.theme = theme
-        self.setObjectName("cardFrame")
+        self.setObjectName("actionMatrixContainer")
         self._items: List[dict] = []
-        self._filter_mode: str = "all"  # "all", "pending", "completed"
+        self._filter_mode: str = "all"
+        self._participant_filter: str = ""
+        self._priority_filter: str = ""
+        self._search_query: str = ""
+        self._visible_limit: int = self.PAGE_SIZE
+        self._expanded_ids: set[int] = set()
         self._build_ui()
+        self.set_theme(self.theme)
 
     def _build_ui(self) -> None:
+        from PyQt6.QtWidgets import QMenu
+
+        self.setMinimumWidth(0)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        # Header toolbar
-        hdr = QHBoxLayout()
-        hdr.setSpacing(8)
-        lbl_title = QLabel("✅ Action Items & Commitments")
-        lbl_title.setStyleSheet("font-size: 13px; font-weight: 700;")
-        hdr.addWidget(lbl_title)
+        # Row 1: Title, Count Pill, Copy / Export actions (wrapping flow, zero QScrollArea)
+        hdr = VoxFlowLayout(margin=0, h_spacing=6, v_spacing=6)
+        self.lbl_title = QLabel("Action Items & Commitments")
+        self.lbl_title.setMinimumWidth(0)
+        hdr.addWidget(self.lbl_title)
 
         self.lbl_count = QLabel("0 tasks")
-        self.lbl_count.setStyleSheet("font-size: 11px; font-weight: 600; color: #8B949E; background: rgba(139, 148, 158, 0.15); border-radius: 10px; padding: 2px 8px;")
         hdr.addWidget(self.lbl_count)
 
-        hdr.addStretch()
+        self.btn_copy_menu = QPushButton("Copy ▾")
+        self.btn_copy_menu.setFixedHeight(28)
+        self.btn_copy_menu.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_menu = QMenu(self)
+        copy_menu.addAction("Copy Filtered List", self._copy_filtered_plain)
+        copy_menu.addAction("Copy All Actions", self._copy_all_plain)
+        copy_menu.addAction("Copy for Slack / Teams", self._copy_for_slack)
+        self.btn_copy_menu.setMenu(copy_menu)
+        hdr.addWidget(self.btn_copy_menu)
 
-        # Filter buttons
-        self.btn_filter_all = QPushButton("All")
-        self.btn_filter_pending = QPushButton("Pending")
-        self.btn_filter_completed = QPushButton("Completed")
-        for btn in (self.btn_filter_all, self.btn_filter_pending, self.btn_filter_completed):
-            btn.setFixedHeight(26)
-            btn.setCheckable(True)
-            btn.setStyleSheet("QPushButton { font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 6px; }")
-        self.btn_filter_all.setChecked(True)
-        self.btn_filter_all.clicked.connect(lambda: self._set_filter("all"))
-        self.btn_filter_pending.clicked.connect(lambda: self._set_filter("pending"))
-        self.btn_filter_completed.clicked.connect(lambda: self._set_filter("completed"))
-        hdr.addWidget(self.btn_filter_all)
-        hdr.addWidget(self.btn_filter_pending)
-        hdr.addWidget(self.btn_filter_completed)
-
-        self.btn_copy_slack = QPushButton("📋 Copy for Slack / Teams")
-        self.btn_copy_slack.setFixedHeight(26)
+        # Keep direct attribute for backward compatibility
+        self.btn_copy_slack = QPushButton("Copy Slack / Teams")
+        self.btn_copy_slack.setFixedHeight(28)
+        self.btn_copy_slack.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_copy_slack.setToolTip("Copy action items formatted for Slack or Microsoft Teams")
         self.btn_copy_slack.clicked.connect(self._copy_for_slack)
         hdr.addWidget(self.btn_copy_slack)
 
+        self.btn_export_actions = QPushButton("Export ▾")
+        self.btn_export_actions.setFixedHeight(28)
+        self.btn_export_actions.setCursor(Qt.CursorShape.PointingHandCursor)
+        exp_menu = QMenu(self)
+        exp_menu.addAction("Export as Markdown (.md)", lambda: self._export_actions("md"))
+        exp_menu.addAction("Export as Plain Text (.txt)", lambda: self._export_actions("txt"))
+        exp_menu.addAction("Export as JSON (.json)", lambda: self._export_actions("json"))
+        self.btn_export_actions.setMenu(exp_menu)
+        hdr.addWidget(self.btn_export_actions)
         layout.addLayout(hdr)
 
-        # Scrollable items container
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_content = QWidget()
-        self.items_layout = QVBoxLayout(self.scroll_content)
-        self.items_layout.setContentsMargins(0, 4, 0, 4)
-        self.items_layout.setSpacing(6)
-        self.scroll.setWidget(self.scroll_content)
-        layout.addWidget(self.scroll, 1)
+        # Row 2: Filter Pills + Participant + Priority + Search (wrapping flow, zero QScrollArea)
+        filters_row = VoxFlowLayout(margin=0, h_spacing=6, v_spacing=6)
+
+        self.btn_filter_all = QPushButton("All")
+        self.btn_filter_pending = QPushButton("Pending")
+        self.btn_filter_completed = QPushButton("Completed")
+        for btn in (self.btn_filter_all, self.btn_filter_pending, self.btn_filter_completed):
+            btn.setFixedHeight(27)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_filter_all.setChecked(True)
+        self.btn_filter_all.clicked.connect(lambda: self._set_filter("all"))
+        self.btn_filter_pending.clicked.connect(lambda: self._set_filter("pending"))
+        self.btn_filter_completed.clicked.connect(lambda: self._set_filter("completed"))
+        filters_row.addWidget(self.btn_filter_all)
+        filters_row.addWidget(self.btn_filter_pending)
+        filters_row.addWidget(self.btn_filter_completed)
+
+        self.combo_participant = QComboBox()
+        self.combo_participant.setFixedHeight(27)
+        self.combo_participant.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_participant.setMinimumContentsLength(6)
+        self.combo_participant.setMinimumWidth(90)
+        self.combo_participant.addItem("All Participants", "")
+        self.combo_participant.currentIndexChanged.connect(self._on_participant_changed)
+        filters_row.addWidget(self.combo_participant)
+
+        self.combo_priority = QComboBox()
+        self.combo_priority.setFixedHeight(27)
+        self.combo_priority.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_priority.setMinimumContentsLength(6)
+        self.combo_priority.addItem("All Priorities", "")
+        self.combo_priority.addItem("High Priority", "High")
+        self.combo_priority.addItem("Medium Priority", "Medium")
+        self.combo_priority.addItem("Low Priority", "Low")
+        self.combo_priority.currentIndexChanged.connect(self._on_priority_changed)
+        filters_row.addWidget(self.combo_priority)
+
+        self.txt_action_search = QLineEdit()
+        self.txt_action_search.setFixedHeight(27)
+        self.txt_action_search.setMinimumWidth(140)
+        self.txt_action_search.setPlaceholderText("Search tasks...")
+        self.txt_action_search.setClearButtonEnabled(True)
+        self.txt_action_search.textChanged.connect(self._on_search_changed)
+        filters_row.addWidget(self.txt_action_search)
+
+        layout.addLayout(filters_row)
+
+        # Responsive non-nested items container
+        self.items_host = QWidget()
+        self.items_layout = QVBoxLayout(self.items_host)
+        self.items_layout.setContentsMargins(0, 2, 0, 2)
+        self.items_layout.setSpacing(8)
+        layout.addWidget(self.items_host)
+
+        # Pagination footer for 60+ items
+        self.pager_row = QHBoxLayout()
+        self.pager_row.setSpacing(8)
+        self.lbl_showing = QLabel("")
+        self.pager_row.addWidget(self.lbl_showing)
+        self.pager_row.addStretch()
+        self.btn_show_more = QPushButton("Show 20 more")
+        self.btn_show_more.setFixedHeight(27)
+        self.btn_show_more.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_show_more.clicked.connect(self._on_show_more)
+        self.pager_row.addWidget(self.btn_show_more)
+        self.btn_show_all = QPushButton("Show All")
+        self.btn_show_all.setFixedHeight(27)
+        self.btn_show_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_show_all.clicked.connect(self._on_show_all)
+        self.pager_row.addWidget(self.btn_show_all)
+        self.pager_widget = QWidget()
+        self.pager_widget.setLayout(self.pager_row)
+        self.pager_widget.setVisible(False)
+        layout.addWidget(self.pager_widget)
+
+    def _on_participant_changed(self) -> None:
+        self._participant_filter = str(self.combo_participant.currentData() or "")
+        self._visible_limit = self.PAGE_SIZE
+        self._render_items()
+
+    def _on_priority_changed(self) -> None:
+        self._priority_filter = str(self.combo_priority.currentData() or "")
+        self._visible_limit = self.PAGE_SIZE
+        self._render_items()
+
+    def _on_search_changed(self, text: str) -> None:
+        self._search_query = str(text or "").strip().lower()
+        self._visible_limit = self.PAGE_SIZE
+        self._render_items()
+
+    def _on_show_more(self) -> None:
+        self._visible_limit += self.PAGE_SIZE
+        self._render_items()
+
+    def _on_show_all(self) -> None:
+        self._visible_limit = max(len(self._items) + 10, 1000)
+        self._render_items()
 
     def _set_filter(self, mode: str) -> None:
         self._filter_mode = mode
         self.btn_filter_all.setChecked(mode == "all")
         self.btn_filter_pending.setChecked(mode == "pending")
         self.btn_filter_completed.setChecked(mode == "completed")
+        self._visible_limit = self.PAGE_SIZE
+        self._style_filter_buttons()
         self._render_items()
 
+    def _style_filter_buttons(self) -> None:
+        t = get_theme_tokens(self.theme)
+        for btn, key in ((self.btn_filter_all, "all"), (self.btn_filter_pending, "pending"), (self.btn_filter_completed, "completed")):
+            active = (self._filter_mode == key)
+            if active:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background: {t['fathom_btn_bg']}; color: {t['fathom_btn_text']}; "
+                    f"border: 1px solid {t['fathom_btn_border']}; border-radius: 7px; padding: 2px 11px; font-size: 11.5px; font-weight: 700; }}"
+                )
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background: {t['secondary_btn_bg']}; color: {t['text_secondary']}; "
+                    f"border: 1px solid {t['border']}; border-radius: 7px; padding: 2px 11px; font-size: 11.5px; font-weight: 600; }} "
+                    f"QPushButton:hover {{ background: {t['surface_hover']}; color: {t['text_primary']}; }}"
+                )
+
+    def set_theme(self, theme_name: str) -> None:
+        self.theme = (theme_name or "light").lower()
+        t = get_theme_tokens(self.theme)
+        self.lbl_title.setStyleSheet(f"font-size: 13.5px; font-weight: 700; color: {t['text_primary']};")
+        self.lbl_count.setStyleSheet(
+            f"font-size: 11px; font-weight: 600; color: {t['text_secondary']}; "
+            f"background: {t['chip_bg']}; border: 1px solid {t['chip_border']}; border-radius: 10px; padding: 2px 9px;"
+        )
+        btn_css = (
+            f"QPushButton {{ background: {t['secondary_btn_bg']}; color: {t['text_primary']}; "
+            f"border: 1px solid {t['border']}; border-radius: 7px; padding: 3px 10px; font-size: 11.5px; font-weight: 600; }} "
+            f"QPushButton:hover {{ background: {t['surface_hover']}; }}"
+        )
+        for b in (self.btn_copy_menu, self.btn_copy_slack, self.btn_export_actions, self.btn_show_more, self.btn_show_all):
+            b.setStyleSheet(btn_css)
+        self.lbl_showing.setStyleSheet(f"font-size: 11.5px; color: {t['text_muted']};")
+        self._style_filter_buttons()
+        self._render_items()
+
+    apply_theme = set_theme
+
+    def _clean_display_owner(self, raw_owner: Optional[str]) -> Optional[str]:
+        s = str(raw_owner or "").strip()
+        if not s or s.lower() in ("none", "null", "unassigned", "unassigned — confirmation required", "owner unknown", "n/a"):
+            return None
+        return s
+
+    def _clean_display_due(self, raw_due: Optional[str]) -> Optional[str]:
+        s = str(raw_due or "").strip()
+        if not s or s.lower() in ("none", "null", "not specified", "no due date", "tbd", "n/a"):
+            return None
+        return s
+
     def set_items(self, items: List[dict]) -> None:
-        self._items = items or []
-        pending_c = sum(1 for it in self._items if it.get("status") in ("pending", "blocked", "reopened"))
+        self._items = [dict(it) for it in (items or [])]
+        self._visible_limit = self.PAGE_SIZE
+        pending_c = sum(1 for it in self._items if str(it.get("status") or "pending").lower() in ("pending", "blocked", "reopened"))
         total_c = len(self._items)
         self.lbl_count.setText(f"{pending_c} pending · {total_c} total")
+
+        # Refresh participant filter options cleanly
+        owners = sorted({o for o in (self._clean_display_owner(it.get("owner")) for it in self._items) if o})
+        has_unknown = any(self._clean_display_owner(it.get("owner")) is None for it in self._items)
+        self.combo_participant.blockSignals(True)
+        prev_p = self._participant_filter
+        self.combo_participant.clear()
+        self.combo_participant.addItem("All Participants", "")
+        for ow in owners:
+            self.combo_participant.addItem(ow, ow)
+        if has_unknown:
+            self.combo_participant.addItem("Owner Unknown", "__unknown__")
+        idx = self.combo_participant.findData(prev_p)
+        self.combo_participant.setCurrentIndex(idx if idx >= 0 else 0)
+        self._participant_filter = str(self.combo_participant.currentData() or "")
+        self.combo_participant.blockSignals(False)
+
         self._render_items()
+
+    def _filtered_items(self) -> List[dict]:
+        out: List[dict] = []
+        for it in self._items:
+            st = str(it.get("status") or "pending").strip().lower()
+            if self._filter_mode == "pending" and st not in ("pending", "blocked", "reopened"):
+                continue
+            if self._filter_mode == "completed" and st != "completed":
+                continue
+
+            owner_clean = self._clean_display_owner(it.get("owner"))
+            if self._participant_filter == "__unknown__" and owner_clean is not None:
+                continue
+            elif self._participant_filter and self._participant_filter != "__unknown__" and owner_clean != self._participant_filter:
+                continue
+
+            prio_clean = str(it.get("priority") or "").strip().capitalize()
+            if self._priority_filter and prio_clean != self._priority_filter:
+                continue
+
+            if self._search_query:
+                hay = " ".join(
+                    str(it.get(k) or "")
+                    for k in ("description", "owner", "due_date", "related_topic", "context", "evidence_quote", "notes")
+                ).lower()
+                if self._search_query not in hay:
+                    continue
+            out.append(it)
+        return out
 
     def _render_items(self) -> None:
         while self.items_layout.count():
@@ -1388,94 +1669,400 @@ class VoxActionItemMatrixWidget(QFrame):
             if w:
                 w.deleteLater()
 
-        filtered = [
-            it for it in self._items
-            if (self._filter_mode == "all")
-            or (self._filter_mode == "pending" and it.get("status") in ("pending", "blocked", "reopened"))
-            or (self._filter_mode == "completed" and it.get("status") == "completed")
-        ]
+        t = get_theme_tokens(self.theme)
+        filtered = self._filtered_items()
 
         if not filtered:
-            lbl_empty = QLabel("No action items match the selected filter.")
-            lbl_empty.setStyleSheet("color: #8B949E; font-size: 11.5px; padding: 12px; font-style: italic;")
+            empty_box = QFrame()
+            empty_box.setStyleSheet(
+                f"background: {t['surface_alt']}; border: 1px dashed {t['border']}; border-radius: 10px; padding: 14px;"
+            )
+            el = QVBoxLayout(empty_box)
+            msg = "No action items recorded in this meeting." if not self._items else "No action items match the current filters."
+            lbl_empty = QLabel(msg)
+            lbl_empty.setStyleSheet(f"color: {t['text_muted']}; font-size: 12.5px; border: none;")
             lbl_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.items_layout.addWidget(lbl_empty)
-            self.items_layout.addStretch()
+            el.addWidget(lbl_empty)
+            self.items_layout.addWidget(empty_box)
+            self.pager_widget.setVisible(False)
             return
 
-        for item in filtered:
-            row_frame = QFrame()
-            row_frame.setObjectName("nestedCard")
-            rf_layout = QHBoxLayout(row_frame)
-            rf_layout.setContentsMargins(10, 6, 10, 6)
-            rf_layout.setSpacing(8)
+        shown = filtered[: self._visible_limit]
+        for idx_row, item in enumerate(shown):
+            item_id = int(item.get("id") or (idx_row + 1))
+            is_done = str(item.get("status") or "pending").strip().lower() == "completed"
+            owner = self._clean_display_owner(item.get("owner"))
+            due = self._clean_display_due(item.get("due_date"))
+            prio = str(item.get("priority") or "").strip().capitalize()
+            if prio not in ("High", "Medium", "Low"):
+                prio = ""
+            cstate = str(item.get("confirmation_state") or ("confirmed" if owner else "needs_confirmation")).strip().lower()
+            topic = str(item.get("related_topic") or "").strip()
+            context = str(item.get("context") or "").strip()
+            evidence = str(item.get("evidence_quote") or "").strip()
+            notes = str(item.get("notes") or "").strip()
+            ts_sec = float(item.get("timestamp_sec") or 0.0)
 
-            item_id = item.get("id", 0)
-            is_done = (item.get("status") == "completed")
+            card = QFrame()
+            card.setObjectName("actionCardRow")
+            card.setMinimumWidth(0)
+            bdr_col = t["border"] if not is_done else t["line"]
+            bg_col = t["surface_alt"] if not is_done else t["surface_secondary"]
+            card.setStyleSheet(
+                f"QFrame#actionCardRow {{ background-color: {bg_col}; border: 1px solid {bdr_col}; border-radius: 10px; }}"
+            )
+            c_lay = QVBoxLayout(card)
+            c_lay.setContentsMargins(12, 10, 12, 10)
+            c_lay.setSpacing(6)
+
+            top_row = QHBoxLayout()
+            top_row.setSpacing(8)
 
             chk = QCheckBox()
             chk.setChecked(is_done)
-            chk.setToolTip("Mark completed / pending")
-            chk.toggled.connect(lambda checked, iid=item_id: self._on_item_toggled(iid, checked))
-            rf_layout.addWidget(chk)
+            chk.setToolTip("Reopen task" if is_done else "Mark completed")
+            chk.toggled.connect(lambda checked, iid=item_id, ref=item: self._on_item_toggled(iid, checked, ref))
+            top_row.addWidget(chk, 0, Qt.AlignmentFlag.AlignTop)
 
-            owner = item.get("owner") or "Unassigned"
-            lbl_owner = QLabel(f"👤 {owner}")
-            owner_bg = "rgba(59, 130, 246, 0.15)" if owner != "Unassigned" else "rgba(148, 163, 184, 0.15)"
-            owner_fg = "#60A5FA" if owner != "Unassigned" else "#94A3B8"
-            lbl_owner.setStyleSheet(f"font-size: 10px; font-weight: 700; color: {owner_fg}; background: {owner_bg}; border-radius: 4px; padding: 2px 6px;")
-            rf_layout.addWidget(lbl_owner)
-
-            desc = item.get("description", "")
+            desc = str(item.get("description") or "")
             lbl_desc = QLabel(desc)
             lbl_desc.setWordWrap(True)
+            lbl_desc.setMinimumWidth(0)
+            lbl_desc.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            lbl_desc.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             if is_done:
-                lbl_desc.setStyleSheet("font-size: 12px; color: #8B949E; text-decoration: line-through;")
+                lbl_desc.setStyleSheet(
+                    f"font-size: 13px; color: {t['text_muted']}; text-decoration: line-through; border: none; background: transparent;"
+                )
             else:
-                lbl_desc.setStyleSheet("font-size: 12px; font-weight: 500;")
-            rf_layout.addWidget(lbl_desc, 1)
+                lbl_desc.setStyleSheet(
+                    f"font-size: 13px; font-weight: 600; color: {t['text_primary']}; border: none; background: transparent;"
+                )
+            top_row.addWidget(lbl_desc, 1)
 
-            due = item.get("due_date", "")
+            btn_edit = QPushButton("Edit")
+            btn_edit.setFixedHeight(24)
+            btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_edit.setToolTip("Edit task, owner, due date, priority, or notes")
+            btn_edit.setStyleSheet(
+                f"QPushButton {{ background: {t['surface']}; color: {t['text_secondary']}; border: 1px solid {t['border']}; border-radius: 6px; padding: 1px 8px; font-size: 11px; font-weight: 600; }} "
+                f"QPushButton:hover {{ color: {t['text_primary']}; background: {t['surface_hover']}; }}"
+            )
+            btn_edit.clicked.connect(lambda _=False, it_ref=item: self._open_edit_dialog(it_ref))
+            top_row.addWidget(btn_edit, 0, Qt.AlignmentFlag.AlignTop)
+
+            btn_cp = QPushButton("Copy")
+            btn_cp.setFixedHeight(24)
+            btn_cp.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_cp.setStyleSheet(btn_edit.styleSheet())
+            btn_cp.clicked.connect(lambda _=False, it_ref=item: self._copy_single_action(it_ref))
+            top_row.addWidget(btn_cp, 0, Qt.AlignmentFlag.AlignTop)
+
+            c_lay.addLayout(top_row)
+
+            # Metadata chips row using wrapping VoxFlowLayout (zero QScrollArea)
+            meta_row = VoxFlowLayout(margin=0, h_spacing=6, v_spacing=5)
+            meta_host = QWidget()
+            meta_host.setMinimumWidth(0)
+            meta_host.setLayout(meta_row)
+
+            if owner:
+                lbl_owner = QLabel(owner)
+                lbl_owner.setStyleSheet(
+                    f"font-size: 11px; font-weight: 700; color: {t['status_info_text']}; "
+                    f"background: {t['status_info_bg']}; border-radius: 6px; padding: 2px 8px;"
+                )
+            else:
+                lbl_owner = QLabel("Owner unknown")
+                lbl_owner.setStyleSheet(
+                    f"font-size: 11px; font-weight: 600; color: {t['status_neutral_text']}; "
+                    f"background: {t['status_neutral_bg']}; border-radius: 6px; padding: 2px 8px;"
+                )
+            meta_row.addWidget(lbl_owner)
+
             if due:
-                lbl_due = QLabel(f"📅 {due}")
-                lbl_due.setStyleSheet("font-size: 10.5px; color: #F59E0B; background: rgba(245, 158, 11, 0.12); border-radius: 4px; padding: 2px 6px; font-weight: 600;")
-                rf_layout.addWidget(lbl_due)
+                lbl_due = QLabel(f"Due: {due}")
+                lbl_due.setStyleSheet(
+                    f"font-size: 11px; font-weight: 600; color: {t['status_warning_text']}; "
+                    f"background: {t['status_warning_bg']}; border-radius: 6px; padding: 2px 8px;"
+                )
+                meta_row.addWidget(lbl_due)
 
-            ts_sec = float(item.get("timestamp_sec") or 0.0)
+            if prio:
+                p_bg, p_fg = {
+                    "High": (t["status_danger_bg"], t["status_danger_text"]),
+                    "Medium": (t["status_warning_bg"], t["status_warning_text"]),
+                    "Low": (t["status_neutral_bg"], t["status_neutral_text"]),
+                }[prio]
+                lbl_prio = QLabel(f"{prio} priority")
+                lbl_prio.setStyleSheet(
+                    f"font-size: 10.5px; font-weight: 700; color: {p_fg}; background: {p_bg}; border-radius: 6px; padding: 2px 7px;"
+                )
+                meta_row.addWidget(lbl_prio)
+
+            # Confirmation badge (prevents questionable items looking over-confident)
+            c_map = {
+                "confirmed_commitment": ("Confirmed", t["status_success_bg"], t["status_success_text"]),
+                "confirmed": ("Confirmed", t["status_success_bg"], t["status_success_text"]),
+                "suggested_action": ("Suggested", t["status_purple_bg"], t["status_purple_text"]),
+                "needs_confirmation": ("Needs confirmation", t["status_warning_bg"], t["status_warning_text"]),
+            }
+            c_lbl, c_bg, c_fg = c_map.get(cstate, ("Needs confirmation", t["status_warning_bg"], t["status_warning_text"]))
+            lbl_conf = QLabel(c_lbl)
+            lbl_conf.setStyleSheet(
+                f"font-size: 10.5px; font-weight: 600; color: {c_fg}; background: {c_bg}; border-radius: 6px; padding: 2px 7px;"
+            )
+            meta_row.addWidget(lbl_conf)
+
+            if topic:
+                lbl_top = QLabel(topic)
+                lbl_top.setStyleSheet(
+                    f"font-size: 10.5px; font-weight: 600; color: {t['text_secondary']}; "
+                    f"background: {t['chip_bg']}; border: 1px solid {t['chip_border']}; border-radius: 6px; padding: 1px 7px;"
+                )
+                meta_row.addWidget(lbl_top)
+
             if ts_sec > 0:
-                btn_ts = QPushButton(f"⏱️ {format_seconds_hms(ts_sec)}")
+                btn_ts = QPushButton(format_seconds_hms(ts_sec))
                 btn_ts.setFixedHeight(22)
-                btn_ts.setToolTip(f"Jump media playback to {format_seconds_hms(ts_sec)}")
-                btn_ts.setStyleSheet("QPushButton { font-size: 10px; font-weight: 700; color: #38BDF8; background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 4px; padding: 1px 6px; } QPushButton:hover { background: rgba(56, 189, 248, 0.25); }")
-                btn_ts.clicked.connect(lambda _, sec=ts_sec: self.timestamp_clicked.emit(sec))
-                rf_layout.addWidget(btn_ts)
+                btn_ts.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_ts.setToolTip(f"Open transcript at {format_seconds_hms(ts_sec)}")
+                btn_ts.setStyleSheet(
+                    f"QPushButton {{ font-size: 10.5px; font-weight: 700; color: {t['accent_fathom']}; "
+                    f"background: {t['accent_fathom_tint']}; border: 1px solid {t['chip_border']}; border-radius: 6px; padding: 1px 8px; }} "
+                    f"QPushButton:hover {{ opacity: 0.9; }}"
+                )
+                btn_ts.clicked.connect(lambda _=False, sec=ts_sec: self.timestamp_clicked.emit(sec))
+                meta_row.addWidget(btn_ts)
 
-            self.items_layout.addWidget(row_frame)
+            has_details = bool(evidence or context or notes)
+            if has_details:
+                is_exp = item_id in self._expanded_ids
+                btn_ev = QPushButton("Hide source" if is_exp else "View source")
+                btn_ev.setFixedHeight(22)
+                btn_ev.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_ev.setStyleSheet(
+                    f"QPushButton {{ background: transparent; color: {t['text_muted']}; border: none; font-size: 11px; font-weight: 600; padding: 1px 6px; }} "
+                    f"QPushButton:hover {{ color: {t['text_primary']}; }}"
+                )
+                btn_ev.clicked.connect(lambda _=False, iid=item_id: self._toggle_expand(iid))
+                meta_row.addWidget(btn_ev)
 
-        self.items_layout.addStretch()
+            c_lay.addWidget(meta_host)
 
-    def _on_item_toggled(self, item_id: int, checked: bool) -> None:
+            if has_details and item_id in self._expanded_ids:
+                det_frame = QFrame()
+                det_frame.setStyleSheet(
+                    f"background: {t['surface']}; border: 1px solid {t['line']}; border-radius: 8px; margin-left: 24px;"
+                )
+                dl = QVBoxLayout(det_frame)
+                dl.setContentsMargins(10, 8, 10, 8)
+                dl.setSpacing(4)
+                if context:
+                    lc = QLabel(f"<b>Context:</b> {context}")
+                    lc.setWordWrap(True)
+                    lc.setStyleSheet(f"font-size: 11.5px; color: {t['text_secondary']}; border: none;")
+                    dl.addWidget(lc)
+                if evidence:
+                    le = QLabel(f"<b>Transcript Evidence:</b> “{evidence}”")
+                    le.setWordWrap(True)
+                    le.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                    le.setStyleSheet(f"font-size: 11.5px; color: {t['text_muted']}; font-style: italic; border: none;")
+                    dl.addWidget(le)
+                if notes:
+                    ln = QLabel(f"<b>Notes:</b> {notes}")
+                    ln.setWordWrap(True)
+                    ln.setStyleSheet(f"font-size: 11.5px; color: {t['text_secondary']}; border: none;")
+                    dl.addWidget(ln)
+                c_lay.addWidget(det_frame)
+
+            self.items_layout.addWidget(card)
+
+        remaining = max(0, len(filtered) - len(shown))
+        if remaining > 0:
+            self.lbl_showing.setText(f"Showing {len(shown)} of {len(filtered)} actions")
+            self.btn_show_more.setText(f"Show {min(self.PAGE_SIZE, remaining)} more")
+            self.btn_show_all.setText(f"Show all ({len(filtered)})")
+            self.pager_widget.setVisible(True)
+        else:
+            self.pager_widget.setVisible(False)
+
+    def _toggle_expand(self, item_id: int) -> None:
+        if item_id in self._expanded_ids:
+            self._expanded_ids.remove(item_id)
+        else:
+            self._expanded_ids.add(item_id)
+        self._render_items()
+
+    def _on_item_toggled(self, item_id: int, checked: bool, item_ref: Optional[dict] = None) -> None:
         new_status = "completed" if checked else "pending"
-        for it in self._items:
-            if it.get("id") == item_id:
-                it["status"] = new_status
-                break
-        self.status_toggled.emit(item_id, new_status)
-        pending_c = sum(1 for it in self._items if it.get("status") != "completed")
+        if item_ref is not None:
+            item_ref["status"] = new_status
+        else:
+            for it in self._items:
+                if int(it.get("id") or 0) == int(item_id):
+                    it["status"] = new_status
+                    break
+        self.status_toggled.emit(int(item_id), new_status)
+        pending_c = sum(1 for it in self._items if str(it.get("status") or "pending").lower() != "completed")
         total_c = len(self._items)
         self.lbl_count.setText(f"{pending_c} pending · {total_c} total")
         self._render_items()
 
+    def _open_edit_dialog(self, item: dict) -> None:
+        from PyQt6.QtWidgets import QTextEdit
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Action Item")
+        dlg.setMinimumWidth(460)
+        lyt = QVBoxLayout(dlg)
+        lyt.setSpacing(10)
+
+        lyt.addWidget(QLabel("Action Description *:"))
+        e_desc = QTextEdit(str(item.get("description") or ""))
+        e_desc.setMaximumHeight(80)
+        lyt.addWidget(e_desc)
+
+        row1 = QHBoxLayout()
+        col_own = QVBoxLayout()
+        col_own.addWidget(QLabel("Owner (leave blank if unknown):"))
+        e_owner = QLineEdit(self._clean_display_owner(item.get("owner")) or "")
+        e_owner.setPlaceholderText("e.g., Abhilash")
+        col_own.addWidget(e_owner)
+        row1.addLayout(col_own, 1)
+
+        col_due = QVBoxLayout()
+        col_due.addWidget(QLabel("Due Date (leave blank if unstated):"))
+        e_due = QLineEdit(self._clean_display_due(item.get("due_date")) or "")
+        e_due.setPlaceholderText("e.g., 2026-12-01 or Next Friday")
+        col_due.addWidget(e_due)
+        row1.addLayout(col_due, 1)
+        lyt.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        col_st = QVBoxLayout()
+        col_st.addWidget(QLabel("Status:"))
+        c_st = QComboBox()
+        for st_val in ("pending", "completed", "blocked", "reopened"):
+            c_st.addItem(st_val.capitalize(), st_val)
+        cur_st = str(item.get("status") or "pending").lower()
+        idx_st = c_st.findData(cur_st)
+        if idx_st >= 0:
+            c_st.setCurrentIndex(idx_st)
+        col_st.addWidget(c_st)
+        row2.addLayout(col_st, 1)
+
+        col_pr = QVBoxLayout()
+        col_pr.addWidget(QLabel("Priority:"))
+        c_pr = QComboBox()
+        c_pr.addItem("Unspecified", "")
+        for pv in ("High", "Medium", "Low"):
+            c_pr.addItem(pv, pv)
+        idx_pr = c_pr.findData(str(item.get("priority") or "").capitalize())
+        if idx_pr >= 0:
+            c_pr.setCurrentIndex(idx_pr)
+        col_pr.addWidget(c_pr)
+        row2.addLayout(col_pr, 1)
+        lyt.addLayout(row2)
+
+        lyt.addWidget(QLabel("Notes (optional):"))
+        e_notes = QLineEdit(str(item.get("notes") or ""))
+        lyt.addWidget(e_notes)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        b_cancel = QPushButton("Cancel")
+        b_cancel.clicked.connect(dlg.reject)
+        b_save = QPushButton("Save Changes")
+        b_save.setObjectName("primaryBtn")
+        b_save.clicked.connect(dlg.accept)
+        btns.addWidget(b_cancel)
+        btns.addWidget(b_save)
+        lyt.addLayout(btns)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_desc = e_desc.toPlainText().strip()
+            if not new_desc:
+                self.toast_requested.emit("Validation", "Action description cannot be empty.")
+                return
+            updates = {
+                "description": new_desc,
+                "owner": e_owner.text().strip() or None,
+                "due_date": e_due.text().strip() or None,
+                "status": str(c_st.currentData() or "pending"),
+                "priority": str(c_pr.currentData() or ""),
+                "notes": e_notes.text().strip(),
+            }
+            item.update(updates)
+            self.action_edited.emit(int(item.get("id") or 0), updates)
+            pending_c = sum(1 for it in self._items if str(it.get("status") or "pending").lower() != "completed")
+            self.lbl_count.setText(f"{pending_c} pending · {len(self._items)} total")
+            self._render_items()
+            self.toast_requested.emit("Action Updated", "Saved action item changes.")
+
+    def _format_actions_plain(self, items: List[dict]) -> str:
+        lines: List[str] = []
+        for it in items:
+            done = "☑" if str(it.get("status") or "").lower() == "completed" else "☐"
+            owner = self._clean_display_owner(it.get("owner")) or "Owner Unknown"
+            due = self._clean_display_due(it.get("due_date"))
+            due_s = f" (Due: {due})" if due else ""
+            prio = str(it.get("priority") or "").strip()
+            prio_s = f" [{prio}]" if prio else ""
+            lines.append(f"{done} [{owner}]{prio_s} {it.get('description', '')}{due_s}")
+        return "\n".join(lines)
+
+    def _copy_text_safe(self, text: str, label: str) -> None:
+        cb = QApplication.clipboard()
+        if cb is None:
+            self.toast_requested.emit("Copy Failed", "System clipboard unavailable.")
+            return
+        cb.setText(text)
+        self.toast_requested.emit("Copied", f"Copied {label} to clipboard.")
+
+    def _copy_single_action(self, item: dict) -> None:
+        self._copy_text_safe(self._format_actions_plain([item]), "action item")
+
+    def _copy_filtered_plain(self) -> None:
+        self._copy_text_safe(self._format_actions_plain(self._filtered_items()), "filtered action items")
+
+    def _copy_all_plain(self) -> None:
+        self._copy_text_safe(self._format_actions_plain(self._items), "all action items")
+
     def _copy_for_slack(self) -> None:
-        from PyQt6.QtWidgets import QApplication
-        lines = ["*Action Items & Next Steps:*"]
+        lines = ["*Action Items & Next Steps*"]
         for it in self._items:
-            done = "x" if it.get("status") == "completed" else " "
-            owner = it.get("owner") or "Unassigned"
-            due = f" (Due: {it.get('due_date')})" if it.get("due_date") else ""
-            lines.append(f"• [{done}] *[{owner}]* {it.get('description', '')}{due}")
-        text = "\n".join(lines)
-        QApplication.clipboard().setText(text)
+            done = "✅" if str(it.get("status") or "").lower() == "completed" else "▫️"
+            owner = self._clean_display_owner(it.get("owner")) or "Owner Unknown"
+            due = self._clean_display_due(it.get("due_date"))
+            due_s = f" _(Due: {due})_" if due else ""
+            lines.append(f"{done} *@{owner}* — {it.get('description', '')}{due_s}")
+        self._copy_text_safe("\n".join(lines), "Slack/Teams action checklist")
+
+    def _export_actions(self, fmt: str) -> None:
+        import json as _json
+        from pathlib import Path
+        from PyQt6.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getSaveFileName(self, "Export Action Items", f"action_items.{fmt}", f"*.{fmt}")
+        if not path:
+            return
+        items = self._filtered_items()
+        if fmt == "json":
+            payload = _json.dumps(items, indent=2, ensure_ascii=False, default=str)
+        elif fmt == "md":
+            lines = ["# Action Items", ""]
+            for it in items:
+                chk = "x" if str(it.get("status") or "").lower() == "completed" else " "
+                owner = self._clean_display_owner(it.get("owner")) or "Owner Unknown"
+                due = self._clean_display_due(it.get("due_date"))
+                due_s = f" *(Due: {due})*" if due else ""
+                lines.append(f"- [{chk}] **{owner}**: {it.get('description', '')}{due_s}")
+            payload = "\n".join(lines) + "\n"
+        else:
+            payload = self._format_actions_plain(items) + "\n"
+        Path(path).write_text(payload, encoding="utf-8")
+        self.toast_requested.emit("Export Completed", f"Saved {Path(path).name}")
 
 
 # ======================================================================
@@ -1483,54 +2070,74 @@ class VoxActionItemMatrixWidget(QFrame):
 # ======================================================================
 class VoxStructuredDecisionsWidget(QFrame):
     """
-    Structured key decisions display with rationale and clickable timestamp chips.
+    Modern 2026 structured decision cards with context, rationale, speaker attribution,
+    status control, verbatim evidence, clickable timestamp jump, and zero nested scrollbars.
     """
     timestamp_clicked = pyqtSignal(float)
+    decision_updated = pyqtSignal(int, dict)
+    toast_requested = pyqtSignal(str, str)
 
     def __init__(self, parent: Optional[QWidget] = None, theme: str = "dark") -> None:
         super().__init__(parent)
         self.theme = theme
-        self.setObjectName("cardFrame")
+        self.setObjectName("decisionsMatrixContainer")
         self._decisions: List[dict] = []
         self._build_ui()
+        self.set_theme(self.theme)
 
     def _build_ui(self) -> None:
+        self.setMinimumWidth(0)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
-        hdr = QHBoxLayout()
-        hdr.setSpacing(8)
-        lbl_title = QLabel("🎯 Key Decisions & Outcomes")
-        lbl_title.setStyleSheet("font-size: 13px; font-weight: 700;")
-        hdr.addWidget(lbl_title)
+        hdr = VoxFlowLayout(margin=0, h_spacing=6, v_spacing=6)
+        self.lbl_title = QLabel("Key Decisions & Outcomes")
+        self.lbl_title.setMinimumWidth(0)
+        hdr.addWidget(self.lbl_title)
 
         self.lbl_count = QLabel("0 decisions")
-        self.lbl_count.setStyleSheet("font-size: 11px; font-weight: 600; color: #8B949E; background: rgba(139, 148, 158, 0.15); border-radius: 10px; padding: 2px 8px;")
         hdr.addWidget(self.lbl_count)
-        hdr.addStretch()
 
-        self.btn_copy = QPushButton("📋 Copy Decisions")
-        self.btn_copy.setFixedHeight(26)
-        self.btn_copy.setToolTip("Copy confirmed decisions for meeting notes or messaging")
+        self.btn_copy = QPushButton("Copy Decisions")
+        self.btn_copy.setFixedHeight(27)
+        self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy.setToolTip("Copy decisions cleanly to clipboard")
         self.btn_copy.clicked.connect(self._copy_decisions)
         hdr.addWidget(self.btn_copy)
 
         layout.addLayout(hdr)
 
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_content = QWidget()
-        self.cards_layout = QVBoxLayout(self.scroll_content)
-        self.cards_layout.setContentsMargins(0, 4, 0, 4)
-        self.cards_layout.setSpacing(6)
-        self.scroll.setWidget(self.scroll_content)
-        layout.addWidget(self.scroll, 1)
+        self.cards_host = QWidget()
+        self.cards_layout = QVBoxLayout(self.cards_host)
+        self.cards_layout.setContentsMargins(0, 2, 0, 2)
+        self.cards_layout.setSpacing(8)
+        layout.addWidget(self.cards_host)
+
+    def set_theme(self, theme_name: str) -> None:
+        self.theme = (theme_name or "light").lower()
+        t = get_theme_tokens(self.theme)
+        self.lbl_title.setStyleSheet(f"font-size: 13.5px; font-weight: 700; color: {t['text_primary']};")
+        self.lbl_count.setStyleSheet(
+            f"font-size: 11px; font-weight: 600; color: {t['status_success_text']}; "
+            f"background: {t['status_success_bg']}; border-radius: 10px; padding: 2px 9px;"
+        )
+        self.btn_copy.setStyleSheet(
+            f"QPushButton {{ background: {t['secondary_btn_bg']}; color: {t['text_primary']}; "
+            f"border: 1px solid {t['border']}; border-radius: 7px; padding: 2px 10px; font-size: 11.5px; font-weight: 600; }} "
+            f"QPushButton:hover {{ background: {t['surface_hover']}; }}"
+        )
+        self._render_cards()
+
+    apply_theme = set_theme
 
     def set_decisions(self, decisions: List[dict]) -> None:
-        self._decisions = decisions or []
-        self.lbl_count.setText(f"{len(self._decisions)} confirmed")
+        self._decisions = [dict(d) for d in (decisions or [])]
+        conf_cnt = sum(1 for d in self._decisions if str(d.get("status") or "").lower() == "confirmed")
+        if conf_cnt:
+            self.lbl_count.setText(f"{len(self._decisions)} total · {conf_cnt} confirmed")
+        else:
+            self.lbl_count.setText(f"{len(self._decisions)} decisions")
         self._render_cards()
 
     def _render_cards(self) -> None:
@@ -1540,60 +2147,181 @@ class VoxStructuredDecisionsWidget(QFrame):
             if w:
                 w.deleteLater()
 
+        t = get_theme_tokens(self.theme)
         if not self._decisions:
-            lbl_empty = QLabel("No explicit decisions logged for this meeting.")
-            lbl_empty.setStyleSheet("color: #8B949E; font-size: 11.5px; padding: 12px; font-style: italic;")
+            empty_box = QFrame()
+            empty_box.setStyleSheet(
+                f"background: {t['surface_alt']}; border: 1px dashed {t['border']}; border-radius: 10px; padding: 14px;"
+            )
+            el = QVBoxLayout(empty_box)
+            lbl_empty = QLabel("No explicit decisions were logged during this meeting.")
+            lbl_empty.setStyleSheet(f"color: {t['text_muted']}; font-size: 12.5px; border: none;")
             lbl_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.cards_layout.addWidget(lbl_empty)
-            self.cards_layout.addStretch()
+            el.addWidget(lbl_empty)
+            self.cards_layout.addWidget(empty_box)
             return
 
-        for dec in self._decisions:
+        for idx, dec in enumerate(self._decisions):
+            dec_id = int(dec.get("id") or (idx + 1))
+            stat = str(dec.get("status") or "confirmed").strip().lower()
+            cat = str(dec.get("category") or "General").strip()
+            speaker = str(dec.get("speaker") or "").strip()
+            ctx = str(dec.get("context") or "").strip()
+            rationale = str(dec.get("rationale") or "").strip()
+            evidence = str(dec.get("evidence_quote") or "").strip()
+            ts_sec = float(dec.get("timestamp_sec") or 0.0)
+
+            accent_bar = {
+                "confirmed": t["status_success"],
+                "proposed": t["status_info"],
+                "rejected": t["status_danger"],
+                "unresolved": t["status_warning"],
+            }.get(stat, t["status_success"])
+
             card = QFrame()
-            card.setObjectName("nestedCard")
-            card.setStyleSheet("QFrame#nestedCard { border-left: 3px solid #10B981; }")
+            card.setObjectName("decisionCardRow")
+            card.setMinimumWidth(0)
+            card.setStyleSheet(
+                f"QFrame#decisionCardRow {{ background-color: {t['surface_alt']}; border: 1px solid {t['border']}; "
+                f"border-left: 3px solid {accent_bar}; border-radius: 10px; }}"
+            )
             c_layout = QVBoxLayout(card)
-            c_layout.setContentsMargins(12, 8, 12, 8)
-            c_layout.setSpacing(4)
+            c_layout.setContentsMargins(12, 10, 12, 10)
+            c_layout.setSpacing(6)
 
             top = QHBoxLayout()
-            dec_text = dec.get("decision", "")
-            lbl_dec = QLabel(f"• {dec_text}")
-            lbl_dec.setStyleSheet("font-size: 12px; font-weight: 700;")
+            top.setSpacing(6)
+            lbl_dec = QLabel(str(dec.get("decision") or ""))
+            lbl_dec.setStyleSheet(f"font-size: 13px; font-weight: 700; color: {t['text_primary']}; border: none;")
             lbl_dec.setWordWrap(True)
+            lbl_dec.setMinimumWidth(0)
+            lbl_dec.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            lbl_dec.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             top.addWidget(lbl_dec, 1)
 
-            ts_sec = float(dec.get("timestamp_sec") or 0.0)
             if ts_sec > 0:
-                btn_ts = QPushButton(f"⏱️ {format_seconds_hms(ts_sec)}")
+                btn_ts = QPushButton(format_seconds_hms(ts_sec))
                 btn_ts.setFixedHeight(22)
-                btn_ts.setToolTip(f"Jump playback to decision at {format_seconds_hms(ts_sec)}")
-                btn_ts.setStyleSheet("QPushButton { font-size: 10px; font-weight: 700; color: #10B981; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 4px; padding: 1px 6px; } QPushButton:hover { background: rgba(16, 185, 129, 0.25); }")
-                btn_ts.clicked.connect(lambda _, sec=ts_sec: self.timestamp_clicked.emit(sec))
-                top.addWidget(btn_ts)
+                btn_ts.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_ts.setToolTip(f"Jump transcript to {format_seconds_hms(ts_sec)}")
+                btn_ts.setStyleSheet(
+                    f"QPushButton {{ font-size: 10.5px; font-weight: 700; color: {t['status_success_text']}; "
+                    f"background: {t['status_success_bg']}; border: 1px solid {t['border']}; border-radius: 6px; padding: 1px 8px; }}"
+                )
+                btn_ts.clicked.connect(lambda _=False, sec=ts_sec: self.timestamp_clicked.emit(sec))
+                top.addWidget(btn_ts, 0, Qt.AlignmentFlag.AlignTop)
+
+            if stat != "confirmed" and dec.get("id"):
+                btn_confirm = QPushButton("Confirm")
+                btn_confirm.setFixedHeight(22)
+                btn_confirm.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_confirm.setStyleSheet(
+                    f"QPushButton {{ font-size: 10.5px; font-weight: 600; color: {t['status_success_text']}; "
+                    f"background: {t['surface']}; border: 1px solid {t['status_success']}; border-radius: 6px; padding: 1px 8px; }}"
+                )
+                btn_confirm.clicked.connect(lambda _=False, did=dec_id, dref=dec: self._mark_confirmed(did, dref))
+                top.addWidget(btn_confirm, 0, Qt.AlignmentFlag.AlignTop)
+
+            btn_cp = QPushButton("Copy")
+            btn_cp.setFixedHeight(22)
+            btn_cp.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_cp.setStyleSheet(
+                f"QPushButton {{ font-size: 10.5px; font-weight: 600; color: {t['text_secondary']}; "
+                f"background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 6px; padding: 1px 8px; }}"
+            )
+            btn_cp.clicked.connect(lambda _=False, dref=dec: self._copy_single_decision(dref))
+            top.addWidget(btn_cp, 0, Qt.AlignmentFlag.AlignTop)
 
             c_layout.addLayout(top)
 
-            rationale = dec.get("rationale", "")
+            # Badges row using wrapping VoxFlowLayout (zero QScrollArea)
+            badges = VoxFlowLayout(margin=0, h_spacing=6, v_spacing=5)
+            badges_host = QWidget()
+            badges_host.setMinimumWidth(0)
+            badges_host.setLayout(badges)
+            st_colors = {
+                "confirmed": (t["status_success_bg"], t["status_success_text"]),
+                "proposed": (t["status_info_bg"], t["status_info_text"]),
+                "rejected": (t["status_danger_bg"], t["status_danger_text"]),
+                "unresolved": (t["status_warning_bg"], t["status_warning_text"]),
+            }.get(stat, (t["status_neutral_bg"], t["status_neutral_text"]))
+            lbl_st = QLabel(stat.capitalize())
+            lbl_st.setStyleSheet(
+                f"font-size: 10.5px; font-weight: 700; color: {st_colors[1]}; background: {st_colors[0]}; border-radius: 6px; padding: 2px 7px;"
+            )
+            badges.addWidget(lbl_st)
+
+            lbl_cat = QLabel(cat)
+            lbl_cat.setStyleSheet(
+                f"font-size: 10.5px; font-weight: 600; color: {t['text_secondary']}; "
+                f"background: {t['chip_bg']}; border: 1px solid {t['chip_border']}; border-radius: 6px; padding: 1px 7px;"
+            )
+            badges.addWidget(lbl_cat)
+
+            if speaker:
+                lbl_spk = QLabel(f"Raised by: {speaker}")
+                lbl_spk.setStyleSheet(
+                    f"font-size: 10.5px; font-weight: 600; color: {t['status_info_text']}; "
+                    f"background: {t['status_info_bg']}; border-radius: 6px; padding: 2px 7px;"
+                )
+                badges.addWidget(lbl_spk)
+            c_layout.addWidget(badges_host)
+
+            if ctx and ctx != rationale:
+                lbl_ctx = QLabel(f"Context: {ctx}")
+                lbl_ctx.setWordWrap(True)
+                lbl_ctx.setMinimumWidth(0)
+                lbl_ctx.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                lbl_ctx.setStyleSheet(f"font-size: 12px; color: {t['text_secondary']}; border: none;")
+                c_layout.addWidget(lbl_ctx)
             if rationale:
-                lbl_rat = QLabel(f"Context: {rationale}")
-                lbl_rat.setStyleSheet("font-size: 11px; color: #8B949E; font-style: italic;")
+                lbl_rat = QLabel(f"Rationale: {rationale}")
                 lbl_rat.setWordWrap(True)
+                lbl_rat.setMinimumWidth(0)
+                lbl_rat.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                lbl_rat.setStyleSheet(f"font-size: 12px; color: {t['text_secondary']}; border: none;")
                 c_layout.addWidget(lbl_rat)
+            if evidence:
+                lbl_ev = QLabel(f"Evidence: “{evidence}”")
+                lbl_ev.setWordWrap(True)
+                lbl_ev.setMinimumWidth(0)
+                lbl_ev.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                lbl_ev.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                lbl_ev.setStyleSheet(f"font-size: 11.5px; color: {t['text_muted']}; font-style: italic; border: none;")
+                c_layout.addWidget(lbl_ev)
 
             self.cards_layout.addWidget(card)
 
-        self.cards_layout.addStretch()
+    def _mark_confirmed(self, decision_id: int, dec_ref: dict) -> None:
+        dec_ref["status"] = "confirmed"
+        self.decision_updated.emit(decision_id, {"status": "confirmed"})
+        self.set_decisions(self._decisions)
+        self.toast_requested.emit("Decision Confirmed", "Updated decision status to Confirmed.")
+
+    def _format_decision_lines(self, decs: List[dict]) -> str:
+        lines: List[str] = []
+        for dec in decs:
+            ts = f"[{format_seconds_hms(float(dec.get('timestamp_sec', 0.0)))}] " if dec.get("timestamp_sec") else ""
+            stat = str(dec.get("status") or "confirmed").capitalize()
+            lines.append(f"• {ts}{dec.get('decision', '')} ({stat})")
+            if dec.get("rationale"):
+                lines.append(f"  Rationale: {dec.get('rationale')}")
+            if dec.get("evidence_quote"):
+                lines.append(f"  Evidence: \"{dec.get('evidence_quote')}\"")
+        return "\n".join(lines)
+
+    def _copy_single_decision(self, dec: dict) -> None:
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(self._format_decision_lines([dec]))
+            self.toast_requested.emit("Copied", "Copied decision to clipboard.")
 
     def _copy_decisions(self) -> None:
-        from PyQt6.QtWidgets import QApplication
-        lines = ["*Confirmed Key Decisions:*"]
-        for dec in self._decisions:
-            ts = f" [{format_seconds_hms(float(dec.get('timestamp_sec', 0.0)))}]" if dec.get("timestamp_sec") else ""
-            lines.append(f"•{ts} {dec.get('decision', '')}")
-            if dec.get("rationale"):
-                lines.append(f"  _Context: {dec.get('rationale')}_")
-        QApplication.clipboard().setText("\n".join(lines))
+        cb = QApplication.clipboard()
+        if cb is not None:
+            text = "Key Decisions:\n" + self._format_decision_lines(self._decisions) if self._decisions else "No decisions recorded."
+            cb.setText(text)
+            self.toast_requested.emit("Copied", "Copied all decisions to clipboard.")
 
 
 # ======================================================================
@@ -2343,20 +3071,34 @@ class VoxEmptyStateWidget(QFrame):
 
     def _build_ui(self, icon: str, title: str, subtitle: str) -> None:
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(32, 40, 32, 40)
-        lay.setSpacing(16)
-        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.setContentsMargins(28, 32, 28, 32)
+        lay.setSpacing(14)
+        lay.addStretch(1)
 
         # Icon badge
-        self.lbl_icon = QLabel(icon)
+        from voxlocal.ui.icons import VectorIconLabel, get_pixmap
+
+        self.lbl_icon = VectorIconLabel(icon)
         self.lbl_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_icon.setFixedSize(56, 56)
         self.lbl_icon.setAccessibleName("Empty state icon")
+        self._empty_icon_raw = icon
+        self._empty_icon_key = None
+        try:
+            icon_key = "meetings" if ("🎙" in str(icon) or not str(icon).strip()) else str(icon)
+            if icon_key in ("meetings", "calendar", "sparkles", "scratchpad", "snippets", "home"):
+                self._empty_icon_key = icon_key
+                self.lbl_icon.setPixmap(get_pixmap(icon_key, "#1967D2", 26))
+            else:
+                self.lbl_icon.setText(icon)
+        except Exception:
+            self.lbl_icon.setText(icon)
         lay.addWidget(self.lbl_icon, 0, Qt.AlignmentFlag.AlignCenter)
 
         # Title
         self.lbl_title = QLabel(title)
-        self.lbl_title.setFont(get_ui_font(20, 600, serif=True))
+        self.lbl_title.setFont(get_ui_font(20, 600))
+        self.lbl_title.setMinimumHeight(28)
         self.lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_title.setAccessibleName(title)
         lay.addWidget(self.lbl_title)
@@ -2364,16 +3106,21 @@ class VoxEmptyStateWidget(QFrame):
         # Subtitle
         self.lbl_sub = QLabel(subtitle)
         self.lbl_sub.setWordWrap(True)
-        self.lbl_sub.setMaximumWidth(520)
+        self.lbl_sub.setFixedWidth(480)
+        self.lbl_sub.setMinimumHeight(44)
+        self.lbl_sub.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.lbl_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_sub.setAccessibleName(subtitle)
-        lay.addWidget(self.lbl_sub, 0, Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.lbl_sub, 0, Qt.AlignmentFlag.AlignHCenter)
 
         # Quick start container
         self.cards_wrap = QWidget(self)
+        self.cards_wrap.setFixedHeight(112)
+        self.cards_wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._cards_layout = QHBoxLayout(self.cards_wrap)
         self._cards_layout.setContentsMargins(0, 8, 0, 8)
         self._cards_layout.setSpacing(12)
+        self._cards_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(self.cards_wrap)
 
         # Primary action button
@@ -2383,14 +3130,15 @@ class VoxEmptyStateWidget(QFrame):
         self.btn_action.setAccessibleName("Start Recording")
         self.btn_action.setAccessibleDescription("Start capturing audio and meeting notes")
         self.btn_action.clicked.connect(self.action_clicked.emit)
-        lay.addWidget(self.btn_action, 0, Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.btn_action, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addStretch(1)
 
     def add_starter_card(self, title: str, desc: str, template_key: str, tag: str = "") -> QPushButton:
         btn = QPushButton(self.cards_wrap if hasattr(self, "cards_wrap") else self)
         btn.setObjectName("starterCard")
         btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setMinimumSize(160, 84)
+        btn.setFixedSize(184, 96)
         btn.setAccessibleName(f"Template {title}")
         btn.setAccessibleDescription(f"Use {title} starter template: {desc}")
 
@@ -2413,7 +3161,7 @@ class VoxEmptyStateWidget(QFrame):
         b_lay.addWidget(d_lbl)
 
         btn.clicked.connect(lambda _=False, k=template_key: self.starter_clicked.emit(k))
-        if self._cards_layout:
+        if self._cards_layout is not None:
             self._cards_layout.addWidget(btn)
         self._starter_buttons.append(btn)
         return btn
@@ -2430,4 +3178,10 @@ class VoxEmptyStateWidget(QFrame):
         self.lbl_icon.setStyleSheet(
             f"background-color: {t['surface_well']}; border: 1px solid {t['border']}; border-radius: 28px; font-size: 24px;"
         )
+        if getattr(self, "_empty_icon_key", None):
+            try:
+                from voxlocal.ui.icons import get_pixmap
+                self.lbl_icon.setPixmap(get_pixmap(self._empty_icon_key, t.get("accent_fathom", "#1967D2"), 26))
+            except Exception:
+                pass
 

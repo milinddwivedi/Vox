@@ -18,7 +18,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QObject, QTimer, pyqtSignal
 
 from voxlocal.calendar.auth_service import classify_account_kind, make_account_id
 from voxlocal.calendar.base import (
@@ -361,7 +361,8 @@ class UnifiedCalendarEngine(QObject):
         """Start background synchronisation daemon."""
         if interval_sec:
             self._timer.setInterval(max(10, interval_sec) * 1000)
-        self._timer.start()
+        if QCoreApplication.instance() is not None:
+            self._timer.start()
         logger.info("UnifiedCalendarEngine polling started (%ds interval)", self._timer.interval() // 1000)
         self.poll_all_now()
 

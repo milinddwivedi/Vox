@@ -23,6 +23,7 @@ import sqlite3
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
+import weakref
 
 from voxlocal.calendar.auth_service import dpapi_decrypt, dpapi_encrypt
 from voxlocal.core.logger import get_app_root, get_logger
@@ -158,20 +159,107 @@ class UsageMeteringEngine:
         else:
             self.db_path = Path(db_path)
 
+        self._is_memory = (str(self.db_path) == ":memory:")
+        self._local = threading.local()
+        self._conn_registry_lock = threading.Lock()
+        self._thread_conns: List[sqlite3.Connection] = []
+        self._mem_conn: Optional[sqlite3.Connection] = None
+
+        if self._is_memory:
+            self._mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
+        else:
+            os.makedirs(self.db_path.parent, exist_ok=True)
+            init_con = self._open_disk_connection(enable_wal=True)
+            self._local.conn = init_con
+            self._local.db_path = str(self.db_path)
+            with self._conn_registry_lock:
+                self._thread_conns.append(init_con)
+
         self._plan_code: str = "free"  # "free", "pro_monthly", "pro_annual"
         self._user_id: str = "default"
         self._device_id: str = self._resolve_device_id()
         self._ensure_metering_tables()
 
+    def _open_disk_connection(self, *, enable_wal: bool = False) -> sqlite3.Connection:
+        con = sqlite3.connect(str(self.db_path), timeout=15.0, check_same_thread=False)
+        con.execute("PRAGMA busy_timeout=15000;")
+        if enable_wal:
+            try:
+                con.execute("PRAGMA journal_mode=WAL;")
+            except sqlite3.OperationalError:
+                pass
+        con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA temp_store=MEMORY;")
+        return con
+
+    def _get_thread_conn(self) -> sqlite3.Connection:
+        if self._is_memory and self._mem_conn is not None:
+            return self._mem_conn
+        con = getattr(self._local, "conn", None)
+        bound = getattr(self._local, "db_path", None)
+        if con is not None and bound == str(self.db_path):
+            try:
+                con.execute("SELECT 1")
+                return con
+            except sqlite3.Error:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+                with self._conn_registry_lock:
+                    if con in self._thread_conns:
+                        self._thread_conns.remove(con)
+                con = None
+        con = self._open_disk_connection(enable_wal=False)
+        self._local.conn = con
+        self._local.db_path = str(self.db_path)
+        with self._conn_registry_lock:
+            self._thread_conns.append(con)
+        return con
+
+    def close(self) -> None:
+        """Close all pooled SQLite connections held by the metering engine."""
+        with self.lock:
+            if self._mem_conn is not None:
+                try:
+                    self._mem_conn.close()
+                except Exception:
+                    pass
+                self._mem_conn = None
+            with self._conn_registry_lock:
+                conns = list(self._thread_conns)
+                self._thread_conns.clear()
+            for con in conns:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+            try:
+                if getattr(self._local, "conn", None) is not None:
+                    self._local.conn = None
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     @contextmanager
     def _get_connection(self):
-        con = sqlite3.connect(str(self.db_path), timeout=15.0)
+        con = self._get_thread_conn()
         try:
-            con.execute("PRAGMA journal_mode=WAL;")
-            with con:
-                yield con
-        finally:
-            con.close()
+            yield con
+            if getattr(con, "in_transaction", False):
+                con.commit()
+        except Exception:
+            if getattr(con, "in_transaction", False):
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+            raise
 
     def _resolve_device_id(self) -> str:
         """Resolve a stable, anonymous Windows hardware GUID."""

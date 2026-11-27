@@ -26,7 +26,7 @@ import urllib.request
 import webbrowser
 
 from voxlocal.calendar.auth_service import dpapi_decrypt, dpapi_encrypt
-from voxlocal.core.logger import get_app_root, get_logger
+from voxlocal.core.logger import get_app_root, get_logger, get_user_data_root
 
 logger = get_logger("desktop_auth")
 
@@ -115,8 +115,7 @@ class DesktopAuthBroker:
         self.lock = threading.RLock()
         self.backend_url = os.environ.get("VOX_BACKEND_URL", backend_url).rstrip("/")
         if vault_path is None:
-            root = get_app_root()
-            self.vault_path = root / "data" / "auth_session.vault"
+            self.vault_path = get_user_data_root() / "auth_session.vault"
             self._has_custom_vault = False
         else:
             self.vault_path = Path(vault_path)
@@ -269,7 +268,7 @@ class DesktopAuthBroker:
             paths = [self.vault_path]
             if not os.environ.get("PYTEST_CURRENT_TEST"):
                 paths.append(Path.home() / ".voxlocal" / "auth_session.vault")
-                paths.append(get_app_root() / "data" / "auth_session.vault")
+                paths.append(get_user_data_root() / "auth_session.vault")
             for p in paths:
                 if p.exists():
                     try:
@@ -599,6 +598,19 @@ class DesktopAuthBroker:
 
         for p in (8400, 3000):
             threading.Thread(target=_run_server, args=(p,), daemon=True, name=f"VoxLoopbackSSO-{p}").start()
+
+    def stop_background_sync_listener(self) -> None:
+        """Stop persistent background loopback HTTP listeners and close bound sockets cleanly."""
+        self._stop_background_listener.set()
+        with self.lock:
+            servers = list(getattr(self, "_background_servers", []) or [])
+            if hasattr(self, "_background_servers"):
+                self._background_servers.clear()
+        for srv in servers:
+            try:
+                srv.server_close()
+            except Exception:
+                pass
 
     def register_windows_uri_scheme(self) -> None:
         """Registers 'voxlocal://' URI scheme in Windows Registry (HKCU) for 1-click browser SSO."""

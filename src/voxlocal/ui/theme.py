@@ -8,6 +8,8 @@ Lumen (#FFFFEB) accents. Dark mode pairs deep Vast obsidian surfaces (#1A1A1A /
 
 from __future__ import annotations
 
+from pathlib import Path
+import sys
 from typing import Dict
 from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import (
@@ -64,8 +66,6 @@ LIGHT_TOKENS: ThemeTokenDict = ThemeTokenDict({
     "surface_well": "#E2E8F0",
     "surface_elevated": "#F8FAFC",
     "sidebar_bg": "#F8FAFC",
-    "sidebar_hover": "#F1F5F9",
-    "sidebar_active": "#E2E8F0",
     "ivory": "#F8FAFC",
     "canvas_ivory": "#F1F5F9",
     "surface_canvas": "#F8FAFC",
@@ -85,16 +85,25 @@ LIGHT_TOKENS: ThemeTokenDict = ThemeTokenDict({
     "text_dim": "#94A3B8",
     "text_tertiary": "#64748B",
 
-    # Signature Accents (Electric Indigo, Sonic Cyan, Cobalt, Crimson)
-    "accent": "#4F46E5",
-    "accent_primary": "#4F46E5",
-    "accent_dawn": "#EEF2FF",
-    "accent_dawn_tint": "#F5F3FF",
-    "accent_dawn_hover": "#E0E7FF",
-    "accent_dawn_text": "#312E81",
-    "accent_fathom": "#4F46E5",
-    "accent_fathom_tint": "#EEF2FF",
-    "accent_fathom_hover": "#4338CA",
+    # Surface containers & outline hierarchy (Material 3)
+    "surface_container": "#F1F5F9",
+    "surface_container_low": "#F8FAFC",
+    "surface_container_high": "#E8EEF6",
+    "outline_variant": "#E2E8F0",
+    "ai_tint": "#F3F0FF",
+    "ai_border": "#DDD6FE",
+    "ai_text": "#5B21B6",
+
+    # Signature Accents (Google Workspace Blue & Semantic Accents)
+    "accent": "#1967D2",
+    "accent_primary": "#1967D2",
+    "accent_dawn": "#E8F0FE",
+    "accent_dawn_tint": "#F1F6FE",
+    "accent_dawn_hover": "#D2E3FC",
+    "accent_dawn_text": "#174EA6",
+    "accent_fathom": "#1967D2",
+    "accent_fathom_tint": "#E8F0FE",
+    "accent_fathom_hover": "#1557B0",
     "accent_lumen": "#F0FDF4",
     "accent_lumen_border": "#BBF7D0",
     "accent_gold": "#D97706",
@@ -106,17 +115,17 @@ LIGHT_TOKENS: ThemeTokenDict = ThemeTokenDict({
     "signal_pink": "#EC4899",
 
     # Interactive Controls
-    "primary_btn_bg": "#0F172A",
+    "primary_btn_bg": "#1967D2",
     "primary_btn_text": "#FFFFFF",
     "primary_btn_border": "transparent",
-    "primary_btn_hover": "#1E293B",
-    "dawn_btn_bg": "#EEF2FF",
-    "dawn_btn_text": "#312E81",
-    "dawn_btn_border": "#C7D2FE",
-    "fathom_btn_bg": "#4F46E5",
+    "primary_btn_hover": "#1557B0",
+    "dawn_btn_bg": "#E8F0FE",
+    "dawn_btn_text": "#174EA6",
+    "dawn_btn_border": "#D2E3FC",
+    "fathom_btn_bg": "#1967D2",
     "fathom_btn_text": "#FFFFFF",
-    "fathom_btn_border": "#4338CA",
-    "fathom_btn_hover": "#4338CA",
+    "fathom_btn_border": "#1967D2",
+    "fathom_btn_hover": "#1557B0",
     "secondary_btn_bg": "#FFFFFF",
     "secondary_btn_text": "#0F172A",
     "secondary_btn_border": "#E2E8F0",
@@ -127,7 +136,9 @@ LIGHT_TOKENS: ThemeTokenDict = ThemeTokenDict({
     # Inputs & Tables
     "input_bg": "#FFFFFF",
     "input_border": "#CBD5E1",
-    "input_focus_border": "#4F46E5",
+    "input_focus_border": "#1A73E8",
+    "sidebar_hover": "#F1F5F9",
+    "sidebar_active": "#E8F0FE",
     "tab_bg": "transparent",
     "tab_hover": "#F1F5F9",
     "tab_selected_bg": "#FFFFFF",
@@ -216,8 +227,6 @@ DARK_TOKENS: ThemeTokenDict = ThemeTokenDict({
     "surface_well": "#070A12",
     "surface_elevated": "#1E293B",
     "sidebar_bg": "#070A12",
-    "sidebar_hover": "#162032",
-    "sidebar_active": "#1E293B",
     "obsidian": "#0B0F19",
     "canvas_obsidian": "#0B0F19",
     "surface_canvas": "#111827",
@@ -237,16 +246,25 @@ DARK_TOKENS: ThemeTokenDict = ThemeTokenDict({
     "text_dim": "#64748B",
     "text_tertiary": "#94A3B8",
 
-    # Signature Accents
-    "accent": "#6366F1",
-    "accent_primary": "#6366F1",
-    "accent_dawn": "#818CF8",
-    "accent_dawn_tint": "#1E1B4B",
-    "accent_dawn_hover": "#A5B4FC",
-    "accent_dawn_text": "#E0E7FF",
-    "accent_fathom": "#38BDF8",
-    "accent_fathom_tint": "#082F49",
-    "accent_fathom_hover": "#7DD3FC",
+    # Surface containers & outline hierarchy (Material 3 Dark)
+    "surface_container": "#162032",
+    "surface_container_low": "#0F1624",
+    "surface_container_high": "#1E293B",
+    "outline_variant": "#1E293B",
+    "ai_tint": "#1E1B3A",
+    "ai_border": "#3B326B",
+    "ai_text": "#C4B5FD",
+
+    # Signature Accents (Google Workspace Blue Dark & Semantic Accents)
+    "accent": "#8AB4F8",
+    "accent_primary": "#8AB4F8",
+    "accent_dawn": "#1D3354",
+    "accent_dawn_tint": "#152238",
+    "accent_dawn_hover": "#244068",
+    "accent_dawn_text": "#D2E3FC",
+    "accent_fathom": "#8AB4F8",
+    "accent_fathom_tint": "#17253D",
+    "accent_fathom_hover": "#AECBFA",
     "accent_lumen": "#064E3B",
     "accent_lumen_border": "#065F46",
     "accent_gold": "#FBBF24",
@@ -258,17 +276,17 @@ DARK_TOKENS: ThemeTokenDict = ThemeTokenDict({
     "signal_pink": "#F472B6",
 
     # Interactive Controls
-    "primary_btn_bg": "#F8FAFC",
+    "primary_btn_bg": "#8AB4F8",
     "primary_btn_text": "#0B0F19",
     "primary_btn_border": "transparent",
-    "primary_btn_hover": "#FFFFFF",
-    "dawn_btn_bg": "#6366F1",
-    "dawn_btn_text": "#FFFFFF",
-    "dawn_btn_border": "#4F46E5",
-    "fathom_btn_bg": "#0284C7",
+    "primary_btn_hover": "#AECBFA",
+    "dawn_btn_bg": "#1D3354",
+    "dawn_btn_text": "#D2E3FC",
+    "dawn_btn_border": "#2B4C7E",
+    "fathom_btn_bg": "#2563EB",
     "fathom_btn_text": "#FFFFFF",
-    "fathom_btn_border": "#0369A1",
-    "fathom_btn_hover": "#0369A1",
+    "fathom_btn_border": "#1D4ED8",
+    "fathom_btn_hover": "#1D4ED8",
     "secondary_btn_bg": "#1E293B",
     "secondary_btn_text": "#F8FAFC",
     "secondary_btn_border": "#334155",
@@ -279,7 +297,9 @@ DARK_TOKENS: ThemeTokenDict = ThemeTokenDict({
     # Inputs & Tables
     "input_bg": "#070A12",
     "input_border": "#283548",
-    "input_focus_border": "#6366F1",
+    "input_focus_border": "#8AB4F8",
+    "sidebar_hover": "#162032",
+    "sidebar_active": "#1A263C",
     "tab_bg": "transparent",
     "tab_hover": "#162032",
     "tab_selected_bg": "#1E293B",
@@ -362,17 +382,94 @@ def get_theme_tokens(theme: str = "light") -> ThemeTokenDict:
     return DARK_TOKENS if (theme or "light").lower().strip() == "dark" else LIGHT_TOKENS
 
 
-def get_ui_font(size_px: int = 14, weight: int = 400, serif: bool = False, mono: bool = False) -> QFont:
-    """Resolve clean UI sans, editorial serif, or monospace font stacks with graceful fallback."""
-    if serif:
-        families = ["EB Garamond", "Georgia", "Times New Roman"]
-    elif mono:
-        families = ["Google Sans Code", "Consolas", "Cascadia Mono"]
-    else:
-        families = ["Figtree", "Segoe UI Variable Text", "Segoe UI", "Inter"]
+_GOOGLE_FONTS_LOADED: bool = False
+_PRIMARY_FONT_CACHE: str = ""
+_MONO_FONT_CACHE: str = ""
 
+TYPE_SCALE: Dict[str, tuple[int, int, float]] = {
+    "headline_large": (26, 500, 1.24),
+    "headline_small": (20, 600, 1.30),
+    "title_large": (18, 600, 1.32),
+    "title_medium": (15, 600, 1.40),
+    "title_small": (13, 600, 1.42),
+    "body_large": (14, 400, 1.55),
+    "body_medium": (13, 400, 1.50),
+    "body_small": (12, 400, 1.40),
+    "label_large": (13, 500, 1.40),
+    "label_medium": (12, 500, 1.35),
+    "label_small": (11, 500, 1.35),
+}
+
+
+def ensure_google_fonts_loaded() -> None:
+    """Load bundled SIL OFL Google Sans & Google Sans Code fonts into Qt once (idempotent)."""
+    global _GOOGLE_FONTS_LOADED, _PRIMARY_FONT_CACHE, _MONO_FONT_CACHE
+    if _GOOGLE_FONTS_LOADED:
+        return
+    try:
+        roots = []
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).resolve().parent
+            roots.extend([exe_dir / "assets" / "fonts", exe_dir / "_internal" / "assets" / "fonts"])
+        src_root = Path(__file__).resolve().parents[3]
+        roots.append(src_root / "assets" / "fonts")
+        for fdir in roots:
+            if not fdir.is_dir():
+                continue
+            for fname in ("GoogleSans.ttf", "GoogleSans-Italic.ttf", "GoogleSansCode.ttf"):
+                fpath = fdir / fname
+                if fpath.is_file():
+                    QFontDatabase.addApplicationFont(str(fpath))
+            break
+    except Exception:
+        pass
+    _PRIMARY_FONT_CACHE = ""
+    _MONO_FONT_CACHE = ""
+    _GOOGLE_FONTS_LOADED = True
+
+
+def get_primary_font_family() -> str:
+    """Return the loaded primary Google Sans family with crisp Windows fallbacks."""
+    global _PRIMARY_FONT_CACHE
+    ensure_google_fonts_loaded()
+    if _PRIMARY_FONT_CACHE:
+        return _PRIMARY_FONT_CACHE
     available = set(QFontDatabase.families())
-    chosen = next((fam for fam in families if fam in available), families[-1])
+    for cand in ("Google Sans", "Google Sans Flex", "Segoe UI Variable Text", "Segoe UI", "Inter"):
+        if cand in available:
+            _PRIMARY_FONT_CACHE = cand
+            return cand
+    _PRIMARY_FONT_CACHE = "Segoe UI"
+    return _PRIMARY_FONT_CACHE
+
+
+def get_mono_font_family() -> str:
+    """Return the loaded Google Sans Code monospace family with Consolas fallback."""
+    global _MONO_FONT_CACHE
+    ensure_google_fonts_loaded()
+    if _MONO_FONT_CACHE:
+        return _MONO_FONT_CACHE
+    available = set(QFontDatabase.families())
+    for cand in ("Google Sans Code", "Cascadia Mono", "Consolas"):
+        if cand in available:
+            _MONO_FONT_CACHE = cand
+            return cand
+    _MONO_FONT_CACHE = "Consolas"
+    return _MONO_FONT_CACHE
+
+
+def get_html_font_family() -> str:
+    """Return CSS font-family stack anchored on the verified loaded primary font."""
+    primary = get_primary_font_family()
+    if primary == "Google Sans":
+        return "'Google Sans', 'Segoe UI Variable Text', 'Segoe UI', sans-serif"
+    return f"'{primary}', 'Segoe UI', sans-serif"
+
+
+def get_ui_font(size_px: int = 14, weight: int = 400, serif: bool = False, mono: bool = False) -> QFont:
+    """Resolve Google Workspace-inspired sans or monospace QFont (unified modern typography)."""
+    ensure_google_fonts_loaded()
+    chosen = get_mono_font_family() if mono else get_primary_font_family()
     font = QFont(chosen)
     font.setPixelSize(max(10, int(size_px)))
     if weight >= 650:
@@ -383,7 +480,118 @@ def get_ui_font(size_px: int = 14, weight: int = 400, serif: bool = False, mono:
         font.setWeight(QFont.Weight.Medium)
     else:
         font.setWeight(QFont.Weight.Normal)
+    font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
     return font
+
+
+def get_type_font(role: str = "body_medium", mono: bool = False) -> QFont:
+    """Return a QFont configured to Material Design 3 type-scale role metrics."""
+    size_px, weight, _lh = TYPE_SCALE.get(role, TYPE_SCALE["body_medium"])
+    return get_ui_font(size_px=size_px, weight=weight, mono=mono)
+
+
+def get_chrome_stylesheet(theme: str = "light") -> str:
+    """Targeted Material 3 / Fluent desktop chrome rules with zero universal QWidget wildcard."""
+    t = get_theme_tokens(theme)
+    font_css = get_html_font_family()
+    return f"""
+    QMainWindow {{
+        background-color: {t['bg']};
+        color: {t['text']};
+        font-family: {font_css};
+    }}
+    QScrollBar:vertical {{
+        background: transparent;
+        width: 7px;
+        margin: 2px 1px;
+    }}
+    QScrollBar::handle:vertical {{
+        background: {t['scrollbar_handle']};
+        border-radius: 3px;
+        min-height: 28px;
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background: {t['scrollbar_hover']};
+    }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+        height: 0px;
+    }}
+    QScrollBar:horizontal {{
+        background: transparent;
+        height: 7px;
+        margin: 1px 2px;
+    }}
+    QScrollBar::handle:horizontal {{
+        background: {t['scrollbar_handle']};
+        border-radius: 3px;
+        min-width: 28px;
+    }}
+    QScrollBar::handle:horizontal:hover {{
+        background: {t['scrollbar_hover']};
+    }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+        width: 0px;
+    }}
+    QToolTip {{
+        background-color: {t['tooltip_bg']};
+        color: {t['tooltip_text']};
+        border: 1px solid {t['tooltip_border']};
+        border-radius: 7px;
+        padding: 5px 9px;
+        font-family: {font_css};
+        font-size: 12px;
+    }}
+    QMenu {{
+        background-color: {t['surface']};
+        color: {t['text']};
+        border: 1px solid {t['border']};
+        border-radius: 10px;
+        padding: 5px;
+        font-family: {font_css};
+        font-size: 12.5px;
+    }}
+    QMenu::item {{
+        padding: 6px 20px 6px 12px;
+        border-radius: 6px;
+        color: {t['text']};
+    }}
+    QMenu::item:selected {{
+        background-color: {t['accent_dawn']};
+        color: {t['accent_dawn_text']};
+    }}
+    QMenu::separator {{
+        height: 1px;
+        background: {t['line']};
+        margin: 4px 8px;
+    }}
+    QSplitter::handle {{
+        background-color: transparent;
+    }}
+    QSplitter::handle:hover {{
+        background-color: {t['accent_dawn']};
+        border-radius: 2px;
+    }}
+    QSlider::groove:horizontal {{
+        height: 4px;
+        background: {t['surface_well']};
+        border-radius: 2px;
+    }}
+    QSlider::sub-page:horizontal {{
+        background: {t['accent']};
+        border-radius: 2px;
+    }}
+    QSlider::handle:horizontal {{
+        background: {t['accent']};
+        border: 2px solid {t['surface']};
+        width: 12px;
+        height: 12px;
+        margin: -5px 0;
+        border-radius: 7px;
+    }}
+    QSlider::handle:horizontal:disabled {{
+        background: {t['text_dim']};
+    }}
+    """
 
 
 def get_theme_palette(theme: str = "light") -> QPalette:
@@ -431,13 +639,13 @@ def get_theme_stylesheet(theme: str = "light") -> str:
 QMainWindow, QDialog {{
     background-color: {t['bg']};
     color: {t['text']};
-    font-family: 'Figtree', 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
+    font-family: 'Google Sans', 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
     font-size: 14px;
 }}
 
 QWidget {{
     color: {t['text']};
-    font-family: 'Figtree', 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
+    font-family: 'Google Sans', 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
     font-size: 14px;
 }}
 
@@ -615,6 +823,35 @@ QListWidget, QTableWidget, QTreeWidget {{
     gridline-color: {t['line']};
 }}
 
+QTabWidget#unifiedMeetingTabs::pane, QTabWidget#advancedStudioTabs::pane {{
+    border: none;
+    background: transparent;
+    margin-top: 6px;
+}}
+
+QTabWidget#unifiedMeetingTabs QTabBar::tab, QTabWidget#advancedStudioTabs QTabBar::tab {{
+    background: transparent;
+    color: {t['text_secondary']};
+    border: 1px solid transparent;
+    border-radius: 9px;
+    padding: 8px 16px;
+    margin-right: 6px;
+    font-size: 13px;
+    font-weight: 600;
+}}
+
+QTabWidget#unifiedMeetingTabs QTabBar::tab:hover, QTabWidget#advancedStudioTabs QTabBar::tab:hover {{
+    background: {t['surface_hover']};
+    color: {t['text_primary']};
+}}
+
+QTabWidget#unifiedMeetingTabs QTabBar::tab:selected, QTabWidget#advancedStudioTabs QTabBar::tab:selected {{
+    background: {t['surface']};
+    color: {t['accent_fathom']};
+    border: 1px solid {t['border']};
+    border-bottom: 2px solid {t['accent_fathom']};
+}}
+
 QHeaderView::section {{
     background-color: {t['table_header_bg']};
     color: {t['table_header_text']};
@@ -704,7 +941,7 @@ def get_floating_pill_stylesheet(theme: str = "light") -> str:
         border: 1px solid {t['border']};
         border-radius: 10px;
         padding: 6px;
-        font-family: 'Figtree', 'Segoe UI', sans-serif;
+        font-family: 'Google Sans', 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
         font-size: 12.5px;
     }}
     QMenu::item {{
@@ -738,11 +975,11 @@ def get_dialog_stylesheet(theme: str = "light") -> str:
         color: {t['text']};
     }}
     QLabel {{
-        font-family: 'Figtree', 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
+        font-family: 'Google Sans', 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
         color: {t['text']};
     }}
     QLabel#onbHeadline, QLabel#onbStepTitle {{
-        font-family: 'EB Garamond', 'Georgia', 'Cambria', serif;
+        font-family: 'Google Sans', 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
         color: {t['text']};
         font-weight: 500;
         letter-spacing: -0.3px;

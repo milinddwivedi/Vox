@@ -29,6 +29,8 @@ class TestReadAIFeatures(unittest.TestCase):
         self.db = LocalDatabase(self.db_path)
 
     def tearDown(self):
+        if getattr(self, "db", None) is not None:
+            self.db.close()
         self.temp_dir.cleanup()
 
     def test_default_folders_and_crud(self):
@@ -67,9 +69,9 @@ class TestReadAIFeatures(unittest.TestCase):
 
         # 3. Action Items with Owner and Due Date
         self.assertGreaterEqual(len(analysis["action_items"]), 1)
-        abhilash_act = next((a for a in analysis["action_items"] if "Abhilash" in a.get("owner", "") or "Abhilash" in a["description"]), None)
+        abhilash_act = next((a for a in analysis["action_items"] if "Abhilash" in (a.get("owner") or "") or "Abhilash" in (a.get("description") or "")), None)
         self.assertIsNotNone(abhilash_act)
-        self.assertIn("friday", abhilash_act.get("due_date", "").lower())
+        self.assertIn("friday", (abhilash_act.get("due_date") or "").lower())
 
         # 4. Questions & Suggested Prompts
         self.assertGreaterEqual(len(analysis["questions"]), 1)

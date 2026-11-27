@@ -10,15 +10,31 @@ so that:
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 from ctypes import wintypes
 import threading
 import time
 from typing import Callable, Dict, Optional, Set, Tuple
+import weakref
 
 from voxlocal.core.logger import get_logger
 
 logger = get_logger("win32.hotkeys")
+
+_ACTIVE_HOTKEY_MANAGERS: "weakref.WeakSet[GlobalHotkeyManager]" = weakref.WeakSet()
+_ACTIVE_HOOK_REFS: Dict[int, object] = {}
+
+
+def _cleanup_all_hotkeys() -> None:
+    for mgr in list(_ACTIVE_HOTKEY_MANAGERS):
+        try:
+            mgr.stop()
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_all_hotkeys)
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -199,7 +215,9 @@ class GlobalHotkeyManager:
         self._thread_id: int = 0
         self._hook_handle: Optional[int] = None
         self._hook_proc_ref: Optional[HOOKPROC] = None
+        self._hook_ready = threading.Event()
         self._running = False
+        _ACTIVE_HOTKEY_MANAGERS.add(self)
 
     def configure(
         self,
@@ -265,18 +283,27 @@ class GlobalHotkeyManager:
         if self._running:
             return
         self._running = True
+        self._hook_ready.clear()
         self._thread = threading.Thread(
             target=self._hook_loop, name="Win32GlobalHotkeyThread", daemon=True
         )
         self._thread.start()
 
     def stop(self) -> None:
+        if not self._running and self._thread is None and self._hook_handle is None:
+            return
         self._running = False
-        if self._thread_id:
-            try:
-                user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
-            except Exception:
-                pass
+        if self._thread is not None and not self._thread_id:
+            self._hook_ready.wait(timeout=0.5)
+        tid = int(self._thread_id or 0)
+        if tid:
+            for _ in range(3):
+                try:
+                    if user32.PostThreadMessageW(tid, WM_QUIT, 0, 0):
+                        break
+                except Exception:
+                    break
+                time.sleep(0.02)
         if self._thread and self._thread.is_alive() and threading.current_thread() is not self._thread:
             self._thread.join(timeout=1.5)
         self._thread = None
@@ -323,6 +350,7 @@ class GlobalHotkeyManager:
 
     def _hook_loop(self) -> None:
         self._thread_id = int(kernel32.GetCurrentThreadId())
+        self._hook_ready.set()
 
         def low_level_handler(n_code: int, w_param: int, l_param: int) -> int:
             hook_handle = self._hook_handle
@@ -342,15 +370,21 @@ class GlobalHotkeyManager:
                     logger.error("Error in low-level keyboard hook: %s", exc)
             return int(user32.CallNextHookEx(hook_handle, n_code, w_param, l_param))
 
-        self._hook_proc_ref = HOOKPROC(low_level_handler)
-        self._hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_proc_ref, None, 0)
+        hook_proc = HOOKPROC(low_level_handler)
+        self._hook_proc_ref = hook_proc
+        self._hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc, None, 0)
         if not self._hook_handle:
             logger.error("Failed to install WH_KEYBOARD_LL hook (err=%d)", ctypes.get_last_error())
+            self._running = False
+            self._hook_proc_ref = None
             return
+        _ACTIVE_HOOK_REFS[self._thread_id] = hook_proc
 
         logger.info("Installed Win32 global keyboard hook (thread_id=%d)", self._thread_id)
         msg = wintypes.MSG()
         try:
+            # Ensure message queue exists and honor stop() if signaled during startup
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
             while self._running:
                 res = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if res <= 0:
@@ -359,8 +393,13 @@ class GlobalHotkeyManager:
                 user32.DispatchMessageW(ctypes.byref(msg))
         finally:
             if self._hook_handle:
-                user32.UnhookWindowsHookEx(self._hook_handle)
+                try:
+                    user32.UnhookWindowsHookEx(self._hook_handle)
+                except Exception:
+                    pass
                 self._hook_handle = None
+            _ACTIVE_HOOK_REFS.pop(self._thread_id, None)
+            self._hook_proc_ref = None
             logger.info("Uninstalled Win32 global keyboard hook.")
 
     def _fire_utility_shortcuts_down(self) -> None:

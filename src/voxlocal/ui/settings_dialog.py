@@ -277,6 +277,11 @@ class SettingsWorkspaceWidget(QWidget):
     mic_level_updated = pyqtSignal(float)
     open_calendar_requested = pyqtSignal()
     _model_download_finished = pyqtSignal(str, bool, str)
+    _rebuild_index_finished = pyqtSignal(bool, str)
+    _mics_loaded = pyqtSignal(list)
+
+    _cached_mics: Optional[List[Any]] = None
+    _cached_mics_ts: float = 0.0
 
     SECTIONS = [
         ("General", "Hotkeys, microphone & local AI engine", "group1"),
@@ -304,10 +309,14 @@ class SettingsWorkspaceWidget(QWidget):
         self._build_ui()
         self.mic_level_updated.connect(lambda lvl: self.mic_level_bar.set_level(lvl) if hasattr(self, "mic_level_bar") else None)
         self._model_download_finished.connect(self._on_model_download_finished)
+        self._rebuild_index_finished.connect(self._on_rebuild_index_finished)
+        self._mics_loaded.connect(self._apply_mic_devices)
+        if hasattr(self.controller, "meeting_models_updated"):
+            self.controller.meeting_models_updated.connect(self._refresh_meeting_model_rows)
         if hasattr(self.controller, "auth_state_changed"):
-            self.controller.auth_state_changed.connect(lambda _: self._update_account_ui())
+            self.controller.auth_state_changed.connect(self._on_controller_account_changed)
         if hasattr(self.controller, "entitlement_changed"):
-            self.controller.entitlement_changed.connect(lambda _: self._update_account_ui())
+            self.controller.entitlement_changed.connect(self._on_controller_account_changed)
         self.load_from_config()
         self._update_account_ui()
         self.apply_theme(self._theme)
@@ -810,46 +819,34 @@ class SettingsWorkspaceWidget(QWidget):
             "Separate voices locally and attribute speakers in transcripts.",
             lambda v: self._save_cfg("notetaker_auto_detect_speakers", v),
         )
-        self.sw_nt_live = self._add_toggle_row(
+        self.sw_echo_bleed = self._add_toggle_row(
             nt_lay,
-            "Live Call Transcript",
-            "Stream live captioned lines while a meeting is in progress.",
-            lambda v: self._save_cfg("notetaker_live_transcript", v),
+            "Echo-Bleed Suppression",
+            "Suppress remote speaker bleed picked up by open laptop microphones during post-call transcription.",
+            lambda v: self._save_cfg("post_call_echo_bleed_suppression", bool(v)),
         )
-        self.combo_asr_session_mode = QComboBox()
-        self.combo_asr_session_mode.setAccessibleName("Meeting ASR Mode")
-        self.combo_asr_session_mode.setAccessibleDescription(
-            "Choose Auto (English + Hinglish), English Only (Incremental Live), or Hindi / Hinglish (Guarded ONNX)"
+        self.sw_glossary_norm = self._add_toggle_row(
+            nt_lay,
+            "Glossary & Vocabulary Normalization",
+            "Apply custom vocabulary & knowledge glossary terms while keeping immutable raw ASR text.",
+            lambda v: self._save_cfg("post_call_glossary_normalization", bool(v)),
         )
-        self.combo_asr_session_mode.addItem("Auto (English + Hinglish)", "auto")
-        self.combo_asr_session_mode.addItem("English Only (Incremental Live)", "english")
-        self.combo_asr_session_mode.addItem("Hindi / Hinglish (Guarded ONNX)", "hinglish")
-        self.combo_asr_session_mode.currentIndexChanged.connect(
-            lambda: self._save_cfg("asr_session_mode", str(self.combo_asr_session_mode.currentData() or "auto"))
+        self.combo_llm_device = QComboBox()
+        self.combo_llm_device.setAccessibleName("Meeting Intelligence Execution Device")
+        self.combo_llm_device.setAccessibleDescription(
+            "Select Vulkan GPU (auto CPU fallback), Vulkan GPU preferred, or CPU-only execution for Qwen3.5-4B"
+        )
+        self.combo_llm_device.addItem("Auto (Vulkan GPU → CPU Fallback)", "auto")
+        self.combo_llm_device.addItem("Vulkan GPU", "vulkan")
+        self.combo_llm_device.addItem("CPU Only", "cpu")
+        self.combo_llm_device.currentIndexChanged.connect(
+            lambda: self._save_cfg("llm_device", str(self.combo_llm_device.currentData() or "auto"))
         )
         self._add_control_row(
             nt_lay,
-            "Meeting ASR Mode",
-            "Select English incremental streaming or Guarded Hinglish ONNX transcription.",
-            self.combo_asr_session_mode,
-        )
-        self.sw_phase2_asr = self._add_toggle_row(
-            nt_lay,
-            "Phase 2 Adaptive ONNX Pipeline",
-            "Enable hardware-aware ONNX streaming and guarded Hinglish recognition (disable to roll back to legacy Whisper).",
-            lambda v: self._save_cfg("enable_phase2_asr_pipeline", bool(v)),
-        )
-        self.sw_live_preview = self._add_toggle_row(
-            nt_lay,
-            "Live Preview During Calls",
-            "Show bounded provisional live captions during meetings while full audio is saved for post-call transcription.",
-            lambda v: self._save_cfg("live_preview_enabled", bool(v)),
-        )
-        self.sw_cpu_verifier = self._add_toggle_row(
-            nt_lay,
-            "CPU Post-Call Hinglish Verifier",
-            "Allow second-pass Hinglish verification using Oriserve Apex on CPU INT8 when no discrete GPU is available.",
-            lambda v: self._save_cfg("post_call_allow_cpu_verifier", bool(v)),
+            "Meeting Intelligence Execution",
+            "Qwen3.5-4B local runtime for summaries, decisions, actions, knowledge & Ask VOX.",
+            self.combo_llm_device,
         )
         self.combo_drawer_start = QComboBox()
         self.combo_drawer_start.setAccessibleName("Notepad on Call Start")
@@ -884,26 +881,27 @@ class SettingsWorkspaceWidget(QWidget):
         lay.addWidget(card_nt)
 
         card_models, mod_lay = self._make_card()
-        lbl_mod_hdr = QLabel("Local ASR Models (100% Offline)")
+        lbl_mod_hdr = QLabel("Meeting AI Models (100% Local · Separate from Voice Dictation)")
         lbl_mod_hdr.setStyleSheet("font-size: 13px; font-weight: 700;")
         lbl_mod_sub = QLabel(
-            "Download local ONNX models on demand for English incremental preview, high-accuracy English, and Hinglish post-call transcription."
+            "Dedicated local English Meeting ASR, neural speaker diarization, Qwen3.5-4B intelligence, "
+            "and BGE-Small-EN RAG embeddings. Voice Dictation Whisper models remain untouched."
         )
         lbl_mod_sub.setObjectName("settingsMuted")
         lbl_mod_sub.setWordWrap(True)
         mod_lay.addWidget(lbl_mod_hdr)
         mod_lay.addWidget(lbl_mod_sub)
 
-        self._phase2_model_rows: Dict[str, tuple[QLabel, QPushButton, bool]] = {}
+        self._meeting_model_rows: Dict[str, tuple[QLabel, QPushButton, QPushButton]] = {}
         model_defs = (
-            ("qwen3_onnx", "Guarded Qwen3 ASR 0.6B (ONNX INT8 · ~942 MB)", "Primary Hinglish, Hindi & Multilingual local model", False),
-            ("parakeet", "Parakeet TDT 0.6B v2 (ONNX INT8 · ~631 MB)", "High-accuracy English post-call & adaptive upgrade", False),
-            ("nemotron", "Nemotron Streaming EN 0.6B (ONNX INT8 · ~632 MB)", "Incremental word-by-word English live preview", False),
-            ("oriserve_apex", "Oriserve Apex Hinglish Verifier (CT2 INT8 · ~782 MB)", "Selective post-call Hinglish refinement model", True),
+            ("meeting_asr", "Cohere Transcribe 2B (ONNX INT8 · ~2.75 GB)", "Primary Indian & US English post-call meeting ASR (CPU)"),
+            ("meeting_diarization", "Sherpa Neural Diarization (PyAnnote 3.0 + WeSpeaker · ~32 MB)", "Multi-speaker segmentation & clustering (CPU)"),
+            ("meeting_llm", "Qwen3.5-4B (Q4_K_M GGUF · ~2.55 GB)", "Executive/Detailed MoM, Decisions, Actions, Knowledge & Ask VOX"),
+            ("meeting_embeddings", "BGE-Small-EN v1.5 (ONNX INT8 · ~34 MB)", "384-d semantic vectors for cross-meeting local RAG search"),
         )
-        for m_key, m_title, m_desc, needs_conv in model_defs:
+        for m_key, m_title, m_desc in model_defs:
             row = QHBoxLayout()
-            row.setSpacing(10)
+            row.setSpacing(8)
             col = QVBoxLayout()
             col.setSpacing(2)
             lt = QLabel(m_title)
@@ -917,15 +915,34 @@ class SettingsWorkspaceWidget(QWidget):
 
             lbl_st = QLabel("Checking...")
             lbl_st.setStyleSheet("font-size: 11px; font-weight: 600;")
+            lbl_st.setMinimumWidth(90)
             row.addWidget(lbl_st)
+
+            btn_verify = QPushButton("Verify")
+            btn_verify.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_verify.setFixedWidth(72)
+            btn_verify.clicked.connect(lambda _=False, k=m_key: self._verify_meeting_model(k))
+            row.addWidget(btn_verify)
 
             btn_dl = QPushButton("Download")
             btn_dl.setCursor(Qt.CursorShape.PointingHandCursor)
             btn_dl.setFixedWidth(104)
-            btn_dl.clicked.connect(lambda _=False, k=m_key: self._start_phase2_model_download(k))
+            btn_dl.clicked.connect(lambda _=False, k=m_key: self._start_meeting_model_download(k))
             row.addWidget(btn_dl)
             mod_lay.addLayout(row)
-            self._phase2_model_rows[m_key] = (lbl_st, btn_dl, needs_conv)
+            self._meeting_model_rows[m_key] = (lbl_st, btn_dl, btn_verify)
+
+        idx_row = QHBoxLayout()
+        idx_row.setSpacing(10)
+        lbl_idx = QLabel("Rebuild local FTS5 + BGE vector search index across all stored meetings & knowledge items.")
+        lbl_idx.setObjectName("settingsMuted")
+        lbl_idx.setWordWrap(True)
+        idx_row.addWidget(lbl_idx, 1)
+        self.btn_rebuild_knowledge = QPushButton("Rebuild Knowledge Index")
+        self.btn_rebuild_knowledge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_rebuild_knowledge.clicked.connect(self._start_rebuild_knowledge_index)
+        idx_row.addWidget(self.btn_rebuild_knowledge)
+        mod_lay.addLayout(idx_row)
 
         lay.addWidget(card_models)
         lay.addStretch(1)
@@ -1189,96 +1206,124 @@ class SettingsWorkspaceWidget(QWidget):
         lay.addStretch(1)
         return page
 
+    def _on_controller_account_changed(self, *_args) -> None:
+        try:
+            self._update_account_ui()
+        except RuntimeError:
+            self._disconnect_controller_signals()
+
+    def _disconnect_controller_signals(self) -> None:
+        ctrl = getattr(self, "controller", None)
+        if ctrl is None:
+            return
+        for sig_name, slot in (
+            ("meeting_models_updated", self._refresh_meeting_model_rows),
+            ("auth_state_changed", self._on_controller_account_changed),
+            ("entitlement_changed", self._on_controller_account_changed),
+        ):
+            sig = getattr(ctrl, sig_name, None)
+            if sig is not None:
+                try:
+                    sig.disconnect(slot)
+                except Exception:
+                    pass
+
     def _update_account_ui(self) -> None:
         """Dynamically refresh account status, plan badge, and quota meters."""
-        if not hasattr(self, "lbl_user_email") or not hasattr(self.controller, "get_account_status"):
+        try:
+            if not hasattr(self, "lbl_user_email") or not hasattr(self.controller, "get_account_status"):
+                return
+            status = self.controller.get_account_status()
+            signed_in = bool(status.get("signed_in", False))
+            raw_email = status.get("email")
+            email = raw_email if isinstance(raw_email, str) else ""
+            raw_name = status.get("name")
+            name = raw_name if isinstance(raw_name, str) and raw_name else "Guest User"
+            is_pro = bool(status.get("is_pro", False)) if signed_in else False
+            usage = status.get("usage") or {}
+            limits = status.get("limits") or {}
+
+            if hasattr(self, "edit_display_name"):
+                self.edit_display_name.setText(name if signed_in else "")
+                self.edit_display_name.setPlaceholderText(
+                    "Sign in with Google to customize display name" if not signed_in else "Your display name"
+                )
+            if hasattr(self, "btn_save_display_name"):
+                self.btn_save_display_name.setEnabled(bool(signed_in))
+            if hasattr(self, "btn_switch_account"):
+                self.btn_switch_account.setVisible(bool(signed_in))
+
+            if signed_in and email:
+                self.lbl_user_email.setText(f"Signed in as: <b>{name}</b> ({email})")
+                self.btn_auth_action.setText("Sign Out")
+                if hasattr(self, "btn_manual_auth"):
+                    self.btn_manual_auth.setVisible(False)
+                try:
+                    self.btn_auth_action.clicked.disconnect()
+                except Exception:
+                    pass
+                self.btn_auth_action.clicked.connect(self._on_logout_clicked)
+            else:
+                self.lbl_user_email.setText("Signed in as: <b>Guest / Local Mode</b>")
+                self.btn_auth_action.setText("Sign In with Google")
+                if hasattr(self, "btn_manual_auth"):
+                    self.btn_manual_auth.setVisible(True)
+                try:
+                    self.btn_auth_action.clicked.disconnect()
+                except Exception:
+                    pass
+                self.btn_auth_action.clicked.connect(self._on_login_clicked)
+
+            if is_pro:
+                self.lbl_plan_badge.setText("👑 VOX PRO (Active) · Unlimited")
+                self.lbl_plan_badge.setStyleSheet("color: #10b981; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(16, 185, 129, 0.12);")
+                self.btn_upgrade_pro.setVisible(False)
+                self.lbl_usage_words.setText(f"Voice Typing: {int(usage.get('dictation_words') or 0):,} words this week (Unlimited)")
+                self.bar_words.setMaximum(100)
+                self.bar_words.setValue(100)
+                self.lbl_usage_minutes.setText(f"Meeting Audio: {int(float(usage.get('meeting_duration_sec') or 0) / 60)} mins this week (Unlimited)")
+                self.bar_minutes.setMaximum(100)
+                self.bar_minutes.setValue(100)
+                self.lbl_usage_meetings.setText(f"Meetings Recorded: {int(usage.get('meeting_count') or 0)} sessions this week (Unlimited)")
+                self.bar_meetings.setMaximum(100)
+                self.bar_meetings.setValue(100)
+                self.lbl_usage_ask_vox.setText(f"Ask VOX Queries: {int(usage.get('ask_vox_count') or 0)} queries this week (Unlimited)")
+                self.bar_ask_vox.setMaximum(100)
+                self.bar_ask_vox.setValue(100)
+            else:
+                self.lbl_plan_badge.setText("VOX FREE TIER · ₹0/mo")
+                self.lbl_plan_badge.setStyleSheet("color: #f59e0b; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(245, 158, 11, 0.12);")
+                self.btn_upgrade_pro.setVisible(True)
+
+                w_used = int(usage.get("dictation_words") or 0)
+                w_lim = int(limits.get("dictation_words_weekly") or limits.get("dictation_words_per_week") or 3000)
+                self.lbl_usage_words.setText(f"Voice Typing: {w_used:,} / {w_lim:,} words this week")
+                self.bar_words.setMaximum(w_lim)
+                self.bar_words.setValue(min(w_used, w_lim))
+
+                m_sec = float(usage.get("meeting_duration_sec") or 0.0)
+                m_min = int(m_sec / 60)
+                raw_m_sec = limits.get("meeting_duration_sec_per_week")
+                raw_m_min = limits.get("meeting_minutes_weekly")
+                m_lim = int(raw_m_min) if raw_m_min is not None else (int(raw_m_sec / 60) if raw_m_sec is not None else 180)
+                self.lbl_usage_minutes.setText(f"Meeting Audio: {m_min} / {m_lim} mins this week")
+                self.bar_minutes.setMaximum(m_lim)
+                self.bar_minutes.setValue(min(m_min, m_lim))
+
+                c_used = int(usage.get("meeting_count") or 0)
+                c_lim = int(limits.get("meeting_sessions_weekly") or limits.get("meeting_count_per_week") or 5)
+                self.lbl_usage_meetings.setText(f"Meetings Recorded: {c_used} / {c_lim} sessions this week")
+                self.bar_meetings.setMaximum(c_lim)
+                self.bar_meetings.setValue(min(c_used, c_lim))
+
+                q_used = int(usage.get("ask_vox_count") or 0)
+                q_lim = int(limits.get("ask_vox_queries_weekly") or limits.get("ask_vox_queries_per_week") or 10)
+                self.lbl_usage_ask_vox.setText(f"Ask VOX Queries: {q_used} / {q_lim} queries this week")
+                self.bar_ask_vox.setMaximum(q_lim)
+                self.bar_ask_vox.setValue(min(q_used, q_lim))
+        except RuntimeError:
+            self._disconnect_controller_signals()
             return
-        status = self.controller.get_account_status()
-        signed_in = bool(status.get("signed_in", False))
-        email = status.get("email")
-        name = status.get("name") or "Guest User"
-        is_pro = bool(status.get("is_pro", False)) if signed_in else False
-        usage = status.get("usage") or {}
-        limits = status.get("limits") or {}
-
-        if hasattr(self, "edit_display_name"):
-            self.edit_display_name.setText(name if signed_in else "")
-            self.edit_display_name.setPlaceholderText(
-                "Sign in with Google to customize display name" if not signed_in else "Your display name"
-            )
-        if hasattr(self, "btn_save_display_name"):
-            self.btn_save_display_name.setEnabled(bool(signed_in))
-        if hasattr(self, "btn_switch_account"):
-            self.btn_switch_account.setVisible(bool(signed_in))
-
-        if signed_in and email:
-            self.lbl_user_email.setText(f"Signed in as: <b>{name}</b> ({email})")
-            self.btn_auth_action.setText("Sign Out")
-            if hasattr(self, "btn_manual_auth"):
-                self.btn_manual_auth.setVisible(False)
-            try:
-                self.btn_auth_action.clicked.disconnect()
-            except Exception:
-                pass
-            self.btn_auth_action.clicked.connect(self._on_logout_clicked)
-        else:
-            self.lbl_user_email.setText("Signed in as: <b>Guest / Local Mode</b>")
-            self.btn_auth_action.setText("Sign In with Google")
-            if hasattr(self, "btn_manual_auth"):
-                self.btn_manual_auth.setVisible(True)
-            try:
-                self.btn_auth_action.clicked.disconnect()
-            except Exception:
-                pass
-            self.btn_auth_action.clicked.connect(self._on_login_clicked)
-
-        if is_pro:
-            self.lbl_plan_badge.setText("👑 VOX PRO (Active) · Unlimited")
-            self.lbl_plan_badge.setStyleSheet("color: #10b981; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(16, 185, 129, 0.12);")
-            self.btn_upgrade_pro.setVisible(False)
-            self.lbl_usage_words.setText(f"Voice Typing: {int(usage.get('dictation_words') or 0):,} words this week (Unlimited)")
-            self.bar_words.setMaximum(100)
-            self.bar_words.setValue(100)
-            self.lbl_usage_minutes.setText(f"Meeting Audio: {int(float(usage.get('meeting_duration_sec') or 0) / 60)} mins this week (Unlimited)")
-            self.bar_minutes.setMaximum(100)
-            self.bar_minutes.setValue(100)
-            self.lbl_usage_meetings.setText(f"Meetings Recorded: {int(usage.get('meeting_count') or 0)} sessions this week (Unlimited)")
-            self.bar_meetings.setMaximum(100)
-            self.bar_meetings.setValue(100)
-            self.lbl_usage_ask_vox.setText(f"Ask VOX Queries: {int(usage.get('ask_vox_count') or 0)} queries this week (Unlimited)")
-            self.bar_ask_vox.setMaximum(100)
-            self.bar_ask_vox.setValue(100)
-        else:
-            self.lbl_plan_badge.setText("VOX FREE TIER · ₹0/mo")
-            self.lbl_plan_badge.setStyleSheet("color: #f59e0b; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(245, 158, 11, 0.12);")
-            self.btn_upgrade_pro.setVisible(True)
-
-            w_used = int(usage.get("dictation_words") or 0)
-            w_lim = int(limits.get("dictation_words_weekly") or limits.get("dictation_words_per_week") or 3000)
-            self.lbl_usage_words.setText(f"Voice Typing: {w_used:,} / {w_lim:,} words this week")
-            self.bar_words.setMaximum(w_lim)
-            self.bar_words.setValue(min(w_used, w_lim))
-
-            m_sec = float(usage.get("meeting_duration_sec") or 0.0)
-            m_min = int(m_sec / 60)
-            raw_m_sec = limits.get("meeting_duration_sec_per_week")
-            raw_m_min = limits.get("meeting_minutes_weekly")
-            m_lim = int(raw_m_min) if raw_m_min is not None else (int(raw_m_sec / 60) if raw_m_sec is not None else 180)
-            self.lbl_usage_minutes.setText(f"Meeting Audio: {m_min} / {m_lim} mins this week")
-            self.bar_minutes.setMaximum(m_lim)
-            self.bar_minutes.setValue(min(m_min, m_lim))
-
-            c_used = int(usage.get("meeting_count") or 0)
-            c_lim = int(limits.get("meeting_sessions_weekly") or limits.get("meeting_count_per_week") or 5)
-            self.lbl_usage_meetings.setText(f"Meetings Recorded: {c_used} / {c_lim} sessions this week")
-            self.bar_meetings.setMaximum(c_lim)
-            self.bar_meetings.setValue(min(c_used, c_lim))
-
-            q_used = int(usage.get("ask_vox_count") or 0)
-            q_lim = int(limits.get("ask_vox_queries_weekly") or limits.get("ask_vox_queries_per_week") or 10)
-            self.lbl_usage_ask_vox.setText(f"Ask VOX Queries: {q_used} / {q_lim} queries this week")
-            self.bar_ask_vox.setMaximum(q_lim)
-            self.bar_ask_vox.setValue(min(q_used, q_lim))
 
     _update_subscription_display = _update_account_ui
 
@@ -1412,18 +1457,15 @@ class SettingsWorkspaceWidget(QWidget):
     # ------------------------------------------------------------------
     # State hydration & Handlers
     # ------------------------------------------------------------------
-    def _populate_mics(self) -> None:
+    def _apply_mic_devices(self, mics: List[Any]) -> None:
+        if not hasattr(self, "combo_mic"):
+            return
         self.combo_mic.blockSignals(True)
         self.combo_mic.clear()
         self.combo_mic.addItem("System Default Microphone", None)
-        try:
-            from voxlocal.audio.devices import AudioDeviceManager
-            mics, _ = AudioDeviceManager.list_devices()
-            for dev in mics:
-                tag = " (Default)" if dev.is_default else ""
-                self.combo_mic.addItem(f"{dev.name}{tag}", (dev.index, dev.name))
-        except Exception as exc:
-            logger.debug("Mic listing fallback: %s", exc)
+        for dev in mics or []:
+            tag = " (Default)" if getattr(dev, "is_default", False) else ""
+            self.combo_mic.addItem(f"{dev.name}{tag}", (dev.index, dev.name))
 
         cfg = self.controller.config
         idx_target = getattr(cfg, "mic_device_index", None)
@@ -1436,6 +1478,44 @@ class SettingsWorkspaceWidget(QWidget):
                 break
         self.combo_mic.setCurrentIndex(matched)
         self.combo_mic.blockSignals(False)
+
+    def _populate_mics(self) -> None:
+        now = time.monotonic()
+        cached = SettingsWorkspaceWidget._cached_mics
+        if cached is not None and (now - SettingsWorkspaceWidget._cached_mics_ts) < 30.0:
+            self._apply_mic_devices(cached)
+            return
+
+        # Populate immediately without blocking UI thread, then enumerate PortAudio asynchronously
+        if self.combo_mic.count() == 0:
+            self.combo_mic.blockSignals(True)
+            self.combo_mic.addItem("System Default Microphone", None)
+            cfg = self.controller.config
+            saved_name = str(getattr(cfg, "mic_device_name", "") or "").strip()
+            saved_idx = getattr(cfg, "mic_device_index", None)
+            if saved_name and saved_idx is not None:
+                self.combo_mic.addItem(saved_name, (saved_idx, saved_name))
+                self.combo_mic.setCurrentIndex(1)
+            self.combo_mic.blockSignals(False)
+
+        def _worker() -> None:
+            if getattr(self.controller, "_shutting_down", False):
+                return
+            try:
+                from voxlocal.audio.devices import AudioDeviceManager
+                mics, _ = AudioDeviceManager.list_devices()
+                SettingsWorkspaceWidget._cached_mics = list(mics or [])
+                SettingsWorkspaceWidget._cached_mics_ts = time.monotonic()
+                if not getattr(self.controller, "_shutting_down", False):
+                    self._mics_loaded.emit(list(mics or []))
+            except Exception as exc:
+                logger.debug("Async mic listing fallback: %s", exc)
+
+        tm = getattr(self.controller, "task_manager", None)
+        if tm is not None:
+            tm.submit("enumerate_mics", _worker, description="Enumerate audio input devices", dedupe_key="enumerate_mics", lane="io")
+        else:
+            threading.Thread(target=_worker, name="SettingsEnumerateMics", daemon=True).start()
 
     def load_from_config(self) -> None:
         """Populate every widget cleanly from controller.config."""
@@ -1462,10 +1542,8 @@ class SettingsWorkspaceWidget(QWidget):
             (self.sw_nt_auto_end, "notetaker_auto_end", True),
             (self.sw_nt_auto_open, "notetaker_auto_open_summary", True),
             (self.sw_nt_speakers, "notetaker_auto_detect_speakers", True),
-            (self.sw_nt_live, "notetaker_live_transcript", True),
-            (self.sw_phase2_asr, "enable_phase2_asr_pipeline", True),
-            (self.sw_live_preview, "live_preview_enabled", True),
-            (self.sw_cpu_verifier, "post_call_allow_cpu_verifier", True),
+            (self.sw_echo_bleed, "post_call_echo_bleed_suppression", True),
+            (self.sw_glossary_norm, "post_call_glossary_normalization", True),
             (self.sw_vibe_vars, "vibe_coding_variable_recognition", True),
             (self.sw_vibe_files, "vibe_coding_file_tagging", True),
         ):
@@ -1495,7 +1573,7 @@ class SettingsWorkspaceWidget(QWidget):
         self._set_combo_by_data(self.combo_theme, getattr(cfg, "theme", "light"))
         self._set_combo_by_data(self.combo_edge, getattr(cfg, "flow_bar_edge", "bottom"))
         self._set_combo_by_data(self.combo_rec_mode, getattr(cfg, "meeting_recording_mode", "audio_video"))
-        self._set_combo_by_data(self.combo_asr_session_mode, getattr(cfg, "asr_session_mode", "auto"))
+        self._set_combo_by_data(self.combo_llm_device, str(getattr(cfg, "llm_device", "auto") or "auto").lower())
         self._set_combo_by_data(self.combo_drawer_start, getattr(cfg, "notetaker_notepad_on_start", "open"))
         self._set_combo_by_data(self.combo_lead_min, int(getattr(cfg, "calendar_reminder_lead_min", 1)))
         self._set_combo_by_data(self.combo_retention, int(getattr(cfg, "retention_days", 0)))
@@ -1508,64 +1586,112 @@ class SettingsWorkspaceWidget(QWidget):
         self.spin_max_len.setValue(int(getattr(cfg, "notetaker_max_length_min", 120)))
         self.spin_max_len.blockSignals(False)
         self._refresh_calendar_status()
-        self._refresh_phase2_model_rows()
+        self._refresh_meeting_model_rows()
 
-    def _refresh_phase2_model_rows(self) -> None:
-        if not hasattr(self, "_phase2_model_rows"):
+    def _refresh_meeting_model_rows(self) -> None:
+        if not hasattr(self, "_meeting_model_rows"):
             return
         try:
-            from voxlocal.engine.onnx_asr_engines import get_phase2_runtime_capabilities
+            statuses: Dict[str, Any] = {}
+            try:
+                if hasattr(self.controller, "get_meeting_models_status"):
+                    statuses = dict(self.controller.get_meeting_models_status() or {})
+                else:
+                    from voxlocal.engine.meeting_model_manager import MeetingModelManager
+                    models_dir = getattr(getattr(self.controller, "config", None), "models_dir", None)
+                    statuses = MeetingModelManager(models_dir).get_all_statuses()
+            except Exception:
+                statuses = {}
 
-            models_dir = getattr(getattr(self.controller, "config", None), "models_dir", None)
-            caps = get_phase2_runtime_capabilities(models_dir)
-            avail = dict(caps.get("models_available") or {})
-        except Exception:
-            avail = {}
-        for m_key, (lbl_st, btn_dl, needs_conv) in self._phase2_model_rows.items():
-            is_ok = bool(avail.get(m_key, False))
-            if is_ok:
-                lbl_st.setText("Installed")
-                btn_dl.setText("Installed")
-                btn_dl.setEnabled(False)
-            elif needs_conv:
-                lbl_st.setText("Not Installed")
-                btn_dl.setText("Setup")
-                btn_dl.setEnabled(True)
-            else:
-                lbl_st.setText("Not Downloaded")
-                btn_dl.setText("Download")
-                btn_dl.setEnabled(True)
-
-    def _start_phase2_model_download(self, model_key: str) -> None:
-        if not hasattr(self, "_phase2_model_rows") or model_key not in self._phase2_model_rows:
+            for m_key, (lbl_st, btn_dl, btn_verify) in self._meeting_model_rows.items():
+                info = dict(statuses.get(m_key) or {})
+                is_ok = bool(info.get("installed", False))
+                sz_mb = float(info.get("size_mb") or 0.0)
+                if is_ok:
+                    lbl_st.setText(f"Installed ({sz_mb:.0f} MB)" if sz_mb > 0 else "Installed")
+                    btn_dl.setText("Re-download")
+                    btn_dl.setEnabled(True)
+                    btn_verify.setEnabled(True)
+                else:
+                    lbl_st.setText("Missing")
+                    btn_dl.setText("Download")
+                    btn_dl.setEnabled(True)
+                    btn_verify.setEnabled(False)
+        except RuntimeError:
+            self._disconnect_controller_signals()
             return
-        lbl_st, btn_dl, _ = self._phase2_model_rows[model_key]
+
+    def _verify_meeting_model(self, model_key: str) -> None:
+        ok, msg = (False, "Unavailable")
+        try:
+            if hasattr(self.controller, "verify_meeting_model"):
+                ok, msg = self.controller.verify_meeting_model(model_key)
+            else:
+                from voxlocal.engine.meeting_model_manager import MeetingModelManager
+                models_dir = getattr(getattr(self.controller, "config", None), "models_dir", None)
+                ok, msg = MeetingModelManager(models_dir).verify_artifact(model_key)
+        except Exception as exc:
+            ok, msg = False, str(exc)
+        self._refresh_meeting_model_rows()
+        self.status_toast.emit("Model Verification" if ok else "Model Missing / Corrupt", msg)
+
+    def _start_meeting_model_download(self, model_key: str) -> None:
+        if not hasattr(self, "_meeting_model_rows") or model_key not in self._meeting_model_rows:
+            return
+        lbl_st, btn_dl, _btn_verify = self._meeting_model_rows[model_key]
         btn_dl.setEnabled(False)
         btn_dl.setText("Working...")
         lbl_st.setText("Downloading...")
-        models_dir = getattr(getattr(self.controller, "config", None), "models_dir", None)
 
         def _worker() -> None:
             try:
-                from voxlocal.engine.onnx_asr_engines import download_phase2_model
-
-                ok, msg = download_phase2_model(model_key, models_dir=models_dir)
+                if hasattr(self.controller, "download_meeting_model"):
+                    ok, msg = self.controller.download_meeting_model(model_key)
+                else:
+                    from voxlocal.engine.meeting_model_manager import MeetingModelManager
+                    models_dir = getattr(getattr(self.controller, "config", None), "models_dir", None)
+                    ok, msg = MeetingModelManager(models_dir).download_artifact(model_key)
             except Exception as exc:
                 ok, msg = False, str(exc)
             self._model_download_finished.emit(model_key, ok, msg)
 
-        threading.Thread(target=_worker, name=f"DownloadModel-{model_key}", daemon=True).start()
+        threading.Thread(target=_worker, name=f"DownloadMeetingModel-{model_key}", daemon=True).start()
 
     def _on_model_download_finished(self, model_key: str, ok: bool, msg: str) -> None:
-        self._refresh_phase2_model_rows()
+        self._refresh_meeting_model_rows()
         if ok:
-            self.status_toast.emit("Model Ready", msg)
+            self.status_toast.emit("Meeting AI Model Ready", msg)
         else:
-            if hasattr(self, "_phase2_model_rows") and model_key in self._phase2_model_rows:
-                lbl_st, btn_dl, needs_conv = self._phase2_model_rows[model_key]
-                lbl_st.setText("Unavailable" if needs_conv else "Failed")
+            if hasattr(self, "_meeting_model_rows") and model_key in self._meeting_model_rows:
+                lbl_st, btn_dl, _ = self._meeting_model_rows[model_key]
+                lbl_st.setText("Failed")
                 btn_dl.setEnabled(True)
-            self.status_toast.emit("Model Setup", msg)
+            self.status_toast.emit("Meeting AI Model Setup", msg)
+
+    def _start_rebuild_knowledge_index(self) -> None:
+        if hasattr(self, "btn_rebuild_knowledge"):
+            self.btn_rebuild_knowledge.setEnabled(False)
+            self.btn_rebuild_knowledge.setText("Rebuilding...")
+        self.status_toast.emit("Knowledge Index", "Rebuilding local FTS5 & semantic RAG index...")
+
+        def _worker() -> None:
+            try:
+                if hasattr(self.controller, "rebuild_knowledge_index"):
+                    stats = self.controller.rebuild_knowledge_index()
+                    msg = f"Indexed {stats.get('meetings_indexed', 0)} meetings ({stats.get('chunks_indexed', 0)} chunks)."
+                    self._rebuild_index_finished.emit(True, msg)
+                else:
+                    self._rebuild_index_finished.emit(False, "Knowledge indexer not attached.")
+            except Exception as exc:
+                self._rebuild_index_finished.emit(False, str(exc))
+
+        threading.Thread(target=_worker, name="SettingsRebuildKnowledge", daemon=True).start()
+
+    def _on_rebuild_index_finished(self, ok: bool, msg: str) -> None:
+        if hasattr(self, "btn_rebuild_knowledge"):
+            self.btn_rebuild_knowledge.setEnabled(True)
+            self.btn_rebuild_knowledge.setText("Rebuild Knowledge Index")
+        self.status_toast.emit("Knowledge Index Ready" if ok else "Knowledge Index Error", msg)
 
     @staticmethod
     def _set_combo_by_data(combo: QComboBox, target: Any) -> None:
@@ -1703,6 +1829,7 @@ class SettingsWorkspaceWidget(QWidget):
             self.mic_level_bar.set_level(0.0)
 
     def teardown(self) -> None:
+        self._disconnect_controller_signals()
         self._stop_mic_probe()
         if hasattr(self, "mic_level_bar"):
             self.mic_level_bar.teardown()

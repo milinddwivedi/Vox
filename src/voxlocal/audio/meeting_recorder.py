@@ -907,68 +907,80 @@ def _write_mixed(mic_path: Optional[Path], sys_path: Optional[Path], out: Path, 
 
     readers = []
     for p in (mic_path, sys_path):
-        readers.append(wave.open(str(p), "rb") if p and p.exists() else None)
+        if p and p.exists():
+            try:
+                readers.append(wave.open(str(p), "rb"))
+            except Exception as w_exc:
+                logger.warning("Skipping unreadable track '%s' during mix: %s", p, w_exc)
+                readers.append(None)
+        else:
+            readers.append(None)
     lengths = [r.getnframes() if r else 0 for r in readers]
     total = max(lengths) if lengths else 0
 
     block = block_sec * TARGET_SAMPLE_RATE
-    with wave.open(str(out), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(TARGET_SAMPLE_RATE)
-        done = 0
-        while done < total:
-            n = min(block, total - done)
-            mix = np.zeros(n, dtype=np.float32)
-            if readers[0]:
-                raw_m = readers[0].readframes(n)
-                mic_buf = np.frombuffer(raw_m, dtype=np.int16).astype(np.float32) / 32768.0
-                if mic_buf.size > 0:
-                    try:
-                        mic_dsp = clean_speech_microphone_audio(
-                            mic_buf,
-                            TARGET_SAMPLE_RATE,
-                            hp_cutoff=85.0,
-                            target_peak=0.62,
-                            spectral_nr_db=18.0,
+    try:
+        with wave.open(str(out), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(TARGET_SAMPLE_RATE)
+            done = 0
+            while done < total:
+                n = min(block, total - done)
+                mix = np.zeros(n, dtype=np.float32)
+                if readers[0]:
+                    raw_m = readers[0].readframes(n)
+                    mic_buf = np.frombuffer(raw_m, dtype=np.int16).astype(np.float32) / 32768.0
+                    if mic_buf.size > 0:
+                        try:
+                            mic_dsp = clean_speech_microphone_audio(
+                                mic_buf,
+                                TARGET_SAMPLE_RATE,
+                                hp_cutoff=85.0,
+                                target_peak=0.62,
+                                spectral_nr_db=18.0,
+                            )
+                        except Exception:
+                            mic_dsp = mic_buf
+                        mix[: mic_dsp.size] += np.clip(mic_dsp, -0.75, 0.75) * 0.70
+
+                if len(readers) > 1 and readers[1]:
+                    raw_s = readers[1].readframes(n)
+                    sys_buf = np.frombuffer(raw_s, dtype=np.int16).astype(np.float32) / 32768.0
+                    if sys_buf.size > 0:
+                        sys_dsp = sys_buf - float(np.mean(sys_buf))
+                        s_peak = (
+                            float(np.percentile(np.abs(sys_dsp), 99.8))
+                            if sys_dsp.size > 500
+                            else float(np.max(np.abs(sys_dsp)))
                         )
-                    except Exception:
-                        mic_dsp = mic_buf
-                    mix[: mic_dsp.size] += np.clip(mic_dsp, -0.75, 0.75) * 0.70
+                        if s_peak > 0.85:
+                            sys_dsp = sys_dsp * (0.85 / s_peak)
+                        elif 0.025 < s_peak < 0.65:
+                            sys_dsp = sys_dsp * min(2.5, 0.78 / s_peak)
+                        # Preserve high fidelity and intelligibility for remote meeting callers (0.85 weight)
+                        mix[: sys_dsp.size] += np.clip(sys_dsp, -0.98, 0.98) * 0.85
 
-            if len(readers) > 1 and readers[1]:
-                raw_s = readers[1].readframes(n)
-                sys_buf = np.frombuffer(raw_s, dtype=np.int16).astype(np.float32) / 32768.0
-                if sys_buf.size > 0:
-                    sys_dsp = sys_buf - float(np.mean(sys_buf))
-                    s_peak = (
-                        float(np.percentile(np.abs(sys_dsp), 99.8))
-                        if sys_dsp.size > 500
-                        else float(np.max(np.abs(sys_dsp)))
+                # True-Peak soft-knee saturation: preserves linear dynamics below 0.75, soft-rounds loud combined peaks
+                abs_m = np.abs(mix)
+                knee = 0.75
+                over = abs_m > knee
+                if np.any(over):
+                    span = 0.95 - knee
+                    mix = np.where(
+                        abs_m <= knee,
+                        mix,
+                        np.sign(mix) * (knee + span * np.tanh((abs_m - knee) / span)),
                     )
-                    if s_peak > 0.85:
-                        sys_dsp = sys_dsp * (0.85 / s_peak)
-                    elif 0.025 < s_peak < 0.65:
-                        sys_dsp = sys_dsp * min(2.5, 0.78 / s_peak)
-                    # Preserve high fidelity and intelligibility for remote meeting callers (0.85 weight)
-                    mix[: sys_dsp.size] += np.clip(sys_dsp, -0.98, 0.98) * 0.85
-
-            # True-Peak soft-knee saturation: preserves linear dynamics below 0.75, soft-rounds loud combined peaks
-            abs_m = np.abs(mix)
-            knee = 0.75
-            over = abs_m > knee
-            if np.any(over):
-                span = 0.95 - knee
-                mix = np.where(
-                    abs_m <= knee,
-                    mix,
-                    np.sign(mix) * (knee + span * np.tanh((abs_m - knee) / span)),
-                )
-            w.writeframes((np.clip(mix, -0.95, 0.95) * 32767).astype(np.int16).tobytes())
-            done += n
-    for r in readers:
-        if r:
-            r.close()
+                w.writeframes((np.clip(mix, -0.95, 0.95) * 32767).astype(np.int16).tobytes())
+                done += n
+    finally:
+        for r in readers:
+            if r:
+                try:
+                    r.close()
+                except Exception:
+                    pass
     return total / TARGET_SAMPLE_RATE
 
 

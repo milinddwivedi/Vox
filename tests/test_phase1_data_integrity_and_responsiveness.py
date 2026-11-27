@@ -142,66 +142,70 @@ class TestPhase1DataIntegrityAndResponsiveness(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_01_summary_and_risks_autosave_and_switch_flush(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vox_p1_sum_") as td:
-            db = LocalDatabase(Path(td) / "studio.db")
-            m1 = db.create_meeting(title="Architecture Review")
-            m2 = db.create_meeting(title="Budget Sync")
-            db.update_meeting(m1, summary="Initial M1 summary.")
-            db.update_meeting(m2, summary="Initial M2 summary.")
+            with LocalDatabase(Path(td) / "studio.db") as db:
+                m1 = db.create_meeting(title="Architecture Review")
+                m2 = db.create_meeting(title="Budget Sync")
+                db.update_meeting(m1, summary="Initial M1 summary.")
+                db.update_meeting(m2, summary="Initial M2 summary.")
 
-            workspace = VoxMeetingStudioWorkspace(theme="dark", db=db)
-            workspace.load_meeting(m1)
-            tab: VoxSummaryDeliverablesTab = workspace.tab_summary
+                workspace = VoxMeetingStudioWorkspace(theme="dark", db=db)
+                workspace.load_meeting(m1)
+                tab: VoxSummaryDeliverablesTab = workspace.tab_summary
 
-            # Speed up test debounce slightly? Keep default 600ms and wait deterministically.
-            tab.txt_summary.setPlainText("Updated M1 executive summary with API metrics.")
-            tab.txt_risks.setPlainText("• Delay in GPU quota\n• Pending security review")
-            self.assertEqual(tab.lbl_summary_save_status.text(), "Saving...")
+                # Speed up test debounce slightly? Keep default 600ms and wait deterministically.
+                tab.txt_summary.setPlainText("Updated M1 executive summary with API metrics.")
+                tab.txt_risks.setPlainText("• Delay in GPU quota\n• Pending security review")
+                self.assertEqual(tab.lbl_summary_save_status.text(), "Saving...")
 
-            saved = _wait_until(lambda: tab.lbl_summary_save_status.text() == "✓ Saved", timeout_sec=2.0)
-            self.assertTrue(saved, f"Expected '✓ Saved', got {tab.lbl_summary_save_status.text()!r}")
+                saved = _wait_until(lambda: tab.lbl_summary_save_status.text() == "✓ Saved", timeout_sec=2.0)
+                self.assertTrue(saved, f"Expected '✓ Saved', got {tab.lbl_summary_save_status.text()!r}")
 
-            reloaded_m1 = db.get_meeting(m1)
-            self.assertIsNotNone(reloaded_m1)
-            self.assertEqual(reloaded_m1["summary"], "Updated M1 executive summary with API metrics.")
-            self.assertEqual(reloaded_m1["user_edited"], 1)
-            risks_m1 = reloaded_m1.get("risks_and_blockers_list", [])
-            self.assertEqual(len(risks_m1), 2)
-            self.assertEqual(risks_m1[0]["description"], "Delay in GPU quota")
+                reloaded_m1 = db.get_meeting(m1)
+                self.assertIsNotNone(reloaded_m1)
+                self.assertEqual(reloaded_m1["summary"], "Updated M1 executive summary with API metrics.")
+                self.assertEqual(reloaded_m1["user_edited"], 1)
+                risks_m1 = reloaded_m1.get("risks_and_blockers_list", [])
+                self.assertEqual(len(risks_m1), 2)
+                self.assertEqual(risks_m1[0]["description"], "Delay in GPU quota")
 
-            # Reloading m1 into workspace restores exact risks_and_blockers_list
-            workspace.load_meeting(m2)
-            workspace.load_meeting(m1)
-            self.assertIn("Delay in GPU quota", tab.txt_risks.toPlainText())
-            self.assertIn("Pending security review", tab.txt_risks.toPlainText())
+                # Reloading m1 into workspace restores exact risks_and_blockers_list
+                workspace.load_meeting(m2)
+                workspace.load_meeting(m1)
+                self.assertIn("Delay in GPU quota", tab.txt_risks.toPlainText())
+                self.assertIn("Pending security review", tab.txt_risks.toPlainText())
 
-            # Edit m1 and switch immediately to m2 BEFORE timer expires -> flush_pending_saves must persist m1 cleanly
-            tab.txt_summary.setPlainText("Flushed M1 summary before switch.")
-            tab.txt_risks.setPlainText("• Urgent blocker prior to switch")
-            self.assertTrue(tab._save_timer.isActive())
+                # Edit m1 and switch immediately to m2 BEFORE timer expires -> flush_pending_saves must persist m1 cleanly
+                tab.txt_summary.setPlainText("Flushed M1 summary before switch.")
+                tab.txt_risks.setPlainText("• Urgent blocker prior to switch")
+                self.assertTrue(tab._save_timer.isActive())
 
-            workspace.load_meeting(m2)
-            self.assertFalse(tab._save_timer.isActive())
-            self.assertEqual(tab.txt_summary.toPlainText(), "Initial M2 summary.")
+                workspace.load_meeting(m2)
+                self.assertFalse(tab._save_timer.isActive())
+                self.assertEqual(tab.txt_summary.toPlainText(), "Initial M2 summary.")
 
-            persisted_m1 = db.get_meeting(m1)
-            persisted_m2 = db.get_meeting(m2)
-            self.assertEqual(persisted_m1["summary"], "Flushed M1 summary before switch.")
-            self.assertEqual(len(persisted_m1["risks_and_blockers_list"]), 1)
-            self.assertEqual(persisted_m1["risks_and_blockers_list"][0]["description"], "Urgent blocker prior to switch")
-            self.assertEqual(persisted_m2["summary"], "Initial M2 summary.")
-            self.assertEqual(len(persisted_m2.get("risks_and_blockers_list", [])), 0)
+                persisted_m1 = db.get_meeting(m1)
+                persisted_m2 = db.get_meeting(m2)
+                self.assertEqual(persisted_m1["summary"], "Flushed M1 summary before switch.")
+                self.assertEqual(len(persisted_m1["risks_and_blockers_list"]), 1)
+                self.assertEqual(persisted_m1["risks_and_blockers_list"][0]["description"], "Urgent blocker prior to switch")
+                self.assertEqual(persisted_m2["summary"], "Initial M2 summary.")
+                self.assertEqual(len(persisted_m2.get("risks_and_blockers_list", [])), 0)
 
-            workspace.close()
-            workspace.deleteLater()
-            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-            self.app.processEvents()
+                workspace.close()
+                workspace.deleteLater()
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                self.app.processEvents()
 
     # ------------------------------------------------------------------
     # 2. Virtualized Transcript: 1,500 rows, Seek, Rename, Selection, Filter, Resize
     # ------------------------------------------------------------------
     def test_02_virtualized_transcript_performance_and_interactions(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vox_p1_tx_") as td:
-            db = LocalDatabase(Path(td) / "tx.db")
+            with LocalDatabase(Path(td) / "tx.db") as db:
+                self._run_test_02_body(db)
+
+    def _run_test_02_body(self, db: LocalDatabase) -> None:
+        if True:
             m_id = db.create_meeting(title="Massive All-Hands")
 
             # Seed DB segments for rename persistence verification

@@ -175,6 +175,10 @@ def commercial_env(ed25519_keypair: Dict[str, Any]) -> Generator[Dict[str, Any],
         "entitlement": entitlement,
         "keypair": ed25519_keypair,
     }
+    try:
+        metering.close()
+    except Exception:
+        pass
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -384,29 +388,49 @@ class TestTier1FeatureCoverage:
         self, qapp: QApplication, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """F3.2: Monthly checkout button opens approved Razorpay URL https://rzp.io/rzp/ugv7JBF2."""
+        import voxlocal.ui.pro_upgrade_dialog as pud
         mock_controller = MagicMock()
+        mock_controller.get_account_status.return_value = {
+            "signed_in": True,
+            "is_signed_in": True,
+            "is_pro": False,
+            "email": "test@vox.ai",
+            "name": "Test User",
+            "user_id": "u_test",
+        }
         dlg = VoxProUpgradeDialog(mock_controller, reason="Testing Monthly", theme="light")
 
         opened_urls: List[str] = []
+        monkeypatch.setattr(pud.webbrowser, "open", lambda url, new=2: opened_urls.append(url) or True)
         monkeypatch.setattr(
             QDesktopServices, "openUrl", lambda url: opened_urls.append(url.toString())
         )
         dlg._open_monthly_checkout()
-        assert RAZORPAY_MONTHLY_LINK in opened_urls
+        assert any(u.startswith(RAZORPAY_MONTHLY_LINK) for u in opened_urls)
 
     def test_tier1_f03_annual_checkout_button_link(
         self, qapp: QApplication, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """F3.3: Annual checkout button opens approved Razorpay URL https://rzp.io/rzp/fycKln1w."""
+        import voxlocal.ui.pro_upgrade_dialog as pud
         mock_controller = MagicMock()
+        mock_controller.get_account_status.return_value = {
+            "signed_in": True,
+            "is_signed_in": True,
+            "is_pro": False,
+            "email": "test@vox.ai",
+            "name": "Test User",
+            "user_id": "u_test",
+        }
         dlg = VoxProUpgradeDialog(mock_controller, reason="Testing Annual", theme="dark")
 
         opened_urls: List[str] = []
+        monkeypatch.setattr(pud.webbrowser, "open", lambda url, new=2: opened_urls.append(url) or True)
         monkeypatch.setattr(
             QDesktopServices, "openUrl", lambda url: opened_urls.append(url.toString())
         )
         dlg._open_yearly_checkout()
-        assert RAZORPAY_YEARLY_LINK in opened_urls
+        assert any(u.startswith(RAZORPAY_YEARLY_LINK) for u in opened_urls)
 
     def test_tier1_f03_dialog_refresh_button_action(self, qapp: QApplication) -> None:
         """F3.4: Dialog refresh/sync button checks cloud entitlement status via controller."""
@@ -1255,6 +1279,10 @@ class TestTier3PairwiseCombinations:
         db_path = commercial_env["db_path"]
         import gc
         import time
+        try:
+            commercial_env["metering"].close()
+        except Exception:
+            pass
         gc.collect()
         if db_path.exists():
             try:

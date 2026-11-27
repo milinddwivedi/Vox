@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QKeyEvent
 from PyQt6.QtWidgets import (
     QDialog,
@@ -19,7 +19,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from voxlocal.ui.theme import get_theme_tokens
+from voxlocal.ui.icons import get_pixmap
+from voxlocal.ui.theme import get_theme_tokens, get_ui_font
 
 
 @dataclass
@@ -145,9 +146,9 @@ class VoxCommandPaletteDialog(QDialog):
         search_row = QHBoxLayout()
         search_row.setSpacing(10)
 
-        lbl_icon = QLabel("🔍")
-        lbl_icon.setStyleSheet("font-size: 15px;")
-        search_row.addWidget(lbl_icon)
+        self.lbl_icon = QLabel()
+        self.lbl_icon.setFixedSize(16, 16)
+        search_row.addWidget(self.lbl_icon)
 
         self.txt_search = QLineEdit()
         self.txt_search.setObjectName("paletteSearchInput")
@@ -201,6 +202,10 @@ class VoxCommandPaletteDialog(QDialog):
         """Apply theme styling to dialog container and search elements."""
         self._theme = theme.lower()
         t = get_theme_tokens(theme)
+        if hasattr(self, "lbl_icon"):
+            self.lbl_icon.setPixmap(get_pixmap("search", t.get("text_muted", "#5F6368"), size=15))
+        if hasattr(self, "txt_search"):
+            self.txt_search.setFont(get_ui_font(13, 400))
 
         bg = t.get("surface", "#161B22")
         border = t.get("line", "rgba(255, 255, 255, 0.12)")
@@ -557,7 +562,7 @@ def create_default_vox_commands(main_window: Any, controller: Optional[Any] = No
     cmds.append(PaletteCommand(
         id="action_theme",
         title="Toggle Theme",
-        description="Switch between Sand Light and Vast Dark themes",
+        description="Switch between Light and Dark themes",
         category="Action",
         shortcut="Ctrl+T",
         handler=_action_toggle_theme,

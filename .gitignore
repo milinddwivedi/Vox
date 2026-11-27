@@ -69,3 +69,6 @@ External References/
 node_modules/
 
 .env*
+
+docs/downloads/*.exe
+runtime/

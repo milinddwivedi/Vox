@@ -127,10 +127,10 @@ class TestE2EProductUxAndArchitecture(unittest.TestCase):
         self.assertEqual(self.pill.upper_pill.width(), 40)
         self.assertEqual(self.pill.upper_pill.height(), 8)
 
-        # Listening (Hands-Free): 104x30 capsule with 40x18 waveform and 18x18 action buttons
+        # Listening (Hands-Free): 102x30 capsule with 40x18 waveform and 18x18 action buttons
         self.pill._is_ptt_session = False
         self.pill.set_state(PillState.LISTENING)
-        self.assertEqual(self.pill.upper_pill.width(), 104)
+        self.assertEqual(self.pill.upper_pill.width(), 102)
         self.assertEqual(self.pill.upper_pill.height(), 30)
 
         # Waveform capsule dimensions (40px x 18px during Listening)

@@ -115,32 +115,32 @@ class VoxLocalHardeningTestSuite(unittest.TestCase):
     def test_database_retention_and_wipe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "test.db"
-            db = LocalDatabase(db_path)
-            m_id = db.create_meeting(title="Test Retention Meeting")
-            db.replace_meeting_segments(
-                m_id,
-                [
-                    {
-                        "start_time": 0.0,
-                        "end_time": 2.5,
-                        "speaker": "You (Mic)",
-                        "source_track": "mic",
-                        "text": "Testing database segments and export.",
-                    }
-                ],
-            )
-            meeting = db.get_meeting(m_id)
-            self.assertIsNotNone(meeting)
-            self.assertIn("Testing database segments", meeting["full_transcript"])
+            with LocalDatabase(db_path) as db:
+                m_id = db.create_meeting(title="Test Retention Meeting")
+                db.replace_meeting_segments(
+                    m_id,
+                    [
+                        {
+                            "start_time": 0.0,
+                            "end_time": 2.5,
+                            "speaker": "You (Mic)",
+                            "source_track": "mic",
+                            "text": "Testing database segments and export.",
+                        }
+                    ],
+                )
+                meeting = db.get_meeting(m_id)
+                self.assertIsNotNone(meeting)
+                self.assertIn("Testing database segments", meeting["full_transcript"])
 
-            # Verify SRT & VTT formatting
-            srt = TranscriptExporter.to_srt(meeting)
-            vtt = TranscriptExporter.to_vtt(meeting)
-            self.assertIn("00:00:00,000 --> 00:00:02,500", srt)
-            self.assertIn("WEBVTT", vtt)
+                # Verify SRT & VTT formatting
+                srt = TranscriptExporter.to_srt(meeting)
+                vtt = TranscriptExporter.to_vtt(meeting)
+                self.assertIn("00:00:00,000 --> 00:00:02,500", srt)
+                self.assertIn("WEBVTT", vtt)
 
-            db.wipe_all_user_data()
-            self.assertEqual(len(db.list_meetings()), 0)
+                db.wipe_all_user_data()
+                self.assertEqual(len(db.list_meetings()), 0)
 
 
 if __name__ == "__main__":

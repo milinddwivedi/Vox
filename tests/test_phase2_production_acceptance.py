@@ -289,52 +289,54 @@ def test_05_06_hardware_cpu_only_and_vram_gates(tmp_path: Path) -> None:
     cfg_auto = AppConfig(storage_dir=str(tmp_path / "data"), models_dir=str(models_dir), enable_phase2_asr_pipeline=True, asr_session_mode="auto")
     cfg_en = AppConfig(storage_dir=str(tmp_path / "data"), models_dir=str(models_dir), enable_phase2_asr_pipeline=True, asr_session_mode="english")
 
-    # CPU-only system: 0 GPU dependency
+    # CPU-only system: 0 GPU dependency (v2.0 post-call Cohere EN single-winner profile)
     cpu_prof = SimpleNamespace(**{**prof_base, "cuda_available": False, "gpu_name": "Intel Iris", "gpu_type": "CPU Only"})
     with patch.object(HardwareProfiler, "get_profile", return_value=cpu_prof), \
          patch.object(HardwareProfiler, "_query_live_gpu_vram_mb", return_value=(None, None)), \
          patch.object(HardwareProfiler, "_check_hf_asr_runtime_available", return_value=False):
         ep_auto = HardwareProfiler.select_execution_profile(config=cfg_auto)
-        assert ep_auto.live_backend == "qwen3_onnx"
+        assert ep_auto.live_backend == "disabled"
         assert ep_auto.live_device == "cpu"
-        assert ep_auto.live_execution_mode == "endpointed"
-        assert ep_auto.offline_backend == "qwen3_onnx"
+        assert ep_auto.live_execution_mode == "post_call_only"
+        assert ep_auto.offline_backend == "sherpa_onnx_cohere"
+        assert ep_auto.offline_model == "cohere-transcribe-2b-en-int8"
         assert ep_auto.selective_verifier_backend == "disabled"
 
         ep_en = HardwareProfiler.select_execution_profile(config=cfg_en)
-        assert ep_en.live_backend == "nemotron_onnx"
-        assert ep_en.live_execution_mode == "incremental"
-        assert ep_en.offline_backend == "parakeet_onnx"
+        assert ep_en.live_backend == "disabled"
+        assert ep_en.live_execution_mode == "post_call_only"
+        assert ep_en.offline_backend == "sherpa_onnx_cohere"
         assert ep_en.selective_verifier_backend == "disabled"
 
-    # Insufficient VRAM (< 1100 MB): skips both HF GPU & Oriserve CUDA cleanly!
+    # Insufficient VRAM (< 2800 MB): stays in Tier 2 standard CPU profile
     gpu_prof = SimpleNamespace(**prof_base)
     with patch.object(HardwareProfiler, "get_profile", return_value=gpu_prof), \
          patch.object(HardwareProfiler, "_query_live_gpu_vram_mb", return_value=(3200, 800)), \
          patch.object(HardwareProfiler, "_check_hf_asr_runtime_available", return_value=True), \
          patch.object(HardwareProfiler, "_has_local_hf_asr_checkpoint", return_value=True):
         ep_low = HardwareProfiler.select_execution_profile(config=cfg_auto)
-        assert ep_low.offline_backend == "qwen3_onnx"
+        assert ep_low.tier_id == "tier2_standard"
+        assert ep_low.offline_backend == "sherpa_onnx_cohere"
         assert ep_low.selective_verifier_backend == "disabled"
-        assert "800 MB" in ep_low.fallback_reason
 
-    # Moderate VRAM (1400 MB): skips HF FP16 (<2000) cleanly, allows Oriserve (>=1100) for Hinglish selective pass!
+    # Moderate VRAM (1400 MB): Tier 2 CPU ASR without double-loading heavy GPU models
     with patch.object(HardwareProfiler, "get_profile", return_value=gpu_prof), \
          patch.object(HardwareProfiler, "_query_live_gpu_vram_mb", return_value=(2600, 1400)), \
          patch.object(HardwareProfiler, "_check_hf_asr_runtime_available", return_value=True), \
          patch.object(HardwareProfiler, "_has_local_hf_asr_checkpoint", return_value=True):
         ep_mid = HardwareProfiler.select_execution_profile(config=cfg_auto)
-        assert ep_mid.offline_backend == "qwen3_onnx"
-        assert ep_mid.selective_verifier_backend == "oriserve_apex_ct2"
+        assert ep_mid.tier_id == "tier2_standard"
+        assert ep_mid.offline_backend == "sherpa_onnx_cohere"
 
-    # High VRAM (>= 2400 MB): unlocks HF Guarded Qwen3 FP16 + Oriserve selective verifier
+    # High VRAM (>= 2800 MB): unlocks Tier 3 performance profile (Vulkan LLM + CPU Cohere ASR)
     with patch.object(HardwareProfiler, "get_profile", return_value=gpu_prof), \
-         patch.object(HardwareProfiler, "_query_live_gpu_vram_mb", return_value=(1600, 2400)), \
+         patch.object(HardwareProfiler, "_query_live_gpu_vram_mb", return_value=(1000, 3000)), \
          patch.object(HardwareProfiler, "_check_hf_asr_runtime_available", return_value=True), \
          patch.object(HardwareProfiler, "_has_local_hf_asr_checkpoint", return_value=True):
         ep_hi = HardwareProfiler.select_execution_profile(config=cfg_auto)
-        assert ep_hi.offline_backend == "hf_qwen3_asr"
-        assert ep_hi.selective_verifier_backend == "oriserve_apex_ct2"
+        assert ep_hi.tier_id == "tier3_performance"
+        assert ep_hi.offline_backend == "sherpa_onnx_cohere"
+        assert ep_hi.selective_verifier_backend == "disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +546,7 @@ def test_16_rollback_switch_and_selective_routing_guards(tmp_path: Path) -> None
     )
     ep_rb = HardwareProfiler.select_execution_profile(config=cfg_rb)
     assert ep_rb.phase2_enabled is False
-    assert ep_rb.live_backend in ("faster_whisper", "hf_qwen3_asr")
+    assert ep_rb.live_backend in ("disabled", "faster_whisper", "hf_qwen3_asr")
     assert ep_rb.selective_verifier_backend == "disabled"
 
     # B. Homograph exclusion: Indian/US English using 'to', 'me', 'par' MUST NEVER trigger Hinglish cues!
@@ -565,7 +567,7 @@ def test_16_rollback_switch_and_selective_routing_guards(tmp_path: Path) -> None
         session_mode="auto", selective_verifier_backend="oriserve_apex_ct2", phase2_enabled=True,
     )
     with patch.object(OriserveApexVerifierEngine, "ensure_loaded") as mock_ori_load:
-        out_en, stats_en = verifier.verify_segments(segs_en, execution_profile=ep_ori, config=AppConfig())
+        out_en, stats_en = verifier.verify_segments(segs_en, execution_profile=ep_ori, config=AppConfig(selective_second_pass_enabled=True))
         assert mock_ori_load.called is False
         assert stats_en["skipped_guard_count"] == 1
         assert "english_never_routed_to_oriserve" in json.dumps(out_en[0]["processing_history"])
@@ -580,7 +582,7 @@ def test_16_rollback_switch_and_selective_routing_guards(tmp_path: Path) -> None
         {"start_time": 0.0, "end_time": 2.0, "text": "Abhi woh check karna hai kyunki issue hai", "raw_text": "अभी वो चेक करना है", "raw_model_score": -0.60, "detected_language": "hi"}
     ]
     with patch.object(ParakeetOnnxEngine, "ensure_loaded") as mock_pk_load:
-        out_hi, stats_hi = verifier.verify_segments(segs_hi, execution_profile=ep_para, config=AppConfig())
+        out_hi, stats_hi = verifier.verify_segments(segs_hi, execution_profile=ep_para, config=AppConfig(selective_second_pass_enabled=True))
         assert mock_pk_load.called is False
         assert stats_hi["skipped_guard_count"] == 1
         assert "hinglish_never_routed_to_english_only" in json.dumps(out_hi[0]["processing_history"])
@@ -634,7 +636,11 @@ def test_17_selective_verifier_positive_acceptance_and_ui_badge_honesty(tmp_path
         out_segs, st = verifier.verify_segments(
             seg_in,
             execution_profile=ep,
-            config=AppConfig(storage_dir=str(tmp_path / "data"), models_dir=str(models_dir)),
+            config=AppConfig(
+                storage_dir=str(tmp_path / "data"),
+                models_dir=str(models_dir),
+                selective_second_pass_enabled=True,
+            ),
             sys_wav_path=str(wav_s),
         )
     assert st["escalated_count"] == 1
@@ -647,19 +653,10 @@ def test_17_selective_verifier_positive_acceptance_and_ui_badge_honesty(tmp_path
     assert out_segs[0]["transcript_state"] == "verified"
     assert any(h.get("stage") == "selective_second_pass_accepted" for h in out_segs[0]["processing_history"])
 
-    # UI Badge Honesty check (Incremental vs Endpointed)
+    # UI Badge Honesty check (Post-Call stages vs Completed)
     from voxlocal.ui.notetaker_page import NotetakerPage
 
-    dummy_page = SimpleNamespace(controller=SimpleNamespace(streaming_transcriber=None))
-    badge_nem = NotetakerPage._format_live_engine_badge(
-        dummy_page, {"execution_mode": "incremental", "asr_backend": "nemotron_onnx", "asr_device": "cpu"}
-    )
-    badge_q3 = NotetakerPage._format_live_engine_badge(
-        dummy_page, {"execution_mode": "endpointed", "asr_backend": "qwen3_onnx", "asr_device": "cpu"}
-    )
-    badge_pk = NotetakerPage._format_live_engine_badge(
-        dummy_page, {"execution_mode": "endpointed", "asr_backend": "parakeet_onnx", "asr_device": "cpu"}
-    )
-    assert "Incremental" in badge_nem and "Nemotron" in badge_nem
-    assert "Endpointed" in badge_q3 and "Incremental" not in badge_q3 and "Qwen3" in badge_q3
-    assert "Endpointed" in badge_pk and "Incremental" not in badge_pk and "Parakeet" in badge_pk
+    assert "Post-Call" in NotetakerPage._format_status_badge("recording", "")
+    assert "Transcribing" in NotetakerPage._format_status_badge("finalizing", "transcribing")
+    assert "Verifying" in NotetakerPage._format_status_badge("finalizing", "verifying")
+    assert "Completed" in NotetakerPage._format_status_badge("completed", "completed")

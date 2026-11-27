@@ -440,15 +440,12 @@ def test_08_09_immediate_audio_save_playback_and_provisional_toggle(tmp_path: Pa
 # ---------------------------------------------------------------------------
 # 10. Post-Call CPU Oriserve Verifier Fallback
 # ---------------------------------------------------------------------------
-def test_10_post_call_cpu_oriserve_verifier_fallback(tmp_path: Path) -> None:
+def test_10_post_call_v2_hardware_profile_uses_single_winner_stack(tmp_path: Path) -> None:
     models_dir = tmp_path / "models"
-    _make_fake_models(models_dir)
+    models_dir.mkdir(parents=True, exist_ok=True)
     cfg = AppConfig(
         storage_dir=str(tmp_path / "data"),
         models_dir=str(models_dir),
-        enable_phase2_asr_pipeline=True,
-        asr_session_mode="auto",
-        post_call_allow_cpu_verifier=True,
     )
     cpu_prof = SimpleNamespace(
         os_name="Windows 11", os_version="10.0", os_build="22631", is_64bit=True,
@@ -462,52 +459,43 @@ def test_10_post_call_cpu_oriserve_verifier_fallback(tmp_path: Path) -> None:
          patch.object(HardwareProfiler, "_query_live_gpu_vram_mb", return_value=(None, None)), \
          patch.object(HardwareProfiler, "_check_hf_asr_runtime_available", return_value=False):
         ep = HardwareProfiler.select_execution_profile(config=cfg)
+        assert ep.offline_backend == "sherpa_onnx_cohere"
         assert ep.selective_verifier_backend == "disabled"
-        assert ep.post_call_verifier_backend == "oriserve_apex_ct2"
-
-    fake_whisper_mod = SimpleNamespace(WhisperModel=MagicMock(return_value=MagicMock()))
-    eng = OriserveApexVerifierEngine(models_dir=models_dir, allow_cpu=True, cpu_threads=4)
-    with patch.object(onnx_mod, "is_cuda_runtime_available", return_value=False), \
-         patch.dict(sys.modules, {"faster_whisper": fake_whisper_mod}):
-        ok, msg = eng.ensure_loaded()
-        assert ok is True
-        assert eng.asr_device == "cpu"
-        assert "CPU" in msg
-        assert fake_whisper_mod.WhisperModel.call_args[1]["device"] == "cpu"
+        assert ep.live_best_effort is False
 
 
 # ---------------------------------------------------------------------------
-# 11. Adaptive English Parakeet Post-Call Upgrade Guard
+# 11. Post-Call Punctuation Polish & v2.0 Cohere Finalization Pipeline
 # ---------------------------------------------------------------------------
-def test_11_adaptive_english_parakeet_upgrade_and_guards(tmp_path: Path) -> None:
+def test_11_post_call_cohere_pipeline_and_punctuation_polish(tmp_path: Path) -> None:
+    from voxlocal.engine.meeting_asr_pipeline import PostCallEnglishASRPipeline
+    from voxlocal.audio.meeting_recorder import MeetingRecordingResult
+
     models_dir = tmp_path / "models"
-    _make_fake_models(models_dir)
+    models_dir.mkdir(parents=True, exist_ok=True)
     t = np.linspace(0, 1.5, 24000, dtype=np.float32)
     wav_x = tmp_path / "mixed.wav"
     _write_wav(wav_x, 0.05 * np.sin(2.0 * np.pi * 220.0 * t))
 
     ctrl = _make_ctrl(tmp_path, models_dir=str(models_dir), auto_summarize_meeting=False)
     try:
-        from voxlocal.audio.meeting_recorder import MeetingRecordingResult
-
-        mid = ctrl.db.create_meeting(title="EN Upgrade", model_used="qwen3")
-        ctrl.config.enable_phase2_asr_pipeline = True
-        ctrl.config.post_call_adaptive_english_parakeet = True
-        ctrl.config.post_call_allow_cpu_verifier = False
-
-        ep_auto = ExecutionProfile(
-            tier_id="t2", tier_label="T2", live_backend="qwen3_onnx", live_model="q", live_device="cpu", live_compute_type="int8",
-            offline_backend="qwen3_onnx", offline_model="qwen3-asr-0.6b-onnx-int8", offline_device="cpu", offline_compute_type="int8",
-            safe_cpu_threads=4, live_best_effort=True, max_concurrent_models=1, hf_runtime_available=False, free_vram_mb=None,
-            session_mode="auto", phase2_enabled=True, available_phase2_models={"qwen3_onnx": True, "parakeet": True},
-        )
-        q3_segs = [
-            {"start_time": 0.0, "end_time": 1.4, "speaker": "Speaker 1", "source_track": "mixed", "raw_text": "please deploy the build now", "text": "please deploy the build now", "detected_language": "en"}
+        mid = ctrl.db.create_meeting(title="EN Cohere Finalization", model_used="cohere")
+        fake_segs = [
+            {
+                "start_time": 0.0,
+                "end_time": 1.4,
+                "speaker": "Speaker 1",
+                "source_track": "system",
+                "raw_text": "Please deploy the production build now.",
+                "normalized_text": "Please deploy the production build now.",
+                "corrected_text": "Please deploy the production build now.",
+                "text": "Please deploy the production build now.",
+                "asr_model": "Cohere Transcribe 2B (INT8)",
+                "asr_backend": "cohere_onnx",
+                "asr_device": "cpu",
+                "asr_compute_type": "int8",
+            }
         ]
-        pk_segs_good = [
-            {"start_time": 0.0, "end_time": 1.4, "speaker": "Speaker 1", "source_track": "mixed", "raw_text": "please deploy the production build now", "text": "please deploy the production build now", "detected_language": "en"}
-        ]
-
         res_obj = MeetingRecordingResult(
             duration_sec=1.5,
             mixed_wav_path=str(wav_x),
@@ -517,37 +505,14 @@ def test_11_adaptive_english_parakeet_upgrade_and_guards(tmp_path: Path) -> None
             loopback_device_name="TestLoop",
             capture_mode="both",
         )
-
-        class _FakeWhisper(LocalWhisperTranscriber):
-            pass
-
-        ctrl.transcriber = _FakeWhisper(models_dir=models_dir, model_name="small", compute_device="cpu")
-        with patch.object(ctrl, "_resolve_asr_execution_profile", return_value=ep_auto), \
-             patch.object(GuardedQwen3OnnxEngine, "transcribe_meeting_dual_track", return_value=q3_segs), \
-             patch.object(GuardedQwen3OnnxEngine, "unload_model"), \
-             patch.object(ParakeetOnnxEngine, "transcribe_meeting_dual_track", return_value=pk_segs_good) as pk_spy, \
-             patch.object(ParakeetOnnxEngine, "unload_model"), \
-             patch.object(ctrl.transcriber, "reconcile_meeting_transcript", side_effect=lambda **kw: kw["segments"]):
+        with patch.object(PostCallEnglishASRPipeline, "transcribe_meeting_dual_track", return_value=fake_segs), \
+             patch.object(PostCallEnglishASRPipeline, "unload"):
             ctrl._finalize_meeting_worker(mid, res_obj, "")
-            assert pk_spy.called is True
             mtg = ctrl.db.get_meeting(mid)
-            assert "parakeet" in str(mtg["model_used"]).lower()
+            assert "cohere" in str(mtg["model_used"]).lower()
             segs_out = ctrl.db.get_meeting_segments(mid)
+            assert len(segs_out) == 1
             assert _polish_final_punctuation("hello world from vox") == "Hello world from vox."
-            assert segs_out[0]["text"].endswith(".")
-
-        # Hinglish utterances MUST skip Parakeet upgrade
-        mid_hi = ctrl.db.create_meeting(title="Hinglish Skip", model_used="qwen3")
-        hi_segs = [
-            {"start_time": 0.0, "end_time": 1.4, "speaker": "Speaker 1", "source_track": "mixed", "raw_text": "abhi woh issue check karna hai kyunki nahi chal raha", "text": "abhi woh issue check karna hai kyunki nahi chal raha", "detected_language": "hi"}
-        ]
-        with patch.object(ctrl, "_resolve_asr_execution_profile", return_value=ep_auto), \
-             patch.object(GuardedQwen3OnnxEngine, "transcribe_meeting_dual_track", return_value=hi_segs), \
-             patch.object(GuardedQwen3OnnxEngine, "unload_model"), \
-             patch.object(ParakeetOnnxEngine, "transcribe_meeting_dual_track") as pk_spy_hi, \
-             patch.object(ctrl.transcriber, "reconcile_meeting_transcript", side_effect=lambda **kw: kw["segments"]):
-            ctrl._finalize_meeting_worker(mid_hi, res_obj, "")
-            assert pk_spy_hi.called is False
     finally:
         ctrl.shutdown()
 

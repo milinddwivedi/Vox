@@ -51,8 +51,8 @@ class TestUIRefinement(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_main_window_tabs_count(self):
-        self.assertEqual(self.main_window.workspace_stack.count(), 8)
-        self.assertEqual(self.main_window.tab_widget.count(), 8)
+        self.assertEqual(self.main_window.workspace_stack.count(), 9)
+        self.assertEqual(self.main_window.tab_widget.count(), 9)
 
     def test_ask_vox_widgets_and_helpers(self):
         # Verify Ask VOX streaming callbacks and citation list cleanup

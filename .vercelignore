@@ -5,6 +5,11 @@ src
 data
 dist
 build
+runtime
+licenses
+release_artifacts
+requirements-dev.txt
+requirements-prod.txt
 temp_test_rec*
 extensions
 models

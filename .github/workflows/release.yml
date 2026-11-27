@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag version (e.g. v1.0.0)"
+        description: "Release tag version (e.g. v2.1.0)"
         required: true
-        default: "v1.0.0"
+        default: "v2.1.0"
 
 permissions:
   contents: write
@@ -26,35 +26,25 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install Python dependencies and PyInstaller
+      - name: Install clean production & build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements-prod.txt pyinstaller pefile
 
-      - name: Build standalone app bundle with PyInstaller
+      - name: Build production desktop & Windows installer
+        shell: pwsh
         run: |
-          pyinstaller VoxLocal.spec --noconfirm
+          $env:PYTHONPATH = "src"
+          python scripts/build_v21_release.py --skip-docs-sync
 
-      - name: Verify headless GUI startup smoke test
+      - name: Verify built binaries & trust chain
+        shell: pwsh
         run: |
+          .\dist\VoxLocal\VoxLocal.exe --verify-runtime
+          .\dist\VoxLocal\VoxLocal.exe --hardware-diagnostics
+          .\dist\VoxLocal\VoxLocal.exe --health-check
           .\dist\VoxLocal\VoxLocal.exe --smoke-test-ms 3000
-
-      - name: Package Portable ZIP
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path release_artifacts | Out-Null
-          Compress-Archive -Path .\dist\VoxLocal\* -DestinationPath .\release_artifacts\VoxLocal-Portable-win64.zip -Force
-
-      - name: Build Windows Installer (VoxLocal-Setup.exe) with Inno Setup
-        shell: pwsh
-        run: |
-          choco install innosetup -y --no-progress
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe" }
-          $ver = "${{ github.ref_name }}".TrimStart("v")
-          if (-not $ver -or $ver -eq "main") { $ver = "${{ github.event.inputs.version }}".TrimStart("v") }
-          if (-not $ver) { $ver = "1.0.0" }
-          & $iscc "/DMyAppVersion=$ver" .\packaging\VoxLocal.iss
+          .\release_artifacts\VoxLocal-Setup.exe --smoke-test
 
       - name: Publish Release Artifacts to GitHub Releases
         uses: softprops/action-github-release@v2
@@ -64,4 +54,6 @@ jobs:
           generate_release_notes: true
           files: |
             release_artifacts/VoxLocal-Setup.exe
-            release_artifacts/VoxLocal-Portable-win64.zip
+            release_artifacts/SHA256SUMS.txt
+            release_artifacts/release_manifest_*.json
+            release_artifacts/RELEASE_NOTES_*.md

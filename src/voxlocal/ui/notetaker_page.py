@@ -1,16 +1,20 @@
-"""VOX Notetaker Hub Workspace — Calendar, Past Notes, Folders, Playback & Meeting Studio."""
+"""VOX Notetaker Hub Workspace — Dual-Context Meeting Workspace & Overall Intelligence."""
 
 from __future__ import annotations
 
+import html
+import json
 import os
 import subprocess
 import threading
+import time
 import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QRect, QSize, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QShortcut
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QApplication,
@@ -29,8 +33,14 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
+    QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -38,7 +48,14 @@ from PyQt6.QtWidgets import (
 from voxlocal.core.logger import get_logger
 from voxlocal.storage.exporter import TranscriptExporter, format_seconds_hms
 from voxlocal.ui.components import VoxEmptyStateWidget
+from voxlocal.ui.icons import get_icon, get_pixmap
 from voxlocal.ui.meeting_studio import VoxMeetingStudioWorkspace
+from voxlocal.ui.meeting_ui_helpers import (
+    VoxSegmentedControl,
+    render_safe_markdown_html,
+    strip_markdown_for_plain_copy,
+)
+from voxlocal.ui.overall_intelligence_view import VoxOverallIntelligenceView
 from voxlocal.ui.theme import (
     MARGINS_BTN_GROUP,
     MARGINS_CARD,
@@ -46,6 +63,7 @@ from voxlocal.ui.theme import (
     PADDING_BTN_GROUP_PX,
     PADDING_CARD_PX,
     PADDING_TOOLBAR_PX,
+    get_html_font_family,
     get_theme_tokens,
     get_ui_font,
 )
@@ -56,11 +74,128 @@ if TYPE_CHECKING:
 logger = get_logger("ui.notetaker_page")
 
 
+class VoxMeetingListDelegate(QStyledItemDelegate):
+    """Compact/Comfortable chronological library row renderer with inline section headers."""
+
+    ROLE_META = Qt.ItemDataRole.UserRole + 1
+    ROLE_GROUP = Qt.ItemDataRole.UserRole + 2
+
+    def __init__(self, parent: Optional[QWidget] = None, theme: str = "light", compact: bool = False) -> None:
+        super().__init__(parent)
+        self.theme = (theme or "light").lower()
+        self.compact = bool(compact)
+
+    def set_theme(self, theme: str) -> None:
+        self.theme = (theme or "light").lower()
+
+    def set_compact(self, compact: bool) -> None:
+        self.compact = bool(compact)
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: Any) -> QSize:
+        group = str(index.data(self.ROLE_GROUP) or "")
+        base_h = 48 if self.compact else 58
+        grp_h = 20 if group else 0
+        w = max(210, int(option.rect.width()) if option.rect.width() > 0 else 250)
+        return QSize(w, base_h + grp_h)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
+        meta = index.data(self.ROLE_META)
+        if not isinstance(meta, dict):
+            super().paint(painter, option, index)
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        t = get_theme_tokens(self.theme)
+
+        group = str(index.data(self.ROLE_GROUP) or "")
+        rect = QRect(option.rect)
+        grp_h = 20 if group else 0
+
+        if group:
+            grp_rect = QRect(rect.left() + 10, rect.top() + 4, rect.width() - 20, 16)
+            painter.setPen(QColor(t.get("text_dim", "#64748B")))
+            gfont = get_ui_font(10, 600)
+            painter.setFont(gfont)
+            painter.drawText(grp_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, group)
+
+        card_rect = rect.adjusted(4, grp_h + 2, -4, -2)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        if selected:
+            bg = QColor(t.get("accent_dawn_tint", "#152238" if self.theme == "dark" else "#E8F0FE"))
+            bdr = QColor(t.get("accent", "#1967D2"))
+        elif hovered:
+            bg = QColor(t.get("surface_hover", "#F1F5F9"))
+            bdr = QColor(t.get("outline_variant", "#E2E8F0"))
+        else:
+            bg = QColor(t.get("surface", "#FFFFFF"))
+            bdr = QColor("transparent")
+
+        painter.setBrush(bg)
+        painter.setPen(bdr if hovered or selected else Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(card_rect, 9, 9)
+
+        if selected:
+            painter.save()
+            painter.setBrush(QColor(t.get("accent", "#1967D2")))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(QRect(card_rect.left() + 2, card_rect.top() + 8, 3, max(16, card_rect.height() - 16)), 1.5, 1.5)
+            painter.restore()
+
+        title = str(meta.get("title") or "Untitled Meeting")
+        sub = str(meta.get("sub") or "")
+        status_kind = str(meta.get("status_kind") or "ok")
+        is_compact = bool(meta.get("compact", self.compact))
+
+        pad_x = 12
+        inner_left = card_rect.left() + pad_x
+        inner_w = max(40, card_rect.width() - (pad_x * 2) - 12)
+
+        # Right status dot
+        dot_color = {
+            "recoverable": t.get("status_warning", "#D97706"),
+            "processing": t.get("accent", "#1967D2"),
+            "recording": t.get("status_danger", "#DC2626"),
+        }.get(status_kind, "")
+        if dot_color:
+            painter.setBrush(QColor(dot_color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(card_rect.right() - 14, card_rect.top() + 12, 7, 7)
+
+        # Title line
+        tfont = get_ui_font(12 if is_compact else 13, 600 if selected else 550)
+        painter.setFont(tfont)
+        title_col = t.get("accent_dawn_text", t.get("text_primary", "#0F172A")) if selected else t.get("text_primary", "#0F172A")
+        painter.setPen(QColor(title_col))
+        elided_title = QFontMetrics(tfont).elidedText(title, Qt.TextElideMode.ElideRight, inner_w)
+        title_h = 18 if is_compact else 20
+        painter.drawText(
+            QRect(inner_left, card_rect.top() + (5 if is_compact else 7), inner_w, title_h),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            elided_title,
+        )
+
+        # Metadata subtitle line
+        sfont = get_ui_font(10 if is_compact else 11, 400)
+        painter.setFont(sfont)
+        sub_col = t.get("text_secondary", "#475569") if selected else t.get("text_muted", "#64748B")
+        painter.setPen(QColor(sub_col))
+        elided_sub = QFontMetrics(sfont).elidedText(sub, Qt.TextElideMode.ElideRight, card_rect.width() - 22)
+        painter.drawText(
+            QRect(inner_left, card_rect.top() + (23 if is_compact else 29), card_rect.width() - 22, 17),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            elided_sub,
+        )
+
+        painter.restore()
+
+
 class VoxAutoStartBanner(QFrame):
     """
-    Top-of-Notetaker activation banner:
+    Compact top activation banner:
     'Want Notetaker to start automatically?'
-    'This will turn on Notetaker as soon as your meeting begins'
     with 'Not now' (dismiss) and 'Turn on' (auto-record without prompt).
     """
 
@@ -74,37 +209,34 @@ class VoxAutoStartBanner(QFrame):
 
     def _build_ui(self) -> None:
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(18, 14, 18, 14)
-        lay.setSpacing(14)
+        lay.setContentsMargins(12, 6, 12, 6)
+        lay.setSpacing(10)
 
-        # Left Icon badge with concentric circles (◎)
         self.icon_badge = QFrame()
-        self.icon_badge.setFixedSize(36, 36)
+        self.icon_badge.setFixedSize(26, 26)
         self.icon_badge.setObjectName("ntAutoBadge")
         badge_lay = QVBoxLayout(self.icon_badge)
         badge_lay.setContentsMargins(0, 0, 0, 0)
         badge_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_icon = QLabel("◎")
+        from .icons import VectorIconLabel
+        self.lbl_icon = VectorIconLabel("◎")
         self.lbl_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_icon.setFont(get_ui_font(18, 600))
+        self.lbl_icon.setPixmap(get_pixmap("meetings", "#1967D2", 15))
         badge_lay.addWidget(self.lbl_icon)
         lay.addWidget(self.icon_badge)
 
-        # Middle text column
-        text_col = QVBoxLayout()
-        text_col.setSpacing(2)
+        text_row = QHBoxLayout()
+        text_row.setSpacing(8)
         self.lbl_title = QLabel("Want Notetaker to start automatically?")
-        self.lbl_title.setFont(get_ui_font(13, 600))
+        self.lbl_title.setFont(get_ui_font(12, 600))
         self.lbl_sub = QLabel("This will turn on Notetaker as soon as your meeting begins")
         self.lbl_sub.setObjectName("ntMuted")
-        self.lbl_sub.setWordWrap(True)
-        text_col.addWidget(self.lbl_title)
-        text_col.addWidget(self.lbl_sub)
-        lay.addLayout(text_col, 1)
+        text_row.addWidget(self.lbl_title)
+        text_row.addWidget(self.lbl_sub, 1)
+        lay.addLayout(text_row, 1)
 
-        # Right action buttons
         btn_box = QHBoxLayout()
-        btn_box.setSpacing(10)
+        btn_box.setSpacing(6)
         btn_box.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
 
         self.btn_not_now = QPushButton("Not now")
@@ -123,41 +255,80 @@ class VoxAutoStartBanner(QFrame):
 
 
 class NotetakerPage(QWidget):
-    """Notetaker Hub workspace combining Calendar upcoming meetings, library, playback, and Studio."""
+    """Notetaker Hub workspace combining Dual-Context Intelligence, Library, Playback, and Studio."""
 
     status_toast = pyqtSignal(str, str)
     open_calendar_requested = pyqtSignal()
     open_settings_requested = pyqtSignal(int)
-    _studio_ask_completed = pyqtSignal(int, str, str, object)
+    _studio_ask_completed = pyqtSignal(str, str, str, object)
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.controller = controller
         self._theme = getattr(controller, "theme", "light")
+        cfg = getattr(controller, "config", None)
+
         self._selected_meeting_id: Optional[int] = None
+        self._last_meetings_sig: Optional[Any] = None
         self._active_folder_id: Optional[int] = None
+        self._workspace_context: str = "meeting"  # "meeting" | "overall"
+        self._library_filter: str = "all"  # "all" | "completed" | "recoverable" | "video"
+        self._library_sort: str = "newest"  # "newest" | "duration" | "title"
+        self._library_compact: bool = bool(getattr(cfg, "notetaker_library_compact", False))
+        self._sidebar_collapsed: bool = bool(getattr(cfg, "notetaker_library_collapsed", False))
+        self._ask_rail_open: bool = bool(getattr(cfg, "notetaker_ask_rail_open", False))
+        self._split_mode: str = str(getattr(cfg, "notetaker_split_mode", "off") or "off")
+        self._playback_rates: Tuple[float, ...] = (1.0, 1.25, 1.5, 2.0)
+        self._playback_rate_idx: int = 0
+
         self._cal_filter: str = "today"
         self._cached_calendar_meetings: List[Any] = []
+        self._cal_user_toggled: bool = False
         self._prepared_calendar_meeting: Optional[Any] = None
         self._silent_loopback_since: Optional[float] = None
         self._first_interrupted_id: Optional[int] = None
+        self._interrupted_dismissed: bool = False
         self._cal_expanded: bool = False
         self._inline_next_cal_meeting: Optional[Any] = None
         self._mic_ok: bool = True
         self._sys_healthy: bool = True
+
+        # Context-isolated Ask VOX conversation stores (NEVER cross-leak)
+        self._meeting_ask_threads: Dict[int, List[Dict[str, Any]]] = {}
+        self._overall_ask_thread: List[Dict[str, Any]] = []
+        self._overall_scope_ids: Optional[List[int]] = None
+        self._overall_scope_label: str = "All Recorded Meetings"
+        self._ask_loading_key: Optional[str] = None
+        self._last_ask_answer_plain: str = ""
+        self._last_ask_with_sources_plain: str = ""
 
         self._search_debounce_timer = QTimer(self)
         self._search_debounce_timer.setSingleShot(True)
         self._search_debounce_timer.setInterval(200)
         self._search_debounce_timer.timeout.connect(self.refresh_meetings_list)
 
+        self._pending_media_path: Optional[Path] = None
+        self._loaded_media_url: str = ""
+        self._media_probe_timer = QTimer(self)
+        self._media_probe_timer.setSingleShot(True)
+        self._media_probe_timer.setInterval(60)
+        self._media_probe_timer.timeout.connect(self._apply_pending_media_source)
+
+        self._fin_started_mono: Optional[float] = None
+        self._fin_elapsed_timer = QTimer(self)
+        self._fin_elapsed_timer.setInterval(1000)
+        self._fin_elapsed_timer.timeout.connect(self._update_finalization_timer)
+
         self.media_player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.media_player.setAudioOutput(self.audio_output)
         self.media_player.positionChanged.connect(self._on_media_position_changed)
         self.media_player.durationChanged.connect(self._on_media_duration_changed)
+        if hasattr(self.media_player, "errorOccurred"):
+            self.media_player.errorOccurred.connect(self._on_media_error)
 
         self._build_ui()
+        self._setup_shortcuts()
         self._studio_ask_completed.connect(self._on_studio_ask_completed)
         self.apply_theme(self._theme)
 
@@ -170,14 +341,35 @@ class NotetakerPage(QWidget):
             self.controller.dictation_interim_updated.connect(self._on_dictation_interim_updated)
         if hasattr(self.controller, "dictation_completed"):
             self.controller.dictation_completed.connect(self._on_dictation_completed)
-        if hasattr(self.controller, "meeting_live_partial"):
-            self.controller.meeting_live_partial.connect(self._on_live_meeting_partial)
-        if hasattr(self.controller, "meeting_live_confirmed"):
-            self.controller.meeting_live_confirmed.connect(self._on_live_meeting_confirmed)
-        if hasattr(self.controller, "meeting_progressive_segment"):
-            self.controller.meeting_progressive_segment.connect(self._on_live_meeting_segment)
+        if hasattr(self.controller, "knowledge_updated"):
+            self.controller.knowledge_updated.connect(self._on_knowledge_updated)
 
         self.refresh_all()
+
+    def _setup_shortcuts(self) -> None:
+        QShortcut(QKeySequence("Alt+1"), self).activated.connect(lambda: self.set_workspace_context("meeting"))
+        QShortcut(QKeySequence("Alt+2"), self).activated.connect(lambda: self.set_workspace_context("overall"))
+        QShortcut(QKeySequence("Ctrl+\\"), self).activated.connect(self._toggle_sidebar_collapsed)
+        QShortcut(QKeySequence("Ctrl+Shift+A"), self).activated.connect(self._toggle_ask_rail)
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self._focus_library_search)
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self).activated.connect(self._toggle_summary_transcript_split)
+        for tab_i in range(4):
+            QShortcut(QKeySequence(f"Alt+Shift+{tab_i + 1}"), self).activated.connect(
+                lambda idx=tab_i: self.studio.unified_tabs.setCurrentIndex(idx)
+                if hasattr(self, "studio") and self.studio.unified_tabs.count() > idx
+                else None
+            )
+
+    def _focus_library_search(self) -> None:
+        if getattr(self, "_sidebar_collapsed", False):
+            self._toggle_sidebar_collapsed(False)
+        if hasattr(self, "txt_search"):
+            self.txt_search.setFocus()
+            self.txt_search.selectAll()
+
+    def _toggle_summary_transcript_split(self) -> None:
+        cur = getattr(self, "_split_mode", "off")
+        self.set_split_mode("off" if cur != "off" else "summary_transcript")
 
     def showEvent(self, event: Any) -> None:
         super().showEvent(event)
@@ -188,6 +380,9 @@ class NotetakerPage(QWidget):
     def closeEvent(self, event: Any) -> None:
         if hasattr(self, "_search_debounce_timer") and self._search_debounce_timer.isActive():
             self._search_debounce_timer.stop()
+        if hasattr(self, "overall_view") and hasattr(self.overall_view, "_search_timer"):
+            if self.overall_view._search_timer.isActive():
+                self.overall_view._search_timer.stop()
         studio = getattr(self, "studio", None)
         if studio is not None:
             tab_sum = getattr(studio, "tab_summary", None)
@@ -209,23 +404,76 @@ class NotetakerPage(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 22, 28, 20)
-        root.setSpacing(14)
+        root.setContentsMargins(16, 12, 16, 12)
+        root.setSpacing(8)
 
-        # Header row
-        hdr = QHBoxLayout()
-        hdr.setSpacing(12)
-        title_col = QVBoxLayout()
-        title_col.setSpacing(2)
-        self.lbl_title = QLabel("Notetaker")
-        self.lbl_title.setFont(get_ui_font(26, 500, serif=True))
-        self.lbl_sub = QLabel("Capture Teams, Zoom, and Meet calls locally — with zero meeting bots.")
-        self.lbl_sub.setObjectName("ntMuted")
-        title_col.addWidget(self.lbl_title)
-        title_col.addWidget(self.lbl_sub)
-        hdr.addLayout(title_col, 1)
+        # ------------------------------------------------------------------
+        # 1. Slim Top Command Bar (~46px) — Mode Switcher + Status Pills + Core Actions
+        # ------------------------------------------------------------------
+        self.command_bar = QFrame()
+        self.command_bar.setObjectName("ntCommandBar")
+        hdr = QHBoxLayout(self.command_bar)
+        hdr.setContentsMargins(10, 6, 10, 6)
+        hdr.setSpacing(8)
 
-        self.btn_drawer = QPushButton("Open Floating Drawer")
+        self.btn_toggle_sidebar = QPushButton("")
+        self.btn_toggle_sidebar.setFixedSize(30, 30)
+        self.btn_toggle_sidebar.setIconSize(QSize(16, 16))
+        self.btn_toggle_sidebar.setObjectName("ghostBtn")
+        self.btn_toggle_sidebar.setCheckable(True)
+        self.btn_toggle_sidebar.setChecked(not self._sidebar_collapsed)
+        self.btn_toggle_sidebar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_sidebar.setToolTip("Show or hide Meeting Library (Ctrl+\\)")
+        self.btn_toggle_sidebar.setAccessibleName("Toggle meeting library sidebar")
+        self.btn_toggle_sidebar.clicked.connect(self._toggle_sidebar_collapsed)
+        hdr.addWidget(self.btn_toggle_sidebar)
+
+        self.lbl_title = QLabel("Meetings")
+        self.lbl_title.setFont(get_ui_font(18, 600))
+        hdr.addWidget(self.lbl_title)
+
+        self.mode_switcher = VoxSegmentedControl(
+            [("meeting", "This Meeting"), ("overall", "Overall Intelligence")],
+            parent=self.command_bar,
+            theme=self._theme,
+        )
+        self.mode_switcher.selection_changed.connect(self.set_workspace_context)
+        hdr.addWidget(self.mode_switcher)
+
+        self.btn_upcoming_pill = QPushButton("Upcoming (0)")
+        self.btn_upcoming_pill.setObjectName("ntStatusPillBtn")
+        self.btn_upcoming_pill.setIconSize(QSize(14, 14))
+        self.btn_upcoming_pill.setCheckable(True)
+        self.btn_upcoming_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_upcoming_pill.setToolTip("Show or hide upcoming calendar meetings")
+        self.btn_upcoming_pill.clicked.connect(self._toggle_upcoming_card)
+        hdr.addWidget(self.btn_upcoming_pill)
+
+        self.btn_rescued_pill = QPushButton("0 Rescued")
+        self.btn_rescued_pill.setObjectName("ntWarnPillBtn")
+        self.btn_rescued_pill.setIconSize(QSize(14, 14))
+        self.btn_rescued_pill.setVisible(False)
+        self.btn_rescued_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_rescued_pill.setToolTip("Recover rescued interrupted recording")
+        self.btn_rescued_pill.clicked.connect(self._on_recover_interrupted_clicked)
+        hdr.addWidget(self.btn_rescued_pill)
+
+        hdr.addStretch(1)
+
+        self.btn_ask_vox_rail = QPushButton("Ask VOX")
+        self.btn_ask_vox_rail.setObjectName("ntAskToggleBtn")
+        self.btn_ask_vox_rail.setIconSize(QSize(14, 14))
+        self.btn_ask_vox_rail.setCheckable(True)
+        self.btn_ask_vox_rail.setChecked(self._ask_rail_open)
+        self.btn_ask_vox_rail.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ask_vox_rail.setToolTip("Toggle context-locked Ask VOX AI assistant (Ctrl+Shift+A)")
+        self.btn_ask_vox_rail.setAccessibleName("Toggle Ask VOX assistant")
+        self.btn_ask_vox_rail.clicked.connect(self._toggle_ask_rail)
+        hdr.addWidget(self.btn_ask_vox_rail)
+
+        self.btn_drawer = QPushButton("Drawer")
+        self.btn_drawer.setObjectName("secondaryBtn")
+        self.btn_drawer.setIconSize(QSize(14, 14))
         self.btn_drawer.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_drawer.setAccessibleName("Open Floating Drawer")
         self.btn_drawer.setAccessibleDescription("Open the slide-out companion notetaker drawer for call notes")
@@ -236,8 +484,9 @@ class NotetakerPage(QWidget):
         )
         hdr.addWidget(self.btn_drawer)
 
-        self.btn_settings = QPushButton("⚙")
-        self.btn_settings.setFixedSize(34, 34)
+        self.btn_settings = QPushButton("")
+        self.btn_settings.setFixedSize(30, 30)
+        self.btn_settings.setIconSize(QSize(15, 15))
         self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_settings.setToolTip("Notetaker Settings")
         self.btn_settings.setObjectName("ghostBtn")
@@ -246,30 +495,31 @@ class NotetakerPage(QWidget):
         self.btn_settings.clicked.connect(lambda: self.open_settings_requested.emit(2))
         hdr.addWidget(self.btn_settings)
 
-        self.btn_start_adhoc = QPushButton("◎  Start Notetaker")
-        self.btn_start_adhoc.setObjectName("dawnBtn")
+        self.btn_start_adhoc = QPushButton("Start Notetaker")
+        self.btn_start_adhoc.setObjectName("fathomBtn")
+        self.btn_start_adhoc.setIconSize(QSize(14, 14))
         self.btn_start_adhoc.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_start_adhoc.setAccessibleName("Toggle Notetaker recording")
         self.btn_start_adhoc.setAccessibleDescription("Start, pause, or stop local notetaker recording for desktop calls")
         self.btn_start_adhoc.clicked.connect(self._on_toggle_recording_clicked)
         hdr.addWidget(self.btn_start_adhoc)
-        root.addLayout(hdr)
+        root.addWidget(self.command_bar)
 
-        # Auto-Start Activation Banner (Shown at the very top of Notetaker)
+        # Auto-Start Activation Banner
         self.auto_start_banner = VoxAutoStartBanner(self)
         self.auto_start_banner.turn_on_clicked.connect(self._on_auto_start_turn_on)
         self.auto_start_banner.not_now_clicked.connect(self._on_auto_start_not_now)
         root.addWidget(self.auto_start_banner)
 
-        # Live recording status banner (shown only during active capture)
+        # Live recording status banner (shown only during active capture/finalizing)
         self.rec_banner = QFrame()
         self.rec_banner.setObjectName("ntBanner")
         self.rec_banner.setVisible(False)
         b_lay = QHBoxLayout(self.rec_banner)
-        b_lay.setContentsMargins(*MARGINS_TOOLBAR)
-        b_lay.setSpacing(10)
+        b_lay.setContentsMargins(10, 5, 10, 5)
+        b_lay.setSpacing(8)
         self.lbl_rec_dot = QLabel("● Capturing Call")
-        self.lbl_rec_dot.setStyleSheet("font-weight: 700;")
+        self.lbl_rec_dot.setStyleSheet("font-weight: 700; font-size: 12px;")
         self.lbl_rec_timer = QLabel("00:00")
         b_lay.addWidget(self.lbl_rec_dot)
         b_lay.addWidget(self.lbl_rec_timer)
@@ -311,7 +561,7 @@ class NotetakerPage(QWidget):
         b_lay.addWidget(self.lbl_capture_anomaly)
 
         self.lbl_rec_live = QLabel("")
-        self.lbl_rec_live.setStyleSheet("color: #6366f1; font-weight: 500; font-size: 11.5px;")
+        self.lbl_rec_live.setObjectName("ntMuted")
         b_lay.addWidget(self.lbl_rec_live, 1)
         b_lay.addStretch(1)
         self.btn_pause_rec = QPushButton("Pause")
@@ -320,7 +570,7 @@ class NotetakerPage(QWidget):
         self.btn_pause_rec.setAccessibleDescription("Temporarily pause active call audio recording")
         self.btn_pause_rec.clicked.connect(self._on_pause_resume_clicked)
         b_lay.addWidget(self.btn_pause_rec)
-        self.btn_stop_rec = QPushButton("Stop & Save")
+        self.btn_stop_rec = QPushButton("Stop && Save")
         self.btn_stop_rec.setObjectName("primaryBtn")
         self.btn_stop_rec.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_stop_rec.setAccessibleName("Stop and save recording")
@@ -329,16 +579,16 @@ class NotetakerPage(QWidget):
         b_lay.addWidget(self.btn_stop_rec)
         root.addWidget(self.rec_banner)
 
-        # Prepared Calendar Meeting Banner (shown when user prepares a meeting from Calendar)
+        # Prepared Calendar Meeting Banner
         self.prepared_banner = QFrame()
         self.prepared_banner.setObjectName("ntBanner")
         self.prepared_banner.setVisible(False)
         pb_lay = QHBoxLayout(self.prepared_banner)
-        pb_lay.setContentsMargins(*MARGINS_TOOLBAR)
-        pb_lay.setSpacing(10)
+        pb_lay.setContentsMargins(10, 5, 10, 5)
+        pb_lay.setSpacing(8)
         self.lbl_prepared_summary = QLabel("")
         self.lbl_prepared_summary.setWordWrap(True)
-        self.lbl_prepared_summary.setStyleSheet("font-weight: 600;")
+        self.lbl_prepared_summary.setStyleSheet("font-weight: 600; font-size: 12px;")
         pb_lay.addWidget(self.lbl_prepared_summary, 1)
 
         self.btn_start_prepared = QPushButton("Start Recording")
@@ -354,35 +604,50 @@ class NotetakerPage(QWidget):
         pb_lay.addWidget(self.btn_clear_prepared)
         root.addWidget(self.prepared_banner)
 
-        # Interrupted Recording Recovery Banner (strictly user-controlled)
+        # Compact Interrupted Recording Recovery Banner (strictly user-controlled)
         self.interrupted_banner = QFrame()
         self.interrupted_banner.setObjectName("ntInterruptedBanner")
         self.interrupted_banner.setVisible(False)
         ib_lay = QHBoxLayout(self.interrupted_banner)
-        ib_lay.setContentsMargins(*MARGINS_TOOLBAR)
-        ib_lay.setSpacing(10)
+        ib_lay.setContentsMargins(10, 4, 10, 4)
+        ib_lay.setSpacing(8)
         self.lbl_interrupted_summary = QLabel("")
-        self.lbl_interrupted_summary.setWordWrap(True)
         self.lbl_interrupted_summary.setStyleSheet(
-            f"font-weight: 600; color: {t_init['status_warning_text']};"
+            f"font-weight: 600; font-size: 12px; color: {t_init['status_warning_text']};"
         )
         ib_lay.addWidget(self.lbl_interrupted_summary, 1)
-        self.btn_recover_interrupted = QPushButton("↻ Recover & Re-Transcribe")
+        self.btn_recover_interrupted = QPushButton("↻ Recover && Re-Transcribe")
         self.btn_recover_interrupted.setObjectName("secondaryBtn")
         self.btn_recover_interrupted.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_recover_interrupted.clicked.connect(self._on_recover_interrupted_clicked)
         ib_lay.addWidget(self.btn_recover_interrupted)
+        self.btn_dismiss_interrupted = QPushButton("×")
+        self.btn_dismiss_interrupted.setFixedSize(22, 22)
+        self.btn_dismiss_interrupted.setObjectName("ghostBtn")
+        self.btn_dismiss_interrupted.setToolTip("Dismiss recovery banner for this session")
+        self.btn_dismiss_interrupted.clicked.connect(self._dismiss_interrupted_banner)
+        ib_lay.addWidget(self.btn_dismiss_interrupted)
         root.addWidget(self.interrupted_banner)
 
-        # Unified Multi-Provider Upcoming Meetings Hub (collapsible strip by default)
+        # Upcoming Meetings Strip (hidden when 0 upcoming meetings unless toggled open via command bar)
         self.cal_card = QFrame()
         self.cal_card.setObjectName("ntCard")
+        self.cal_card.setMinimumWidth(0)
         cal_root_lay = QVBoxLayout(self.cal_card)
-        cal_root_lay.setContentsMargins(*MARGINS_CARD)
-        cal_root_lay.setSpacing(8)
+        cal_root_lay.setContentsMargins(12, 6, 12, 6)
+        cal_root_lay.setSpacing(6)
 
-        # Top Bar: Title, badges, inline next meeting strip, expand toggle
-        cal_top = QHBoxLayout()
+        cal_top_scroll = QScrollArea()
+        cal_top_scroll.setWidgetResizable(True)
+        cal_top_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        cal_top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        cal_top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        cal_top_scroll.setFixedHeight(32)
+        cal_top_scroll.setMinimumWidth(0)
+        cal_top_host = QWidget()
+        cal_top_host.setMinimumWidth(0)
+        cal_top = QHBoxLayout(cal_top_host)
+        cal_top.setContentsMargins(0, 0, 0, 0)
         cal_top.setSpacing(8)
 
         lbl_cal_title = QLabel("UPCOMING MEETINGS")
@@ -402,6 +667,8 @@ class NotetakerPage(QWidget):
 
         self.lbl_cal_next_inline = QLabel("No upcoming meetings")
         self.lbl_cal_next_inline.setObjectName("ntMuted")
+        self.lbl_cal_next_inline.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_cal_next_inline.setMinimumWidth(0)
         cal_top.addWidget(self.lbl_cal_next_inline, 1)
 
         self.btn_cal_quick_record = QPushButton("▶ Notetake")
@@ -415,7 +682,6 @@ class NotetakerPage(QWidget):
         )
         cal_top.addWidget(self.btn_cal_quick_record)
 
-        # Horizon Filter Buttons inside toggleable container
         self.cal_filters_container = QWidget()
         filt_lay = QHBoxLayout(self.cal_filters_container)
         filt_lay.setContentsMargins(0, 0, 0, 0)
@@ -473,126 +739,190 @@ class NotetakerPage(QWidget):
         self.btn_cal_expand.clicked.connect(self._toggle_cal_expanded)
         cal_top.addWidget(self.btn_cal_expand)
 
-        cal_root_lay.addLayout(cal_top)
+        cal_top_scroll.setWidget(cal_top_host)
+        cal_root_lay.addWidget(cal_top_scroll)
 
-        # Content area for meeting cards (hidden when collapsed)
         self.cal_content_container = QWidget()
         self.cal_content = QHBoxLayout(self.cal_content_container)
         self.cal_content.setContentsMargins(0, 0, 0, 0)
         self.cal_content.setSpacing(10)
         cal_root_lay.addWidget(self.cal_content_container)
         self._apply_cal_collapsed_state()
+        self.cal_card.setVisible(False)
         root.addWidget(self.cal_card)
 
-        # Main Split Workspace (Left: Library / Folders | Right: Player + Actions + Studio)
+        # ------------------------------------------------------------------
+        # 2. 3-Column Adaptive Workspace Splitter:
+        #    [Pane 1: Collapsible Meeting Library] | [Pane 2: Dual-Context Canvas] | [Pane 3: Context-Locked Ask VOX Rail]
+        # ------------------------------------------------------------------
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(6)
 
-        # --- Left Library Panel ---
+        # --- Pane 1: Meeting Library (Google Workspace 2-Row Clean Toolbar) ---
         self.lib_card = QFrame()
         self.lib_card.setObjectName("ntCard")
-        self.lib_card.setMinimumWidth(260)
+        self.lib_card.setMinimumWidth(240)
         self.lib_card.setMaximumWidth(360)
         lib_lay = QVBoxLayout(self.lib_card)
-        lib_lay.setContentsMargins(*MARGINS_CARD)
-        lib_lay.setSpacing(8)
+        lib_lay.setContentsMargins(10, 10, 10, 10)
+        lib_lay.setSpacing(6)
 
+        search_row = QHBoxLayout()
+        search_row.setSpacing(4)
         self.txt_search = QLineEdit()
-        self.txt_search.setPlaceholderText("Search call notes & transcripts...")
+        self.txt_search.setObjectName("voxSearchField")
+        self.txt_search.setClearButtonEnabled(True)
+        self.txt_search.setPlaceholderText("Search meetings & transcripts... (Ctrl+F)")
         self.txt_search.setAccessibleName("Search call notes and transcripts")
         self.txt_search.setAccessibleDescription("Filter meeting recordings by title, date, platform, or transcript content")
+        self._lib_search_action = self.txt_search.addAction(
+            get_icon("search", "#64748B", 14), QLineEdit.ActionPosition.LeadingPosition
+        )
         self.txt_search.textChanged.connect(lambda _t: self._search_debounce_timer.start())
-        lib_lay.addWidget(self.txt_search)
+        search_row.addWidget(self.txt_search, 1)
 
-        folder_row = QHBoxLayout()
-        folder_row.setSpacing(6)
-        self.combo_folders = QComboBox()
-        self.combo_folders.setAccessibleName("Filter by folder")
-        self.combo_folders.setAccessibleDescription("Filter the meeting recordings library by folder")
-        self.combo_folders.currentIndexChanged.connect(self._on_folder_filter_changed)
-        folder_row.addWidget(self.combo_folders, 1)
-
-        self.btn_new_folder = QPushButton("+ Folder")
+        self.btn_new_folder = QPushButton("")
+        self.btn_new_folder.setObjectName("ghostBtn")
+        self.btn_new_folder.setFixedSize(28, 28)
+        self.btn_new_folder.setIconSize(QSize(15, 15))
+        self.btn_new_folder.setToolTip("Create new folder")
         self.btn_new_folder.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_new_folder.setAccessibleName("Create new folder")
         self.btn_new_folder.setAccessibleDescription("Create a new organizational folder for meeting notes")
         self.btn_new_folder.clicked.connect(self._on_create_folder_clicked)
-        folder_row.addWidget(self.btn_new_folder)
-        lib_lay.addLayout(folder_row)
+        search_row.addWidget(self.btn_new_folder)
+
+        self.btn_density = QPushButton("")
+        self.btn_density.setObjectName("ntIconToggleBtn")
+        self.btn_density.setFixedSize(28, 28)
+        self.btn_density.setIconSize(QSize(15, 15))
+        self.btn_density.setCheckable(True)
+        self.btn_density.setChecked(self._library_compact)
+        self.btn_density.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_density.setToolTip("Switch row density (Compact / Comfortable)")
+        self.btn_density.setAccessibleName("Toggle meeting list row density")
+        self.btn_density.clicked.connect(self._toggle_library_density)
+        search_row.addWidget(self.btn_density)
+        lib_lay.addLayout(search_row)
+
+        # Compact Folder + Sort Row
+        lib_ctrl_row = QHBoxLayout()
+        lib_ctrl_row.setSpacing(6)
+        self.combo_folders = QComboBox()
+        self.combo_folders.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_folders.setMinimumContentsLength(9)
+        self.combo_folders.setAccessibleName("Filter by folder")
+        self.combo_folders.setAccessibleDescription("Filter the meeting recordings library by folder")
+        self.combo_folders.currentIndexChanged.connect(self._on_folder_filter_changed)
+        lib_ctrl_row.addWidget(self.combo_folders, 1)
+
+        self.combo_sort = QComboBox()
+        self.combo_sort.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_sort.setMinimumContentsLength(7)
+        self.combo_sort.addItem("Newest", "newest")
+        self.combo_sort.addItem("Longest", "duration")
+        self.combo_sort.addItem("Title A–Z", "title")
+        self.combo_sort.currentIndexChanged.connect(self._on_sort_changed)
+        lib_ctrl_row.addWidget(self.combo_sort)
+        lib_lay.addLayout(lib_ctrl_row)
+
+        # Clean borderless status filter tabs
+        lib_pill_row = QHBoxLayout()
+        lib_pill_row.setSpacing(4)
+        self._lib_filter_btns: Dict[str, QPushButton] = {}
+        for fkey, flbl in (
+            ("all", "All"),
+            ("completed", "Done"),
+            ("recoverable", "Rescued"),
+            ("video", "Video"),
+        ):
+            fb = QPushButton(flbl)
+            fb.setObjectName("ntChipBtn")
+            fb.setCheckable(True)
+            fb.setChecked(fkey == "all")
+            fb.setCursor(Qt.CursorShape.PointingHandCursor)
+            fb.clicked.connect(lambda _=False, k=fkey: self._set_library_filter(k))
+            lib_pill_row.addWidget(fb)
+            self._lib_filter_btns[fkey] = fb
+        lib_pill_row.addStretch(1)
+        lib_lay.addLayout(lib_pill_row)
 
         self.meetings_list = QListWidget()
+        self.meetings_list.setObjectName("ntMeetingsList")
         self.meetings_list.setAlternatingRowColors(False)
         self.meetings_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.meetings_list.setAccessibleName("Recorded meetings library")
         self.meetings_list.setAccessibleDescription("List of recorded meetings and notes. Use arrow keys to select, Space/Enter to load.")
+        self.meetings_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.meetings_list.customContextMenuRequested.connect(self._show_meeting_context_menu)
+        self.meetings_delegate = VoxMeetingListDelegate(self.meetings_list, theme=self._theme, compact=self._library_compact)
+        self.meetings_list.setItemDelegate(self.meetings_delegate)
         self.meetings_list.currentItemChanged.connect(self._on_meeting_item_selected)
         lib_lay.addWidget(self.meetings_list, 1)
 
+        self.lib_card.setVisible(not self._sidebar_collapsed)
         self.splitter.addWidget(self.lib_card)
 
-        # --- Right Detail Panel ---
-        detail_wrap = QWidget()
-        detail_lay = QVBoxLayout(detail_wrap)
-        detail_lay.setContentsMargins(12, 0, 0, 0)
-        detail_lay.setSpacing(10)
+        # --- Pane 2: Dual-Context Stacked Canvas (Page 0: This Meeting | Page 1: Overall Intelligence) ---
+        self.context_stack = QStackedWidget()
+        self.context_stack.setMinimumWidth(0)
 
-        # Metadata & Action Bar
+        detail_wrap = QWidget()
+        detail_wrap.setMinimumWidth(0)
+        detail_lay = QVBoxLayout(detail_wrap)
+        detail_lay.setContentsMargins(6, 0, 6, 0)
+        detail_lay.setSpacing(8)
+
+        # Unified Contextual Meeting Header + Docked Media Player
         self.action_card = QFrame()
         self.action_card.setObjectName("ntCard")
+        self.action_card.setMinimumWidth(0)
         act_lay = QVBoxLayout(self.action_card)
-        act_lay.setContentsMargins(*MARGINS_CARD)
-        act_lay.setSpacing(8)
+        act_lay.setContentsMargins(12, 8, 12, 8)
+        act_lay.setSpacing(5)
 
+        # Row 1: Editable Title + Context Lock + Primary Actions
         top_meta = QHBoxLayout()
-        top_meta.setSpacing(8)
-        meta_col = QVBoxLayout()
-        meta_col.setSpacing(2)
+        top_meta.setSpacing(6)
         self.lbl_sel_title = QLineEdit("Select a call note")
         self.lbl_sel_title.setObjectName("ntSelTitleEdit")
+        self.lbl_sel_title.setFont(get_ui_font(19, 600))
+        self.lbl_sel_title.setMinimumWidth(72)
+        self.lbl_sel_title.setCursorPosition(0)
         self.lbl_sel_title.setReadOnly(True)
         self.lbl_sel_title.setFrame(False)
         self.lbl_sel_title.setPlaceholderText("Untitled Meeting")
         self.lbl_sel_title.setAccessibleName("Selected meeting title")
         self.lbl_sel_title.editingFinished.connect(self._on_selected_title_edited)
-        self.lbl_sel_meta = QLabel("Pick a recorded meeting from the left library or start a new capture.")
-        self.lbl_sel_meta.setObjectName("ntMuted")
-        meta_col.addWidget(self.lbl_sel_title)
-        meta_col.addWidget(self.lbl_sel_meta)
-        top_meta.addLayout(meta_col, 1)
+        top_meta.addWidget(self.lbl_sel_title, 1)
 
-        self.btn_reprocess = QPushButton("↻ Reprocess")
-        self.btn_reprocess.setEnabled(False)
-        self.btn_reprocess.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_reprocess.setToolTip("Re-run local Whisper transcription and summary without modifying original audio")
-        self.btn_reprocess.clicked.connect(lambda: self._on_reprocess_meeting_clicked())
-        top_meta.addWidget(self.btn_reprocess)
+        self.lbl_scope_badge = QLabel("This Meeting")
+        self.lbl_scope_badge.setObjectName("ntScopeBadge")
+        top_meta.addWidget(self.lbl_scope_badge)
 
-        self.btn_view_in_calendar = QPushButton("Calendar Event")
-        self.btn_view_in_calendar.setObjectName("secondaryBtn")
-        self.btn_view_in_calendar.setVisible(False)
-        self.btn_view_in_calendar.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_view_in_calendar.setToolTip("Open Calendar workspace")
-        self.btn_view_in_calendar.clicked.connect(self.open_calendar_requested.emit)
-        top_meta.addWidget(self.btn_view_in_calendar)
+        self.btn_split_view = QPushButton("Split ▾")
+        self.btn_split_view.setObjectName("secondaryBtn")
+        self.btn_split_view.setIconSize(QSize(14, 14))
+        self.btn_split_view.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_split_view.setToolTip("Show Summary or My Notes alongside Transcript side-by-side (Ctrl+Shift+S)")
+        self.btn_split_view.clicked.connect(self._show_split_menu)
+        top_meta.addWidget(self.btn_split_view)
 
-        self.btn_watch_video = QPushButton("Watch Video")
-        self.btn_watch_video.setObjectName("primaryBtn")
+        self.btn_watch_video = QPushButton("Video")
+        self.btn_watch_video.setObjectName("secondaryBtn")
+        self.btn_watch_video.setIconSize(QSize(14, 14))
         self.btn_watch_video.setEnabled(False)
+        self.btn_watch_video.setVisible(False)
         self.btn_watch_video.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_watch_video.setAccessibleName("Watch call video")
         self.btn_watch_video.setAccessibleDescription("Play recorded screen video for the selected meeting in default player")
         self.btn_watch_video.clicked.connect(self._open_selected_video)
         top_meta.addWidget(self.btn_watch_video)
 
-        self.btn_speakers = QPushButton("Speakers")
-        self.btn_speakers.setEnabled(False)
-        self.btn_speakers.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_speakers.setAccessibleName("Manage meeting speakers")
-        self.btn_speakers.setAccessibleDescription("Assign participant names to detected speaker diarization tracks")
-        self.btn_speakers.clicked.connect(self._assign_speakers_dialog)
-        top_meta.addWidget(self.btn_speakers)
-
         self.btn_export = QPushButton("Export")
+        self.btn_export.setObjectName("secondaryBtn")
+        self.btn_export.setIconSize(QSize(14, 14))
         self.btn_export.setEnabled(False)
         self.btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_export.setAccessibleName("Export meeting deliverables")
@@ -600,26 +930,92 @@ class NotetakerPage(QWidget):
         self.btn_export.clicked.connect(self._show_export_menu)
         top_meta.addWidget(self.btn_export)
 
-        self.btn_more = QPushButton("...")
+        self.btn_more = QPushButton("")
+        self.btn_more.setObjectName("ghostBtn")
         self.btn_more.setEnabled(False)
-        self.btn_more.setFixedWidth(34)
+        self.btn_more.setFixedSize(30, 30)
+        self.btn_more.setIconSize(QSize(16, 16))
+        self.btn_more.setToolTip("More meeting options (Reprocess, Move to Folder, Reveal, Delete)")
         self.btn_more.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_more.setAccessibleName("More meeting actions")
-        self.btn_more.setAccessibleDescription("Open options menu to move to folder, reveal recording in Explorer, or delete")
+        self.btn_more.setAccessibleDescription("Open options menu to reprocess, rename speakers, move to folder, reveal recording, or delete")
         self.btn_more.clicked.connect(self._show_more_menu)
         top_meta.addWidget(self.btn_more)
         act_lay.addLayout(top_meta)
 
-        # Inline Audio Playback Strip
+        # Row 2: Unclipped Human-Readable Metadata + Contextual Actions
+        sub_meta_row = QHBoxLayout()
+        sub_meta_row.setSpacing(6)
+        self.lbl_sel_meta = QLabel("Pick a recorded meeting from the left library or start a new capture.")
+        self.lbl_sel_meta.setObjectName("ntMuted")
+        self.lbl_sel_meta.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_sel_meta.setMinimumWidth(0)
+        sub_meta_row.addWidget(self.lbl_sel_meta, 1)
+
+        self.btn_reprocess = QPushButton("↻ Reprocess")
+        self.btn_reprocess.setEnabled(False)
+        self.btn_reprocess.setVisible(False)
+        self.btn_reprocess.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_reprocess.setToolTip("Re-run local transcription and summary without modifying original audio")
+        self.btn_reprocess.clicked.connect(lambda: self._on_reprocess_meeting_clicked())
+        sub_meta_row.addWidget(self.btn_reprocess)
+
+        self.btn_view_in_calendar = QPushButton("Calendar Event")
+        self.btn_view_in_calendar.setObjectName("ghostBtn")
+        self.btn_view_in_calendar.setIconSize(QSize(13, 13))
+        self.btn_view_in_calendar.setVisible(False)
+        self.btn_view_in_calendar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_view_in_calendar.setToolTip("Open Calendar workspace")
+        self.btn_view_in_calendar.clicked.connect(self.open_calendar_requested.emit)
+        sub_meta_row.addWidget(self.btn_view_in_calendar)
+
+        self.btn_speakers = QPushButton("Speakers")
+        self.btn_speakers.setObjectName("ghostBtn")
+        self.btn_speakers.setIconSize(QSize(14, 14))
+        self.btn_speakers.setEnabled(False)
+        self.btn_speakers.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_speakers.setAccessibleName("Manage meeting speakers")
+        self.btn_speakers.setAccessibleDescription("Assign participant names to detected speaker diarization tracks")
+        self.btn_speakers.clicked.connect(self._assign_speakers_dialog)
+        sub_meta_row.addWidget(self.btn_speakers)
+        act_lay.addLayout(sub_meta_row)
+
+        # Docked Compact Audio Scrubber Strip
         player_row = QHBoxLayout()
-        player_row.setSpacing(8)
-        self.btn_play_pause = QPushButton("Play Audio")
+        player_row.setSpacing(6)
+        self.btn_play_pause = QPushButton("")
+        self.btn_play_pause.setObjectName("ntPlayBtn")
+        self.btn_play_pause.setFixedSize(30, 30)
+        self.btn_play_pause.setIconSize(QSize(14, 14))
         self.btn_play_pause.setEnabled(False)
         self.btn_play_pause.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_play_pause.setToolTip("Play audio")
         self.btn_play_pause.setAccessibleName("Toggle audio playback")
         self.btn_play_pause.setAccessibleDescription("Play or pause audio playback for the selected meeting")
         self.btn_play_pause.clicked.connect(self._toggle_media_playback)
         player_row.addWidget(self.btn_play_pause)
+
+        self.btn_skip_back = QPushButton("")
+        self.btn_skip_back.setObjectName("ghostBtn")
+        self.btn_skip_back.setFixedSize(26, 26)
+        self.btn_skip_back.setIconSize(QSize(14, 14))
+        self.btn_skip_back.setEnabled(False)
+        self.btn_skip_back.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_skip_back.setToolTip("Skip back 10 seconds")
+        self.btn_skip_back.setAccessibleName("Skip back 10 seconds")
+        self.btn_skip_back.clicked.connect(lambda: self._skip_media_delta(-10.0))
+        player_row.addWidget(self.btn_skip_back)
+
+        self.btn_skip_forward = QPushButton("")
+        self.btn_skip_forward.setObjectName("ghostBtn")
+        self.btn_skip_forward.setFixedSize(26, 26)
+        self.btn_skip_forward.setIconSize(QSize(14, 14))
+        self.btn_skip_forward.setEnabled(False)
+        self.btn_skip_forward.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_skip_forward.setToolTip("Skip forward 10 seconds")
+        self.btn_skip_forward.setAccessibleName("Skip forward 10 seconds")
+        self.btn_skip_forward.clicked.connect(lambda: self._skip_media_delta(10.0))
+        player_row.addWidget(self.btn_skip_forward)
 
         self.media_slider = QSlider(Qt.Orientation.Horizontal)
         self.media_slider.setEnabled(False)
@@ -630,12 +1026,21 @@ class NotetakerPage(QWidget):
 
         self.lbl_media_time = QLabel("00:00 / 00:00")
         self.lbl_media_time.setObjectName("ntMuted")
+        self.lbl_media_time.setFont(get_ui_font(11, 500, mono=True))
         player_row.addWidget(self.lbl_media_time)
+
+        self.btn_playback_speed = QPushButton("1.0x")
+        self.btn_playback_speed.setObjectName("ntChipBtn")
+        self.btn_playback_speed.setFixedWidth(46)
+        self.btn_playback_speed.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_playback_speed.setToolTip("Cycle audio playback speed (1.0x / 1.25x / 1.5x / 2.0x)")
+        self.btn_playback_speed.clicked.connect(self._cycle_playback_speed)
+        player_row.addWidget(self.btn_playback_speed)
         act_lay.addLayout(player_row)
 
         detail_lay.addWidget(self.action_card)
 
-        # Embedded Empty State Card (Shown when 0 meetings exist or none selected)
+        # Embedded Empty State Card
         self.empty_card = VoxEmptyStateWidget(
             icon="🎙️",
             title="No Meeting Notes Recorded Yet",
@@ -650,17 +1055,170 @@ class NotetakerPage(QWidget):
         self.empty_card.action_clicked.connect(self._on_toggle_recording_clicked)
         detail_lay.addWidget(self.empty_card, 1)
 
-        # Embedded Studio Workspace
-        self.studio = VoxMeetingStudioWorkspace(parent=detail_wrap, theme=self._theme, db=self.controller.db)
+        # Embedded Strictly-Scoped Meeting Studio Workspace
+        self.studio = VoxMeetingStudioWorkspace(
+            parent=detail_wrap,
+            theme=self._theme,
+            db=self.controller.db,
+            embedded_mode=True,
+            strict_meeting_scope=True,
+        )
+        self.studio.setMinimumWidth(0)
+        self.studio.set_split_mode(self._split_mode)
         self.studio.tab_summary.ask_vox_submitted.connect(self._on_studio_ask_submitted)
-        self.studio.ask_rail_submitted.connect(self._on_studio_ask_rail_submitted)
+        if hasattr(self.studio, "ask_rail_scoped_submitted"):
+            self.studio.ask_rail_scoped_submitted.connect(self._on_studio_ask_rail_scoped_submitted)
+        else:
+            self.studio.ask_rail_submitted.connect(self._on_studio_ask_rail_submitted)
+        if hasattr(self.studio, "tab_knowledge"):
+            self.studio.tab_knowledge.rebuild_requested.connect(self._on_rebuild_knowledge_index_requested)
+            if hasattr(self.studio.tab_knowledge, "rebuild_with_extract_requested"):
+                self.studio.tab_knowledge.rebuild_with_extract_requested.connect(
+                    self._on_rebuild_knowledge_index_requested
+                )
+            if hasattr(self.studio.tab_knowledge, "open_meeting_requested"):
+                self.studio.tab_knowledge.open_meeting_requested.connect(self._open_meeting_at_seconds)
+            if hasattr(self.studio.tab_knowledge, "open_overall_knowledge_requested"):
+                self.studio.tab_knowledge.open_overall_knowledge_requested.connect(
+                    lambda: (self.set_workspace_context("overall"), self.overall_view.set_subview("knowledge"))
+                )
+        if hasattr(self.studio.tab_transcript, "speaker_renamed"):
+            self.studio.tab_transcript.speaker_renamed.connect(self._on_studio_speaker_renamed)
+        if hasattr(self.studio, "meeting_mutated"):
+            self.studio.meeting_mutated.connect(lambda _mid: self.refresh_meetings_list())
         self.studio.seek_requested.connect(self._seek_to_seconds)
         self.studio.tab_transcript.seek_requested.connect(self._seek_to_seconds)
         self.studio.tab_thoughts.seek_requested.connect(self._seek_to_seconds)
         detail_lay.addWidget(self.studio, 1)
 
-        self.splitter.addWidget(detail_wrap)
-        self.splitter.setSizes([300, 760])
+        self.context_stack.addWidget(detail_wrap)  # index 0: "meeting"
+
+        # Overall Meeting Intelligence View (index 1: "overall")
+        self.overall_view = VoxOverallIntelligenceView(
+            db=self.controller.db,
+            engine=getattr(self.controller, "intelligence", None),
+            theme=self._theme,
+            parent=self.context_stack,
+        )
+        self.overall_view.setMinimumWidth(0)
+        self.overall_view.open_meeting_requested.connect(self._open_meeting_at_seconds)
+        self.overall_view.scope_changed.connect(self._on_overall_scope_changed)
+        self.overall_view.ask_overall_requested.connect(self._ask_from_overall_view)
+        self.overall_view.rebuild_knowledge_requested.connect(self._on_rebuild_knowledge_index_requested)
+        self.context_stack.addWidget(self.overall_view)
+
+        self.splitter.addWidget(self.context_stack)
+
+        # --- Pane 3: Unified Context-Locked Ask VOX Right Rail ---
+        self.ask_rail = QFrame()
+        self.ask_rail.setObjectName("ntAskRail")
+        self.ask_rail.setMinimumWidth(320)
+        self.ask_rail.setMaximumWidth(480)
+        ar_lay = QVBoxLayout(self.ask_rail)
+        ar_lay.setContentsMargins(12, 10, 12, 10)
+        ar_lay.setSpacing(8)
+
+        ar_hdr = QHBoxLayout()
+        ar_hdr.setSpacing(6)
+        self.lbl_ask_rail_icon = QLabel()
+        self.lbl_ask_rail_icon.setFixedSize(18, 18)
+        ar_hdr.addWidget(self.lbl_ask_rail_icon)
+        self.lbl_ask_rail_title = QLabel("Ask VOX")
+        self.lbl_ask_rail_title.setFont(get_ui_font(15, 600))
+        ar_hdr.addWidget(self.lbl_ask_rail_title)
+        ar_hdr.addStretch(1)
+        self.combo_ask_depth = QComboBox()
+        self.combo_ask_depth.addItem("Concise", "concise")
+        self.combo_ask_depth.addItem("Detailed", "detailed")
+        ar_hdr.addWidget(self.combo_ask_depth)
+        self.btn_ask_close = QPushButton("")
+        self.btn_ask_close.setFixedSize(28, 28)
+        self.btn_ask_close.setIconSize(QSize(14, 14))
+        self.btn_ask_close.setObjectName("ghostBtn")
+        self.btn_ask_close.setToolTip("Collapse Ask VOX assistant")
+        self.btn_ask_close.setAccessibleName("Close Ask VOX rail")
+        self.btn_ask_close.clicked.connect(lambda: self._toggle_ask_rail(False))
+        ar_hdr.addWidget(self.btn_ask_close)
+        ar_lay.addLayout(ar_hdr)
+
+        # Prominent Context Lock Indicator
+        self.lbl_ask_scope_badge = QLabel("This Meeting")
+        self.lbl_ask_scope_badge.setObjectName("ntAskScopeLock")
+        self.lbl_ask_scope_badge.setWordWrap(True)
+        ar_lay.addWidget(self.lbl_ask_scope_badge)
+
+        # Action toolbar
+        ar_tools = QHBoxLayout()
+        ar_tools.setSpacing(6)
+        self.btn_ask_copy_ans = QPushButton("Copy Answer")
+        self.btn_ask_copy_ans.setObjectName("ntChipBtn")
+        self.btn_ask_copy_ans.setIconSize(QSize(12, 12))
+        self.btn_ask_copy_ans.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ask_copy_ans.clicked.connect(lambda: self._copy_ask_answer(with_sources=False))
+        ar_tools.addWidget(self.btn_ask_copy_ans)
+
+        self.btn_ask_copy_src = QPushButton("Copy w/ Sources")
+        self.btn_ask_copy_src.setObjectName("ntChipBtn")
+        self.btn_ask_copy_src.setIconSize(QSize(12, 12))
+        self.btn_ask_copy_src.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ask_copy_src.clicked.connect(lambda: self._copy_ask_answer(with_sources=True))
+        ar_tools.addWidget(self.btn_ask_copy_src)
+        ar_tools.addStretch(1)
+
+        self.btn_ask_clear = QPushButton("Clear")
+        self.btn_ask_clear.setObjectName("ghostBtn")
+        self.btn_ask_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ask_clear.clicked.connect(self._clear_current_ask_thread)
+        ar_tools.addWidget(self.btn_ask_clear)
+        ar_lay.addLayout(ar_tools)
+
+        # Starter prompt chips (context-reactive)
+        chips_wrap = QHBoxLayout()
+        chips_wrap.setSpacing(4)
+        self._ask_chip_btns: List[QPushButton] = []
+        for idx in range(3):
+            cb = QPushButton("")
+            cb.setObjectName("ntChipBtn")
+            cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            cb.clicked.connect(lambda _=False, i=idx: self._on_ask_chip_clicked(i))
+            chips_wrap.addWidget(cb)
+            self._ask_chip_btns.append(cb)
+        chips_wrap.addStretch(1)
+        ar_lay.addLayout(chips_wrap)
+
+        self.ask_rail_browser = QTextBrowser()
+        self.ask_rail_browser.setObjectName("ntAskBrowser")
+        self.ask_rail_browser.setOpenExternalLinks(False)
+        self.ask_rail_browser.setFrameShape(QFrame.Shape.NoFrame)
+        self.ask_rail_browser.anchorClicked.connect(self._on_ask_anchor_clicked)
+        ar_lay.addWidget(self.ask_rail_browser, 1)
+
+        ask_inp_row = QHBoxLayout()
+        ask_inp_row.setSpacing(6)
+        self.txt_ask_rail = QLineEdit()
+        self.txt_ask_rail.setObjectName("voxSearchField")
+        self.txt_ask_rail.setPlaceholderText("Ask about this meeting...")
+        self.txt_ask_rail.returnPressed.connect(self._submit_ask_rail_input)
+        ask_inp_row.addWidget(self.txt_ask_rail, 1)
+
+        self.btn_ask_rail_send = QPushButton("Ask")
+        self.btn_ask_rail_send.setObjectName("fathomBtn")
+        self.btn_ask_rail_send.setIconSize(QSize(13, 13))
+        self.btn_ask_rail_send.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ask_rail_send.clicked.connect(self._submit_ask_rail_input)
+        ask_inp_row.addWidget(self.btn_ask_rail_send)
+        ar_lay.addLayout(ask_inp_row)
+
+        self.ask_rail.setVisible(self._ask_rail_open)
+        if hasattr(self, "studio") and hasattr(self.studio, "tab_summary") and hasattr(self.studio.tab_summary, "ask_box"):
+            self.studio.tab_summary.ask_box.setVisible(not self._ask_rail_open)
+        if hasattr(self, "overall_view") and hasattr(self.overall_view, "prompt_strip_card"):
+            self.overall_view.prompt_strip_card.setVisible(not self._ask_rail_open)
+        self.splitter.addWidget(self.ask_rail)
+
+        cfg = getattr(self.controller, "config", None)
+        lib_w = max(240, min(380, int(getattr(cfg, "notetaker_library_width", 285) or 285)))
+        self.splitter.setSizes([lib_w, 760, 350])
         root.addWidget(self.splitter, 1)
 
     # ------------------------------------------------------------------
@@ -672,6 +1230,50 @@ class NotetakerPage(QWidget):
         self._refresh_calendar_strip()
         self.refresh_folders()
         self.refresh_meetings_list()
+        if hasattr(self, "overall_view"):
+            self.overall_view.refresh_folders()
+            if self._workspace_context == "overall":
+                self.overall_view.refresh_data()
+            else:
+                self.overall_view._needs_refresh = True
+        self._refresh_ask_rail_ui()
+
+    def _update_finalization_timer(self) -> None:
+        if self._fin_started_mono is None:
+            return
+        elapsed = max(0.0, time.monotonic() - self._fin_started_mono)
+        if hasattr(self, "lbl_rec_timer"):
+            self.lbl_rec_timer.setText(format_seconds_hms(elapsed))
+
+    def _on_media_error(self, _err: Any, err_str: str = "") -> None:
+        msg = (err_str or "").strip()
+        if msg:
+            logger.debug("Media player warning: %s", msg)
+
+    def _apply_pending_media_source(self) -> None:
+        res_audio = getattr(self, "_pending_media_path", None)
+        target_str = QUrl.fromLocalFile(str(res_audio)).toString() if res_audio is not None else ""
+        if target_str == self._loaded_media_url:
+            return
+        self._loaded_media_url = target_str
+        if res_audio is not None:
+            self.media_player.setSource(QUrl.fromLocalFile(str(res_audio)))
+        else:
+            self.media_player.setSource(QUrl())
+
+    def teardown(self) -> None:
+        for attr in ("_search_debounce_timer", "_media_probe_timer", "_fin_elapsed_timer"):
+            tmr = getattr(self, attr, None)
+            if tmr is not None and tmr.isActive():
+                tmr.stop()
+        try:
+            self.media_player.stop()
+        except Exception:
+            pass
+
+    def closeEvent(self, event: Any) -> None:
+        self.teardown()
+        super().closeEvent(event)
 
     def _on_auto_start_turn_on(self) -> None:
         if self.controller and hasattr(self.controller, "config"):
@@ -741,18 +1343,27 @@ class NotetakerPage(QWidget):
             else:
                 self._cached_calendar_meetings = []
         self._render_calendar_strip()
+        cnt = len(self._cached_calendar_meetings)
+        if hasattr(self, "btn_upcoming_pill"):
+            self.btn_upcoming_pill.setText(f"Upcoming ({cnt})")
+        if hasattr(self, "cal_card"):
+            self.cal_card.setVisible(cnt > 0 or bool(getattr(self, "_cal_user_toggled", False)))
 
     def _render_calendar_strip(self) -> None:
         while self.cal_content.count():
             item = self.cal_content.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
         while self.cal_providers_layout.count():
             item = self.cal_providers_layout.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
         engine = getattr(self.controller, "calendar_engine", None) or getattr(self.controller, "calendar_manager", None)
@@ -996,8 +1607,9 @@ class NotetakerPage(QWidget):
                 self._silent_loopback_since = None
 
         if rec:
-            live_badge = self._format_live_engine_badge()
-            self.lbl_rec_dot.setText(f"● {live_badge}")
+            self.lbl_rec_dot.setText("● Recording Dual-Track English Audio")
+            if hasattr(self, "lbl_rec_live"):
+                self.lbl_rec_live.setText("Post-call English transcription & AI intelligence runs automatically after stop")
             self.btn_pause_rec.setVisible(True)
             self.btn_stop_rec.setVisible(True)
             self.btn_pause_rec.setText("Pause")
@@ -1010,7 +1622,7 @@ class NotetakerPage(QWidget):
                 except Exception:
                     pass
         elif paused:
-            self.lbl_rec_dot.setText("❚❚ Notetaker Paused (Transcript Provisional)")
+            self.lbl_rec_dot.setText("❚❚ Notetaker Paused (Post-Call Transcription Queued on Stop)")
             self.btn_pause_rec.setVisible(True)
             self.btn_stop_rec.setVisible(True)
             self.btn_pause_rec.setText("Resume")
@@ -1021,8 +1633,15 @@ class NotetakerPage(QWidget):
             self.btn_pause_rec.setVisible(False)
             self.btn_stop_rec.setVisible(False)
             self.btn_start_adhoc.setText("Finalizing...")
+            if self._fin_started_mono is None:
+                self._fin_started_mono = time.monotonic()
+            if not self._fin_elapsed_timer.isActive():
+                self._fin_elapsed_timer.start()
         else:
             self._silent_loopback_since = None
+            self._fin_started_mono = None
+            if hasattr(self, "_fin_elapsed_timer") and self._fin_elapsed_timer.isActive():
+                self._fin_elapsed_timer.stop()
             if hasattr(self, "lbl_capture_anomaly"):
                 self.lbl_capture_anomaly.setVisible(False)
             self.btn_pause_rec.setVisible(True)
@@ -1032,67 +1651,67 @@ class NotetakerPage(QWidget):
             if hasattr(self, "lbl_rec_live"):
                 self.lbl_rec_live.setText("")
 
-    def _should_stream_to_active_studio(self, meeting_id: int) -> bool:
-        if self._selected_meeting_id is not None:
-            return int(meeting_id) == int(self._selected_meeting_id)
-        active_mid = getattr(self.controller, "active_meeting_id", None)
-        return active_mid is not None and int(meeting_id) == int(active_mid)
-
-    def _format_live_engine_badge(self, payload: Optional[dict] = None) -> str:
-        """Honestly display Incremental vs Endpointed mode and active backend/device."""
-        exec_mode = ""
-        backend = ""
-        device = ""
-        if isinstance(payload, dict) and payload:
-            exec_mode = str(payload.get("execution_mode") or "").strip().lower()
-            backend = str(payload.get("asr_backend") or "").strip().lower()
-            device = str(payload.get("asr_device") or "").strip().upper()
-        if not exec_mode and hasattr(self.controller, "streaming_transcriber"):
-            st = getattr(self.controller, "streaming_transcriber", None)
-            if st is not None and hasattr(st, "get_active_live_identity"):
+    def _on_knowledge_updated(self) -> None:
+        if hasattr(self, "studio") and hasattr(self.studio, "tab_knowledge"):
+            try:
+                self.studio.tab_knowledge.refresh_items()
+            except Exception:
+                pass
+        if hasattr(self, "overall_view"):
+            if self._workspace_context == "overall":
                 try:
-                    info = st.get_active_live_identity()
-                    exec_mode = str(info.get("execution_mode") or "").strip().lower()
-                    backend = str(info.get("asr_backend") or "").strip().lower()
-                    device = str(info.get("asr_device") or "").strip().upper()
+                    self.overall_view.refresh_data()
                 except Exception:
                     pass
-        mode_lbl = "Incremental" if exec_mode == "incremental" else "Endpointed"
-        if backend == "nemotron_onnx":
-            eng_lbl = f"Nemotron {device or 'CPU'}"
-        elif backend == "qwen3_onnx":
-            eng_lbl = f"Guarded Qwen3 {device or 'CPU'}"
-        elif backend == "parakeet_onnx":
-            eng_lbl = f"Parakeet {device or 'CPU'}"
-        else:
-            eng_lbl = f"Whisper {device or 'CPU'}"
-        return f"Live Preview (Provisional) · {mode_lbl} ({eng_lbl})"
+            else:
+                self.overall_view._needs_refresh = True
 
-    def _on_live_meeting_partial(self, meeting_id: int, partial_dict: dict) -> None:
-        txt = str((partial_dict or {}).get("text", "")).strip()
-        spk = str((partial_dict or {}).get("speaker", "Speaker")).strip() or "Speaker"
-        if partial_dict and hasattr(self, "lbl_rec_dot") and getattr(self.controller, "is_meeting_recording", False):
-            self.lbl_rec_dot.setText(f"● {self._format_live_engine_badge(partial_dict)}")
-        if getattr(self, "lbl_rec_live", None) is not None and txt:
-            tag = "…" if (partial_dict or {}).get("execution_mode") == "incremental" else "●"
-            self.lbl_rec_live.setText(f"{tag} {spk}: {txt}")
-        if hasattr(self, "studio") and self._should_stream_to_active_studio(meeting_id):
-            self.studio.tab_transcript.set_live_partial(spk, txt)
-
-    def _on_live_meeting_confirmed(self, meeting_id: int, conf_dict: dict) -> None:
-        txt = str((conf_dict or {}).get("text", "")).strip()
-        spk = str((conf_dict or {}).get("speaker", "Speaker")).strip() or "Speaker"
-        if conf_dict and hasattr(self, "lbl_rec_dot") and getattr(self.controller, "is_meeting_recording", False):
-            self.lbl_rec_dot.setText(f"● {self._format_live_engine_badge(conf_dict)}")
-        if getattr(self, "lbl_rec_live", None) is not None and txt:
-            self.lbl_rec_live.setText(f"✓ {spk}: {txt}")
-        self._on_live_meeting_segment(meeting_id, conf_dict)
-
-    def _on_live_meeting_segment(self, meeting_id: int, seg_dict: dict) -> None:
-        if not seg_dict:
+    def _on_rebuild_knowledge_index_requested(self, extract_current: bool = False) -> None:
+        ctrl = getattr(self, "controller", None)
+        if ctrl is None or not hasattr(ctrl, "rebuild_knowledge_index"):
             return
-        if hasattr(self, "studio") and self._should_stream_to_active_studio(meeting_id):
-            self.studio.tab_transcript.append_live_segment(seg_dict)
+        self.status_toast.emit("Knowledge Index", "Refreshing search index & knowledge...")
+        sel_mid = self._selected_meeting_id if extract_current else None
+
+        def _worker() -> None:
+            try:
+                try:
+                    stats = ctrl.rebuild_knowledge_index(extract_missing_for_meeting_id=sel_mid)
+                except TypeError:
+                    stats = ctrl.rebuild_knowledge_index()
+                msg = (
+                    f"Indexed {stats.get('meetings_indexed', 0)} meetings "
+                    f"({stats.get('chunks_indexed', 0)} chunks)."
+                )
+                if hasattr(self, "studio") and hasattr(self.studio, "tab_knowledge"):
+                    QTimer.singleShot(
+                        0,
+                        lambda m=msg: self.studio.tab_knowledge.set_rebuild_progress(False, m),
+                    )
+                self.status_toast.emit("Knowledge Index Ready", msg)
+            except Exception as exc:
+                if hasattr(self, "studio") and hasattr(self.studio, "tab_knowledge"):
+                    QTimer.singleShot(
+                        0,
+                        lambda e=str(exc): self.studio.tab_knowledge.set_rebuild_progress(False, f"Error: {e}"),
+                    )
+                self.status_toast.emit("Knowledge Index Error", str(exc))
+
+        threading.Thread(target=_worker, name="NotetakerRebuildKnowledge", daemon=True).start()
+
+    def _on_studio_speaker_renamed(self, old_name: str, new_name: str) -> None:
+        mid = self._selected_meeting_id
+        ctrl = getattr(self, "controller", None)
+        if mid is None or ctrl is None:
+            return
+        if hasattr(ctrl, "rename_meeting_speaker_and_reindex"):
+            try:
+                ctrl.rename_meeting_speaker_and_reindex(int(mid), old_name, new_name)
+                self.select_meeting(int(mid))
+                self.refresh_meetings_list()
+                self.status_toast.emit("Speaker Renamed", f"{old_name} → {new_name} synced across Summary & Knowledge")
+            except Exception as exc:
+                self.status_toast.emit("Rename Error", str(exc))
 
     def _on_meeting_tick(self, elapsed_sec: float, *extra: Any) -> None:
         t_val = float(elapsed_sec or 0.0)
@@ -1185,6 +1804,187 @@ class NotetakerPage(QWidget):
         else:
             self.controller.pause_meeting_recording()
 
+    def _persist_ui_pref(self, key: str, value: Any) -> None:
+        cfg = getattr(self.controller, "config", None)
+        if cfg is not None and hasattr(cfg, key):
+            try:
+                setattr(cfg, key, value)
+                if hasattr(cfg, "save"):
+                    cfg.save()
+            except Exception:
+                pass
+
+    def _dismiss_interrupted_banner(self) -> None:
+        self._interrupted_dismissed = True
+        if hasattr(self, "interrupted_banner"):
+            self.interrupted_banner.setVisible(False)
+        if hasattr(self, "btn_rescued_pill") and self._first_interrupted_id is not None:
+            self.btn_rescued_pill.setVisible(True)
+
+    def _toggle_upcoming_card(self) -> None:
+        self._cal_user_toggled = bool(self.btn_upcoming_pill.isChecked())
+        if hasattr(self, "cal_card"):
+            show = self._cal_user_toggled or bool(self._cached_calendar_meetings)
+            self.cal_card.setVisible(show)
+
+    def _toggle_sidebar_collapsed(self, collapsed: Optional[bool] = None) -> None:
+        if collapsed is None:
+            self._sidebar_collapsed = not self._sidebar_collapsed
+        else:
+            self._sidebar_collapsed = bool(collapsed)
+        if hasattr(self, "lib_card"):
+            self.lib_card.setVisible(not self._sidebar_collapsed)
+        if hasattr(self, "btn_toggle_sidebar"):
+            self.btn_toggle_sidebar.blockSignals(True)
+            self.btn_toggle_sidebar.setChecked(not self._sidebar_collapsed)
+            self.btn_toggle_sidebar.blockSignals(False)
+        self._persist_ui_pref("notetaker_library_collapsed", self._sidebar_collapsed)
+
+    def set_workspace_context(self, mode: str) -> None:
+        norm = "overall" if str(mode or "").strip().lower() == "overall" else "meeting"
+        self._workspace_context = norm
+        if hasattr(self, "mode_switcher"):
+            self.mode_switcher.set_current(norm, emit=False)
+        if hasattr(self, "context_stack"):
+            self.context_stack.setCurrentIndex(1 if norm == "overall" else 0)
+        if norm == "overall" and hasattr(self, "overall_view"):
+            self.overall_view.refresh_folders()
+            self.overall_view.refresh_data()
+        self._refresh_ask_rail_ui()
+
+    def _open_meeting_at_seconds(self, meeting_id: int, seconds: float = 0.0) -> None:
+        self.set_workspace_context("meeting")
+        self.select_meeting(int(meeting_id))
+        if float(seconds or 0.0) > 0.0:
+            self._seek_to_seconds(float(seconds))
+            if hasattr(self, "studio") and hasattr(self.studio, "unified_tabs"):
+                self.studio.unified_tabs.setCurrentIndex(1)
+
+    def _on_overall_scope_changed(self, meeting_ids: object, scope_label: str) -> None:
+        self._overall_scope_ids = list(meeting_ids) if isinstance(meeting_ids, list) else None
+        self._overall_scope_label = str(scope_label or "All Recorded Meetings")
+        self._refresh_ask_rail_ui()
+
+    def _ask_from_overall_view(self, query: str) -> None:
+        self.set_workspace_context("overall")
+        self._toggle_ask_rail(True)
+        clean_q = str(query or "").strip()
+        if clean_q:
+            self.txt_ask_rail.setText(clean_q)
+            self._submit_ask_rail_input()
+
+    def _on_sort_changed(self) -> None:
+        if hasattr(self, "combo_sort"):
+            self._library_sort = str(self.combo_sort.currentData() or "newest")
+        self.refresh_meetings_list()
+
+    def _toggle_library_density(self) -> None:
+        self._library_compact = not self._library_compact
+        if hasattr(self, "btn_density"):
+            self.btn_density.blockSignals(True)
+            self.btn_density.setChecked(self._library_compact)
+            t = get_theme_tokens(self._theme)
+            self.btn_density.setIcon(
+                get_icon("density_compact" if self._library_compact else "density_comfy", t.get("text_secondary", "#475569"), 15)
+            )
+            self.btn_density.blockSignals(False)
+        if hasattr(self, "meetings_delegate"):
+            self.meetings_delegate.set_compact(self._library_compact)
+        self._persist_ui_pref("notetaker_library_compact", self._library_compact)
+        self.refresh_meetings_list()
+
+    def _set_library_filter(self, filter_key: str) -> None:
+        self._library_filter = filter_key
+        if hasattr(self, "_lib_filter_btns"):
+            for k, btn in self._lib_filter_btns.items():
+                btn.setChecked(k == filter_key)
+        self.refresh_meetings_list()
+
+    def _show_split_menu(self) -> None:
+        menu = QMenu(self)
+        opts = (
+            ("off", "Single View"),
+            ("summary_transcript", "Summary + Transcript"),
+            ("notes_transcript", "My Notes + Transcript"),
+        )
+        for key, label in opts:
+            act = menu.addAction(("✓ " if self._split_mode == key else "   ") + label)
+            act.triggered.connect(lambda _=False, k=key: self.set_split_mode(k))
+        menu.exec(self.btn_split_view.mapToGlobal(self.btn_split_view.rect().bottomLeft()))
+
+    def set_split_mode(self, mode: str) -> None:
+        valid = {"off", "summary_transcript", "notes_transcript"}
+        self._split_mode = mode if mode in valid else "off"
+        if hasattr(self, "btn_split_view"):
+            lbl_map = {
+                "off": "Split ▾",
+                "summary_transcript": "Split: Summary ▾",
+                "notes_transcript": "Split: Notes ▾",
+            }
+            self.btn_split_view.setText(lbl_map.get(self._split_mode, "Split ▾"))
+        if hasattr(self, "studio") and hasattr(self.studio, "set_split_mode"):
+            self.studio.set_split_mode(self._split_mode)
+        if hasattr(self, "splitter") and self._split_mode != "off" and self._ask_rail_open:
+            self.splitter.setSizes([240, 880, 320])
+        self._persist_ui_pref("notetaker_split_mode", self._split_mode)
+
+    def _cycle_playback_speed(self) -> None:
+        self._playback_rate_idx = (self._playback_rate_idx + 1) % len(self._playback_rates)
+        rate = self._playback_rates[self._playback_rate_idx]
+        try:
+            self.media_player.setPlaybackRate(rate)
+        except Exception:
+            pass
+        if hasattr(self, "btn_playback_speed"):
+            self.btn_playback_speed.setText(f"{rate:g}x")
+
+    @staticmethod
+    def _date_group_for_meeting(m: Dict[str, Any]) -> str:
+        raw = str(m.get("started_at") or m.get("created_at") or "").strip()
+        if not raw:
+            return "EARLIER"
+        try:
+            clean = raw[:19].replace("T", " ")
+            dt = datetime.strptime(clean, "%Y-%m-%d %H:%M:%S")
+            today = datetime.now().date()
+            d = dt.date()
+            delta = (today - d).days
+            if delta <= 0:
+                return "TODAY"
+            if delta == 1:
+                return "YESTERDAY"
+            if delta <= 7:
+                return "THIS WEEK"
+        except Exception:
+            pass
+        return "EARLIER"
+
+    def _show_meeting_context_menu(self, pos: Any) -> None:
+        item = self.meetings_list.itemAt(pos)
+        if item is None:
+            return
+        mid = item.data(Qt.ItemDataRole.UserRole)
+        if mid is None:
+            return
+        self.select_meeting(int(mid))
+        menu = QMenu(self)
+        act_open = menu.addAction("Open in This Meeting")
+        act_open.triggered.connect(lambda: self._open_meeting_at_seconds(int(mid), 0.0))
+        act_reproc = menu.addAction("↻ Recover && Re-Transcribe")
+        m = self.controller.db.get_meeting(int(mid)) if hasattr(self.controller, "db") else None
+        act_reproc.setEnabled(bool(m and self._resolve_audio_path(m) is not None))
+        act_reproc.triggered.connect(lambda: self._on_reprocess_meeting_clicked(int(mid)))
+        act_move = menu.addAction("Move to Folder...")
+        act_move.triggered.connect(self._move_selected_to_folder)
+        act_exp = menu.addAction("Export Markdown (.md)...")
+        act_exp.triggered.connect(lambda: self._export_format("md"))
+        act_rev = menu.addAction("Reveal Recording Folder")
+        act_rev.triggered.connect(self._reveal_recording_folder)
+        menu.addSeparator()
+        act_del = menu.addAction("Delete Recording")
+        act_del.triggered.connect(self._delete_selected_meeting)
+        menu.exec(self.meetings_list.viewport().mapToGlobal(pos))
+
     def refresh_folders(self) -> None:
         self.combo_folders.blockSignals(True)
         current = self.combo_folders.currentData()
@@ -1197,6 +1997,8 @@ class NotetakerPage(QWidget):
                 self.combo_folders.setCurrentIndex(i)
                 break
         self.combo_folders.blockSignals(False)
+        if hasattr(self, "overall_view"):
+            self.overall_view.refresh_folders()
 
     def _on_folder_filter_changed(self) -> None:
         self._active_folder_id = self.combo_folders.currentData()
@@ -1208,7 +2010,7 @@ class NotetakerPage(QWidget):
             self.controller.db.create_folder(name=name.strip(), folder_type="personal")
             self.refresh_folders()
 
-    def refresh_meetings_list(self) -> None:
+    def refresh_meetings_list(self, force: bool = False) -> None:
         if getattr(self.controller, "_cancel_ask_vox", False):
             return
         db = getattr(self.controller, "db", None)
@@ -1216,28 +2018,125 @@ class NotetakerPage(QWidget):
         if db is None or (db_path and ":memory:" not in str(db_path).lower() and not Path(str(db_path)).exists()):
             return
         q = self.txt_search.text().strip()
-        meetings = self.controller.db.list_meetings(search_query=q, folder_id=self._active_folder_id, limit=200)
+        all_meetings = self.controller.db.list_meetings(search_query=q, folder_id=self._active_folder_id, limit=300)
+
+        # Compute recoverable count across unfiltered folder/query scope
+        path_exists_cache: Dict[str, bool] = {}
+
+        def _fast_exists(raw_p: Any) -> bool:
+            s = str(raw_p or "").strip()
+            if not s:
+                return False
+            cached = path_exists_cache.get(s)
+            if cached is None:
+                cached = Path(s).exists()
+                path_exists_cache[s] = cached
+            return cached
+
         recoverable_count = 0
         first_interrupted: Optional[int] = None
+        for m in all_meetings:
+            raw_s = str(m.get("status") or "").strip().lower()
+            is_recov = raw_s in ("interrupted", "incomplete", "finalization_failed", "error", "failed")
+            if is_recov and self._resolve_audio_path(m) is not None:
+                recoverable_count += 1
+                if first_interrupted is None:
+                    first_interrupted = int(m["id"])
+
+        # Apply client-side quick status/media filter pill
+        flt = getattr(self, "_library_filter", "all")
+        meetings: List[Dict[str, Any]] = []
+        for m in all_meetings:
+            raw_s = str(m.get("status") or "").strip().lower()
+            is_recov = raw_s in ("interrupted", "incomplete", "finalization_failed", "error", "failed")
+            has_vid = _fast_exists(m.get("video_path"))
+            if flt == "completed" and raw_s != "completed":
+                continue
+            if flt == "recoverable" and not is_recov:
+                continue
+            if flt == "video" and not has_vid:
+                continue
+            meetings.append(m)
+
+        # Apply sort mode
+        sort_mode = getattr(self, "_library_sort", "newest")
+        if sort_mode == "duration":
+            meetings.sort(key=lambda x: float(x.get("duration_sec") or 0.0), reverse=True)
+        elif sort_mode == "title":
+            meetings.sort(key=lambda x: str(x.get("title") or "").lower())
+
+        list_sig = (
+            self._theme,
+            q,
+            self._active_folder_id,
+            flt,
+            sort_mode,
+            bool(self._library_compact),
+            self._selected_meeting_id,
+            recoverable_count,
+            first_interrupted,
+            bool(self._interrupted_dismissed),
+            tuple(
+                (
+                    int(m["id"]),
+                    str(m.get("title") or ""),
+                    str(m.get("status") or ""),
+                    str(m.get("post_call_stage") or ""),
+                    float(m.get("duration_sec") or 0.0),
+                    str(m.get("started_at") or ""),
+                    str(m.get("source_platform") or ""),
+                    _fast_exists(m.get("video_path")),
+                )
+                for m in meetings
+            ),
+        )
+        if not force and self._last_meetings_sig == list_sig and self.meetings_list.count() == len(meetings):
+            return
+        self._last_meetings_sig = list_sig
+
         self.meetings_list.blockSignals(True)
         self.meetings_list.clear()
+        prev_group = ""
         for m in meetings:
             dur = format_seconds_hms(float(m.get("duration_sec") or 0.0))
             date_str = str(m.get("started_at") or "")[:10]
             plat = str(m.get("source_platform") or "Call")
-            has_vid = bool(m.get("video_path") and Path(str(m.get("video_path"))).exists())
+            has_vid = _fast_exists(m.get("video_path"))
             raw_status = str(m.get("status") or "").strip().lower()
             is_recoverable = raw_status in ("interrupted", "incomplete", "finalization_failed", "error", "failed")
             badge = " · Video" if has_vid else ""
             status_badge = self._format_status_badge(raw_status, str(m.get("post_call_stage") or ""))
             if status_badge and raw_status not in ("completed", ""):
                 badge += f" · {status_badge}"
-            if is_recoverable and self._resolve_audio_path(m) is not None:
-                recoverable_count += 1
-                if first_interrupted is None:
-                    first_interrupted = int(m["id"])
-            item = QListWidgetItem(f"{m.get('title') or 'Untitled Meeting'}\n{date_str} · {dur} · {plat}{badge}")
+
+            title_text = str(m.get("title") or "Untitled Meeting")
+            sub_text = f"{date_str} · {dur} · {plat}{badge}"
+            status_kind = (
+                "recoverable"
+                if is_recoverable
+                else (
+                    "recording"
+                    if raw_status == "recording"
+                    else ("processing" if raw_status in ("transcribing", "processing", "finalizing") else "ok")
+                )
+            )
+            grp = self._date_group_for_meeting(m) if sort_mode == "newest" else ""
+            grp_header = grp if (grp and grp != prev_group) else ""
+            if grp:
+                prev_group = grp
+
+            item = QListWidgetItem(f"{title_text}\n{sub_text}")
             item.setData(Qt.ItemDataRole.UserRole, m["id"])
+            item.setData(
+                VoxMeetingListDelegate.ROLE_META,
+                {
+                    "title": title_text,
+                    "sub": sub_text,
+                    "status_kind": status_kind,
+                    "compact": self._library_compact,
+                },
+            )
+            item.setData(VoxMeetingListDelegate.ROLE_GROUP, grp_header)
             self.meetings_list.addItem(item)
             if m["id"] == self._selected_meeting_id:
                 item.setSelected(True)
@@ -1245,10 +2144,13 @@ class NotetakerPage(QWidget):
         self.meetings_list.blockSignals(False)
 
         self._first_interrupted_id = first_interrupted
+        if hasattr(self, "btn_rescued_pill"):
+            self.btn_rescued_pill.setVisible(recoverable_count > 0 and self._interrupted_dismissed)
+            self.btn_rescued_pill.setText(f"{recoverable_count} Rescued")
         if hasattr(self, "interrupted_banner"):
-            if recoverable_count > 0:
+            if recoverable_count > 0 and not self._interrupted_dismissed:
                 self.lbl_interrupted_summary.setText(
-                    f"⚠ {recoverable_count} interrupted recording{'s' if recoverable_count != 1 else ''} "
+                    f"{recoverable_count} interrupted recording{'s' if recoverable_count != 1 else ''} "
                     "rescued — original audio preserved"
                 )
                 self.interrupted_banner.setVisible(True)
@@ -1266,10 +2168,18 @@ class NotetakerPage(QWidget):
         if show_empty:
             self.lbl_sel_title.blockSignals(True)
             self.lbl_sel_title.setText("Select a call note")
+            self.lbl_sel_title.setCursorPosition(0)
             self.lbl_sel_title.setReadOnly(True)
             self.lbl_sel_title.blockSignals(False)
             if hasattr(self, "btn_reprocess"):
                 self.btn_reprocess.setEnabled(False)
+                self.btn_reprocess.setVisible(False)
+            for bname in ("btn_watch_video", "btn_speakers", "btn_export", "btn_more", "btn_play_pause", "btn_skip_back", "btn_skip_forward"):
+                b = getattr(self, bname, None)
+                if b is not None:
+                    b.setEnabled(False)
+            if hasattr(self, "btn_watch_video"):
+                self.btn_watch_video.setVisible(False)
         if hasattr(self, "empty_card"):
             self.empty_card.setVisible(show_empty)
         if hasattr(self, "action_card"):
@@ -1339,6 +2249,11 @@ class NotetakerPage(QWidget):
             self._selected_meeting_id = meeting_id
             self.refresh_meetings_list()
             self.select_meeting(meeting_id)
+            if hasattr(self, "overall_view"):
+                if self._workspace_context == "overall":
+                    self.overall_view.refresh_data()
+                else:
+                    self.overall_view._needs_refresh = True
         except Exception as exc:
             import logging
             logging.getLogger(__name__).debug("_on_meeting_saved error: %s", exc)
@@ -1348,6 +2263,7 @@ class NotetakerPage(QWidget):
             return
         mid = current.data(Qt.ItemDataRole.UserRole)
         if mid is not None:
+            self.set_workspace_context("meeting")
             self.select_meeting(int(mid))
 
     @staticmethod
@@ -1365,7 +2281,7 @@ class NotetakerPage(QWidget):
             if pc in pc_map:
                 return pc_map[pc]
         mapping = {
-            "recording": "● Live Preview (Provisional)",
+            "recording": "● Recording Audio (Post-Call)",
             "transcribing": "⏳ Finalizing...",
             "processing": "⏳ Finalizing...",
             "finalizing": "⏳ Finalizing...",
@@ -1390,29 +2306,38 @@ class NotetakerPage(QWidget):
         if not m:
             return
 
+        from voxlocal.storage.exporter import format_meeting_local_datetime
         dur = format_seconds_hms(float(m.get("duration_sec") or 0.0))
         plat = str(m.get("source_platform") or "Desktop Call")
-        date_str = str(m.get("started_at") or "")[:16].replace("T", " ")
+        date_str = format_meeting_local_datetime(
+            m.get("created_at") or m.get("started_at"),
+            str(m.get("timezone") or ""),
+        )
         cal_ev_id = str(m.get("calendar_event_id") or "")
         raw_status = str(m.get("status") or "").strip().lower()
         is_recoverable = raw_status in ("interrupted", "incomplete", "finalization_failed", "error", "failed")
 
         self.lbl_sel_title.blockSignals(True)
         self.lbl_sel_title.setText(str(m.get("title") or "Untitled Meeting"))
+        self.lbl_sel_title.setCursorPosition(0)
         self.lbl_sel_title.setReadOnly(False)
         self.lbl_sel_title.blockSignals(False)
 
-        meta_text = f"{date_str} · Duration {dur} · {plat}"
+        meta_text = f"{date_str} · {dur} · {plat}"
         post_stage = str(m.get("post_call_stage") or "").strip().lower()
         status_badge = self._format_status_badge(raw_status, post_stage)
         if status_badge:
             meta_text += f" · {status_badge}"
         eng_summary = str(m.get("post_call_engine_summary") or "").strip()
         post_msg = str(m.get("post_call_status_message") or "").strip()
-        if raw_status == "completed" and eng_summary:
-            meta_text += f" · {eng_summary}"
-        elif raw_status in ("transcribing", "processing", "finalizing") and post_msg:
+        if raw_status in ("transcribing", "processing", "finalizing") and post_msg:
             meta_text += f" · {post_msg}"
+        if cal_ev_id:
+            meta_text += " · Calendar Event"
+
+        tooltip_parts = [meta_text]
+        if eng_summary:
+            tooltip_parts.append(f"Engine: {eng_summary}")
         comp_raw = str(m.get("completeness_report_json") or "").strip()
         if comp_raw:
             try:
@@ -1428,14 +2353,14 @@ class NotetakerPage(QWidget):
                     if v is not None
                 ]
                 if cov_vals:
-                    meta_text += f" · {min(cov_vals):.0f}% audio processed"
+                    tooltip_parts.append(f"{min(cov_vals):.0f}% audio processed")
                 if unc_cnt > 0:
-                    meta_text += f" · {unc_cnt} uncertain span{'s' if unc_cnt != 1 else ''}"
+                    meta_text += f" · {unc_cnt} uncertain"
+                    tooltip_parts.append(f"{unc_cnt} uncertain span{'s' if unc_cnt != 1 else ''}")
             except Exception:
                 pass
-        if cal_ev_id:
-            meta_text += " · Linked Calendar Event"
         self.lbl_sel_meta.setText(meta_text)
+        self.lbl_sel_meta.setToolTip(" · ".join(tooltip_parts))
         if hasattr(self, "btn_view_in_calendar"):
             self.btn_view_in_calendar.setVisible(bool(cal_ev_id))
 
@@ -1443,36 +2368,46 @@ class NotetakerPage(QWidget):
         res_audio = self._resolve_audio_path(m)
         if hasattr(self, "btn_reprocess"):
             self.btn_reprocess.setEnabled(res_audio is not None)
+            self.btn_reprocess.setVisible(is_recoverable)
             if is_recoverable:
                 t_btn = get_theme_tokens(self._theme)
                 self.btn_reprocess.setText("↻ Recover & Re-Transcribe")
                 self.btn_reprocess.setStyleSheet(
                     f"background-color: {t_btn['status_warning_bg']}; color: {t_btn['status_warning_text']}; "
-                    f"border: 1px solid {t_btn['status_warning']}; border-radius: 6px; padding: 4px 10px; font-weight: 700;"
+                    f"border: 1px solid {t_btn['status_warning']}; border-radius: 7px; padding: 4px 10px; font-weight: 600;"
                 )
             else:
                 self.btn_reprocess.setText("↻ Reprocess")
                 self.btn_reprocess.setStyleSheet("")
 
         self.btn_watch_video.setEnabled(has_vid)
+        self.btn_watch_video.setVisible(has_vid)
         self.btn_watch_video.setToolTip("Play call window video recording" if has_vid else "No video recorded for this meeting")
         self.btn_speakers.setEnabled(True)
         self.btn_export.setEnabled(True)
         self.btn_more.setEnabled(True)
 
-        # Load audio player cleanly
+        # Coalesced async media load (avoids blocking rapid meeting switching in FFmpeg probe)
         self.media_player.stop()
-        if res_audio is not None:
-            self.media_player.setSource(QUrl.fromLocalFile(str(res_audio)))
+        self._pending_media_path = res_audio
+        has_audio = res_audio is not None
+        if has_audio:
             self.btn_play_pause.setEnabled(True)
             self.media_slider.setEnabled(True)
+            self._media_probe_timer.start()
         else:
+            self._media_probe_timer.stop()
+            self._loaded_media_url = ""
             self.media_player.setSource(QUrl())
             self.btn_play_pause.setEnabled(False)
             self.media_slider.setEnabled(False)
-        self.btn_play_pause.setText("Play Audio")
+        for skip_b in ("btn_skip_back", "btn_skip_forward"):
+            if hasattr(self, skip_b):
+                getattr(self, skip_b).setEnabled(has_audio)
+        self._sync_play_pause_visual(False)
 
         self.studio.load_meeting(meeting_id)
+        self._refresh_ask_rail_ui()
 
     @staticmethod
     def _resolve_audio_path(m: Dict[str, Any]) -> Optional[Path]:
@@ -1501,6 +2436,7 @@ class NotetakerPage(QWidget):
             cur = self.controller.db.get_meeting(m_id) if hasattr(self.controller, "db") else None
             self.lbl_sel_title.blockSignals(True)
             self.lbl_sel_title.setText(str((cur or {}).get("title") or "Untitled Meeting"))
+            self.lbl_sel_title.setCursorPosition(0)
             self.lbl_sel_title.blockSignals(False)
             return
         if hasattr(self.controller, "db") and hasattr(self.controller.db, "update_meeting"):
@@ -1604,8 +2540,20 @@ class NotetakerPage(QWidget):
             for old_name, edit in edits.items():
                 new_name = edit.text().strip()
                 if new_name and new_name != old_name:
-                    changed += self.controller.db.rename_meeting_speaker(self._selected_meeting_id, old_name, new_name)
+                    if hasattr(self.controller, "rename_meeting_speaker_and_reindex"):
+                        changed += int(
+                            self.controller.rename_meeting_speaker_and_reindex(
+                                self._selected_meeting_id, old_name, new_name
+                            )
+                            or 0
+                        )
+                    else:
+                        changed += self.controller.db.rename_meeting_speaker(
+                            self._selected_meeting_id, old_name, new_name
+                        )
             self.studio.load_meeting(self._selected_meeting_id)
+            if hasattr(self.studio, "tab_knowledge"):
+                self.studio.tab_knowledge.refresh_items()
             self.status_toast.emit("Speakers Updated", f"Updated {changed} transcript segments.")
 
     def _show_export_menu(self) -> None:
@@ -1654,7 +2602,9 @@ class NotetakerPage(QWidget):
         if self._selected_meeting_id is None:
             return
         menu = QMenu(self)
-        act_reprocess = menu.addAction("↻ Recover & Re-Transcribe")
+        act_speakers = menu.addAction("Manage Speakers...")
+        act_speakers.triggered.connect(self._assign_speakers_dialog)
+        act_reprocess = menu.addAction("Reprocess Transcription & Summary")
         m = self.controller.db.get_meeting(self._selected_meeting_id) if hasattr(self.controller, "db") else None
         act_reprocess.setEnabled(bool(m and self._resolve_audio_path(m) is not None))
         act_reprocess.triggered.connect(lambda: self._on_reprocess_meeting_clicked(self._selected_meeting_id))
@@ -1702,13 +2652,35 @@ class NotetakerPage(QWidget):
             self._selected_meeting_id = None
             self.refresh_meetings_list()
 
+    def _sync_play_pause_visual(self, playing: bool) -> None:
+        t = get_theme_tokens(self._theme)
+        fg = t.get("primary_btn_text", "#FFFFFF")
+        if hasattr(self, "btn_play_pause"):
+            self.btn_play_pause.setText("")
+            self.btn_play_pause.setIcon(get_icon("pause" if playing else "play", fg, 14, filled=True))
+            self.btn_play_pause.setToolTip("Pause audio" if playing else "Play audio")
+
+    def _skip_media_delta(self, delta_sec: float) -> None:
+        if self._media_probe_timer.isActive():
+            self._media_probe_timer.stop()
+        self._apply_pending_media_source()
+        dur_ms = max(0, int(self.media_player.duration() or 0))
+        cur_ms = max(0, int(self.media_player.position() or 0))
+        nxt_ms = max(0, cur_ms + int(round(delta_sec * 1000.0)))
+        if dur_ms > 0:
+            nxt_ms = min(dur_ms, nxt_ms)
+        self.media_player.setPosition(nxt_ms)
+
     def _toggle_media_playback(self) -> None:
+        if self._media_probe_timer.isActive():
+            self._media_probe_timer.stop()
+        self._apply_pending_media_source()
         if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.media_player.pause()
-            self.btn_play_pause.setText("Play Audio")
+            self._sync_play_pause_visual(False)
         else:
             self.media_player.play()
-            self.btn_play_pause.setText("Pause Audio")
+            self._sync_play_pause_visual(True)
 
     def _on_media_position_changed(self, pos_ms: int) -> None:
         self.media_slider.blockSignals(True)
@@ -1730,6 +2702,9 @@ class NotetakerPage(QWidget):
 
     def _seek_to_seconds(self, seconds: float) -> None:
         """Seek local audio playback to the clicked transcript/note timestamp and start playing if loaded."""
+        if self._media_probe_timer.isActive():
+            self._media_probe_timer.stop()
+        self._apply_pending_media_source()
         pos_ms = max(0, int(float(seconds) * 1000.0))
         self.media_player.setPosition(pos_ms)
         if hasattr(self, "studio"):
@@ -1739,7 +2714,7 @@ class NotetakerPage(QWidget):
             and self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState
         ):
             self.media_player.play()
-            self.btn_play_pause.setText("Pause Audio")
+            self._sync_play_pause_visual(True)
 
     def apply_theme(self, theme_name: str) -> None:
         self._theme = "dark" if (theme_name or "").lower() == "dark" else "light"
@@ -1748,109 +2723,241 @@ class NotetakerPage(QWidget):
             f"""
             QWidget {{ background-color: {t['bg']}; color: {t['text']}; }}
             QLabel {{ background: transparent; border: none; color: {t['text']}; }}
-            QLabel#ntMuted {{ color: {t['text_muted']}; font-size: 12px; }}
-            QFrame#ntCard {{
+            QLabel#ntMuted {{ color: {t['text_muted']}; font-size: 11.5px; }}
+            QFrame#ntCommandBar {{
                 background-color: {t['surface']};
-                border: 1px solid {t['border']};
+                border: 1px solid {t['outline_variant']};
+                border-radius: 11px;
+            }}
+            QFrame#ntCard, QFrame#ntAskRail {{
+                background-color: {t['surface']};
+                border: 1px solid {t['outline_variant']};
                 border-radius: 12px;
             }}
             QFrame#ntBanner {{
                 background-color: {t['accent_lumen']};
                 border: 1px solid {t['accent_lumen_border']};
-                border-radius: 12px;
+                border-radius: 10px;
             }}
             QFrame#ntInterruptedBanner {{
-                background-color: {t.get('surface_secondary', t['surface'])};
-                border: 1px solid {t.get('accent_amber', '#F59E0B')};
-                border-radius: 12px;
+                background-color: {t['status_warning_bg']};
+                border: 1px solid {t['status_warning']};
+                border-radius: 10px;
+            }}
+            QLabel#ntScopeBadge {{
+                background-color: {t['accent_dawn']};
+                color: {t['accent_dawn_text']};
+                border: none;
+                border-radius: 6px;
+                padding: 3px 9px;
+                font-size: 11px;
+                font-weight: 600;
+            }}
+            QLabel#ntAskScopeLock {{
+                background-color: {t['surface_container']};
+                color: {t['text_primary']};
+                border: 1px solid {t['outline_variant']};
+                border-radius: 8px;
+                padding: 6px 9px;
+                font-size: 11.5px;
+                font-weight: 600;
             }}
             QLineEdit#ntSelTitleEdit {{
                 background: transparent;
                 border: 1px solid transparent;
-                border-radius: 6px;
-                padding: 2px 4px;
+                border-radius: 7px;
+                padding: 2px 6px;
                 color: {t['text']};
-                font-size: 16px;
-                font-weight: 700;
+                font-size: 19px;
+                font-weight: 600;
             }}
             QLineEdit#ntSelTitleEdit:hover {{
-                border: 1px solid {t['border']};
+                background-color: {t['surface_hover']};
+                border: 1px solid {t['outline_variant']};
             }}
             QLineEdit#ntSelTitleEdit:focus {{
-                background-color: {t.get('surface_secondary', t['surface'])};
-                border: 1px solid {t.get('accent', '#6366F1')};
+                background-color: {t['surface']};
+                border: 1.5px solid {t['input_focus_border']};
+            }}
+            QLineEdit#voxSearchField, QComboBox {{
+                background-color: {t['surface_container']};
+                color: {t['text_primary']};
+                border: 1px solid {t['outline_variant']};
+                border-radius: 8px;
+                padding: 4px 8px;
+                font-size: 12px;
+            }}
+            QLineEdit#voxSearchField:focus, QComboBox:focus {{
+                background-color: {t['surface']};
+                border: 1.5px solid {t['input_focus_border']};
             }}
             QProgressBar#ntLevelBar {{
-                background-color: {t.get('surface_well', t['surface_secondary'])};
-                border: 1px solid {t['border']};
+                background-color: {t['surface_well']};
+                border: 1px solid {t['outline_variant']};
                 border-radius: 3px;
             }}
             QProgressBar#ntLevelBar::chunk {{
-                background-color: {t.get('accent_emerald', '#10B981')};
+                background-color: {t['accent_emerald']};
                 border-radius: 2px;
             }}
-            QListWidget {{
+            QListWidget#ntMeetingsList, QListWidget {{
                 background-color: {t['surface']};
-                border: 1px solid {t['line']};
+                border: none;
                 border-radius: 8px;
-                padding: 4px;
+                padding: 2px 0px;
+                outline: none;
             }}
-            QListWidget::item {{
-                padding: 8px 10px;
+            QTextBrowser#ntAskBrowser {{
+                background-color: {t['bg']};
+                border: 1px solid {t['outline_variant']};
+                border-radius: 9px;
+                padding: 8px;
+            }}
+            QPushButton#secondaryBtn, QPushButton#ntStatusPillBtn {{
+                background-color: {t['secondary_btn_bg']};
+                color: {t['text_primary']};
+                border: 1px solid {t['outline_variant']};
                 border-radius: 8px;
+                padding: 5px 10px;
+                font-size: 12px;
+                font-weight: 600;
             }}
-            QListWidget::item:selected {{
-                background-color: {t['sidebar_active']};
-                color: {t['text']};
+            QPushButton#secondaryBtn:hover, QPushButton#ntStatusPillBtn:hover {{
+                background-color: {t['surface_hover']};
+                border-color: {t['border']};
+            }}
+            QPushButton#secondaryBtn:checked, QPushButton#ntStatusPillBtn:checked {{
+                background-color: {t['accent_dawn']};
+                color: {t['accent_dawn_text']};
+                border: 1px solid {t['accent']};
+            }}
+            QPushButton#ntAskToggleBtn {{
+                background-color: {t['secondary_btn_bg']};
+                color: {t['text_primary']};
+                border: 1px solid {t['outline_variant']};
+                border-radius: 8px;
+                padding: 5px 11px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton#ntAskToggleBtn:hover {{
+                background-color: {t['ai_tint']};
+                color: {t['ai_text']};
+                border-color: {t['ai_border']};
+            }}
+            QPushButton#ntAskToggleBtn:checked {{
+                background-color: {t['ai_tint']};
+                color: {t['ai_text']};
+                border: 1px solid {t['ai_border']};
+            }}
+            QPushButton#ntWarnPillBtn {{
+                background-color: {t['status_warning_bg']};
+                color: {t['status_warning_text']};
+                border: 1px solid {t['status_warning']};
+                border-radius: 8px;
+                padding: 4px 10px;
+                font-size: 11.5px;
+                font-weight: 600;
+            }}
+            QPushButton#ntChipBtn {{
+                background-color: transparent;
+                color: {t['text_secondary']};
+                border: 1px solid transparent;
+                border-radius: 7px;
+                padding: 3px 9px;
+                font-size: 11.5px;
+                font-weight: 600;
+            }}
+            QPushButton#ntChipBtn:hover {{
+                background-color: {t['surface_hover']};
+                color: {t['text_primary']};
+            }}
+            QPushButton#ntChipBtn:checked {{
+                background-color: {t['accent_dawn']};
+                color: {t['accent_dawn_text']};
+                border: 1px solid {t['accent_dawn_hover']};
+            }}
+            QPushButton#ntIconToggleBtn {{
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: 7px;
+                padding: 0px;
+            }}
+            QPushButton#ntIconToggleBtn:hover {{
+                background-color: {t['surface_hover']};
+            }}
+            QPushButton#ntIconToggleBtn:checked {{
+                background-color: {t['accent_dawn']};
+                border: 1px solid {t['accent_dawn_hover']};
+            }}
+            QPushButton#ntPlayBtn {{
+                background-color: {t['primary_btn_bg']};
+                color: {t['primary_btn_text']};
+                border: none;
+                border-radius: 15px;
+                padding: 0px;
+            }}
+            QPushButton#ntPlayBtn:hover {{
+                background-color: {t['primary_btn_hover']};
+            }}
+            QPushButton#ntPlayBtn:disabled {{
+                background-color: {t['surface_well']};
             }}
             QPushButton#dawnBtn {{
                 background-color: {t['dawn_btn_bg']};
                 color: {t['dawn_btn_text']};
                 border: 1px solid {t['dawn_btn_border']};
                 border-radius: 8px;
-                padding: 7px 14px;
-                font-weight: 700;
+                padding: 6px 12px;
+                font-weight: 600;
+                font-size: 12px;
             }}
-            QPushButton#primaryBtn {{
+            QPushButton#primaryBtn, QPushButton#fathomBtn {{
                 background-color: {t['primary_btn_bg']};
                 color: {t['primary_btn_text']};
+                border: none;
                 border-radius: 8px;
-                padding: 6px 14px;
-                font-weight: 700;
+                padding: 6px 13px;
+                font-weight: 600;
+                font-size: 12px;
+            }}
+            QPushButton#primaryBtn:hover, QPushButton#fathomBtn:hover {{
+                background-color: {t['primary_btn_hover']};
             }}
             QFrame#ntAutoStartBanner {{
                 background-color: {t['surface']};
-                border: 1px solid {t['border']};
-                border-radius: 14px;
+                border: 1px solid {t['outline_variant']};
+                border-radius: 10px;
             }}
             QFrame#ntAutoBadge {{
-                background-color: {t['surface_well']};
-                border: 1px solid {t['border']};
-                border-radius: 18px;
+                background-color: {t['accent_dawn']};
+                border: none;
+                border-radius: 13px;
             }}
             QPushButton#ntTurnOnBtn {{
-                background-color: {t['surface']};
-                color: {t['text']};
-                border: 1px solid {t['border']};
-                border-radius: 8px;
-                padding: 5px 16px;
+                background-color: {t['accent_dawn']};
+                color: {t['accent_dawn_text']};
+                border: 1px solid {t['dawn_btn_border']};
+                border-radius: 7px;
+                padding: 4px 12px;
                 font-weight: 600;
-                font-size: 13px;
+                font-size: 12px;
             }}
             QPushButton#ntTurnOnBtn:hover {{
-                background-color: {t['sidebar_active']};
-                border: 1px solid {t['text_muted']};
+                background-color: {t['accent_dawn_hover']};
             }}
             QPushButton#ghostBtn {{
                 background: transparent;
                 border: none;
-                color: {t['text']};
-                padding: 6px 12px;
-                font-size: 13px;
-                font-weight: 500;
+                color: {t['text_secondary']};
+                padding: 4px 8px;
+                font-size: 12px;
+                font-weight: 600;
+                border-radius: 7px;
             }}
             QPushButton#ghostBtn:hover {{
-                color: {t['text_muted']};
+                background: {t['surface_hover']};
+                color: {t['text_primary']};
             }}
             """
         )
@@ -1872,15 +2979,279 @@ class NotetakerPage(QWidget):
             )
         if hasattr(self, "lbl_interrupted_summary"):
             self.lbl_interrupted_summary.setStyleSheet(
-                f"font-weight: 600; color: {t['status_warning_text']};"
+                f"font-weight: 600; font-size: 12px; color: {t['status_warning_text']};"
             )
         if hasattr(self, "btn_reprocess") and self.btn_reprocess.text() == "↻ Recover & Re-Transcribe":
             self.btn_reprocess.setStyleSheet(
                 f"background-color: {t['status_warning_bg']}; color: {t['status_warning_text']}; "
                 f"border: 1px solid {t['status_warning']}; border-radius: 6px; padding: 4px 10px; font-weight: 700;"
             )
+        if hasattr(self, "mode_switcher"):
+            self.mode_switcher.set_theme(self._theme)
+        if hasattr(self, "meetings_delegate"):
+            self.meetings_delegate.set_theme(self._theme)
+            self.meetings_list.viewport().update()
+        if hasattr(self, "empty_card") and hasattr(self.empty_card, "set_theme"):
+            self.empty_card.set_theme(self._theme)
+        if hasattr(self, "overall_view"):
+            self.overall_view.apply_theme(self._theme)
         if hasattr(self, "studio"):
             self.studio.apply_theme(self._theme)
+        self._refresh_toolbar_icons()
+        self._refresh_ask_rail_ui()
+
+    def _refresh_toolbar_icons(self) -> None:
+        t = get_theme_tokens(self._theme)
+        fg = t.get("text_secondary", "#475569")
+        pri_fg = t.get("primary_btn_text", "#FFFFFF")
+        ai_fg = t.get("ai_text", t.get("accent", "#1967D2"))
+        icon_map = [
+            ("btn_toggle_sidebar", "sidebar_toggle", fg, 16),
+            ("btn_upcoming_pill", "calendar", fg, 14),
+            ("btn_rescued_pill", "alert", t.get("status_warning_text", fg), 14),
+            ("btn_ask_vox_rail", "sparkles", ai_fg if self._ask_rail_open else fg, 14),
+            ("btn_drawer", "drawer", fg, 14),
+            ("btn_settings", "settings", fg, 15),
+            ("btn_start_adhoc", "record", pri_fg, 14),
+            ("btn_new_folder", "folder_plus", fg, 15),
+            ("btn_density", "density_compact" if self._library_compact else "density_comfy", fg, 15),
+            ("btn_split_view", "split_view", fg, 14),
+            ("btn_watch_video", "video", fg, 14),
+            ("btn_export", "export", fg, 14),
+            ("btn_more", "more_horiz", fg, 16),
+            ("btn_view_in_calendar", "calendar", fg, 13),
+            ("btn_speakers", "users", fg, 14),
+            ("btn_skip_back", "skip_back", fg, 14),
+            ("btn_skip_forward", "skip_forward", fg, 14),
+            ("btn_ask_close", "close", fg, 14),
+            ("btn_ask_copy_ans", "copy", fg, 12),
+            ("btn_ask_copy_src", "copy", fg, 12),
+            ("btn_ask_rail_send", "send", pri_fg, 13),
+        ]
+        for attr, iname, col, sz in icon_map:
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setIcon(get_icon(iname, col, sz))
+        if hasattr(self, "auto_start_banner") and hasattr(self.auto_start_banner, "lbl_icon"):
+            self.auto_start_banner.lbl_icon.setPixmap(get_pixmap("meetings", t.get("accent", "#1967D2"), 15))
+        if hasattr(self, "lbl_ask_rail_icon"):
+            self.lbl_ask_rail_icon.setPixmap(get_pixmap("sparkles", ai_fg, 16))
+        playing = (
+            hasattr(self, "media_player")
+            and self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        self._sync_play_pause_visual(playing)
+
+    # ------------------------------------------------------------------
+    # Unified Context-Locked Ask VOX Right Rail (Zero Cross-Context Leakage)
+    # ------------------------------------------------------------------
+    def _toggle_ask_rail(self, visible: Optional[bool] = None) -> None:
+        if visible is None:
+            self._ask_rail_open = not self._ask_rail_open
+        else:
+            self._ask_rail_open = bool(visible)
+        if hasattr(self, "ask_rail"):
+            self.ask_rail.setVisible(self._ask_rail_open)
+        if hasattr(self, "btn_ask_vox_rail"):
+            self.btn_ask_vox_rail.blockSignals(True)
+            self.btn_ask_vox_rail.setChecked(self._ask_rail_open)
+            self.btn_ask_vox_rail.blockSignals(False)
+        # Progressive disclosure: prevent duplicate inline Ask VOX bars when Right Rail is open
+        if hasattr(self, "studio") and hasattr(self.studio, "tab_summary") and hasattr(self.studio.tab_summary, "ask_box"):
+            self.studio.tab_summary.ask_box.setVisible(not self._ask_rail_open)
+        if hasattr(self, "overall_view") and hasattr(self.overall_view, "prompt_strip_card"):
+            self.overall_view.prompt_strip_card.setVisible(not self._ask_rail_open)
+        self._persist_ui_pref("notetaker_ask_rail_open", self._ask_rail_open)
+        self._refresh_toolbar_icons()
+        self._refresh_ask_rail_ui()
+
+    def _active_ask_key(self) -> str:
+        if self._workspace_context == "overall":
+            return "overall"
+        return f"m:{self._selected_meeting_id}" if self._selected_meeting_id is not None else "none"
+
+    def _get_current_ask_thread(self) -> List[Dict[str, Any]]:
+        if self._workspace_context == "overall":
+            return self._overall_ask_thread
+        if self._selected_meeting_id is not None:
+            return self._meeting_ask_threads.setdefault(int(self._selected_meeting_id), [])
+        return []
+
+    def _refresh_ask_rail_ui(self) -> None:
+        if not hasattr(self, "lbl_ask_scope_badge"):
+            return
+        t = get_theme_tokens(self._theme)
+        if self._workspace_context == "overall":
+            self.lbl_ask_scope_badge.setText(f"Overall Library · {self._overall_scope_label}")
+            self.lbl_ask_scope_badge.setStyleSheet(
+                f"background: {t['status_info_bg']}; color: {t['status_info_text']}; "
+                f"border: 1px solid {t['accent']}; border-radius: 7px; padding: 6px 9px; font-size: 11.5px; font-weight: 600;"
+            )
+            self.txt_ask_rail.setPlaceholderText("Ask across all filtered meetings...")
+            chips = [
+                ("Topics", "What recurring topics and projects appear across these meetings?"),
+                ("Commitments", "Summarize all open commitments and owners across these meetings."),
+                ("Conflicts", "Compare key decisions across meetings and flag any contradictions."),
+            ]
+        else:
+            title = self.lbl_sel_title.text().strip() if hasattr(self, "lbl_sel_title") else "Select a meeting"
+            if self._selected_meeting_id is None:
+                self.lbl_ask_scope_badge.setText("This Meeting · Select a meeting from Library")
+            else:
+                self.lbl_ask_scope_badge.setText(f"This Meeting Only: {title}")
+            self.lbl_ask_scope_badge.setStyleSheet(
+                f"background: {t['accent_dawn']}; color: {t['accent_dawn_text']}; "
+                f"border: 1px solid {t['outline_variant']}; border-radius: 7px; padding: 6px 9px; font-size: 11.5px; font-weight: 600;"
+            )
+            self.txt_ask_rail.setPlaceholderText("Ask strictly about this meeting...")
+            chips = [
+                ("Decisions", "What were the key decisions made in this meeting?"),
+                ("Actions", "List action items, owners, and due dates from this meeting."),
+                ("Risks", "What risks, blockers, or open questions were raised in this meeting?"),
+            ]
+
+        for idx, btn in enumerate(getattr(self, "_ask_chip_btns", [])):
+            if idx < len(chips):
+                btn.setText(chips[idx][0])
+                btn.setProperty("ask_prompt", chips[idx][1])
+                btn.setVisible(True)
+        self._render_ask_rail_thread()
+
+    def _on_ask_chip_clicked(self, idx: int) -> None:
+        if idx < 0 or idx >= len(getattr(self, "_ask_chip_btns", [])):
+            return
+        prompt = str(self._ask_chip_btns[idx].property("ask_prompt") or "").strip()
+        if prompt:
+            self.txt_ask_rail.setText(prompt)
+            self._submit_ask_rail_input()
+
+    def _submit_ask_rail_input(self) -> None:
+        q = self.txt_ask_rail.text().strip() if hasattr(self, "txt_ask_rail") else ""
+        if not q:
+            return
+        self.txt_ask_rail.clear()
+        if self._workspace_context == "overall":
+            scope_ids = (
+                self.overall_view.get_active_scope()[0]
+                if hasattr(self, "overall_view")
+                else self._overall_scope_ids
+            )
+            self._run_context_ask_async(q, target_key="overall", meeting_id=None, meeting_ids=scope_ids)
+        else:
+            if self._selected_meeting_id is None:
+                return
+            mid = int(self._selected_meeting_id)
+            self._run_context_ask_async(q, target_key=f"m:{mid}", meeting_id=mid, meeting_ids=None)
+
+    def _clear_current_ask_thread(self) -> None:
+        if self._workspace_context == "overall":
+            self._overall_ask_thread.clear()
+        elif self._selected_meeting_id is not None:
+            self._meeting_ask_threads[int(self._selected_meeting_id)] = []
+        self._last_ask_answer_plain = ""
+        self._last_ask_with_sources_plain = ""
+        self._render_ask_rail_thread()
+
+    def _copy_ask_answer(self, with_sources: bool = False) -> None:
+        txt = self._last_ask_with_sources_plain if with_sources else self._last_ask_answer_plain
+        if txt:
+            QApplication.clipboard().setText(txt)
+            self.status_toast.emit("Copied", "Answer copied to clipboard.")
+
+    def _on_ask_anchor_clicked(self, url: QUrl) -> None:
+        raw = url.toString()
+        if raw.startswith("meeting:"):
+            spec = raw[len("meeting:"):]
+            parts = spec.split("@", 1)
+            try:
+                mid = int(parts[0])
+                sec = float(parts[1]) if len(parts) > 1 else 0.0
+                self._open_meeting_at_seconds(mid, sec)
+            except Exception:
+                pass
+        elif raw.startswith("seek:"):
+            try:
+                sec = float(raw[len("seek:"):])
+                self._seek_to_seconds(sec)
+                if hasattr(self, "studio") and hasattr(self.studio, "unified_tabs"):
+                    self.studio.unified_tabs.setCurrentIndex(1)
+            except Exception:
+                pass
+
+    def _render_ask_rail_thread(self) -> None:
+        if not hasattr(self, "ask_rail_browser"):
+            return
+        t = get_theme_tokens(self._theme)
+        thread = self._get_current_ask_thread()
+        loading = self._ask_loading_key == self._active_ask_key()
+
+        font_css = get_html_font_family()
+        if not thread and not loading:
+            scope_desc = (
+                f"the current filtered library (<b>{html.escape(self._overall_scope_label)}</b>)"
+                if self._workspace_context == "overall"
+                else "<b>this selected meeting only</b> — other meetings are strictly excluded"
+            )
+            self.ask_rail_browser.setHtml(
+                f"<div style='font-family:{font_css};font-size:13px;line-height:1.52;color:{t['text_secondary']};padding:6px;'>"
+                f"<p style='margin:0 0 6px 0;'>Ask VOX answers are grounded strictly in local transcripts and memory for {scope_desc}.</p>"
+                f"<p style='margin:0;color:{t['text_muted']};font-size:12px;'>Use the quick prompt chips above or ask any question below.</p>"
+                "</div>"
+            )
+            return
+
+        parts = [f"<div style='font-family:{font_css};font-size:13px;color:{t['text_primary']};line-height:1.52;'>"]
+        for entry in thread:
+            q_html = html.escape(str(entry.get("q") or ""))
+            ans_md = str(entry.get("a") or "")
+            cits = list(entry.get("citations") or [])
+
+            parts.append(
+                f"<div style='background:{t['accent_dawn']};border:1px solid {t['chip_border']};"
+                f"border-radius:8px;padding:7px 10px;margin:0 0 8px 0;'>"
+                f"<div style='font-size:10.5px;font-weight:700;color:{t['accent_dawn_text']};margin-bottom:2px;'>YOU</div>"
+                f"<div style='color:{t['text_primary']};font-weight:600;'>{q_html}</div></div>"
+            )
+            # Synthesis card
+            ans_html = render_safe_markdown_html(ans_md, theme=self._theme)
+            parts.append(
+                f"<div style='background:{t['surface']};border:1px solid {t['border']};"
+                f"border-radius:8px;padding:8px 10px;margin:0 0 8px 0;'>"
+                f"<div style='font-size:10.5px;font-weight:700;color:{t['accent_fathom']};margin-bottom:4px;'>SYNTHESIS</div>"
+                f"{ans_html}"
+            )
+            # Distinct Direct Source Evidence section
+            if cits:
+                parts.append(
+                    f"<div style='margin-top:8px;padding-top:6px;border-top:1px solid {t['line']};'>"
+                    f"<div style='font-size:10.5px;font-weight:700;color:{t['text_muted']};margin-bottom:4px;'>DIRECT SOURCE EVIDENCE</div>"
+                )
+                for c in cits[:5]:
+                    cmid = c.get("meeting_id")
+                    ctitle = html.escape(str(c.get("meeting_title") or "Meeting")[:34])
+                    sec = float(c.get("start_sec") or 0.0)
+                    ts_lbl = format_seconds_hms(sec)
+                    snippet = html.escape(str(c.get("excerpt") or c.get("text") or "")[:140])
+                    href = f"meeting:{int(cmid)}@{sec:.1f}" if cmid is not None else f"seek:{sec:.1f}"
+                    parts.append(
+                        f"<div style='background:{t['surface_secondary']};border-radius:6px;padding:5px 7px;margin-bottom:4px;font-size:11.5px;'>"
+                        f"<a href='{href}' style='color:{t['accent_fathom']};font-weight:700;text-decoration:none;'>"
+                        f"[{ctitle} · {ts_lbl}]</a> "
+                        f"<span style='color:{t['text_secondary']};'>{snippet}</span></div>"
+                    )
+                parts.append("</div>")
+            parts.append("</div>")
+
+        if loading:
+            parts.append(
+                f"<div style='padding:6px 8px;color:{t['text_muted']};font-size:12px;'>"
+                "⏳ Searching scoped local memory & synthesizing answer...</div>"
+            )
+        parts.append("</div>")
+        self.ask_rail_browser.setHtml("".join(parts))
+        sb = self.ask_rail_browser.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(sb.maximum())
 
     def _on_studio_ask_submitted(self, query: str) -> None:
         """Execute a scoped Ask VOX query against the currently selected meeting."""
@@ -1893,50 +3264,104 @@ class NotetakerPage(QWidget):
             res = fn(query, meeting_id=int(m_id))
             ans = str((res or {}).get("answer") or "No relevant excerpts found in this meeting.")
             citations = list((res or {}).get("citations") or [])
-            self._on_studio_ask_completed(int(m_id), query, ans, citations)
+            self._on_studio_ask_completed(f"m:{int(m_id)}", query, ans, citations)
             return
-        self._run_studio_ask_async(query, int(m_id))
+        self._run_context_ask_async(query, target_key=f"m:{int(m_id)}", meeting_id=int(m_id), meeting_ids=None)
 
     def _on_studio_ask_rail_submitted(self, query: str) -> None:
+        self._on_studio_ask_rail_scoped_submitted(query, False)
+
+    def _on_studio_ask_rail_scoped_submitted(self, query: str, cross_meeting: bool = False) -> None:
+        if cross_meeting:
+            self._run_context_ask_async(query, target_key="overall", meeting_id=None, meeting_ids=self._overall_scope_ids)
+            return
         m_id = self._selected_meeting_id
         if m_id is None:
             self.studio.append_ask_rail_exchange(
                 query,
-                "Select a meeting first to ask a scoped question.",
+                "Select a meeting first, or switch Ask VOX scope to 'All Meetings'.",
                 citations=[],
             )
             return
-        self._run_studio_ask_async(query, int(m_id))
+        self._run_context_ask_async(query, target_key=f"m:{int(m_id)}", meeting_id=int(m_id), meeting_ids=None)
 
-    def _run_studio_ask_async(self, query: str, meeting_id: int) -> None:
-        self.studio.set_ask_rail_loading(query)
-        target_id = int(meeting_id)
+    def _run_context_ask_async(
+        self,
+        query: str,
+        *,
+        target_key: str,
+        meeting_id: Optional[int],
+        meeting_ids: Optional[List[int]],
+    ) -> None:
+        self._ask_loading_key = target_key
+        self._render_ask_rail_thread()
+        if hasattr(self, "studio") and hasattr(self.studio, "set_ask_rail_loading"):
+            self.studio.set_ask_rail_loading(query)
+
+        ans_depth = str(self.combo_ask_depth.currentData() or "concise") if hasattr(self, "combo_ask_depth") else "concise"
+        hist_src = self._overall_ask_thread if target_key == "overall" else self._meeting_ask_threads.get(int(meeting_id or 0), [])
+        conv_history = [{"question": e["q"], "answer": e["a"]} for e in hist_src[-4:]]
 
         def _worker() -> None:
             try:
-                res = self.controller.query_meeting_memory(query, meeting_id=target_id)
-                ans = str((res or {}).get("answer") or "No relevant excerpts found in this meeting.")
+                try:
+                    res = self.controller.query_meeting_memory(
+                        query,
+                        meeting_id=meeting_id,
+                        meeting_ids=meeting_ids,
+                        conversation_history=conv_history,
+                        answer_depth=ans_depth,
+                    )
+                except TypeError:
+                    res = self.controller.query_meeting_memory(query, meeting_id=meeting_id)
+                ans = str((res or {}).get("answer") or "No relevant excerpts found in scoped recorded meetings.")
                 cits = list((res or {}).get("citations") or [])
             except Exception as exc:
                 ans = f"Could not query meeting memory: {exc}"
                 cits = []
             try:
-                self._studio_ask_completed.emit(target_id, query, ans, cits)
+                self._studio_ask_completed.emit(target_key, query, ans, cits)
             except RuntimeError:
                 pass
 
         threading.Thread(target=_worker, daemon=True, name="StudioAskVoxWorker").start()
 
     def _on_studio_ask_completed(
-        self, meeting_id: int, question: str, answer: str, citations: object
+        self, target_key: str, question: str, answer: str, citations: object
     ) -> None:
         if getattr(self.controller, "_cancel_ask_vox", False):
             return
-        if self._selected_meeting_id is None or int(self._selected_meeting_id) != int(meeting_id):
-            return
+        if self._ask_loading_key == target_key:
+            self._ask_loading_key = None
         cits = list(citations) if isinstance(citations, (list, tuple)) else []
-        self.studio.tab_summary.set_ask_answer(answer, citations=cits)
-        self.studio.append_ask_rail_exchange(question, answer, citations=cits)
+        entry = {"q": question, "a": answer, "citations": cits}
+
+        if target_key == "overall":
+            self._overall_ask_thread.append(entry)
+        elif target_key.startswith("m:"):
+            try:
+                mid = int(target_key.split(":", 1)[1])
+            except Exception:
+                mid = -1
+            if mid > 0:
+                self._meeting_ask_threads.setdefault(mid, []).append(entry)
+
+        plain_ans = strip_markdown_for_plain_copy(answer)
+        src_lines = [
+            f"- [{c.get('meeting_title', 'Meeting')} @ {format_seconds_hms(float(c.get('start_sec') or 0.0))}] "
+            f"{str(c.get('excerpt') or c.get('text') or '').strip()}"
+            for c in cits[:5]
+        ]
+        if target_key == self._active_ask_key():
+            self._last_ask_answer_plain = plain_ans
+            self._last_ask_with_sources_plain = (plain_ans + ("\n\nSources:\n" + "\n".join(src_lines) if src_lines else "")).strip()
+            self._render_ask_rail_thread()
+
+        if target_key == f"m:{self._selected_meeting_id}":
+            self.studio.tab_summary.set_ask_answer(answer, citations=cits)
+            self.studio.append_ask_rail_exchange(question, answer, citations=cits)
+        elif target_key == "overall" and self._workspace_context == "overall":
+            self.studio.append_ask_rail_exchange(question, answer, citations=cits)
 
     def _on_dictation_interim_updated(self, provisional: str, stable: str) -> None:
         combined = " ".join(x for x in (stable.strip(), provisional.strip()) if x).strip()

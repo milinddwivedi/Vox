@@ -46,8 +46,11 @@ class TestMeetingStudioEnterprisePhase2(unittest.TestCase):
         self.controller.meeting_recorder.start = MagicMock(return_value=(True, "Audio started"))
         self.controller.meeting_recorder.stop = MagicMock(return_value=None)
 
-        # 1. Start Audio + Video before any call window exists
-        with patch("voxlocal.video.meeting_capture.resolve_meeting_source", return_value=None):
+        # 1. Start Audio + Video before any call window exists (isolated from host desktop)
+        with patch("voxlocal.audio.call_detector.list_all_meeting_windows", return_value=[]), \
+             patch("voxlocal.video.meeting_capture.discover_meeting_sources", return_value=[]), \
+             patch("voxlocal.video.meeting_capture.resolve_meeting_source", return_value=None), \
+             patch("voxlocal.video.meeting_capture.MeetingVideoRecorder.start", return_value=True):
             ok, msg = self.controller.start_meeting_recording(
                 title="Sprint Planning Standup",
                 recording_mode="audio_video",
@@ -71,7 +74,9 @@ class TestMeetingStudioEnterprisePhase2(unittest.TestCase):
             is_call_stage=True,
         )
 
-        with patch("voxlocal.video.meeting_capture.resolve_meeting_source", return_value=fake_source), \
+        with patch("voxlocal.audio.call_detector.list_all_meeting_windows", return_value=[]), \
+             patch("voxlocal.video.meeting_capture.discover_meeting_sources", return_value=[]), \
+             patch("voxlocal.video.meeting_capture.resolve_meeting_source", return_value=fake_source), \
              patch("voxlocal.video.meeting_capture.MeetingVideoRecorder.start", return_value=True):
             self.controller._poll_call_detector()
             self.assertFalse(self.controller._pending_video_bind)
@@ -111,14 +116,14 @@ class TestMeetingStudioEnterprisePhase2(unittest.TestCase):
         action = actions[0]
 
         # Verify no invented deadline
-        self.assertEqual(action.get("due_date"), "Not specified")
+        self.assertIsNone(action.get("due_date"))
         self.assertNotEqual(action.get("due_date"), "Next Sprint")
 
-        # Verify MoM markdown does not contain "Next Sprint" or "Host"
+        # Verify MoM markdown does not contain "Next Sprint" or "Host" or "Not specified"
         mom_md = analysis.get("mom_markdown", "")
         self.assertNotIn("Next Sprint", mom_md)
         self.assertNotIn("Host", mom_md)
-        self.assertIn("Not specified", mom_md)
+        self.assertIn("| — |", mom_md)
 
     def test_03_truncated_json_repair_in_llm_engine(self):
         """

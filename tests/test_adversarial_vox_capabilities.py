@@ -326,6 +326,8 @@ class TestAdversarialVoxCapabilities(unittest.TestCase):
 
     def test_v3_01_floating_pill_focus_invariance(self):
         """Verify DualTierFloatingPill has Win32 non-activating styles and Qt NoFocus policy."""
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            self.skipTest("Win32 HWND extended styles require native Windows QPA platform.")
         pill = DualTierFloatingPill()
         try:
             pill.show()
@@ -357,6 +359,8 @@ class TestAdversarialVoxCapabilities(unittest.TestCase):
 
     def test_v3_02_preview_bubble_focus_invariance(self):
         """Verify LiveSpeechPreviewBubble has Win32 non-activating styles and Qt NoFocus policy."""
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            self.skipTest("Win32 HWND extended styles require native Windows QPA platform.")
         bubble = LiveSpeechPreviewBubble()
         try:
             bubble.show()

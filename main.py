@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import importlib.machinery
+import multiprocessing
 import os
 from pathlib import Path
 import sys
@@ -68,6 +69,17 @@ def _run_hardware_diagnostics(out_path: str) -> int:
     return 0
 
 
+def _run_health_check(verify_hashes: bool = False) -> int:
+    import json
+    from voxlocal.core.config import AppConfig
+    from voxlocal.core.first_run_health import run_first_run_health_check
+
+    cfg = AppConfig.load()
+    report = run_first_run_health_check(config=cfg, verify_hashes=verify_hashes)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0 if report.get("runtime_ok") and report.get("manifest_compatible") else 2
+
+
 def _run_verify_runtime(expected_version: str = "") -> int:
     import importlib
     import json
@@ -77,8 +89,12 @@ def _run_verify_runtime(expected_version: str = "") -> int:
     errors: list[str] = []
     required_modules = (
         "voxlocal.core.controller",
-        "voxlocal.engine.onnx_asr_engines",
-        "voxlocal.engine.selective_verifier",
+        "voxlocal.engine.meeting_asr_pipeline",
+        "voxlocal.engine.meeting_model_manager",
+        "voxlocal.engine.llama_server_engine",
+        "voxlocal.engine.knowledge_store",
+        "voxlocal.engine.llm_engine",
+        "voxlocal.engine.meeting_intelligence",
         "onnxruntime",
         "tokenizers",
         "sherpa_onnx",
@@ -211,6 +227,16 @@ def main() -> int:
         help="Optional output file path when running with --hardware-diagnostics",
     )
     parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="Run first-run runtime & canonical model readiness health check and exit",
+    )
+    parser.add_argument(
+        "--verify-model-hashes",
+        action="store_true",
+        help="Include full SHA-256 verification when running --health-check",
+    )
+    parser.add_argument(
         "--verify-runtime",
         action="store_true",
         help="Verify installed version and runtime modules without starting the GUI or modifying user data",
@@ -221,7 +247,22 @@ def main() -> int:
         default="",
         help="Expected application version string for --verify-runtime",
     )
+    parser.add_argument(
+        "--postcall-worker",
+        type=str,
+        default="",
+        help="Internal worker mode: execute post-call ASR & diarization job JSON in isolated subprocess",
+    )
     args = parser.parse_args()
+
+    if getattr(args, "postcall_worker", ""):
+        try:
+            from voxlocal.engine.postcall_worker import run_postcall_worker_cli
+            return int(run_postcall_worker_cli(args.postcall_worker))
+        except Exception as exc:
+            import traceback as _tb
+            print(f"Fatal post-call worker error: {exc}\n{_tb.format_exc()}", file=sys.stderr)
+            return 1
 
     if getattr(args, "print_version", False):
         from voxlocal import __version__
@@ -231,6 +272,9 @@ def main() -> int:
 
     if getattr(args, "verify_runtime", False):
         return _run_verify_runtime(getattr(args, "expected_version", "") or "")
+
+    if getattr(args, "health_check", False):
+        return _run_health_check(verify_hashes=bool(getattr(args, "verify_model_hashes", False)))
 
     if getattr(args, "hardware_diagnostics", False):
         return _run_hardware_diagnostics(getattr(args, "diagnostics_out", "") or "")
@@ -247,6 +291,11 @@ def main() -> int:
 
     from voxlocal.core.config import AppConfig
     from voxlocal.core.controller import AppController
+    from voxlocal.core.diagnostics import (
+        UIEventLoopWatchdog,
+        install_crash_diagnostics,
+        shutdown_crash_diagnostics,
+    )
     from voxlocal.core.logger import get_logger, setup_logging
     from voxlocal.ui.calendar_prompt import VoxMeetingPromptPopup
     from voxlocal.ui.floating_pill import DualTierFloatingPill, PillState
@@ -254,24 +303,13 @@ def main() -> int:
     from voxlocal.ui.notetaker_drawer import VoxNotetakerDrawer
     from voxlocal.ui.onboarding_wizard import VoxOnboardingWizard
     from voxlocal.ui.scratchpad_window import VoxScratchpadWindow
-    from voxlocal.ui.theme import create_app_icon
+    from voxlocal.ui.theme import create_app_icon, ensure_google_fonts_loaded, get_ui_font
     from voxlocal.ui.tray_manager import SystemTrayManager
 
     setup_logging()
     logger = get_logger("main")
+    install_crash_diagnostics()
     set_windows_app_id()
-
-    # Install top-level crash prevention and exception telemetry for Qt
-    def _global_exception_handler(exc_type, exc_value, exc_traceback):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-            return
-        logger.error(
-            "Unhandled exception caught by global hook (preventing fatal abort):",
-            exc_info=(exc_type, exc_value, exc_traceback),
-        )
-
-    sys.excepthook = _global_exception_handler
 
     def _qt_message_handler(mode: QtMsgType, context, message: str):
         msg_clean = (message or "").strip()
@@ -288,13 +326,19 @@ def main() -> int:
     qInstallMessageHandler(_qt_message_handler)
 
     app = QApplication(sys.argv)
+    ensure_google_fonts_loaded()
+    app.setFont(get_ui_font(13, 400))
     app.setApplicationName("VoxLocal")
     app.setOrganizationName("VoxLocal")
     app.setQuitOnLastWindowClosed(False)
     app.setWindowIcon(create_app_icon("idle"))
 
+    watchdog = UIEventLoopWatchdog(app, heartbeat_interval_ms=250, stall_threshold_ms=1500.0)
+    watchdog.start()
+
     config = AppConfig.load()
     controller = AppController(config=config)
+    controller.ui_watchdog = watchdog
     if getattr(args, "auth_url", None):
         controller.complete_login_from_url(args.auth_url)
 
@@ -307,6 +351,10 @@ def main() -> int:
 
     def exit_application() -> None:
         logger.info("User requested complete application exit.")
+        try:
+            watchdog.stop()
+        except Exception:
+            pass
         if main_win_ref:
             main_win_ref[0].prepare_force_quit()
             main_win_ref[0].close()
@@ -450,11 +498,19 @@ def main() -> int:
         logger.info("Running smoke test for %d ms...", args.smoke_test_ms)
         QTimer.singleShot(args.smoke_test_ms, exit_application)
 
-    exit_code = app.exec()
-    if mutex_handle:
-        ctypes.windll.kernel32.CloseHandle(mutex_handle)
+    try:
+        exit_code = app.exec()
+    finally:
+        try:
+            watchdog.stop()
+        except Exception:
+            pass
+        shutdown_crash_diagnostics()
+        if mutex_handle:
+            ctypes.windll.kernel32.CloseHandle(mutex_handle)
     return int(exit_code)
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())

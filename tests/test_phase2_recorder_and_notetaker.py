@@ -279,20 +279,19 @@ class TestPhase2RecorderAndNotetaker(unittest.TestCase):
                 self.assertTrue(tx_tab.btn_jump_live.isVisible())
 
                 ctrl._active_meeting_id = m_id
-                ctrl.meeting_live_partial.emit(m_id, {"speaker": "Alice", "text": "Checking budget now"})
+                tx_tab.set_live_partial("Alice", "Checking budget now")
                 self.app.processEvents()
                 self.assertTrue(tx_tab.lbl_live_partial.isVisible())
                 self.assertIn("Checking budget now", tx_tab.lbl_live_partial.text())
 
                 with patch.object(tx_tab._model, "beginResetModel", wraps=tx_tab._model.beginResetModel) as mock_reset:
-                    ctrl.meeting_progressive_segment.emit(
-                        m_id,
+                    tx_tab.append_live_segment(
                         {
                             "speaker": "Alice",
                             "start_time": 120.0,
                             "end_time": 124.0,
                             "text": "Let's finalize the budget on Friday.",
-                        },
+                        }
                     )
                     self.app.processEvents()
                     self.assertEqual(mock_reset.call_count, 0, "append_live_segment must use incremental insert, not reset")
@@ -300,6 +299,7 @@ class TestPhase2RecorderAndNotetaker(unittest.TestCase):
                 self.assertEqual(tx_tab._model.rowCount(), 26)
                 self.assertEqual(sb.value(), 0, "Scroll Lock must preserve user position when scrolled up")
                 self.assertTrue(tx_tab.btn_jump_live.isVisible())
+                tx_tab.set_live_partial("", "")
                 self.assertFalse(tx_tab.lbl_live_partial.isVisible())
 
                 tx_tab._jump_to_live_bottom()
@@ -434,18 +434,21 @@ class TestPhase2RecorderAndNotetaker(unittest.TestCase):
                 self.assertNotIn("Step 2 of 3", drawer.lbl_prog_step.text())
                 self.assertNotIn("Identifying who said what", drawer.lbl_prog_title.text())
 
-                drawer.update_processing_stage("transcribing", "Stage 1/4: Packaging MP4 video & audio tracks...")
+                drawer.update_processing_stage("transcribing", "Stage 1/5: Packaging MP4 video & audio tracks...")
                 self.assertTrue(drawer.progress_banner.isVisible())
-                self.assertEqual(drawer.lbl_prog_step.text(), "Step 1 of 4")
+                self.assertEqual(drawer.lbl_prog_step.text(), "Step 1 of 5")
 
-                drawer.update_processing_stage("transcribing", "Stage 2/4: Transcribing speech with local Whisper...")
-                self.assertEqual(drawer.lbl_prog_step.text(), "Step 2 of 4")
+                drawer.update_processing_stage("transcribing", "Stage 2/5: Transcribing speech with Cohere Transcribe 2B...")
+                self.assertEqual(drawer.lbl_prog_step.text(), "Step 2 of 5")
 
-                drawer.update_processing_stage("transcribing", "Stage 3/4: Separating speakers...")
-                self.assertEqual(drawer.lbl_prog_step.text(), "Step 3 of 4")
+                drawer.update_processing_stage("transcribing", "Stage 3/5: Separating speakers...")
+                self.assertEqual(drawer.lbl_prog_step.text(), "Step 3 of 5")
 
-                drawer.update_processing_stage("transcribing", "Stage 4/4: Synthesizing executive MoM...")
-                self.assertEqual(drawer.lbl_prog_step.text(), "Step 4 of 4")
+                drawer.update_processing_stage("transcribing", "Stage 4/5: Synthesizing executive MoM...")
+                self.assertEqual(drawer.lbl_prog_step.text(), "Step 4 of 5")
+
+                drawer.update_processing_stage("transcribing", "Stage 5/5: Extracting knowledge & updating RAG index...")
+                self.assertEqual(drawer.lbl_prog_step.text(), "Step 5 of 5")
 
                 drawer.update_processing_stage("error", "Processing failed in Stage 2: disk full")
                 self.assertEqual(drawer.lbl_prog_title.text(), "Processing interrupted")
@@ -457,13 +460,13 @@ class TestPhase2RecorderAndNotetaker(unittest.TestCase):
 
                 # Telemetry ticks reflected cleanly in drawer header status
                 drawer._on_meeting_tick(15.0, 0.3, 0.2, True, True)
-                self.assertEqual(drawer.lbl_tele_status.text(), "● Live · Mic OK · Sys OK")
+                self.assertEqual(drawer.lbl_tele_status.text(), "● Recording · Mic OK · Sys OK (Post-Call English ASR)")
 
                 drawer._on_meeting_tick(16.0, 0.3, 0.0, True, False)
-                self.assertEqual(drawer.lbl_tele_status.text(), "● Live · ⚠ Check Loopback")
+                self.assertEqual(drawer.lbl_tele_status.text(), "● Recording · ⚠ Check Loopback (Post-Call Ready)")
 
                 drawer._on_meeting_tick(17.0, 0.0, 0.2, False, True)
-                self.assertEqual(drawer.lbl_tele_status.text(), "● Live · ⚠ Check Mic")
+                self.assertEqual(drawer.lbl_tele_status.text(), "● Recording · ⚠ Check Mic (Post-Call Ready)")
 
                 drawer.close()
             finally:

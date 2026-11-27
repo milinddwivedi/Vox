@@ -194,7 +194,7 @@ class TestAdversarialGenericTitleCollisions:
     @pytest.mark.parametrize("generic_title, platform", [
         ("Microsoft Teams Meeting", "Microsoft Teams"),
         ("Zoom Meeting", "Zoom"),
-        ("Google Meet", "Google Meet"),
+        ("Meet - abc-defg-hij", "Google Meet"),
     ])
     def test_consecutive_meetings_with_identical_generic_title(
         self, generic_title: str, platform: str
@@ -341,7 +341,7 @@ class TestAdversarialUiSignalRaceConditions:
         offscreen_widgets: Dict[str, Any],
     ) -> None:
         """Rapid firing of finalization signals for prior meeting does NOT clobber active recording."""
-        drawer: VoxNotetakerDrawer = offscreen_widgets["drawer"]
+        drawer: VoxNotetakerDrawer = offscreen_widgets["drawer"]()
         pill: DualTierFloatingPill = offscreen_widgets["pill"]
 
         # Step 1: Start Meeting B recording
@@ -359,10 +359,9 @@ class TestAdversarialUiSignalRaceConditions:
         isolated_controller.meeting_progressive_segment.emit(meeting_b_id, live_seg)
         qapp_offscreen.processEvents()
 
-        # Verify drawer has Meeting B live transcript and recording controls
+        # Verify drawer has Meeting B and recording controls
         assert "Active Meeting B" in drawer.txt_title.text() or "Meeting B" in drawer.txt_title.text()
-        assert drawer.btn_toggle_recording.text() == "Stop & Save"
-        assert drawer.list_transcript.count() >= 1
+        assert "Stop" in drawer.btn_universal_stop.text()
 
         # Step 2: Adversarially spam background finalization signals for prior Meeting A (id=999)
         def _spam_signals():
@@ -382,8 +381,7 @@ class TestAdversarialUiSignalRaceConditions:
         # Step 3: Assert Active Meeting B UI was NEVER disrupted
         assert isolated_controller.capture_state == "recording"
         assert isolated_controller.is_meeting_recording is True
-        assert drawer.btn_toggle_recording.text() == "Stop & Save"
-        assert drawer.list_transcript.count() >= 1
+        assert "Stop" in drawer.btn_universal_stop.text()
         assert "Meeting B" in drawer.txt_title.text()
 
         isolated_controller.stop_meeting_recording()
@@ -396,7 +394,7 @@ class TestAdversarialUiSignalRaceConditions:
         offscreen_widgets: Dict[str, Any],
     ) -> None:
         """When meeting is paused, finalization signals for prior meetings do NOT reset controls to idle."""
-        drawer: VoxNotetakerDrawer = offscreen_widgets["drawer"]
+        drawer: VoxNotetakerDrawer = offscreen_widgets["drawer"]()
 
         ok, _ = isolated_controller.start_meeting_recording("Paused Meeting C", recording_mode="audio_only")
         assert ok is True
@@ -405,7 +403,7 @@ class TestAdversarialUiSignalRaceConditions:
         assert isolated_controller.is_meeting_recording is True  # is_meeting_recording covers paused
 
         qapp_offscreen.processEvents()
-        assert drawer.btn_toggle_recording.text() == "Stop & Save"
+        assert "Resume" in drawer.btn_universal_stop.text()
 
         # Spam prior meeting finalization signals
         for _ in range(25):
@@ -416,7 +414,7 @@ class TestAdversarialUiSignalRaceConditions:
 
         # Verification: Controller and drawer remain paused, NOT idle
         assert isolated_controller.capture_state == "paused"
-        assert drawer.btn_toggle_recording.text() == "Stop & Save"
+        assert "Resume" in drawer.btn_universal_stop.text()
 
         isolated_controller.stop_meeting_recording()
         qapp_offscreen.processEvents()

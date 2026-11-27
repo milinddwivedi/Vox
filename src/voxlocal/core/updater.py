@@ -12,10 +12,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import logging
+import os
 from pathlib import Path
+import time
 from typing import Any, Callable, Dict, Optional, Tuple, Union
+import urllib.error
 import urllib.request
 
 from voxlocal import __version__
@@ -297,14 +301,16 @@ class UpdateManager:
         timeout_sec: int = 15,
     ) -> Tuple[bool, str, str]:
         """
-        Resolves an authorized download URL. If an auth_token is provided,
-        requests a short-lived signed URL from the serverless authorization endpoint.
-        Falls back to manifest['installer_url'].
-        Returns: (success, download_url, message)
+        Resolves an authorized download URL. When `auth_token` is supplied,
+        requests a short-lived signed download ticket from `/api/download/authorize`.
+        Explicitly rejects HTTP 401/403 with clear re-authentication status rather than bypassing policy.
         """
+        ver = manifest.get("version", self.current_version)
+        fallback = str(manifest.get("installer_url") or "")
+        requires_auth_endpoint = "/api/download/" in fallback
+
         if auth_token:
             try:
-                ver = manifest.get("version", self.current_version)
                 payload = json.dumps({"artifact": f"releases/{ver}/VoxLocal-Setup.exe"}).encode("utf-8")
                 req = urllib.request.Request(
                     auth_api_url,
@@ -320,11 +326,19 @@ class UpdateManager:
                     if resp.status == 200:
                         data = json.loads(resp.read().decode("utf-8"))
                         if data.get("ok") and data.get("download_url"):
-                            return True, str(data["download_url"]), "Authorized signed URL retrieved"
+                            dl_url = str(data["download_url"])
+                            if dl_url.startswith("/"):
+                                dl_url = "https://vox-voice-assistant.vercel.app" + dl_url
+                            return True, dl_url, "Authorized signed URL retrieved"
+            except urllib.error.HTTPError as http_err:
+                if http_err.code in (401, 403):
+                    return False, "", "Authentication session expired (HTTP 401). Please sign in with Google again."
+                logger.warning("Failed to obtain authorized download URL (HTTP %s)", http_err.code)
             except Exception as exc:
                 logger.warning("Failed to obtain authorized download URL: %s", exc)
+        elif requires_auth_endpoint:
+            return False, "", "Google sign-in is required to authorize and download this VOX update."
 
-        fallback = manifest.get("installer_url", "")
         if fallback:
             return True, fallback, "Using manifest fallback URL"
         return False, "", "No download URL available"
@@ -336,61 +350,143 @@ class UpdateManager:
         auth_token: Optional[str] = None,
         timeout_sec: int = 120,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
+        auth_api_url: str = "https://vox-voice-assistant.vercel.app/api/download/authorize",
+        max_retries: int = 4,
     ) -> Tuple[bool, str]:
         """
-        Downloads the installer binary from an authorized or manifest URL,
-        writes to dest_path, and validates the complete release trust chain.
+        Downloads the installer binary from an authorized or manifest URL with HTTP Range
+        resume and automatic short-lived ticket renewal across interrupted/slow transfers,
+        writes to `.part`, and validates the complete Ed25519 + SHA-256 trust chain before
+        atomically activating `dest_path`.
         """
-        ok, dl_url, msg = self.resolve_download_url(manifest, auth_token=auth_token)
+        ok, dl_url, msg = self.resolve_download_url(
+            manifest,
+            auth_token=auth_token,
+            auth_api_url=auth_api_url,
+        )
         if not ok or not dl_url:
             return False, f"Could not obtain download URL: {msg}"
 
         dest = Path(dest_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_name(dest.name + ".part")
 
+        expected_size = 0
         try:
-            req = urllib.request.Request(
-                dl_url,
-                headers={"User-Agent": f"VOX-Desktop/{self.current_version}"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-                if resp.status != 200:
-                    return False, f"Download failed with HTTP {resp.status}"
-                total_bytes = 0
-                try:
-                    cl = resp.headers.get("Content-Length") if hasattr(resp, "headers") and resp.headers else None
-                    if cl:
-                        total_bytes = int(cl)
-                except (ValueError, TypeError, AttributeError):
-                    total_bytes = 0
-                if total_bytes <= 0:
+            expected_size = int(manifest.get("installer_size_bytes") or 0)
+        except (ValueError, TypeError):
+            expected_size = 0
+
+        attempt = 0
+        last_err = ""
+        need_ticket_refresh = False
+
+        while attempt < max(1, int(max_retries)):
+            attempt += 1
+            if need_ticket_refresh and auth_token:
+                ok_ref, new_url, msg_ref = self.resolve_download_url(
+                    manifest,
+                    auth_token=auth_token,
+                    auth_api_url=auth_api_url,
+                )
+                if not ok_ref or not new_url:
+                    return False, f"Download authorization rejected or expired: {msg_ref}"
+                dl_url = new_url
+                need_ticket_refresh = False
+
+            existing = part.stat().st_size if part.is_file() else 0
+            if expected_size > 0 and existing > expected_size:
+                part.unlink(missing_ok=True)
+                existing = 0
+
+            if expected_size > 0 and existing == expected_size:
+                # Partial file already holds exact expected byte count; jump to verification
+                break
+
+            try:
+                headers = {"User-Agent": f"VOX-Desktop/{self.current_version}"}
+                if auth_token and "/api/download/" in dl_url and "ticket=" not in dl_url:
+                    headers["Authorization"] = f"Bearer {auth_token}"
+                if existing > 0:
+                    headers["Range"] = f"bytes={existing}-"
+
+                req = urllib.request.Request(dl_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                    status = int(getattr(resp, "status", 200) or 200)
+                    if status not in (200, 206):
+                        last_err = f"Download failed with HTTP {status}"
+                        continue
+
+                    if existing > 0 and status == 200:
+                        # Server ignored Range header and sent full entity from offset 0
+                        existing = 0
+
+                    total_bytes = expected_size
+                    if status == 200:
+                        try:
+                            cl = resp.headers.get("Content-Length") if hasattr(resp, "headers") and resp.headers else None
+                            if cl:
+                                total_bytes = int(cl)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+
+                    mode = "ab" if (existing > 0 and status == 206) else "wb"
+                    downloaded_bytes = existing if mode == "ab" else 0
+
                     try:
-                        total_bytes = int(manifest.get("installer_size_bytes") or 0)
-                    except (ValueError, TypeError):
-                        total_bytes = 0
+                        with part.open(mode) as out_f:
+                            while True:
+                                chunk = resp.read(64 * 1024)
+                                if not chunk:
+                                    break
+                                out_f.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                if progress_callback is not None:
+                                    pct = (
+                                        int(min(100, (downloaded_bytes * 100) // total_bytes))
+                                        if total_bytes > 0
+                                        else 0
+                                    )
+                                    try:
+                                        progress_callback(downloaded_bytes, total_bytes, pct)
+                                    except Exception:
+                                        pass
+                    except http.client.IncompleteRead as inc_err:
+                        if getattr(inc_err, "partial", b""):
+                            with part.open("ab") as out_f:
+                                out_f.write(inc_err.partial)
+                            downloaded_bytes += len(inc_err.partial)
+                        raise ConnectionError(f"Interrupted transfer at {downloaded_bytes} bytes") from inc_err
 
-                downloaded_bytes = 0
-                with dest.open("wb") as out_f:
-                    while chunk := resp.read(64 * 1024):
-                        out_f.write(chunk)
-                        downloaded_bytes += len(chunk)
-                        if progress_callback is not None:
-                            pct = int(min(100, (downloaded_bytes * 100) // total_bytes)) if total_bytes > 0 else 0
-                            try:
-                                progress_callback(downloaded_bytes, total_bytes, pct)
-                            except Exception:
-                                pass
-        except Exception as exc:
-            return False, f"Download error: {exc}"
+                if total_bytes > 0 and downloaded_bytes < total_bytes:
+                    last_err = f"Incomplete transfer: {downloaded_bytes} < {total_bytes} bytes"
+                    continue
+                break
+            except urllib.error.HTTPError as http_err:
+                if http_err.code == 416 and expected_size > 0 and existing == expected_size:
+                    break
+                if http_err.code in (401, 403):
+                    # If ticket expired mid-transfer and caller holds auth_token, renew ticket once cleanly
+                    if attempt < max_retries and auth_token and "ticket=" in dl_url:
+                        need_ticket_refresh = True
+                        last_err = f"Ticket expired (HTTP {http_err.code}); renewed"
+                        continue
+                    part.unlink(missing_ok=True)
+                    return False, "Download authorization rejected or expired (HTTP 401). Please sign in with Google again."
+                last_err = f"Download HTTP error {http_err.code}: {http_err.reason}"
+                if attempt >= max_retries:
+                    return False, last_err
+            except Exception as exc:
+                last_err = f"Download error: {exc}"
+                if attempt >= max_retries:
+                    return False, last_err
+                time.sleep(min(1.5, 0.25 * attempt))
 
-        # Verify trust chain
-        valid, reason = verify_release_trust_chain(manifest, dest, self.public_key_hex)
+        # Verify trust chain before activating installer binary
+        valid, reason = verify_release_trust_chain(manifest, part, self.public_key_hex)
         if not valid:
-            if dest.exists():
-                try:
-                    dest.unlink()
-                except OSError:
-                    pass
+            part.unlink(missing_ok=True)
             return False, f"Trust chain validation failed: {reason}"
 
+        os.replace(part, dest)
         return True, "Download and trust chain verified successfully"

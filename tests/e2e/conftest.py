@@ -75,11 +75,14 @@ def qapp_offscreen() -> Generator[QApplication, None, None]:
 
 
 @pytest.fixture(autouse=True)
-def isolated_env(monkeypatch) -> None:
+def isolated_env(request, monkeypatch) -> None:
     """Isolate OS-level side effects (registry, notifications, audio devices)."""
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    monkeypatch.setattr(StartupManager, "is_enabled", staticmethod(lambda: False))
-    monkeypatch.setattr(StartupManager, "set_enabled", staticmethod(lambda *a, **k: True))
+    if os.environ.get("QT_QPA_PLATFORM", "").lower() != "windows":
+        monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    node_id = request.node.nodeid.lower()
+    if "startup" not in node_id:
+        monkeypatch.setattr(StartupManager, "is_enabled", staticmethod(lambda: False))
+        monkeypatch.setattr(StartupManager, "set_enabled", staticmethod(lambda *a, **k: True))
 
     # Guard against missing AudioDeviceManager import in voxlocal.core.controller
     import voxlocal.core.controller as ctrl_module

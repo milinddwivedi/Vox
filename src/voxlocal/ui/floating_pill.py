@@ -2764,10 +2764,12 @@ class VoxFlowBar(QWidget):
         self._compat_holder = QWidget(self.lay_dictation_widget)
         self._compat_holder.setFixedSize(0, 0)
         self.btn_cancel = _RoundPillButton("cancel", self._compat_holder)
+        self.btn_cancel.setAccessibleName("Cancel dictation")
         self.btn_cancel.clicked.connect(self._on_cancel_clicked)
         self.btn_cancel.hide()
 
         self.btn_check = _RoundPillButton("check", self._compat_holder)
+        self.btn_check.setAccessibleName("Dictation committed")
         self.btn_check.hide()
 
         self.waveform_capsule = DynamicWaveformCapsule(self._compat_holder, bar_count=10)
@@ -2783,14 +2785,17 @@ class VoxFlowBar(QWidget):
         self.btn_undo_toast.hide()
 
         self.btn_stop = _RoundPillButton("stop", self._compat_holder)
+        self.btn_stop.setAccessibleName("Stop dictation")
         self.btn_stop.clicked.connect(self._on_stop_clicked)
         self.btn_stop.hide()
 
         self.btn_scratchpad = _RoundPillButton("scratchpad", self._compat_holder)
+        self.btn_scratchpad.setAccessibleName("Open Scratchpad")
         self.btn_scratchpad.clicked.connect(self._on_open_scratchpad)
         self.btn_scratchpad.hide()
 
         self.meeting_chip = QPushButton("● 00:00 Notetaker", self._compat_holder)
+        self.meeting_chip.setAccessibleName("Open Meeting Notetaker")
         self.meeting_chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.meeting_chip.clicked.connect(self._on_meeting_chip_clicked)
         self.meeting_chip.hide()
@@ -2798,6 +2803,7 @@ class VoxFlowBar(QWidget):
         self.timer_widget = SessionTimerWidget(self._compat_holder)
         self.timer_widget.hide()
         self.menu_btn = QPushButton(self._compat_holder)
+        self.menu_btn.setAccessibleName("VOX Settings Menu")
         self.menu_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.menu_btn.hide()
         self.menu_btn.clicked.connect(lambda: self._on_open_settings())

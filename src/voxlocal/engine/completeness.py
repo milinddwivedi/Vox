@@ -336,7 +336,8 @@ def build_completeness_report(
     def _track_coverage(trk: str, wav_info: Dict[str, Any]) -> Tuple[int, int, float, Optional[float]]:
         if not wav_info.get("exists") or wav_info.get("duration_sec", 0.0) <= 0.05:
             return 0, 0, 0.0, None
-        st = t_stats.get(trk, {})
+        raw_st = t_stats.get(trk, {})
+        st = raw_st if isinstance(raw_st, dict) else {}
         dur = float(wav_info["duration_sec"])
         cap_samples = int(st.get("samples_captured") or 0)
         proc_samples = int(st.get("samples_processed") or 0)
@@ -439,7 +440,7 @@ def build_completeness_report(
     if total_duration_sec <= 0.05 or total_cap <= 0:
         status = "finalization_failed"
         reason = "No readable audio samples found for finalization."
-    elif cancelled or any(bool(t_stats.get(k, {}).get("cancelled")) for k in t_stats):
+    elif cancelled or any(isinstance(v, dict) and bool(v.get("cancelled")) for v in t_stats.values()):
         status = "incomplete"
         reason = f"Finalization interrupted before full completion (min track coverage {min_cov:.1f}%)."
     elif errors and min_cov <= 0.0:

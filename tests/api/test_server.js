@@ -171,6 +171,7 @@ async function mockAuthenticateUser(req) {
   if (token === 'token_user_1') return { id: 'usr_1', email: 'user1@example.com' };
   if (token === 'token_user_2') return { id: 'usr_2', email: 'user2@example.com' };
   if (token === 'token_bob') return { id: 'usr_bob', email: 'bob@company.com' };
+  if (token === 'token_suspended') return { id: 'usr_suspended', email: 'susp@example.com' };
   return null;
 }
 
@@ -189,6 +190,17 @@ require.cache[supabaseLibPath] = {
   }
 };
 
+// Mock Supabase Storage for test harness
+mockSupabase.storage = {
+  from: function(bucket) {
+    return {
+      createSignedUrl: async function(artifact, expires) {
+        return { data: null, error: { message: 'Mock bucket falls back to signed ticket' } };
+      },
+    };
+  },
+};
+
 // Also handle the buggy relative path require('./_lib/supabase') from api/usage/
 const buggySyncPath = path.resolve(rootDir, 'api/usage/_lib/supabase.js');
 require.cache[buggySyncPath] = require.cache[supabaseLibPath];
@@ -196,6 +208,8 @@ require.cache[buggySyncPath] = require.cache[supabaseLibPath];
 // Load serverless handlers
 const entitlementsHandler = require(path.resolve(rootDir, 'api/entitlements.js'));
 const releasesLatestHandler = require(path.resolve(rootDir, 'api/releases/latest.js'));
+const downloadAuthorizeHandler = require(path.resolve(rootDir, 'api/download/authorize.js'));
+const downloadFileHandler = require(path.resolve(rootDir, 'api/download/file.js'));
 
 // Bridged Razorpay Webhook Handler
 async function bridgedRazorpayWebhookHandler(req, res) {
@@ -513,6 +527,13 @@ function createServerlessContext(req, res, bodyBuffer) {
     }
     return res;
   };
+
+  res.redirect = function(code, urlStr) {
+    res.statusCode = code;
+    res.setHeader('Location', urlStr);
+    res.end('');
+    return res;
+  };
 }
 
 // HTTP Server
@@ -539,6 +560,7 @@ const server = http.createServer((req, res) => {
         if (req.body.subscriptions) db.subscriptions.push(...req.body.subscriptions);
         if (req.body.entitlements) db.entitlements.push(...req.body.entitlements);
         if (req.body.usage_periods) db.usage_periods.push(...req.body.usage_periods);
+        if (req.body.profiles) db.profiles.push(...req.body.profiles);
         return res.status(200).json({ status: 'seed_ok' });
       }
 
@@ -554,6 +576,12 @@ const server = http.createServer((req, res) => {
       }
       if (pathname === '/api/releases/latest') {
         return await releasesLatestHandler(req, res);
+      }
+      if (pathname === '/api/download/authorize') {
+        return await downloadAuthorizeHandler(req, res);
+      }
+      if (pathname === '/api/download/file') {
+        return await downloadFileHandler(req, res);
       }
 
       res.status(404).json({ error: 'Endpoint not found' });

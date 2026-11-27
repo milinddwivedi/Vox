@@ -13,6 +13,7 @@ import re
 import shutil
 import sqlite3
 import threading
+import weakref
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
@@ -20,6 +21,7 @@ from typing import Any, Dict, Iterator, List, Optional
 from voxlocal.core.logger import get_logger
 
 logger = get_logger("database")
+_ACTIVE_DATABASES: "weakref.WeakSet[LocalDatabase]" = weakref.WeakSet()
 
 
 class LocalDatabase:
@@ -28,6 +30,11 @@ class LocalDatabase:
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
         self._is_memory = (str(self.db_path) == ":memory:")
+        self._lock = threading.RLock()
+        self._write_lock = self._lock
+        self._local = threading.local()
+        self._conn_registry_lock = threading.Lock()
+        self._thread_conns: List[sqlite3.Connection] = []
         if self._is_memory:
             self._mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._mem_conn.row_factory = sqlite3.Row
@@ -35,12 +42,58 @@ class LocalDatabase:
         else:
             self._mem_conn = None
             os.makedirs(self.db_path.parent, exist_ok=True)
-        self._lock = threading.RLock()
+            init_conn = self._open_disk_connection(enable_wal=True)
+            self._local.conn = init_conn
+            self._local.db_path = str(self.db_path)
+            with self._conn_registry_lock:
+                self._thread_conns.append(init_conn)
         self._init_schema()
         self._seed_default_vocabulary()
+        _ACTIVE_DATABASES.add(self)
+
+    def _open_disk_connection(self, *, enable_wal: bool = False) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=15.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=15000;")
+        if enable_wal:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL;")
+            except sqlite3.OperationalError:
+                pass
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute("PRAGMA cache_size=-16000;")
+        return conn
+
+    def _get_thread_conn(self) -> sqlite3.Connection:
+        if self._is_memory and self._mem_conn is not None:
+            return self._mem_conn
+        conn = getattr(self._local, "conn", None)
+        bound_path = getattr(self._local, "db_path", None)
+        if conn is not None and bound_path == str(self.db_path):
+            try:
+                conn.execute("SELECT 1")
+                return conn
+            except sqlite3.Error:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                with self._conn_registry_lock:
+                    if conn in self._thread_conns:
+                        self._thread_conns.remove(conn)
+                conn = None
+
+        conn = self._open_disk_connection(enable_wal=False)
+        self._local.conn = conn
+        self._local.db_path = str(self.db_path)
+        with self._conn_registry_lock:
+            self._thread_conns.append(conn)
+        return conn
 
     def close(self) -> None:
-        """Close database connection (especially important for in-memory databases)."""
+        """Close all pooled thread-local and in-memory database connections cleanly."""
         with self._lock:
             if self._mem_conn is not None:
                 try:
@@ -48,22 +101,74 @@ class LocalDatabase:
                 except Exception:
                     pass
                 self._mem_conn = None
+            with self._conn_registry_lock:
+                conns = list(self._thread_conns)
+                self._thread_conns.clear()
+            for conn in conns:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            try:
+                if getattr(self._local, "conn", None) is not None:
+                    self._local.conn = None
+            except Exception:
+                pass
+
+    def __enter__(self) -> "LocalDatabase":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc_val: Any, _exc_tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @contextlib.contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _read_connect(self) -> Iterator[sqlite3.Connection]:
+        """Lock-free concurrent WAL reader for disk DBs; serialized only for :memory: DBs."""
         if self._is_memory and self._mem_conn is not None:
             with self._lock:
                 yield self._mem_conn
             return
-
-        conn = sqlite3.connect(str(self.db_path), timeout=15.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
+        conn = self._get_thread_conn()
         try:
             yield conn
         finally:
-            conn.close()
+            if getattr(conn, "in_transaction", False):
+                with contextlib.suppress(Exception):
+                    conn.rollback()
+
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Serialized writer/general connection context using persistent thread-local WAL handles."""
+        if self._is_memory and self._mem_conn is not None:
+            with self._lock:
+                try:
+                    yield self._mem_conn
+                except Exception:
+                    if getattr(self._mem_conn, "in_transaction", False):
+                        with contextlib.suppress(Exception):
+                            self._mem_conn.rollback()
+                    raise
+            return
+
+        with self._write_lock:
+            conn = self._get_thread_conn()
+            try:
+                yield conn
+            except Exception:
+                if getattr(conn, "in_transaction", False):
+                    with contextlib.suppress(Exception):
+                        conn.rollback()
+                raise
+            else:
+                if getattr(conn, "in_transaction", False):
+                    with contextlib.suppress(Exception):
+                        conn.commit()
 
     def _init_schema(self) -> None:
         with self._lock, self._connect() as conn:
@@ -450,8 +555,40 @@ class LocalDatabase:
             conn.commit()
 
         self._migrate_v6()
+        self._migrate_v7()
+        self._ensure_v7_extended_columns()
         self._ensure_performance_indexes()
         self._seed_default_folders()
+
+    def _ensure_v7_extended_columns(self) -> None:
+        """Idempotently ensure extended metadata columns on v7 tables without breaking migration checks."""
+        with self._lock, self._connect() as conn:
+            alter_stmts = [
+                # meetings structured deliverable fields
+                "ALTER TABLE meetings ADD COLUMN brief_summary TEXT DEFAULT '';",
+                "ALTER TABLE meetings ADD COLUMN meeting_purpose TEXT DEFAULT '';",
+                "ALTER TABLE meetings ADD COLUMN overall_outcome TEXT DEFAULT '';",
+                "ALTER TABLE meetings ADD COLUMN topics_json TEXT DEFAULT '[]';",
+                "ALTER TABLE meetings ADD COLUMN open_questions_json TEXT DEFAULT '[]';",
+                # action_items rich fields
+                "ALTER TABLE action_items ADD COLUMN priority TEXT DEFAULT '';",
+                "ALTER TABLE action_items ADD COLUMN context TEXT DEFAULT '';",
+                "ALTER TABLE action_items ADD COLUMN related_topic TEXT DEFAULT '';",
+                "ALTER TABLE action_items ADD COLUMN confirmation_state TEXT DEFAULT 'confirmed';",
+                "ALTER TABLE action_items ADD COLUMN notes TEXT DEFAULT '';",
+                # decisions rich fields
+                "ALTER TABLE decisions ADD COLUMN speaker TEXT DEFAULT '';",
+                "ALTER TABLE decisions ADD COLUMN context TEXT DEFAULT '';",
+                "ALTER TABLE decisions ADD COLUMN participants_json TEXT DEFAULT '[]';",
+                # knowledge_items verification & entity fields
+                "ALTER TABLE knowledge_items ADD COLUMN verified INTEGER DEFAULT 0;",
+                "ALTER TABLE knowledge_items ADD COLUMN entity_name TEXT DEFAULT '';",
+                "ALTER TABLE knowledge_items ADD COLUMN notes TEXT DEFAULT '';",
+            ]
+            for ddl in alter_stmts:
+                with contextlib.suppress(sqlite3.OperationalError):
+                    conn.execute(ddl)
+            conn.commit()
 
     def _ensure_performance_indexes(self) -> None:
         """Create performance indexes if columns exist (Phase 8 Performance Optimization)."""
@@ -461,6 +598,8 @@ class LocalDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_decisions_meeting ON decisions(meeting_id, timestamp_sec);",
                 "CREATE INDEX IF NOT EXISTS idx_decisions_supersedes ON decisions(supersedes_id);",
                 "CREATE INDEX IF NOT EXISTS idx_meetings_status ON meetings(status);",
+                "CREATE INDEX IF NOT EXISTS idx_meetings_created_at ON meetings(created_at DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_meetings_folder_id ON meetings(folder_id);",
                 "CREATE INDEX IF NOT EXISTS idx_finalization_jobs_state ON finalization_jobs(state, updated_at);",
             ]:
                 try:
@@ -661,20 +800,144 @@ class LocalDatabase:
                 logger.info("Database schema successfully migrated to v6.")
 
             except Exception as exc:
-                logger.error("Migration to v6 failed: %s", exc)
-                # Preserve failed database copy for debugging
-                if str(self.db_path) != ":memory:" and self.db_path.exists():
-                    try:
-                        failed_dir = self.db_path.parent / "snapshots"
-                        failed_dir.mkdir(parents=True, exist_ok=True)
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        failed_path = failed_dir / f"voxlocal_failed_v6_{timestamp}.db"
-                        shutil.copy2(str(self.db_path), str(failed_path))
-                        logger.error("Failed database preserved at %s", failed_path)
-                    except Exception as copy_exc:
-                        logger.warning("Could not preserve failed database snapshot: %s", copy_exc)
+                logger.error("Failed persisting snapshot/migration: %s", exc)
                 raise
 
+    def _migrate_v7(self) -> None:
+        """
+        Non-destructive schema migration to v7:
+        - Creates verified pre-migration snapshot of voxlocal.db on disk before touching schema.
+        - Adds meetings columns for detailed_summary, key_points_json, follow_ups_json,
+          llm_model_used, llm_device_used, llm_fallback_reason, knowledge_indexed_at.
+        - Adds tables: speaker_aliases, knowledge_items, knowledge_sources, rag_chunks, rag_chunks_fts (FTS5).
+        - Sets PRAGMA user_version = 7.
+        """
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute("PRAGMA user_version;").fetchone()
+                current_version = row[0] if row else 0
+
+            if current_version >= 7:
+                return
+
+            logger.info("Starting non-destructive schema migration to v7 (current user_version: %d)...", current_version)
+
+            if str(self.db_path) != ":memory:" and self.db_path.exists() and self.db_path.stat().st_size > 0:
+                try:
+                    snapshot_dir = self.db_path.parent / "snapshots"
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    snap_file = snapshot_dir / f"voxlocal_pre_v7_{ts}.db"
+                    snap_path = self.create_verified_snapshot(snap_file)
+                    logger.info("Pre-v7 verified snapshot preserved at %s", snap_path)
+                except Exception as snap_exc:
+                    logger.error("Aborting v7 migration because pre-migration snapshot failed: %s", snap_exc)
+                    raise
+
+            with self._connect() as conn:
+                m_cols = {r["name"] for r in conn.execute("PRAGMA table_info(meetings);").fetchall()}
+                for col, ddl in (
+                    ("detailed_summary", "ALTER TABLE meetings ADD COLUMN detailed_summary TEXT DEFAULT '';"),
+                    ("key_points_json", "ALTER TABLE meetings ADD COLUMN key_points_json TEXT DEFAULT '[]';"),
+                    ("follow_ups_json", "ALTER TABLE meetings ADD COLUMN follow_ups_json TEXT DEFAULT '[]';"),
+                    ("llm_model_used", "ALTER TABLE meetings ADD COLUMN llm_model_used TEXT DEFAULT '';"),
+                    ("llm_device_used", "ALTER TABLE meetings ADD COLUMN llm_device_used TEXT DEFAULT '';"),
+                    ("llm_fallback_reason", "ALTER TABLE meetings ADD COLUMN llm_fallback_reason TEXT DEFAULT '';"),
+                    ("knowledge_indexed_at", "ALTER TABLE meetings ADD COLUMN knowledge_indexed_at TEXT DEFAULT '';"),
+                ):
+                    if col not in m_cols:
+                        conn.execute(ddl)
+
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS speaker_aliases (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        meeting_id INTEGER NOT NULL,
+                        raw_label TEXT NOT NULL,
+                        display_name TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(meeting_id, raw_label),
+                        FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_speaker_aliases_meeting
+                        ON speaker_aliases(meeting_id);
+
+                    CREATE TABLE IF NOT EXISTS knowledge_items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        item_type TEXT NOT NULL,
+                        canonical_key TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        metadata_json TEXT DEFAULT '{}',
+                        confidence REAL DEFAULT 0.85,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        valid_from_date TEXT DEFAULT '',
+                        superseded_by_id INTEGER NULL REFERENCES knowledge_items(id) ON DELETE SET NULL,
+                        user_edited INTEGER DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_knowledge_type_key
+                        ON knowledge_items(item_type, canonical_key);
+                    CREATE INDEX IF NOT EXISTS idx_knowledge_status
+                        ON knowledge_items(status);
+
+                    CREATE TABLE IF NOT EXISTS knowledge_sources (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        knowledge_item_id INTEGER NOT NULL,
+                        meeting_id INTEGER NULL,
+                        meeting_title TEXT DEFAULT '',
+                        meeting_date TEXT DEFAULT '',
+                        speaker TEXT DEFAULT '',
+                        timestamp_sec REAL DEFAULT 0.0,
+                        evidence_quote TEXT DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (knowledge_item_id) REFERENCES knowledge_items(id) ON DELETE CASCADE,
+                        FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE SET NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_ksources_item
+                        ON knowledge_sources(knowledge_item_id);
+                    CREATE INDEX IF NOT EXISTS idx_ksources_meeting
+                        ON knowledge_sources(meeting_id);
+
+                    CREATE TABLE IF NOT EXISTS rag_chunks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        meeting_id INTEGER NOT NULL,
+                        chunk_index INTEGER NOT NULL,
+                        start_time REAL NOT NULL,
+                        end_time REAL NOT NULL,
+                        speakers_json TEXT DEFAULT '[]',
+                        text TEXT NOT NULL,
+                        embedding_blob BLOB NULL,
+                        embedding_model TEXT DEFAULT '',
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(meeting_id, chunk_index),
+                        FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_rag_chunks_meeting
+                        ON rag_chunks(meeting_id, start_time);
+
+                    CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(
+                        chunk_id UNINDEXED,
+                        meeting_id UNINDEXED,
+                        meeting_title,
+                        speakers,
+                        text,
+                        tokenize='porter unicode61'
+                    );
+                    """
+                )
+                conn.execute("PRAGMA user_version = 7;")
+                conn.commit()
+
+            with self._connect() as vconn:
+                fk_res = vconn.execute("PRAGMA foreign_key_check;").fetchall()
+                if fk_res:
+                    logger.warning("Foreign key check warnings after v7 migration: %s", fk_res)
+                chk = [r[0] for r in vconn.execute("PRAGMA integrity_check;").fetchall()]
+                if chk != ["ok"]:
+                    raise sqlite3.DatabaseError(f"Post-v7 integrity check failed: {chk}")
+
+            logger.info("Database schema successfully migrated to v7.")
 
     def _seed_default_folders(self) -> None:
         """Seed default smart and personal folders if table is empty."""
@@ -761,6 +1024,17 @@ class LocalDatabase:
         user_id: str = "default",
     ) -> int:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        eff_tz = str(timezone or "").strip()
+        eff_off = utc_offset_min
+        if not eff_tz or eff_tz.lower() in ("utc", "local"):
+            local_dt = datetime.now().astimezone()
+            eff_tz = local_dt.tzname() or "Local"
+            if eff_off is None and local_dt.utcoffset() is not None:
+                eff_off = int(local_dt.utcoffset().total_seconds() // 60)
+        elif eff_off is None:
+            local_dt = datetime.now().astimezone()
+            if local_dt.utcoffset() is not None:
+                eff_off = int(local_dt.utcoffset().total_seconds() // 60)
         with self._lock, self._connect() as conn:
             cur = conn.execute(
                 """
@@ -790,8 +1064,8 @@ class LocalDatabase:
                     engagement_score,
                     sentiment_score,
                     topics,
-                    timezone,
-                    utc_offset_min,
+                    eff_tz,
+                    eff_off,
                     calendar_event_id,
                     calendar_join_url,
                     calendar_attendees,
@@ -806,9 +1080,9 @@ class LocalDatabase:
 
     def list_unfinalized_meetings(self) -> List[Dict[str, Any]]:
         """Retrieve meetings left in an incomplete state due to crash or abrupt exit."""
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM meetings WHERE status IN ('recording', 'transcribing') ORDER BY id DESC"
+                "SELECT * FROM meetings WHERE status IN ('recording', 'transcribing', 'finalizing') ORDER BY id DESC"
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -876,7 +1150,7 @@ class LocalDatabase:
             return int(row["id"]) if row else 0
 
     def get_finalization_job(self, meeting_id: int) -> Optional[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             row = conn.execute(
                 "SELECT * FROM finalization_jobs WHERE meeting_id = ?",
                 (int(meeting_id),),
@@ -885,7 +1159,7 @@ class LocalDatabase:
 
     def list_pending_finalization_jobs(self, include_future_retries: bool = False) -> List[Dict[str, Any]]:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             if include_future_retries:
                 rows = conn.execute(
                     """
@@ -1000,6 +1274,18 @@ class LocalDatabase:
             "post_call_stage",
             "post_call_status_message",
             "post_call_engine_summary",
+            "detailed_summary",
+            "key_points_json",
+            "follow_ups_json",
+            "llm_model_used",
+            "llm_device_used",
+            "llm_fallback_reason",
+            "knowledge_indexed_at",
+            "brief_summary",
+            "meeting_purpose",
+            "overall_outcome",
+            "topics_json",
+            "open_questions_json",
         }
         fields = {k: v for k, v in kwargs.items() if k in allowed}
         if not fields:
@@ -1277,8 +1563,9 @@ class LocalDatabase:
 
     def rename_meeting_speaker(self, meeting_id: int, old_speaker: str, new_speaker: str) -> int:
         """
-        Rename all occurrences of old_speaker to new_speaker in transcript_segments,
-        rebuild full_transcript, and update owners in action_items and decisions.
+        Rename all occurrences of old_speaker to new_speaker across transcript_segments,
+        full_transcript, action_items, decisions, knowledge_sources, speaker_aliases,
+        key_points/follow_ups JSON, and rag_chunks + rag_chunks_fts.
         """
         old_clean = (old_speaker or "").strip()
         new_clean = (new_speaker or "").strip()
@@ -1290,6 +1577,7 @@ class LocalDatabase:
                 (new_clean, meeting_id, old_clean),
             )
             count = cur.rowcount
+            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if count > 0:
                 segs = conn.execute(
                     "SELECT start_time, speaker, text FROM transcript_segments WHERE meeting_id = ? ORDER BY start_time ASC, segment_index ASC",
@@ -1305,25 +1593,188 @@ class LocalDatabase:
                     "UPDATE meetings SET full_transcript = ? WHERE id = ?",
                     (full_txt, meeting_id),
                 )
+
+            # Always propagate across linked tables & aliases cleanly even if partial
+            conn.execute(
+                "UPDATE action_items SET owner = ? WHERE meeting_id = ? AND owner = ?",
+                (new_clean, meeting_id, old_clean),
+            )
+            dec_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(decisions)").fetchall()
+            }
+            if "speaker" in dec_cols:
                 conn.execute(
-                    "UPDATE action_items SET owner = ? WHERE meeting_id = ? AND owner = ?",
+                    "UPDATE decisions SET speaker = ? WHERE meeting_id = ? AND speaker = ?",
                     (new_clean, meeting_id, old_clean),
                 )
-                dec_cols = {
-                    r["name"]
-                    for r in conn.execute("PRAGMA table_info(decisions)").fetchall()
-                }
-                if "speaker" in dec_cols:
-                    conn.execute(
-                        "UPDATE decisions SET speaker = ? WHERE meeting_id = ? AND speaker = ?",
-                        (new_clean, meeting_id, old_clean),
-                    )
-                conn.commit()
+            if "participants_json" in dec_cols:
+                dec_rows = conn.execute(
+                    "SELECT id, participants_json FROM decisions WHERE meeting_id = ?",
+                    (meeting_id,),
+                ).fetchall()
+                for dr in dec_rows:
+                    try:
+                        p_list = json.loads(dr["participants_json"] or "[]")
+                    except Exception:
+                        p_list = []
+                    if isinstance(p_list, list):
+                        new_pl = [new_clean if str(x).strip() == old_clean else x for x in p_list]
+                        if new_pl != p_list:
+                            conn.execute(
+                                "UPDATE decisions SET participants_json = ? WHERE id = ?",
+                                (json.dumps(new_pl, ensure_ascii=False), int(dr["id"])),
+                            )
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute(
+                    "UPDATE knowledge_sources SET speaker = ? WHERE meeting_id = ? AND speaker = ?",
+                    (new_clean, meeting_id, old_clean),
+                )
+
+            # Update existing alias chains (e.g. raw Speaker 5 -> old -> new) AND upsert current mapping
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute(
+                    "UPDATE speaker_aliases SET display_name = ?, updated_at = ? WHERE meeting_id = ? AND display_name = ?",
+                    (new_clean, now_ts, meeting_id, old_clean),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO speaker_aliases (meeting_id, raw_label, display_name, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(meeting_id, raw_label) DO UPDATE SET
+                        display_name = excluded.display_name,
+                        updated_at = excluded.updated_at
+                    """,
+                    (meeting_id, old_clean, new_clean, now_ts),
+                )
+
+            # Propagate speaker label into summary, key_points_json, follow_ups_json, topics_json & open_questions_json if stored
+            with contextlib.suppress(sqlite3.OperationalError, Exception):
+                mrow = conn.execute(
+                    "SELECT title, summary, key_points_json, follow_ups_json, topics_json, open_questions_json FROM meetings WHERE id = ?",
+                    (meeting_id,),
+                ).fetchone()
+                if mrow:
+                    m_title = str(mrow["title"] or "")
+                    old_pat = re.compile(rf"\b{re.escape(old_clean)}\b")
+                    summary_txt = str(mrow["summary"] or "")
+                    summary_new = old_pat.sub(new_clean, summary_txt) if summary_txt else summary_txt
+                    summary_changed = summary_new != summary_txt
+                    kp_raw = json.loads(mrow["key_points_json"] or "[]")
+                    kp_changed = False
+                    if isinstance(kp_raw, list):
+                        for kp in kp_raw:
+                            if isinstance(kp, dict) and isinstance(kp.get("speakers"), list):
+                                new_spks = [new_clean if str(sp).strip() == old_clean else sp for sp in kp["speakers"]]
+                                if new_spks != kp["speakers"]:
+                                    kp["speakers"] = new_spks
+                                    kp_changed = True
+                    fu_raw = json.loads(mrow["follow_ups_json"] or "[]")
+                    fu_changed = False
+                    if isinstance(fu_raw, list):
+                        for fu in fu_raw:
+                            if isinstance(fu, dict) and str(fu.get("owner") or "").strip() == old_clean:
+                                fu["owner"] = new_clean
+                                fu_changed = True
+                    tp_raw = json.loads(mrow["topics_json"] or "[]")
+                    tp_changed = False
+                    if isinstance(tp_raw, list):
+                        for tp in tp_raw:
+                            if isinstance(tp, dict) and isinstance(tp.get("participants"), list):
+                                new_ps = [new_clean if str(sp).strip() == old_clean else sp for sp in tp["participants"]]
+                                if new_ps != tp["participants"]:
+                                    tp["participants"] = new_ps
+                                    tp_changed = True
+                    oq_raw = json.loads(mrow["open_questions_json"] or "[]")
+                    oq_changed = False
+                    if isinstance(oq_raw, list):
+                        for oq in oq_raw:
+                            if isinstance(oq, dict):
+                                for fld in ("speaker", "asked_by", "raised_by"):
+                                    if str(oq.get(fld) or "").strip() == old_clean:
+                                        oq[fld] = new_clean
+                                        oq_changed = True
+                    if summary_changed or kp_changed or fu_changed or tp_changed or oq_changed:
+                        conn.execute(
+                            "UPDATE meetings SET summary = ?, key_points_json = ?, follow_ups_json = ?, topics_json = ?, open_questions_json = ? WHERE id = ?",
+                            (
+                                summary_new,
+                                json.dumps(kp_raw, ensure_ascii=False),
+                                json.dumps(fu_raw, ensure_ascii=False),
+                                json.dumps(tp_raw, ensure_ascii=False),
+                                json.dumps(oq_raw, ensure_ascii=False),
+                                meeting_id,
+                            ),
+                        )
+
+                    # Immediately rewrite rag_chunks & rag_chunks_fts so stale labels never survive in RAG
+                    rc_rows = conn.execute(
+                        "SELECT id, speakers_json, text FROM rag_chunks WHERE meeting_id = ?",
+                        (meeting_id,),
+                    ).fetchall()
+                    if rc_rows:
+                        conn.execute("DELETE FROM rag_chunks_fts WHERE meeting_id = ?", (meeting_id,))
+                        old_tag = f"|{old_clean}]"
+                        new_tag = f"|{new_clean}]"
+                        for rc in rc_rows:
+                            cid = int(rc["id"])
+                            try:
+                                spks = json.loads(rc["speakers_json"] or "[]")
+                            except Exception:
+                                spks = []
+                            upd_spks = []
+                            seen_s = set()
+                            for s in spks:
+                                val = new_clean if str(s).strip() == old_clean else str(s).strip()
+                                if val and val not in seen_s:
+                                    seen_s.add(val)
+                                    upd_spks.append(val)
+                            txt_new = old_pat.sub(new_clean, str(rc["text"] or "").replace(old_tag, new_tag))
+                            conn.execute(
+                                "UPDATE rag_chunks SET speakers_json = ?, text = ?, updated_at = ? WHERE id = ?",
+                                (json.dumps(upd_spks), txt_new, now_ts, cid),
+                            )
+                            conn.execute(
+                                """
+                                INSERT INTO rag_chunks_fts (chunk_id, meeting_id, meeting_title, speakers, text)
+                                VALUES (?, ?, ?, ?, ?)
+                                """,
+                                (cid, meeting_id, m_title, ", ".join(upd_spks), txt_new),
+                            )
+
+            conn.commit()
             return count
+
+    def set_speaker_alias(self, meeting_id: int, raw_label: str, display_name: str) -> None:
+        raw_c = str(raw_label or "").strip()
+        disp_c = str(display_name or "").strip()
+        if not raw_c or not disp_c:
+            return
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO speaker_aliases (meeting_id, raw_label, display_name, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(meeting_id, raw_label) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    updated_at = excluded.updated_at
+                """,
+                (meeting_id, raw_c, disp_c, now_ts),
+            )
+            conn.commit()
+
+    def get_speaker_aliases(self, meeting_id: int) -> Dict[str, str]:
+        with self._read_connect() as conn:
+            rows = conn.execute(
+                "SELECT raw_label, display_name FROM speaker_aliases WHERE meeting_id = ?",
+                (meeting_id,),
+            ).fetchall()
+            return {str(r["raw_label"]): str(r["display_name"]) for r in rows}
 
     def get_meeting_speakers(self, meeting_id: int) -> list:
         """Return distinct speakers with turn counts and word statistics for a meeting."""
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             rows = conn.execute(
                 """
                 SELECT speaker, COUNT(*) as turn_count, GROUP_CONCAT(text, ' ') as all_text
@@ -1346,7 +1797,7 @@ class LocalDatabase:
             return speakers
 
     def get_meeting(self, meeting_id: int) -> Optional[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             row = conn.execute(
                 """
                 SELECT m.*, f.name AS folder_name, f.color AS folder_color, f.folder_type AS folder_category
@@ -1394,7 +1845,7 @@ class LocalDatabase:
             return meeting
 
     def get_meeting_segments(self, meeting_id: int) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             segs = conn.execute(
                 "SELECT * FROM transcript_segments WHERE meeting_id = ? ORDER BY start_time ASC, end_time ASC, segment_index ASC",
                 (meeting_id,),
@@ -1443,7 +1894,7 @@ class LocalDatabase:
 
     def get_provisional_transcript_segments(self, meeting_id: int) -> List[Dict[str, Any]]:
         """Return archived provisional live-preview segments for comparison, if any."""
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             row = conn.execute(
                 "SELECT provisional_transcript_json FROM meetings WHERE id = ?",
                 (meeting_id,),
@@ -1470,7 +1921,7 @@ class LocalDatabase:
         timeframe: Optional[str] = None,
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             clauses = ["1=1"]
             params: List[Any] = []
 
@@ -1604,7 +2055,7 @@ class LocalDatabase:
             return int(cur.lastrowid)
 
     def list_folders(self) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             rows = conn.execute(
                 """
                 SELECT f.*, COUNT(m.id) AS meeting_count
@@ -1672,22 +2123,56 @@ class LocalDatabase:
             )
             conn.commit()
 
+    @staticmethod
+    def _clean_nullable_field(val: Optional[str]) -> Optional[str]:
+        if val is None:
+            return None
+        s = str(val).strip()
+        if not s or s.lower() in (
+            "none",
+            "null",
+            "n/a",
+            "na",
+            "unknown",
+            "unassigned",
+            "unassigned — confirmation required",
+            "owner unknown",
+            "not specified",
+            "no due date",
+            "tbd",
+        ):
+            return None
+        return s
+
     def add_action_item(
         self,
         meeting_id: int,
         description: str,
-        owner: str = "Unassigned",
-        due_date: str = "",
+        owner: Optional[str] = None,
+        due_date: Optional[str] = None,
         status: str = "pending",
         timestamp_sec: float = 0.0,
         due_date_resolution: str = "",
         evidence_quote: str = "",
         is_manual: int = 0,
         user_edited: int = 0,
+        priority: Optional[str] = None,
+        context: str = "",
+        related_topic: str = "",
+        confirmation_state: str = "confirmed",
+        notes: str = "",
     ) -> int:
         clean_desc = (description or "").strip()
         if not clean_desc:
             return 0
+        owner_val = self._clean_nullable_field(owner)
+        due_val = self._clean_nullable_field(due_date)
+        prio_val = str(priority or "").strip().capitalize()
+        if prio_val not in ("High", "Medium", "Low"):
+            prio_val = ""
+        conf_val = str(confirmation_state or "confirmed").strip().lower()
+        if conf_val not in ("confirmed", "suggested", "needs_confirmation"):
+            conf_val = "confirmed"
         norm_desc = " ".join(clean_desc.lower().split())
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._lock, self._connect() as conn:
@@ -1703,14 +2188,15 @@ class LocalDatabase:
                 """
                 INSERT INTO action_items (
                     meeting_id, description, owner, due_date, status, timestamp_sec, created_at,
-                    due_date_resolution, evidence_quote, is_manual, user_edited
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    due_date_resolution, evidence_quote, is_manual, user_edited,
+                    priority, context, related_topic, confirmation_state, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     meeting_id,
                     clean_desc,
-                    (owner or "").strip() or "Unassigned",
-                    (due_date or "").strip(),
+                    owner_val,
+                    due_val,
                     status,
                     round(float(timestamp_sec), 2),
                     now,
@@ -1718,20 +2204,36 @@ class LocalDatabase:
                     evidence_quote,
                     is_manual,
                     user_edited,
+                    prio_val,
+                    str(context or "").strip(),
+                    str(related_topic or "").strip(),
+                    conf_val,
+                    str(notes or "").strip(),
                 ),
             )
             conn.commit()
             return int(cur.lastrowid)
 
     def list_action_items(
-        self, meeting_id: Optional[int] = None, status: Optional[str] = None, limit: int = 200
+        self,
+        meeting_id: Optional[int] = None,
+        status: Optional[str] = None,
+        limit: int = 200,
+        meeting_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             clauses = ["1=1"]
             params: List[Any] = []
             if meeting_id is not None:
                 clauses.append("a.meeting_id = ?")
                 params.append(meeting_id)
+            elif meeting_ids is not None:
+                clean_ids = [int(x) for x in meeting_ids]
+                if not clean_ids:
+                    return []
+                ph = ",".join("?" for _ in clean_ids)
+                clauses.append(f"a.meeting_id IN ({ph})")
+                params.extend(clean_ids)
             if status:
                 if status.lower() == "open":
                     clauses.append("a.status IN ('pending', 'blocked', 'reopened')")
@@ -1783,6 +2285,11 @@ class LocalDatabase:
         due_date_resolution: Optional[str] = None,
         evidence_quote: Optional[str] = None,
         user_edited: int = 1,
+        priority: Optional[str] = None,
+        context: Optional[str] = None,
+        related_topic: Optional[str] = None,
+        confirmation_state: Optional[str] = None,
+        notes: Optional[str] = None,
         **kwargs: Any,
     ) -> bool:
         """Update editable action details while preserving meeting links and marking user_edited = 1."""
@@ -1795,12 +2302,12 @@ class LocalDatabase:
                 if not clean_desc:
                     return False
                 fields["description"] = clean_desc
-            if owner is not None:
-                fields["owner"] = owner.strip() or "Unassigned"
-            if due_date is not None:
-                fields["due_date"] = due_date.strip()
+            if owner is not None or "owner" in kwargs:
+                fields["owner"] = self._clean_nullable_field(owner if owner is not None else kwargs.get("owner"))
+            if due_date is not None or "due_date" in kwargs:
+                fields["due_date"] = self._clean_nullable_field(due_date if due_date is not None else kwargs.get("due_date"))
             if status is not None:
-                clean_status = status.strip()
+                clean_status = status.strip().lower()
                 valid_statuses = {"pending", "completed", "cancelled", "reopened", "blocked"}
                 if clean_status not in valid_statuses:
                     raise ValueError(f"Invalid action item status: {clean_status}. Allowed: {valid_statuses}")
@@ -1809,6 +2316,19 @@ class LocalDatabase:
                 fields["due_date_resolution"] = due_date_resolution.strip()
             if evidence_quote is not None:
                 fields["evidence_quote"] = evidence_quote.strip()
+            if priority is not None:
+                pv = str(priority).strip().capitalize()
+                fields["priority"] = pv if pv in ("High", "Medium", "Low") else ""
+            if context is not None:
+                fields["context"] = str(context).strip()
+            if related_topic is not None:
+                fields["related_topic"] = str(related_topic).strip()
+            if confirmation_state is not None:
+                cs = str(confirmation_state).strip().lower()
+                if cs in ("confirmed", "suggested", "needs_confirmation"):
+                    fields["confirmation_state"] = cs
+            if notes is not None:
+                fields["notes"] = str(notes).strip()
             for k, v in kwargs.items():
                 if k in ("is_manual", "timestamp_sec"):
                     fields[k] = v
@@ -1838,12 +2358,16 @@ class LocalDatabase:
         evidence_quote: str = "",
         is_manual: int = 0,
         user_edited: int = 0,
+        speaker: str = "",
+        context: str = "",
+        participants: Optional[List[str]] = None,
     ) -> int:
         clean_dec = (decision or "").strip()
         if not clean_dec:
             return 0
         norm_dec = " ".join(clean_dec.lower().split())
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        part_json = json.dumps(list(participants or []), ensure_ascii=False)
         with self._lock, self._connect() as conn:
             existing_rows = conn.execute(
                 "SELECT id, decision FROM decisions WHERE meeting_id = ?",
@@ -1858,8 +2382,8 @@ class LocalDatabase:
                 INSERT INTO decisions (
                     meeting_id, decision, rationale, timestamp_sec, created_at,
                     status, category, evolution_relationship, supersedes_id,
-                    evidence_quote, is_manual, user_edited
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    evidence_quote, is_manual, user_edited, speaker, context, participants_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     meeting_id,
@@ -1874,6 +2398,9 @@ class LocalDatabase:
                     evidence_quote,
                     is_manual,
                     user_edited,
+                    str(speaker or "").strip(),
+                    str(context or "").strip(),
+                    part_json,
                 ),
             )
             conn.commit()
@@ -1890,6 +2417,8 @@ class LocalDatabase:
         supersedes_id: Optional[int] = None,
         evidence_quote: Optional[str] = None,
         user_edited: int = 1,
+        speaker: Optional[str] = None,
+        context: Optional[str] = None,
         **kwargs: Any,
     ) -> bool:
         """Update decision fields and mark user_edited = 1."""
@@ -1911,8 +2440,12 @@ class LocalDatabase:
                 fields["supersedes_id"] = supersedes_id
             if evidence_quote is not None:
                 fields["evidence_quote"] = evidence_quote.strip()
+            if speaker is not None:
+                fields["speaker"] = speaker.strip()
+            if context is not None:
+                fields["context"] = context.strip()
             for k, v in kwargs.items():
-                if k in ("is_manual", "timestamp_sec"):
+                if k in ("is_manual", "timestamp_sec", "participants_json"):
                     fields[k] = v
 
             cols = ", ".join(f"{k} = ?" for k in fields)
@@ -1922,7 +2455,7 @@ class LocalDatabase:
             return cur.rowcount > 0
 
     def get_decision(self, decision_id: int) -> Optional[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             row = conn.execute(
                 """
                 SELECT d.*, m.title AS meeting_title
@@ -1946,13 +2479,21 @@ class LocalDatabase:
         status: Optional[str] = None,
         category: Optional[str] = None,
         limit: int = 100,
+        meeting_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             clauses = ["1=1"]
             params: List[Any] = []
             if meeting_id is not None:
                 clauses.append("d.meeting_id = ?")
                 params.append(meeting_id)
+            elif meeting_ids is not None:
+                clean_ids = [int(x) for x in meeting_ids]
+                if not clean_ids:
+                    return []
+                ph = ",".join("?" for _ in clean_ids)
+                clauses.append(f"d.meeting_id IN ({ph})")
+                params.extend(clean_ids)
             if status is not None:
                 clauses.append("d.status = ?")
                 params.append(status)
@@ -2006,7 +2547,7 @@ class LocalDatabase:
         marker_type: Optional[str] = None,
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             clauses = ["1=1"]
             params: List[Any] = []
             if meeting_id is not None:
@@ -2026,7 +2567,7 @@ class LocalDatabase:
             return [dict(r) for r in rows]
 
     def get_marker(self, marker_id: int) -> Optional[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             row = conn.execute("SELECT * FROM meeting_markers WHERE id = ?", (marker_id,)).fetchone()
             return dict(row) if row else None
 
@@ -2118,7 +2659,7 @@ class LocalDatabase:
         status: Optional[str] = None,
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             clauses = ["1=1"]
             params: List[Any] = []
             if meeting_id is not None:
@@ -2141,7 +2682,7 @@ class LocalDatabase:
             return [dict(r) for r in rows]
 
     def get_risk_or_blocker(self, item_id: int) -> Optional[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             row = conn.execute("SELECT * FROM risks_and_blockers WHERE id = ?", (item_id,)).fetchone()
             return dict(row) if row else None
 
@@ -2224,15 +2765,33 @@ class LocalDatabase:
     # "Ask Vox" — Cross-Meeting Semantic Memory
     # ------------------------------------------------------------------
     def search_meeting_memory(
-        self, query: str, limit: int = 15, meeting_id: Optional[int] = None
+        self,
+        query: str,
+        limit: int = 15,
+        meeting_id: Optional[int] = None,
+        meeting_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search past meeting transcripts, summaries, action items, and decisions
         to ground natural-language questions with verified timestamps and source citations.
-        Uses intelligent stopword filtering and optional meeting scoping.
+        Uses intelligent stopword filtering and optional meeting / meeting_ids scoping.
         """
         if not query.strip():
             return []
+        if meeting_id is None and meeting_ids is not None and len(meeting_ids) == 0:
+            return []
+
+        clean_ids: Optional[List[int]] = None
+        if meeting_id is None and meeting_ids is not None:
+            clean_ids = [int(x) for x in meeting_ids]
+
+        def _scope_sql(col: str) -> Tuple[str, List[Any]]:
+            if meeting_id is not None:
+                return f" AND {col} = ?", [meeting_id]
+            if clean_ids is not None:
+                ph = ",".join("?" for _ in clean_ids)
+                return f" AND {col} IN ({ph})", list(clean_ids)
+            return "", []
 
         stopwords = {
             "what", "when", "where", "which", "who", "whom", "whose", "why", "how",
@@ -2252,34 +2811,26 @@ class LocalDatabase:
         tokens = content_tokens if content_tokens else all_tokens
 
         results: List[Dict[str, Any]] = []
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
+            seg_scope, seg_params = _scope_sql("s.meeting_id")
+            dec_scope, dec_params = _scope_sql("d.meeting_id")
+            act_scope, act_params = _scope_sql("a.meeting_id")
+            mtg_scope, mtg_params = _scope_sql("m.id")
+
             # 1. Search transcript segments for direct spoken quotes
             for token in tokens[:6]:
                 pattern = f"%{token}%"
-                if meeting_id is not None:
-                    rows = conn.execute(
-                        """
-                        SELECT s.meeting_id, s.start_time, s.speaker, s.text,
-                               m.title AS meeting_title, m.created_at AS meeting_date
-                        FROM transcript_segments s
-                        JOIN meetings m ON s.meeting_id = m.id
-                        WHERE s.text LIKE ? AND s.meeting_id = ?
-                        ORDER BY s.id DESC LIMIT ?
-                        """,
-                        (pattern, meeting_id, limit),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        """
-                        SELECT s.meeting_id, s.start_time, s.speaker, s.text,
-                               m.title AS meeting_title, m.created_at AS meeting_date
-                        FROM transcript_segments s
-                        JOIN meetings m ON s.meeting_id = m.id
-                        WHERE s.text LIKE ?
-                        ORDER BY s.id DESC LIMIT ?
-                        """,
-                        (pattern, limit),
-                    ).fetchall()
+                rows = conn.execute(
+                    f"""
+                    SELECT s.meeting_id, s.start_time, s.speaker, s.text,
+                           m.title AS meeting_title, m.created_at AS meeting_date
+                    FROM transcript_segments s
+                    JOIN meetings m ON s.meeting_id = m.id
+                    WHERE s.text LIKE ?{seg_scope}
+                    ORDER BY s.id DESC LIMIT ?
+                    """,
+                    tuple([pattern, *seg_params, limit]),
+                ).fetchall()
                 for r in rows:
                     item = dict(r)
                     item["source_type"] = "transcript"
@@ -2288,30 +2839,17 @@ class LocalDatabase:
             # 2. Search decisions
             for token in tokens[:4]:
                 pattern = f"%{token}%"
-                if meeting_id is not None:
-                    d_rows = conn.execute(
-                        """
-                        SELECT d.meeting_id, d.decision AS text, d.rationale, d.timestamp_sec AS start_time,
-                               'Decision' AS speaker, m.title AS meeting_title, m.created_at AS meeting_date
-                        FROM decisions d
-                        JOIN meetings m ON d.meeting_id = m.id
-                        WHERE (d.decision LIKE ? OR d.rationale LIKE ?) AND d.meeting_id = ?
-                        ORDER BY d.id DESC LIMIT ?
-                        """,
-                        (pattern, pattern, meeting_id, limit),
-                    ).fetchall()
-                else:
-                    d_rows = conn.execute(
-                        """
-                        SELECT d.meeting_id, d.decision AS text, d.rationale, d.timestamp_sec AS start_time,
-                               'Decision' AS speaker, m.title AS meeting_title, m.created_at AS meeting_date
-                        FROM decisions d
-                        JOIN meetings m ON d.meeting_id = m.id
-                        WHERE d.decision LIKE ? OR d.rationale LIKE ?
-                        ORDER BY d.id DESC LIMIT ?
-                        """,
-                        (pattern, pattern, limit),
-                    ).fetchall()
+                d_rows = conn.execute(
+                    f"""
+                    SELECT d.meeting_id, d.decision AS text, d.rationale, d.timestamp_sec AS start_time,
+                           'Decision' AS speaker, m.title AS meeting_title, m.created_at AS meeting_date
+                    FROM decisions d
+                    JOIN meetings m ON d.meeting_id = m.id
+                    WHERE (d.decision LIKE ? OR d.rationale LIKE ?){dec_scope}
+                    ORDER BY d.id DESC LIMIT ?
+                    """,
+                    tuple([pattern, pattern, *dec_params, limit]),
+                ).fetchall()
                 for r in d_rows:
                     item = dict(r)
                     item["source_type"] = "decision"
@@ -2320,32 +2858,18 @@ class LocalDatabase:
             # 3. Search action items
             for token in tokens[:4]:
                 pattern = f"%{token}%"
-                if meeting_id is not None:
-                    a_rows = conn.execute(
-                        """
-                        SELECT a.meeting_id, a.description AS text, a.owner, a.due_date,
-                               a.status, a.timestamp_sec AS start_time, 'Action Item' AS speaker,
-                               m.title AS meeting_title, m.created_at AS meeting_date
-                        FROM action_items a
-                        JOIN meetings m ON a.meeting_id = m.id
-                        WHERE (a.description LIKE ? OR a.owner LIKE ?) AND a.meeting_id = ?
-                        ORDER BY a.id DESC LIMIT ?
-                        """,
-                        (pattern, pattern, meeting_id, limit),
-                    ).fetchall()
-                else:
-                    a_rows = conn.execute(
-                        """
-                        SELECT a.meeting_id, a.description AS text, a.owner, a.due_date,
-                               a.status, a.timestamp_sec AS start_time, 'Action Item' AS speaker,
-                               m.title AS meeting_title, m.created_at AS meeting_date
-                        FROM action_items a
-                        JOIN meetings m ON a.meeting_id = m.id
-                        WHERE a.description LIKE ? OR a.owner LIKE ?
-                        ORDER BY a.id DESC LIMIT ?
-                        """,
-                        (pattern, pattern, limit),
-                    ).fetchall()
+                a_rows = conn.execute(
+                    f"""
+                    SELECT a.meeting_id, a.description AS text, a.owner, a.due_date,
+                           a.status, a.timestamp_sec AS start_time, 'Action Item' AS speaker,
+                           m.title AS meeting_title, m.created_at AS meeting_date
+                    FROM action_items a
+                    JOIN meetings m ON a.meeting_id = m.id
+                    WHERE (a.description LIKE ? OR a.owner LIKE ?){act_scope}
+                    ORDER BY a.id DESC LIMIT ?
+                    """,
+                    tuple([pattern, pattern, *act_params, limit]),
+                ).fetchall()
                 for r in a_rows:
                     item = dict(r)
                     item["source_type"] = "action_item"
@@ -2354,28 +2878,16 @@ class LocalDatabase:
             # 4. Search meeting summaries & titles
             for token in tokens[:3]:
                 pattern = f"%{token}%"
-                if meeting_id is not None:
-                    m_rows = conn.execute(
-                        """
-                        SELECT m.id AS meeting_id, 0.0 AS start_time, 'Meeting Overview' AS speaker,
-                               m.summary AS text, m.title AS meeting_title, m.created_at AS meeting_date
-                        FROM meetings m
-                        WHERE (m.title LIKE ? OR m.summary LIKE ? OR m.topics LIKE ?) AND m.id = ?
-                        LIMIT ?
-                        """,
-                        (pattern, pattern, pattern, meeting_id, limit),
-                    ).fetchall()
-                else:
-                    m_rows = conn.execute(
-                        """
-                        SELECT m.id AS meeting_id, 0.0 AS start_time, 'Meeting Overview' AS speaker,
-                               m.summary AS text, m.title AS meeting_title, m.created_at AS meeting_date
-                        FROM meetings m
-                        WHERE m.title LIKE ? OR m.summary LIKE ? OR m.topics LIKE ?
-                        LIMIT ?
-                        """,
-                        (pattern, pattern, pattern, limit),
-                    ).fetchall()
+                m_rows = conn.execute(
+                    f"""
+                    SELECT m.id AS meeting_id, 0.0 AS start_time, 'Meeting Overview' AS speaker,
+                           m.summary AS text, m.title AS meeting_title, m.created_at AS meeting_date
+                    FROM meetings m
+                    WHERE (m.title LIKE ? OR m.summary LIKE ? OR m.topics LIKE ?){mtg_scope}
+                    LIMIT ?
+                    """,
+                    tuple([pattern, pattern, pattern, *mtg_params, limit]),
+                ).fetchall()
                 for r in m_rows:
                     item = dict(r)
                     item["source_type"] = "summary"
@@ -2400,7 +2912,7 @@ class LocalDatabase:
         Only completed meetings are counted towards meeting totals and duration.
         Open action items canonical definition: status IN ('pending', 'blocked', 'reopened').
         """
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             tot_meetings = conn.execute("SELECT COUNT(*) FROM meetings WHERE status = 'completed'").fetchone()[0]
             tot_duration = conn.execute("SELECT SUM(duration_sec) FROM meetings WHERE status = 'completed'").fetchone()[0] or 0.0
             avg_engagement = conn.execute("SELECT AVG(engagement_score) FROM meetings WHERE status = 'completed'").fetchone()[0]
@@ -2446,6 +2958,136 @@ class LocalDatabase:
                 "total_decisions": tot_decisions,
                 "confirmed_decisions": confirmed_decisions,
                 "platforms": [dict(p) for p in platforms],
+            }
+
+    def get_library_intelligence_snapshot(
+        self, meeting_ids: Optional[List[int]] = None
+    ) -> Dict[str, Any]:
+        """Compute aggregate intelligence KPIs, top speakers, recurring topics, and platforms over exact meeting scope."""
+        if meeting_ids is not None and len(meeting_ids) == 0:
+            return {
+                "total_meetings": 0,
+                "completed_meetings": 0,
+                "total_duration_sec": 0.0,
+                "decisions_count": 0,
+                "confirmed_decisions": 0,
+                "total_actions": 0,
+                "open_actions": 0,
+                "completed_actions": 0,
+                "blocked_actions": 0,
+                "knowledge_count": 0,
+                "platforms": [],
+                "top_speakers": [],
+                "recurring_topics": [],
+            }
+        clean_ids = [int(x) for x in meeting_ids] if meeting_ids is not None else None
+        with self._read_connect() as conn:
+            def _in_clause(col: str) -> Tuple[str, List[Any]]:
+                if clean_ids is None:
+                    return "1=1", []
+                ph = ",".join("?" for _ in clean_ids)
+                return f"{col} IN ({ph})", list(clean_ids)
+
+            m_where, m_params = _in_clause("id")
+            m_rows = conn.execute(
+                f"SELECT id, title, status, duration_sec, source_platform, topics, topics_json FROM meetings WHERE {m_where}",
+                m_params,
+            ).fetchall()
+            total_meetings = len(m_rows)
+            completed_meetings = sum(1 for r in m_rows if str(r["status"] or "").lower() == "completed")
+            total_dur = sum(float(r["duration_sec"] or 0.0) for r in m_rows)
+
+            plat_counts: Dict[str, int] = {}
+            topic_meetings: Dict[str, List[int]] = {}
+            for r in m_rows:
+                mid = int(r["id"])
+                p = str(r["source_platform"] or "Desktop App").strip() or "Desktop App"
+                plat_counts[p] = plat_counts.get(p, 0) + 1
+                seen_t: set[str] = set()
+                t_raw = str(r["topics_json"] or "").strip()
+                if t_raw.startswith("["):
+                    try:
+                        parsed_t = json.loads(t_raw)
+                        for entry in parsed_t:
+                            tname = str(entry.get("title") or entry.get("topic") or entry if isinstance(entry, dict) else entry).strip()
+                            if tname and len(tname) > 2:
+                                low = tname.lower()
+                                if low not in seen_t:
+                                    seen_t.add(low)
+                                    topic_meetings.setdefault(tname, []).append(mid)
+                    except Exception:
+                        pass
+                if not seen_t and r["topics"]:
+                    for part in re.split(r"[,;\n]+", str(r["topics"])):
+                        tname = part.strip(" -•*")
+                        if tname and len(tname) > 2:
+                            low = tname.lower()
+                            if low not in seen_t:
+                                seen_t.add(low)
+                                topic_meetings.setdefault(tname, []).append(mid)
+
+            d_where, d_params = _in_clause("meeting_id")
+            dec_count = conn.execute(f"SELECT COUNT(*) FROM decisions WHERE {d_where}", d_params).fetchone()[0]
+            conf_dec = conn.execute(
+                f"SELECT COUNT(*) FROM decisions WHERE {d_where} AND status = 'confirmed'", d_params
+            ).fetchone()[0]
+
+            tot_act = conn.execute(f"SELECT COUNT(*) FROM action_items WHERE {d_where}", d_params).fetchone()[0]
+            open_act = conn.execute(
+                f"SELECT COUNT(*) FROM action_items WHERE {d_where} AND status IN ('pending', 'blocked', 'reopened')",
+                d_params,
+            ).fetchone()[0]
+            done_act = conn.execute(
+                f"SELECT COUNT(*) FROM action_items WHERE {d_where} AND status = 'completed'",
+                d_params,
+            ).fetchone()[0]
+            blk_act = conn.execute(
+                f"SELECT COUNT(*) FROM action_items WHERE {d_where} AND status = 'blocked'",
+                d_params,
+            ).fetchone()[0]
+
+            if clean_ids is None:
+                k_count = conn.execute("SELECT COUNT(*) FROM knowledge_items WHERE status = 'active'").fetchone()[0]
+            else:
+                k_count = conn.execute(
+                    f"SELECT COUNT(DISTINCT ki.id) FROM knowledge_items ki JOIN knowledge_sources ks ON ks.knowledge_item_id = ki.id WHERE ki.status = 'active' AND {d_where.replace('meeting_id', 'ks.meeting_id')}",
+                    d_params,
+                ).fetchone()[0]
+
+            spk_rows = conn.execute(
+                f"""
+                SELECT speaker, COUNT(DISTINCT meeting_id) AS meeting_count, COUNT(*) AS segment_count
+                FROM transcript_segments
+                WHERE {d_where} AND speaker IS NOT NULL AND TRIM(speaker) != ''
+                GROUP BY speaker
+                ORDER BY meeting_count DESC, segment_count DESC
+                LIMIT 12
+                """,
+                d_params,
+            ).fetchall()
+
+            recurring = [
+                {"topic": k, "count": len(mids), "meeting_ids": mids}
+                for k, mids in topic_meetings.items()
+            ]
+            recurring.sort(key=lambda x: (-x["count"], x["topic"].lower()))
+
+            platforms = [{"platform": k, "count": v} for k, v in sorted(plat_counts.items(), key=lambda kv: -kv[1])]
+            top_speakers = [dict(r) for r in spk_rows]
+            return {
+                "total_meetings": total_meetings,
+                "completed_meetings": completed_meetings,
+                "total_duration_sec": round(total_dur, 1),
+                "decisions_count": int(dec_count or 0),
+                "confirmed_decisions": int(conf_dec or 0),
+                "total_actions": int(tot_act or 0),
+                "open_actions": int(open_act or 0),
+                "completed_actions": int(done_act or 0),
+                "blocked_actions": int(blk_act or 0),
+                "knowledge_count": int(k_count or 0),
+                "platforms": platforms,
+                "top_speakers": top_speakers,
+                "recurring_topics": recurring[:14],
             }
 
     # ------------------------------------------------------------------
@@ -2558,7 +3200,7 @@ class LocalDatabase:
             return cur.rowcount > 0
 
     def list_dictation_history(self, search_query: str = "", limit: int = 100) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             if search_query.strip():
                 q = f"%{search_query.strip()}%"
                 rows = conn.execute(
@@ -2592,7 +3234,7 @@ class LocalDatabase:
 
     def get_dictation_stats(self) -> Dict[str, Any]:
         """Compute KPI totals, WPM velocity, day streak, minutes saved, and per-app breakdown."""
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             rows = conn.execute(
                 "SELECT created_at, duration_sec, final_text, target_process, wpm, word_count FROM dictation_history ORDER BY id DESC"
             ).fetchall()
@@ -2686,7 +3328,7 @@ class LocalDatabase:
     # Custom Vocabulary / Dictionary CRUD
     # ------------------------------------------------------------------
     def list_vocabulary(self, active_only: bool = False) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             if active_only:
                 rows = conn.execute(
                     "SELECT * FROM custom_vocabulary WHERE is_active = 1 ORDER BY is_starred DESC, spoken_phrase ASC"
@@ -2716,7 +3358,7 @@ class LocalDatabase:
             q = f"%{query.strip()}%"
             params.extend([q, q, q])
         where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             rows = conn.execute(
                 f"SELECT * FROM custom_vocabulary {where_clause} ORDER BY {order_sql}",
                 tuple(params),
@@ -2818,7 +3460,7 @@ class LocalDatabase:
             "az": "trigger_phrase COLLATE NOCASE ASC",
             "most_used": "use_count DESC, trigger_phrase COLLATE NOCASE ASC",
         }.get(sort_by, "is_starred DESC, id DESC")
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             if search_query.strip():
                 q = f"%{search_query.strip()}%"
                 rows = conn.execute(
@@ -2898,7 +3540,7 @@ class LocalDatabase:
     # Scratchpad Notes & Version History CRUD
     # ------------------------------------------------------------------
     def list_notes(self, search_query: str = "") -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             if search_query.strip():
                 q = f"%{search_query.strip()}%"
                 rows = conn.execute(
@@ -2916,7 +3558,7 @@ class LocalDatabase:
             return [dict(r) for r in rows]
 
     def get_note(self, note_id: int) -> Optional[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             row = conn.execute("SELECT * FROM scratchpad_notes WHERE id = ?", (note_id,)).fetchone()
             return dict(row) if row else None
 
@@ -3004,7 +3646,7 @@ class LocalDatabase:
             return cur.rowcount > 0
 
     def list_note_versions(self, note_id: int, limit: int = 20) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM scratchpad_versions WHERE note_id = ? ORDER BY id DESC LIMIT ?",
                 (note_id, limit),
@@ -3087,7 +3729,7 @@ class LocalDatabase:
             conn.commit()
 
     def list_screen_recordings(self, limit: int = 100) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM screen_recordings
@@ -3267,7 +3909,7 @@ class LocalDatabase:
 
     def get_calendar_account(self, account_id: str, user_id: str = "default") -> Optional[Dict[str, Any]]:
         uid = user_id or "default"
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             row = conn.execute(
                 """
                 SELECT * FROM calendar_accounts 
@@ -3285,7 +3927,7 @@ class LocalDatabase:
         enabled_only: bool = False,
     ) -> List[Dict[str, Any]]:
         uid = user_id or "default"
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             sql = "SELECT * FROM calendar_accounts WHERE (user_id = ? OR user_id = 'default')"
             params: List[Any] = [uid]
             if enabled_only:
@@ -3384,7 +4026,7 @@ class LocalDatabase:
 
     def load_calendar_credentials(self, user_id: str, account_id: str) -> Optional[bytes]:
         uid = user_id or "default"
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             row = conn.execute(
                 """
                 SELECT encrypted_blob FROM calendar_credentials_vault 
@@ -3562,7 +4204,7 @@ class LocalDatabase:
             clauses.append("start_time <= ?")
             params.append(end_iso)
         sql = f"SELECT * FROM calendar_events WHERE {' AND '.join(clauses)} ORDER BY start_time ASC"
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             rows = conn.execute(sql, params).fetchall()
             out: List[Dict[str, Any]] = []
             for r in rows:
@@ -3592,7 +4234,7 @@ class LocalDatabase:
     ) -> Optional[Dict[str, Any]]:
         if not calendar_event_id:
             return None
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             if user_id:
                 row = conn.execute(
                     "SELECT * FROM meetings WHERE calendar_event_id = ? AND (user_id = ? OR user_id = '') ORDER BY id DESC LIMIT 1",
@@ -3610,7 +4252,7 @@ class LocalDatabase:
         user_id: Optional[str] = None,
     ) -> Dict[str, int]:
         """Map non-empty calendar_event_id -> most recent recorded meeting_id."""
-        with self._lock, self._connect() as conn:
+        with self._read_connect() as conn:
             if user_id:
                 rows = conn.execute(
                     "SELECT id, calendar_event_id FROM meetings WHERE calendar_event_id != '' AND (user_id = ? OR user_id = '') ORDER BY id ASC",
@@ -3626,5 +4268,578 @@ class LocalDatabase:
                 if ev_id:
                     mapping[ev_id] = int(r["id"])
             return mapping
+
+    # ------------------------------------------------------------------
+    # Knowledge Store & Hybrid RAG Chunks CRUD (v7)
+    # ------------------------------------------------------------------
+    def list_knowledge_items(
+        self,
+        item_type: Optional[str] = None,
+        search: str = "",
+        include_superseded: bool = False,
+        limit: int = 300,
+        meeting_id: Optional[int] = None,
+        meeting_ids: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses = ["1=1"]
+        params: List[Any] = []
+        if meeting_id is not None:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM knowledge_sources ks2 WHERE ks2.knowledge_item_id = ki.id AND ks2.meeting_id = ?)"
+            )
+            params.append(int(meeting_id))
+        elif meeting_ids is not None:
+            clean_ids = [int(x) for x in meeting_ids]
+            if not clean_ids:
+                return []
+            ph = ",".join("?" for _ in clean_ids)
+            clauses.append(
+                f"EXISTS (SELECT 1 FROM knowledge_sources ks2 WHERE ks2.knowledge_item_id = ki.id AND ks2.meeting_id IN ({ph}))"
+            )
+            params.extend(clean_ids)
+        if item_type and item_type.lower() != "all":
+            clauses.append("ki.item_type = ?")
+            params.append(item_type.lower())
+        if not include_superseded:
+            clauses.append("ki.status = 'active'")
+        if search and search.strip():
+            q = f"%{search.strip()}%"
+            clauses.append("(ki.title LIKE ? OR ki.content LIKE ? OR ki.canonical_key LIKE ?)")
+            params.extend([q, q, q])
+        sql = f"""
+            SELECT ki.*, COUNT(ks.id) AS source_count
+            FROM knowledge_items ki
+            LEFT JOIN knowledge_sources ks ON ks.knowledge_item_id = ki.id
+            WHERE {' AND '.join(clauses)}
+            GROUP BY ki.id
+            ORDER BY ki.updated_at DESC, ki.id DESC
+            LIMIT ?
+        """
+        params.append(int(limit))
+        with self._read_connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            items: List[Dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                srcs = conn.execute(
+                    """
+                    SELECT * FROM knowledge_sources
+                    WHERE knowledge_item_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 10
+                    """,
+                    (d["id"],),
+                ).fetchall()
+                d["sources"] = [dict(s) for s in srcs]
+                items.append(d)
+            return items
+
+    def get_knowledge_item(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._read_connect() as conn:
+            row = conn.execute("SELECT * FROM knowledge_items WHERE id = ?", (item_id,)).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            srcs = conn.execute(
+                "SELECT * FROM knowledge_sources WHERE knowledge_item_id = ? ORDER BY id DESC",
+                (item_id,),
+            ).fetchall()
+            d["sources"] = [dict(s) for s in srcs]
+            return d
+
+    def upsert_knowledge_item(
+        self,
+        *,
+        item_type: str,
+        canonical_key: str,
+        title: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        confidence: float = 0.85,
+        valid_from_date: str = "",
+        source_meeting_id: Optional[int] = None,
+        source_meeting_title: str = "",
+        source_meeting_date: str = "",
+        source_speaker: str = "",
+        source_timestamp_sec: float = 0.0,
+        source_evidence_quote: str = "",
+        verified: int = 0,
+        entity_name: str = "",
+        notes: str = "",
+    ) -> Dict[str, Any]:
+        itype = str(item_type or "fact").strip().lower()
+        ckey = re.sub(r"\s+", " ", str(canonical_key or title).strip().lower())
+        clean_title = str(title or "").strip()
+        clean_content = str(content or "").strip()
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        meta_str = json.dumps(metadata or {})
+
+        def _attach_source(conn: sqlite3.Connection, kid: int) -> None:
+            if not source_meeting_title and not source_evidence_quote and source_meeting_id is None:
+                return
+            exists = conn.execute(
+                """
+                SELECT id FROM knowledge_sources
+                WHERE knowledge_item_id = ? AND meeting_id IS ? AND ABS(timestamp_sec - ?) < 1.0
+                LIMIT 1
+                """,
+                (kid, source_meeting_id, float(source_timestamp_sec)),
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_sources (
+                        knowledge_item_id, meeting_id, meeting_title, meeting_date,
+                        speaker, timestamp_sec, evidence_quote, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        kid,
+                        source_meeting_id,
+                        source_meeting_title,
+                        source_meeting_date,
+                        source_speaker,
+                        round(float(source_timestamp_sec), 2),
+                        source_evidence_quote,
+                        now_ts,
+                    ),
+                )
+
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT * FROM knowledge_items
+                WHERE item_type = ? AND canonical_key = ? AND status = 'active'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (itype, ckey),
+            ).fetchone()
+
+            if existing:
+                ex_id = int(existing["id"])
+                ex_norm = " ".join(str(existing["content"] or "").lower().split())
+                new_norm = " ".join(clean_content.lower().split())
+                if int(existing["user_edited"] or 0) == 1:
+                    _attach_source(conn, ex_id)
+                    conn.commit()
+                    return {"id": ex_id, "action": "updated"}
+                if ex_norm == new_norm or new_norm in ex_norm or ex_norm in new_norm:
+                    if len(clean_content) > len(str(existing["content"] or "")):
+                        conn.execute(
+                            "UPDATE knowledge_items SET content = ?, title = ?, metadata_json = ?, updated_at = ? WHERE id = ?",
+                            (clean_content, clean_title, meta_str, now_ts, ex_id),
+                        )
+                    else:
+                        conn.execute("UPDATE knowledge_items SET updated_at = ? WHERE id = ?", (now_ts, ex_id))
+                    _attach_source(conn, ex_id)
+                    conn.commit()
+                    return {"id": ex_id, "action": "updated"}
+                # Conflict detected: preserve earlier fact with date & mark it superseded by new active record
+                cur = conn.execute(
+                    """
+                    INSERT INTO knowledge_items (
+                        item_type, canonical_key, title, content, metadata_json,
+                        confidence, status, valid_from_date, superseded_by_id,
+                        user_edited, verified, entity_name, notes, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, 0, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        itype,
+                        ckey,
+                        clean_title,
+                        clean_content,
+                        meta_str,
+                        float(confidence),
+                        valid_from_date or now_ts[:10],
+                        1 if verified else 0,
+                        str(entity_name or "").strip(),
+                        str(notes or "").strip(),
+                        now_ts,
+                        now_ts,
+                    ),
+                )
+                new_id = int(cur.lastrowid)
+                conn.execute(
+                    "UPDATE knowledge_items SET status = 'superseded', superseded_by_id = ?, updated_at = ? WHERE id = ?",
+                    (new_id, now_ts, ex_id),
+                )
+                _attach_source(conn, new_id)
+                conn.commit()
+                return {"id": new_id, "action": "conflicted", "superseded_id": ex_id}
+
+            cur = conn.execute(
+                """
+                INSERT INTO knowledge_items (
+                    item_type, canonical_key, title, content, metadata_json,
+                    confidence, status, valid_from_date, superseded_by_id,
+                    user_edited, verified, entity_name, notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, 0, ?, ?, ?, ?, ?)
+                """,
+                (
+                    itype,
+                    ckey,
+                    clean_title,
+                    clean_content,
+                    meta_str,
+                    float(confidence),
+                    valid_from_date or now_ts[:10],
+                    1 if verified else 0,
+                    str(entity_name or "").strip(),
+                    str(notes or "").strip(),
+                    now_ts,
+                    now_ts,
+                ),
+            )
+            new_id = int(cur.lastrowid)
+            _attach_source(conn, new_id)
+            conn.commit()
+            return {"id": new_id, "action": "inserted"}
+
+    def update_knowledge_item(
+        self,
+        item_id: int,
+        *,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        item_type: Optional[str] = None,
+        status: Optional[str] = None,
+        user_edited: int = 1,
+        verified: Optional[int] = None,
+        entity_name: Optional[str] = None,
+        notes: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        fields: Dict[str, Any] = {"updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "user_edited": int(user_edited)}
+        if title is not None and title.strip():
+            fields["title"] = title.strip()
+            fields["canonical_key"] = re.sub(r"\s+", " ", title.strip().lower())
+        if content is not None and content.strip():
+            fields["content"] = content.strip()
+        if item_type is not None and item_type.strip():
+            fields["item_type"] = item_type.strip().lower()
+        if status is not None and status in ("active", "superseded", "archived"):
+            fields["status"] = status
+        if verified is not None:
+            fields["verified"] = 1 if bool(verified) else 0
+        if entity_name is not None:
+            fields["entity_name"] = str(entity_name).strip()
+        if notes is not None:
+            fields["notes"] = str(notes).strip()
+        if metadata is not None:
+            fields["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        vals = list(fields.values()) + [int(item_id)]
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(f"UPDATE knowledge_items SET {cols} WHERE id = ?", vals)
+            conn.commit()
+            return cur.rowcount > 0
+
+    def set_knowledge_verified(self, item_id: int, verified: bool = True) -> bool:
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE knowledge_items SET verified = ?, updated_at = ? WHERE id = ?",
+                (1 if verified else 0, now_ts, int(item_id)),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def get_knowledge_conflict_history(self, item_id: int) -> List[Dict[str, Any]]:
+        """Return older/superseded or superseding versions linked to this knowledge item."""
+        with self._read_connect() as conn:
+            cur_row = conn.execute("SELECT * FROM knowledge_items WHERE id = ?", (int(item_id),)).fetchone()
+            if not cur_row:
+                return []
+            ckey = cur_row["canonical_key"]
+            itype = cur_row["item_type"]
+            rows = conn.execute(
+                """
+                SELECT * FROM knowledge_items
+                WHERE ((item_type = ? AND canonical_key = ?)
+                   OR superseded_by_id = ?
+                   OR id = ?)
+                  AND id != ?
+                ORDER BY id DESC
+                """,
+                (itype, ckey, int(item_id), int(cur_row["superseded_by_id"] or -1), int(item_id)),
+            ).fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                srcs = conn.execute(
+                    "SELECT * FROM knowledge_sources WHERE knowledge_item_id = ? ORDER BY id DESC LIMIT 5",
+                    (d["id"],),
+                ).fetchall()
+                d["sources"] = [dict(s) for s in srcs]
+                out.append(d)
+            return out
+
+    def resolve_knowledge_conflict(
+        self,
+        *,
+        active_id: int,
+        superseded_id: int,
+        keep: str = "current",
+    ) -> bool:
+        """
+        Resolve a conflict between a newer active item and an older superseded item:
+        - keep='current': verify active_id and mark superseded_id archived/resolved.
+        - keep='previous': restore superseded_id as active & verified, mark active_id superseded by it.
+        """
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock, self._connect() as conn:
+            act_row = conn.execute("SELECT * FROM knowledge_items WHERE id = ?", (int(active_id),)).fetchone()
+            old_row = conn.execute("SELECT * FROM knowledge_items WHERE id = ?", (int(superseded_id),)).fetchone()
+            if not act_row or not old_row:
+                return False
+            choice = str(keep or "current").strip().lower()
+            if choice == "previous":
+                conn.execute(
+                    "UPDATE knowledge_items SET status = 'active', superseded_by_id = NULL, verified = 1, user_edited = 1, updated_at = ? WHERE id = ?",
+                    (now_ts, int(superseded_id)),
+                )
+                conn.execute(
+                    "UPDATE knowledge_items SET status = 'superseded', superseded_by_id = ?, updated_at = ? WHERE id = ?",
+                    (int(superseded_id), now_ts, int(active_id)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE knowledge_items SET status = 'active', superseded_by_id = NULL, verified = 1, user_edited = 1, updated_at = ? WHERE id = ?",
+                    (now_ts, int(active_id)),
+                )
+                conn.execute(
+                    "UPDATE knowledge_items SET status = 'archived', superseded_by_id = ?, updated_at = ? WHERE id = ?",
+                    (int(active_id), now_ts, int(superseded_id)),
+                )
+            conn.commit()
+            return True
+
+    def get_my_thoughts(self, meeting_id: int) -> Dict[str, Any]:
+        """Retrieve private notes & privacy flags for a meeting safely."""
+        with self._read_connect() as conn:
+            with contextlib.suppress(sqlite3.OperationalError):
+                row = conn.execute(
+                    "SELECT * FROM my_thoughts WHERE meeting_id = ?",
+                    (int(meeting_id),),
+                ).fetchone()
+                if row:
+                    return dict(row)
+            mrow = conn.execute("SELECT notes FROM meetings WHERE id = ?", (int(meeting_id),)).fetchone()
+            raw_notes = str(mrow["notes"] or "") if mrow else ""
+            return {
+                "meeting_id": int(meeting_id),
+                "raw_markdown": raw_notes,
+                "include_in_summary": 0,
+                "allow_external_mcp": 0,
+                "word_count": len(raw_notes.split()) if raw_notes.strip() else 0,
+                "updated_at": "",
+            }
+
+    def save_my_thoughts(
+        self,
+        meeting_id: int,
+        raw_markdown: str,
+        include_in_summary: bool = False,
+        allow_external_mcp: bool = False,
+    ) -> bool:
+        """Atomically persist personal notes to both meetings.notes and my_thoughts."""
+        text = str(raw_markdown or "")
+        inc_sum = 1 if include_in_summary else 0
+        allow_mcp = 1 if allow_external_mcp else 0
+        w_count = len(text.split()) if text.strip() else 0
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE meetings SET notes = ? WHERE id = ?", (text, int(meeting_id)))
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS my_thoughts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                    raw_markdown TEXT NOT NULL DEFAULT '',
+                    include_in_summary INTEGER NOT NULL DEFAULT 0,
+                    allow_external_mcp INTEGER NOT NULL DEFAULT 0,
+                    word_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            row = conn.execute(
+                "SELECT id FROM my_thoughts WHERE meeting_id = ?",
+                (int(meeting_id),),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    UPDATE my_thoughts
+                    SET raw_markdown = ?, include_in_summary = ?, allow_external_mcp = ?,
+                        word_count = ?, updated_at = ?
+                    WHERE meeting_id = ?
+                    """,
+                    (text, inc_sum, allow_mcp, w_count, now_ts, int(meeting_id)),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO my_thoughts (
+                        meeting_id, raw_markdown, include_in_summary, allow_external_mcp, word_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (int(meeting_id), text, inc_sum, allow_mcp, w_count, now_ts, now_ts),
+                )
+            conn.commit()
+            return True
+
+    def delete_knowledge_item(self, item_id: int) -> bool:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM knowledge_sources WHERE knowledge_item_id = ?", (int(item_id),))
+            cur = conn.execute("DELETE FROM knowledge_items WHERE id = ?", (int(item_id),))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def list_unindexed_meeting_ids(
+        self,
+        meeting_ids: Optional[List[int]] = None,
+        limit: int = 30,
+    ) -> List[int]:
+        with self._read_connect() as conn:
+            if meeting_ids:
+                phs = ",".join("?" for _ in meeting_ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT m.id FROM meetings m
+                    WHERE m.id IN ({phs})
+                      AND EXISTS (SELECT 1 FROM transcript_segments s WHERE s.meeting_id = m.id)
+                      AND NOT EXISTS (SELECT 1 FROM rag_chunks rc WHERE rc.meeting_id = m.id)
+                    LIMIT ?
+                    """,
+                    list(meeting_ids) + [int(limit)],
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT m.id FROM meetings m
+                    WHERE EXISTS (SELECT 1 FROM transcript_segments s WHERE s.meeting_id = m.id)
+                      AND NOT EXISTS (SELECT 1 FROM rag_chunks rc WHERE rc.meeting_id = m.id)
+                    ORDER BY m.id DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall()
+            return [int(r["id"]) for r in rows]
+
+    def replace_meeting_rag_chunks(
+        self,
+        meeting_id: int,
+        meeting_title: str,
+        chunks: List[Dict[str, Any]],
+    ) -> None:
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM rag_chunks_fts WHERE meeting_id = ?", (int(meeting_id),))
+            conn.execute("DELETE FROM rag_chunks WHERE meeting_id = ?", (int(meeting_id),))
+            for ch in chunks:
+                spk_json = json.dumps(list(ch.get("speakers") or []))
+                spk_text = ", ".join(str(s) for s in (ch.get("speakers") or []))
+                cur = conn.execute(
+                    """
+                    INSERT INTO rag_chunks (
+                        meeting_id, chunk_index, start_time, end_time,
+                        speakers_json, text, embedding_blob, embedding_model, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(meeting_id),
+                        int(ch["chunk_index"]),
+                        float(ch["start_time"]),
+                        float(ch["end_time"]),
+                        spk_json,
+                        str(ch["text"]),
+                        ch.get("embedding_blob"),
+                        str(ch.get("embedding_model") or ""),
+                        now_ts,
+                    ),
+                )
+                cid = int(cur.lastrowid)
+                conn.execute(
+                    """
+                    INSERT INTO rag_chunks_fts (chunk_id, meeting_id, meeting_title, speakers, text)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (cid, int(meeting_id), str(meeting_title or ""), spk_text, str(ch["text"])),
+                )
+            conn.commit()
+
+    def search_rag_fts(
+        self,
+        query: str,
+        meeting_id: Optional[int] = None,
+        limit: int = 40,
+    ) -> List[Dict[str, Any]]:
+        tokens = [w for w in re.findall(r"[a-zA-Z0-9_]{2,}", str(query or "")) if len(w) >= 2]
+        if not tokens:
+            return []
+        fts_query = " OR ".join(f'"{t}"' for t in tokens[:10])
+        with self._read_connect() as conn:
+            try:
+                if meeting_id is not None:
+                    rows = conn.execute(
+                        """
+                        SELECT rc.id AS chunk_id, rc.meeting_id, rc.start_time, rc.end_time,
+                               rc.speakers_json, rc.text, m.title AS meeting_title, m.created_at AS meeting_date,
+                               bm25(rag_chunks_fts) AS bm25_rank
+                        FROM rag_chunks_fts
+                        JOIN rag_chunks rc ON rc.id = rag_chunks_fts.chunk_id
+                        JOIN meetings m ON m.id = rc.meeting_id
+                        WHERE rag_chunks_fts MATCH ? AND rc.meeting_id = ?
+                        ORDER BY bm25_rank ASC
+                        LIMIT ?
+                        """,
+                        (fts_query, int(meeting_id), int(limit)),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT rc.id AS chunk_id, rc.meeting_id, rc.start_time, rc.end_time,
+                               rc.speakers_json, rc.text, m.title AS meeting_title, m.created_at AS meeting_date,
+                               bm25(rag_chunks_fts) AS bm25_rank
+                        FROM rag_chunks_fts
+                        JOIN rag_chunks rc ON rc.id = rag_chunks_fts.chunk_id
+                        JOIN meetings m ON m.id = rc.meeting_id
+                        WHERE rag_chunks_fts MATCH ?
+                        ORDER BY bm25_rank ASC
+                        LIMIT ?
+                        """,
+                        (fts_query, int(limit)),
+                    ).fetchall()
+                return [dict(r) for r in rows]
+            except sqlite3.OperationalError as exc:
+                logger.debug("FTS5 search fallback (%s)", exc)
+                return []
+
+    def list_rag_chunks(self, meeting_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        with self._read_connect() as conn:
+            if meeting_id is not None:
+                rows = conn.execute(
+                    """
+                    SELECT rc.*, m.title AS meeting_title, m.created_at AS meeting_date
+                    FROM rag_chunks rc
+                    JOIN meetings m ON m.id = rc.meeting_id
+                    WHERE rc.meeting_id = ?
+                    ORDER BY rc.chunk_index ASC
+                    """,
+                    (int(meeting_id),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT rc.*, m.title AS meeting_title, m.created_at AS meeting_date
+                    FROM rag_chunks rc
+                    JOIN meetings m ON m.id = rc.meeting_id
+                    ORDER BY rc.meeting_id DESC, rc.chunk_index ASC
+                    """
+                ).fetchall()
+            return [dict(r) for r in rows]
+
 
 

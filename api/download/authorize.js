@@ -1,95 +1,32 @@
 const { supabase, authenticateUser } = require('../_lib/supabase');
+const { signDownloadTicket } = require('../_lib/token');
+
+const LATEST_ARTIFACT = 'releases/2.1.0/VoxLocal-Setup.exe';
 
 const RELEASE_CATALOG = {
+  'releases/2.1.0/VoxLocal-Setup.exe': {
+    version: '2.1.0',
+    filename: 'VoxLocal-Setup.exe',
+    sha256: '7ae6361d16fd851b8ef1abace8dba00fbf514f664b04d99abbd7373b840450ad',
+    size_bytes: 227486842,
+  },
+  'releases/2.0.0/VoxLocal-Setup.exe': {
+    version: '2.0.0',
+    filename: 'VoxLocal-Setup.exe',
+    sha256: '04fff45c3bb4ec484f31a071320d5bed1e440d505497f0a82d3eb7480610f977',
+    size_bytes: 129089386,
+  },
   'releases/1.0.13/VoxLocal-Setup.exe': {
     version: '1.0.13',
     filename: 'VoxLocal-Setup.exe',
     sha256: '1a64e568805c718bd2b825b430a3488a08c38db8ef1a43b799f2a9f8d940cde7',
     size_bytes: 56393405,
   },
-  'releases/1.0.12/VoxLocal-Setup.exe': {
-    version: '1.0.12',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: '38712f4b2fbd1ef1c14db52d96d18d50dc361044fcdfa3227b98d6c78780289f',
-    size_bytes: 31303040,
-  },
-  'releases/1.0.11/VoxLocal-Setup.exe': {
-    version: '1.0.11',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: '473a78952c3b99f14938b1bbed811e63689a9770aafc298ec7345b241bb4ea03',
-    size_bytes: 31016421,
-  },
-  'releases/1.0.10/VoxLocal-Setup.exe': {
-    version: '1.0.10',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: '7639900b8ca85a42f9519ce667f6164b4512c514908c6c09ec3bc7e68a2e335b',
-    size_bytes: 31005826,
-  },
-  'releases/1.0.9/VoxLocal-Setup.exe': {
-    version: '1.0.9',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: 'eb12eb0b456d50c1e4e4c1d2fc186aab0783ca021b80b8564c50302935282715',
-    size_bytes: 31004278,
-  },
-  'releases/1.0.8/VoxLocal-Setup.exe': {
-    version: '1.0.8',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: '49ce7d90b0fd59a3c707ff86ed7855815a584be9a49d4ebfac9bfa1899772642',
-    size_bytes: 31001883,
-  },
-  'releases/1.0.7/VoxLocal-Setup.exe': {
-    version: '1.0.7',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: '030ca041e545e775275eeee542b4f9d27f0dae1480f13dcfbda1a47f4c1ca468',
-    size_bytes: 29818462,
-  },
-  'releases/1.0.6/VoxLocal-Setup.exe': {
-    version: '1.0.6',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: '7bfc7f0e0604ff322e3228569ce6f2f453a3f87b14b40764404e2dc2c4a0c8d5',
-    size_bytes: 29609520,
-  },
-  'releases/1.0.5/VoxLocal-Setup.exe': {
-    version: '1.0.5',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: 'e2128ecec30c6d23517cc2bb3e99b01ed9defb3ed14447f7b04d43abf8c42292',
-    size_bytes: 29606855,
-  },
-  'releases/1.0.0/VoxLocal-Setup.exe': {
-    version: '1.0.0',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: '300a30401653ce4a83c6e86aee84c1480e940964ef60cadf5f95792ca875cec7',
-    size_bytes: 10067409,
-  },
-  'releases/1.0.4/VoxLocal-Setup.exe': {
-    version: '1.0.4',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: '66fa320f5d8a6d8d6de3cfe5f77b22999820a94aa998c2cd1a2f3be2f5d52b83',
-    size_bytes: 29578973,
-  },
-  'releases/1.0.3/VoxLocal-Setup.exe': {
-    version: '1.0.3',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: 'f09eed2da71c02effdeb136249d8de7c012b76e0874a6d600155afc749f7501b',
-    size_bytes: 10160267,
-  },
-  'releases/1.0.2/VoxLocal-Setup.exe': {
-    version: '1.0.2',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: '1e5dfa31afda87a9f2574966499c6971a94f2a0378dd06e1dd44f912d789213f',
-    size_bytes: 10157669,
-  },
-  'releases/1.0.1/VoxLocal-Setup.exe': {
-    version: '1.0.1',
-    filename: 'VoxLocal-Setup.exe',
-    sha256: '77daaf410b3413dd39a3787182d43a79ac7ba109cf305b8ba50db19ace784f48',
-    size_bytes: 10148603,
-  },
   'VoxLocal-Setup.exe': {
-    version: '1.0.13',
+    version: '2.1.0',
     filename: 'VoxLocal-Setup.exe',
-    sha256: '1a64e568805c718bd2b825b430a3488a08c38db8ef1a43b799f2a9f8d940cde7',
-    size_bytes: 56393405,
+    sha256: '7ae6361d16fd851b8ef1abace8dba00fbf514f664b04d99abbd7373b840450ad',
+    size_bytes: 227486842,
   },
 };
 
@@ -97,6 +34,7 @@ module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Cache-Control', 'no-store');
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
@@ -107,7 +45,7 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    // 1. Authenticate user via Supabase Bearer token (optional for download)
+    // 1. Strictly enforce Google / Supabase user authentication on backend
     let user = null;
     try {
       user = await authenticateUser(req);
@@ -115,9 +53,38 @@ module.exports = async function handler(req, res) {
       user = null;
     }
 
-    // 2. Validate requested artifact
-    const requestedArtifact = (req.body && req.body.artifact) || 'releases/1.0.13/VoxLocal-Setup.exe';
-    const metadata = RELEASE_CATALOG[requestedArtifact] || RELEASE_CATALOG['VoxLocal-Setup.exe'];
+    if (!user || !user.id) {
+      return res.status(401).json({
+        ok: false,
+        code: 'AUTH_REQUIRED',
+        error: 'Authentication required. Please sign in with Google to download VOX.',
+      });
+    }
+
+    // 1b. Reject disabled / suspended / ineligible accounts
+    if (supabase && typeof supabase.from === 'function') {
+      try {
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('id, status, account_status')
+          .eq('id', user.id)
+          .maybeSingle();
+        const acctStatus = String((profile && (profile.account_status || profile.status)) || '').toLowerCase();
+        if (profile && ['disabled', 'suspended', 'ineligible', 'revoked'].includes(acctStatus)) {
+          return res.status(403).json({
+            ok: false,
+            code: 'ACCOUNT_INELIGIBLE',
+            error: 'Your account is currently suspended or ineligible to download this release.',
+          });
+        }
+      } catch (profErr) {
+        // Non-fatal if profile table omits optional status columns
+      }
+    }
+
+    // 2. Validate requested artifact against strict allowlist
+    const requestedArtifact = (req.body && req.body.artifact) || LATEST_ARTIFACT;
+    const metadata = RELEASE_CATALOG[requestedArtifact];
     if (!metadata) {
       return res.status(404).json({
         ok: false,
@@ -125,23 +92,40 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // 3. Generate secure download ticket (Supabase Storage with resilient CDN fallback)
-    const expiresInSec = 120; // 2 minutes validity
+    // 3. Issue short-lived signed download ticket (bypass Supabase Storage for v2.1.0+ / direct release origin)
+    const expiresInSec = 120;
+    const skipSupabaseStorage =
+      Boolean(process.env.VOX_RELEASE_DOWNLOAD_URL) || metadata.version === '2.1.0';
     let downloadUrl = null;
-    try {
-      const { data, error } = await supabase.storage
-        .from('vox-releases')
-        .createSignedUrl(requestedArtifact, expiresInSec);
-      if (!error && data && data.signedUrl) {
-        downloadUrl = data.signedUrl;
+    if (!skipSupabaseStorage) {
+      try {
+        if (supabase && supabase.storage) {
+          const { data, error } = await supabase.storage
+            .from('vox-releases')
+            .createSignedUrl(requestedArtifact, expiresInSec);
+          if (!error && data && data.signedUrl) {
+            downloadUrl = data.signedUrl;
+          }
+        }
+      } catch (storageErr) {
+        // Fall through to signed ticket endpoint
       }
-    } catch (storageErr) {
-      console.warn('Supabase signed URL notice:', storageErr);
     }
 
     if (!downloadUrl) {
-      // Tag-pinned GitHub Fastly CDN delivery for verified v1.0.13 binary
-      downloadUrl = 'https://raw.githubusercontent.com/milinddwivedi/Vox/v1.0.13/docs/downloads/VoxLocal-Setup.exe';
+      const ticket = signDownloadTicket({
+        user_id: user.id,
+        artifact: requestedArtifact,
+        version: metadata.version,
+        sha256: metadata.sha256,
+        exp: Math.floor(Date.now() / 1000) + expiresInSec,
+      });
+      const host = (req.headers && (req.headers['x-forwarded-host'] || req.headers.host)) || '';
+      const isLocalHost = /^localhost(?::|$)|^127\.0\.0\.1(?::|$)/i.test(host);
+      const proto = (req.headers && req.headers['x-forwarded-proto']) || (isLocalHost ? 'http' : 'https');
+      downloadUrl = host
+        ? `${proto}://${host}/api/download/file?ticket=${encodeURIComponent(ticket)}`
+        : `/api/download/file?ticket=${encodeURIComponent(ticket)}`;
     }
 
     return res.status(200).json({
@@ -152,13 +136,13 @@ module.exports = async function handler(req, res) {
       sha256: metadata.sha256,
       size_bytes: metadata.size_bytes,
       expires_in_sec: expiresInSec,
-      user: user ? {
+      user: {
         id: user.id,
         email: user.email || '',
-      } : null,
+      },
     });
   } catch (err) {
-    console.error('Download authorization error:', err);
+    console.error('Download authorization error');
     return res.status(500).json({
       ok: false,
       error: 'Internal authorization error',

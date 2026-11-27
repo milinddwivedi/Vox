@@ -221,6 +221,9 @@ class TestAdversarialM2Empirical(unittest.TestCase):
 
     def test_win32_extended_window_styles(self):
         """Verify WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW on pill and bubble."""
+        import os
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            self.skipTest("Win32 HWND extended styles require native Windows QPA platform.")
         pill = DualTierFloatingPill()
         bubble = LiveSpeechPreviewBubble()
         try:

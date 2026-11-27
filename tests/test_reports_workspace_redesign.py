@@ -94,7 +94,7 @@ class TestReportsWorkspaceRedesign(unittest.TestCase):
         nt = self.window.notetaker_page
         self.assertIsNotNone(nt.splitter)
         self.assertFalse(nt.splitter.childrenCollapsible())
-        self.assertEqual(len(nt.splitter.sizes()), 2)
+        self.assertEqual(len(nt.splitter.sizes()), 3)
 
         splitter = VoxResizableSplitter(
             Qt.Orientation.Horizontal,
@@ -239,6 +239,7 @@ class TestReportsWorkspaceRedesign(unittest.TestCase):
         m_id = self.controller.db.create_meeting(title="Silent Sync", source_platform="Desktop App")
         nt = self.window.notetaker_page
         nt.select_meeting(m_id)
+        nt.studio._populate_advanced_tabs()
 
         no_seg_text = nt.studio.adv_analytics_page.toPlainText().lower()
         self.assertIn("0%", no_seg_text)
@@ -264,6 +265,7 @@ class TestReportsWorkspaceRedesign(unittest.TestCase):
         )
 
         nt.select_meeting(m_id)
+        nt.studio._populate_advanced_tabs()
         with_seg_text = nt.studio.adv_analytics_page.toPlainText()
         self.assertIn("Microphone Talk Time: 50%", with_seg_text)
         self.assertIn("Colleague: 50%", with_seg_text)

@@ -551,12 +551,13 @@ class TestMeetingWorkspaceEvolved(unittest.TestCase):
         workspace = VoxMeetingStudioWorkspace(theme="dark", db=self.db)
         workspace.load_meeting(self.m_id)
 
-        # 1. Default mode is Unified 3-Tab Workspace (Stack index 0)
+        # 1. Default mode is Unified 4-Tab Workspace (Stack index 0)
         self.assertEqual(workspace.view_stack.currentIndex(), 0)
-        self.assertEqual(workspace.unified_tabs.count(), 3)
-        self.assertEqual(workspace.unified_tabs.tabText(0), "✏️ My Thoughts")
-        self.assertEqual(workspace.unified_tabs.tabText(1), "🎙️ Transcript")
-        self.assertEqual(workspace.unified_tabs.tabText(2), "✨ Summary")
+        self.assertEqual(workspace.unified_tabs.count(), 4)
+        self.assertEqual(workspace.unified_tabs.tabText(0), "My Notes")
+        self.assertEqual(workspace.unified_tabs.tabText(1), "Transcript")
+        self.assertEqual(workspace.unified_tabs.tabText(2), "Summary")
+        self.assertIn("Knowledge", workspace.unified_tabs.tabText(3))
 
         # 2. Switch to Advanced Studio Mode (Stack index 1)
         workspace.set_view_mode("advanced")

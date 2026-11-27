@@ -1,0 +1,25 @@
+# Production runtime dependencies for VOX Desktop (Windows x64)
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.2
+PyQt6_sip==13.13.0
+faster-whisper==1.2.1
+ctranslate2==4.8.3
+onnxruntime==1.31.0
+sherpa-onnx==2.0.2
+sherpa-onnx-core==2.0.2
+tokenizers==0.23.3
+huggingface_hub==2.2.0
+hf-xet==1.7.0
+cryptography==50.0.2
+PyAudioWPatch==0.2.12.9
+sounddevice==0.5.6
+pywin32==312
+numpy==2.5.4
+scipy==1.18.1
+av==19.0.1
+pillow==13.0.0
+pydantic==2.14.4
+pydantic_core==2.50.5
+PyYAML==6.0.3
+certifi==2026.10.18
+truststore==0.10.5

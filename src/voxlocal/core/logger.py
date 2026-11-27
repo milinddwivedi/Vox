@@ -252,6 +252,8 @@ class InMemoryLogHandler(logging.Handler):
 
 _memory_handler: InMemoryLogHandler | None = None
 _initialized = False
+_migration_lock = threading.Lock()
+_migration_attempted = False
 
 
 def get_app_root() -> Path:
@@ -271,6 +273,78 @@ def get_app_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent.parent
 
 
+def get_user_data_root() -> Path:
+    """
+    Return the writable user-data directory (`data/` equivalent).
+
+    - Honors `VOXLOCAL_DATA_DIR` when explicitly provided.
+    - Keeps non-frozen source workspaces, `VOXLOCAL_APP_ROOT` overrides, and pytest isolated under `<app_root>/data`.
+    - For frozen Windows installs (`%LOCALAPPDATA%\\Programs\\VOX`): separates mutable user data into
+      `%LOCALAPPDATA%\\VOX\\data`, automatically and safely migrating any legacy `<app_root>/data` first.
+    """
+    global _migration_attempted
+    custom_data = os.environ.get("VOXLOCAL_DATA_DIR", "").strip()
+    if custom_data:
+        return Path(custom_data).resolve()
+    app_root = get_app_root()
+    exe_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None
+    is_dev_workspace = (
+        not getattr(sys, "frozen", False)
+        or bool(os.environ.get("VOXLOCAL_APP_ROOT", "").strip())
+        or bool(os.environ.get("PYTEST_CURRENT_TEST", "").strip())
+        or (app_root / "main.py").is_file()
+        or (app_root / "src" / "voxlocal").is_dir()
+        or (app_root / ".git").exists()
+        or (exe_dir is not None and exe_dir.name.lower() == "voxlocal" and exe_dir.parent.name.lower() == "dist")
+    )
+    if is_dev_workspace:
+        return app_root / "data"
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    target_vox_root = (
+        Path(local_app_data).resolve() / "VOX"
+        if local_app_data
+        else (Path.home() / "AppData" / "Local" / "VOX")
+    )
+
+    legacy_data = app_root / "data"
+    if (legacy_data / "voxlocal.db").is_file() or (legacy_data / "config.json").is_file():
+        with _migration_lock:
+            if not _migration_attempted:
+                _migration_attempted = True
+                try:
+                    from voxlocal.core.data_migration import migrate_legacy_install_data
+
+                    res = migrate_legacy_install_data(app_root, target_vox_root)
+                    if res.get("error"):
+                        return legacy_data
+                except Exception:
+                    return legacy_data
+        if (legacy_data / "voxlocal.db").is_file() and not (target_vox_root / "data" / "voxlocal.db").is_file():
+            return legacy_data
+
+    return target_vox_root / "data"
+
+
+def get_user_models_root() -> Path:
+    """
+    Return the writable user AI models directory.
+
+    - In non-frozen workspaces, test runs, or legacy upgrades carrying `<app_root>/data/models`, keeps `<user_data_root>/models`.
+    - On clean frozen Windows installs separated under `%LOCALAPPDATA%\\VOX`, stores models in `%LOCALAPPDATA%\\VOX\\models`.
+    """
+    custom_models = os.environ.get("VOXLOCAL_MODELS_DIR", "").strip()
+    if custom_models:
+        return Path(custom_models).resolve()
+    data_root = get_user_data_root()
+    app_root = get_app_root()
+    if data_root == (app_root / "data"):
+        return data_root / "models"
+    if (data_root / "models").is_dir() and not (data_root.parent / "models").is_dir():
+        return data_root / "models"
+    return data_root.parent / "models"
+
+
 def setup_logging(log_dir: Path | None = None, level: int = logging.INFO) -> logging.Logger:
     """Configure application-wide logging to file, console, and in-memory buffer."""
     global _memory_handler, _initialized
@@ -282,7 +356,7 @@ def setup_logging(log_dir: Path | None = None, level: int = logging.INFO) -> log
     logger.propagate = False
 
     if log_dir is None:
-        log_dir = get_app_root() / "data" / "logs"
+        log_dir = get_user_data_root() / "logs"
     os.makedirs(log_dir, exist_ok=True)
 
     corr_filter = StructuredCorrelationFilter()

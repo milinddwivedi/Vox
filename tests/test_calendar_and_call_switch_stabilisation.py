@@ -329,13 +329,16 @@ def test_acceptance_e_full_meeting_lifecycle_dropped_call_auto_stop(qapp, temp_w
     controller.meeting_recorder.stop.return_value = {"mic_path": "fake_mic.wav", "sys_path": "fake_sys.wav"}
     controller.streaming_transcriber = MagicMock()
 
-    # 1. Start meeting from floating icon bar toggle with Riya
-    ok, msg = controller.start_meeting_recording(
-        title="1-on-1 with Riya",
-        target_hwnd=None,
-        record_screen=False,
-        recording_mode="audio_only",
-    )
+    # 1. Start meeting from floating icon bar toggle with Riya (isolated from host desktop windows)
+    with patch("voxlocal.audio.call_detector.list_all_meeting_windows", return_value=[]), \
+         patch("voxlocal.video.meeting_capture.discover_meeting_sources", return_value=[]), \
+         patch("voxlocal.video.meeting_capture.resolve_meeting_source", return_value=None):
+        ok, msg = controller.start_meeting_recording(
+            title="1-on-1 with Riya",
+            target_hwnd=None,
+            record_screen=False,
+            recording_mode="audio_only",
+        )
     assert ok is True
     assert controller._capture_state == "recording"
     assert controller.call_detector.active_session is not None
@@ -346,15 +349,17 @@ def test_acceptance_e_full_meeting_lifecycle_dropped_call_auto_stop(qapp, temp_w
     controller._active_meeting_target_hwnd = fake_hwnd
 
     # In user32, fake_hwnd is not an open window anymore
-    with patch("voxlocal.core.controller.user32.IsWindow", return_value=False):
-        with patch("voxlocal.video.meeting_capture.discover_meeting_sources", return_value=[]):
-            # First poll detects target lost, records timestamp
-            controller._poll_call_detector()
-            assert controller._manual_target_lost_since is not None
+    with patch("voxlocal.core.controller.user32.IsWindow", return_value=False), \
+         patch("voxlocal.audio.call_detector.list_all_meeting_windows", return_value=[]), \
+         patch("voxlocal.video.meeting_capture.discover_meeting_sources", return_value=[]), \
+         patch("voxlocal.video.meeting_capture.resolve_meeting_source", return_value=None):
+        # First poll detects target lost, records timestamp
+        controller._poll_call_detector()
+        assert controller._manual_target_lost_since is not None
 
-            # Advance time past grace period (>= 2.0s)
-            with patch("time.monotonic", return_value=time.monotonic() + 3.0):
-                controller._poll_call_detector()
+        # Advance time past grace period (>= 2.0s)
+        with patch("time.monotonic", return_value=time.monotonic() + 3.0):
+            controller._poll_call_detector()
 
     # Verified: Auto-stop executed and state transitioned to idle
     assert controller._capture_state == "idle"

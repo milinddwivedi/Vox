@@ -545,14 +545,20 @@ class TestMeetingLifecycleAdversarialStress(unittest.TestCase):
 
     def test_01_rapid_start_stop_meeting_recording(self) -> None:
         """Stress test rapid consecutive start/stop meeting recording calls without deadlocks."""
-        self.controller.meeting_recorder.start = lambda **kw: (True, "Started")
-        self.controller.meeting_recorder.stop = lambda **kw: None
+        self.controller.meeting_recorder = MagicMock()
+        self.controller.meeting_recorder.is_recording = False
+        self.controller.meeting_recorder.start.return_value = (True, "Started")
+        self.controller.meeting_recorder.stop.return_value = None
 
         for i in range(15):
             ok, msg = self.controller.start_meeting_recording(title=f"Rapid Test {i}")
             self.assertTrue(ok, f"Start failed at iteration {i}: {msg}")
-            self.assertEqual(self.controller.meeting_state, "recording")
+            self.assertEqual(self.controller.capture_state, "recording")
             self.controller.stop_meeting_recording()
+            self.assertEqual(self.controller.capture_state, "idle")
+            deadline = time.monotonic() + 2.0
+            while self.controller.meeting_state != "idle" and time.monotonic() < deadline:
+                time.sleep(0.02)
             self.assertEqual(self.controller.meeting_state, "idle")
 
     def test_02_start_recording_while_transcribing_succeeds_concurrently(self) -> None:

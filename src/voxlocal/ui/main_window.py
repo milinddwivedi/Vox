@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QKeySequence, QShortcut
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QCloseEvent, QColor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -36,11 +37,14 @@ from voxlocal.ui.hub_pages import (
     SnippetsPage,
     StylePage,
 )
+from voxlocal.ui.icons import get_icon
 from voxlocal.ui.notetaker_page import NotetakerPage
 from voxlocal.ui.settings_dialog import SettingsWorkspaceWidget, ShortcutCaptureDialog
 from voxlocal.ui.theme import (
     create_app_icon,
     create_app_pixmap,
+    ensure_google_fonts_loaded,
+    get_chrome_stylesheet,
     get_theme_tokens,
     get_ui_font,
 )
@@ -144,6 +148,10 @@ class MainWindow(QMainWindow):
         on_exit_app: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__()
+        ensure_google_fonts_loaded()
+        app_inst = QApplication.instance()
+        if app_inst is not None:
+            app_inst.setFont(get_ui_font(13, 400))
         self.controller = controller
         self.floating_widget = floating_widget
         self.on_exit_app = on_exit_app or (lambda: None)
@@ -155,6 +163,7 @@ class MainWindow(QMainWindow):
         self.sidebar_buttons: List[QPushButton] = self.nav_buttons
         self.sidebar_section_headers: List[QLabel] = []
         self._toasts: List[ToastNotification] = []
+        self._pending_theme_pages: set = set()
 
         # Ask VOX stream test/compatibility state
         self._current_ask_vox_id = 0
@@ -173,20 +182,20 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._setup_shortcuts()
-        self.apply_theme(self._theme)
+        self.apply_theme(self._theme, skip_pages=True)
 
         self.controller.theme_changed.connect(self.apply_theme)
-        self.controller.dictation_state_changed.connect(lambda *_: self._update_float_btn_text())
-        self.controller.meeting_state_changed.connect(lambda *_: self._update_float_btn_text())
+        self.controller.dictation_state_changed.connect(self._on_float_btn_signal)
+        self.controller.meeting_state_changed.connect(self._on_float_btn_signal)
         self.controller.notification_requested.connect(self.show_toast)
         if hasattr(self.controller, "upgrade_dialog_requested"):
             self.controller.upgrade_dialog_requested.connect(self._show_pro_upgrade_dialog)
         if hasattr(self.controller, "entitlement_changed"):
-            self.controller.entitlement_changed.connect(lambda ent: self._update_plan_card(entitlement_data=ent))
+            self.controller.entitlement_changed.connect(self._on_entitlement_changed_slot)
         if hasattr(self.controller, "usage_updated"):
-            self.controller.usage_updated.connect(lambda usg: self._update_plan_card(usage_data=usg))
+            self.controller.usage_updated.connect(self._on_usage_updated_slot)
         if hasattr(self.controller, "auth_state_changed"):
-            self.controller.auth_state_changed.connect(lambda *_: self._update_plan_card())
+            self.controller.auth_state_changed.connect(self._on_auth_state_changed_slot)
         if hasattr(self.controller, "login_completed_signal"):
             self.controller.login_completed_signal.connect(self._on_login_completed)
         if hasattr(self.controller, "toast_requested"):
@@ -228,8 +237,8 @@ class MainWindow(QMainWindow):
         self.sidebar.setObjectName("leftSidebar")
         self.sidebar.setFixedWidth(228)
         sb_lay = QVBoxLayout(self.sidebar)
-        sb_lay.setContentsMargins(14, 18, 14, 16)
-        sb_lay.setSpacing(4)
+        sb_lay.setContentsMargins(14, 12, 14, 12)
+        sb_lay.setSpacing(3)
 
         # Brand Row
         brand_row = QHBoxLayout()
@@ -239,7 +248,7 @@ class MainWindow(QMainWindow):
         self.lbl_logo_mark.setAccessibleName("VOX application logo")
         self.lbl_logo_mark.setAccessibleDescription("Branded logo mark for VOX desktop assistant")
         self.lbl_brand = QLabel("VOX")
-        self.lbl_brand.setFont(get_ui_font(20, 600, serif=True))
+        self.lbl_brand.setFont(get_ui_font(19, 600))
         self.lbl_brand.setAccessibleName("VOX Desktop Hub")
         self.lbl_brand.setAccessibleDescription("Primary application title")
         brand_row.addWidget(self.lbl_logo_mark)
@@ -256,8 +265,9 @@ class MainWindow(QMainWindow):
         sb_lay.addSpacing(8)
 
         # Quick Search Pill
-        self.btn_global_search = QPushButton("Search VOX...   Ctrl+K")
+        self.btn_global_search = QPushButton("  Search VOX...   Ctrl+K")
         self.btn_global_search.setObjectName("sbSearchBtn")
+        self.btn_global_search.setIconSize(QSize(14, 14))
         self.btn_global_search.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_global_search.setAccessibleName("Search VOX and Command Palette")
         self.btn_global_search.setAccessibleDescription("Open global command palette and search dialog, keyboard shortcut Control+K")
@@ -274,7 +284,7 @@ class MainWindow(QMainWindow):
             self.sidebar_section_headers.append(hdr_lbl)
             sb_lay.addWidget(hdr_lbl)
 
-        _nav_icons = ["⌂", "🎙", "📖", "⚡", "✦", "✎", "◔"]
+        _nav_icon_names = ["home", "meetings", "dictionary", "snippets", "style", "scratchpad", "insights"]
         nav_descriptions = [
             ("Home workspace", "Navigate to Home dictation history feed, keyboard shortcut Control+1"),
             ("Notetaker workspace", "Navigate to Notetaker meeting intelligence and recordings, keyboard shortcut Control+2"),
@@ -290,10 +300,12 @@ class MainWindow(QMainWindow):
                 _add_sb_section("VOICE & STYLE")
             elif idx == 6:
                 _add_sb_section("INSIGHTS")
-            btn = QPushButton(f"{_nav_icons[idx]}  {ws['name']}")
+            btn = QPushButton(f"  {ws['name']}")
+            btn.setProperty("vox_icon_name", _nav_icon_names[idx])
+            btn.setIconSize(QSize(16, 16))
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setFixedHeight(33)
+            btn.setFixedHeight(30)
             if idx < len(nav_descriptions):
                 btn.setAccessibleName(nav_descriptions[idx][0])
                 btn.setAccessibleDescription(nav_descriptions[idx][1])
@@ -301,10 +313,12 @@ class MainWindow(QMainWindow):
             self.nav_buttons.append(btn)
             sb_lay.addWidget(btn)
             if idx == 1:
-                self.btn_calendar = QPushButton("📅  Calendar")
+                self.btn_calendar = QPushButton("  Calendar")
+                self.btn_calendar.setProperty("vox_icon_name", "calendar")
+                self.btn_calendar.setIconSize(QSize(16, 16))
                 self.btn_calendar.setCheckable(True)
                 self.btn_calendar.setCursor(Qt.CursorShape.PointingHandCursor)
-                self.btn_calendar.setFixedHeight(33)
+                self.btn_calendar.setFixedHeight(30)
                 self.btn_calendar.setAccessibleName("Calendar workspace")
                 self.btn_calendar.setAccessibleDescription(
                     "Navigate to Calendar ecosystem, connected accounts, and upcoming meetings, keyboard shortcut Control+3"
@@ -321,7 +335,9 @@ class MainWindow(QMainWindow):
         sb_lay.addWidget(sep)
         sb_lay.addSpacing(4)
 
-        btn_settings = QPushButton("⚙  Settings")
+        btn_settings = QPushButton("  Settings")
+        btn_settings.setProperty("vox_icon_name", "settings")
+        btn_settings.setIconSize(QSize(16, 16))
         btn_settings.setCheckable(True)
         btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_settings.setFixedHeight(32)
@@ -335,7 +351,7 @@ class MainWindow(QMainWindow):
         util_row1.setSpacing(4)
         self.btn_open_scratchpad = QPushButton("Scratchpad")
         self.btn_open_scratchpad.setObjectName("sbCompactUtilBtn")
-        self.btn_open_scratchpad.setFixedHeight(28)
+        self.btn_open_scratchpad.setFixedHeight(25)
         self.btn_open_scratchpad.setToolTip("Open Floating Scratchpad")
         self.btn_open_scratchpad.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_scratchpad.setAccessibleName("Open Floating Scratchpad")
@@ -345,7 +361,7 @@ class MainWindow(QMainWindow):
 
         self.btn_open_drawer = QPushButton("Live Drawer")
         self.btn_open_drawer.setObjectName("sbCompactUtilBtn")
-        self.btn_open_drawer.setFixedHeight(28)
+        self.btn_open_drawer.setFixedHeight(25)
         self.btn_open_drawer.setToolTip("Open Live Notetaker Drawer")
         self.btn_open_drawer.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_drawer.setAccessibleName("Open Notetaker Drawer")
@@ -358,7 +374,7 @@ class MainWindow(QMainWindow):
         util_row2.setSpacing(4)
         self.btn_toggle_float = QPushButton("Hide Flow Bar")
         self.btn_toggle_float.setObjectName("sbCompactUtilBtn")
-        self.btn_toggle_float.setFixedHeight(26)
+        self.btn_toggle_float.setFixedHeight(24)
         self.btn_toggle_float.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_toggle_float.setAccessibleName("Toggle Flow Bar")
         self.btn_toggle_float.setAccessibleDescription("Toggle visibility of the floating desktop Flow Bar pill")
@@ -389,13 +405,15 @@ class MainWindow(QMainWindow):
         # ---- Left Sidebar User Profile & Plan Status Card ----
         self.plan_card = QFrame()
         self.plan_card.setObjectName("planStatusCard")
+        self.plan_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         plan_card_lay = QVBoxLayout(self.plan_card)
         plan_card_lay.setContentsMargins(10, 8, 10, 8)
-        plan_card_lay.setSpacing(4)
+        plan_card_lay.setSpacing(6)
 
         # 1. User Profile Row (Full width for avatar + name/email — never squeezed horizontally)
         profile_row = QHBoxLayout()
         profile_row.setSpacing(8)
+        profile_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self.profile_avatar = QLabel("👤")
         self.profile_avatar.setObjectName("profileAvatar")
@@ -406,8 +424,10 @@ class MainWindow(QMainWindow):
         profile_row.addWidget(self.profile_avatar)
 
         profile_text_lay = QVBoxLayout()
-        profile_text_lay.setSpacing(1)
+        profile_text_lay.setContentsMargins(0, 0, 0, 0)
+        profile_text_lay.setSpacing(2)
         self.lbl_user_name = QLabel("Guest Mode")
+        self.lbl_user_name.setMinimumHeight(16)
         self.lbl_user_name.setObjectName("profileUserName")
         self.lbl_user_name.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.lbl_user_name.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -415,6 +435,7 @@ class MainWindow(QMainWindow):
         profile_text_lay.addWidget(self.lbl_user_name)
 
         self.lbl_user_email = QLabel("Offline on this PC")
+        self.lbl_user_email.setMinimumHeight(14)
         self.lbl_user_email.setObjectName("profileUserEmail")
         self.lbl_user_email.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.lbl_user_email.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -590,7 +611,23 @@ class MainWindow(QMainWindow):
         root.addWidget(self.workspace_stack, 1)
         self.navigate_to_workspace(0)
         self._update_float_btn_text()
+        self._refresh_sidebar_icons()
         self._update_plan_card()
+
+    def _refresh_sidebar_icons(self) -> None:
+        t = get_theme_tokens(self._theme)
+        idle_col = t.get("text_secondary", "#475569")
+        act_col = t.get("accent_dawn_text", t.get("accent", "#1967D2"))
+        if hasattr(self, "btn_global_search"):
+            self.btn_global_search.setIcon(get_icon("search", t.get("text_muted", "#64748B"), 14))
+        all_nav = list(getattr(self, "nav_buttons", []))
+        if hasattr(self, "btn_calendar"):
+            all_nav.append(self.btn_calendar)
+        for btn in all_nav:
+            iname = btn.property("vox_icon_name")
+            if iname:
+                checked = bool(btn.isChecked())
+                btn.setIcon(get_icon(str(iname), act_col if checked else idle_col, 16, filled=checked))
 
     def _setup_shortcuts(self) -> None:
         for idx, ws in enumerate(self.WORKSPACES):
@@ -616,16 +653,24 @@ class MainWindow(QMainWindow):
             idx = int(target)
         if legacy_map and idx in self._LEGACY_INT_TO_INDEX:
             return self._LEGACY_INT_TO_INDEX[idx]
+        if idx == 8 and hasattr(self, "workspace_stack") and self.workspace_stack.count() > 8:
+            return 8
         max_ws_idx = max(0, len(self.WORKSPACES) - 1)
         return max(0, min(idx, max_ws_idx))
 
     def navigate_to_workspace(self, target: Union[int, str], legacy_map: bool = False) -> None:
         idx = self._resolve_workspace_index(target, legacy_map=legacy_map)
         self.workspace_stack.setCurrentIndex(idx)
+        active_page = self.workspace_stack.currentWidget()
+        if active_page is not None and active_page in getattr(self, "_pending_theme_pages", ()):
+            self._pending_theme_pages.discard(active_page)
+            if hasattr(active_page, "apply_theme") and getattr(active_page, "_theme", None) != self._theme:
+                active_page.apply_theme(self._theme)
         for i, btn in enumerate(self.nav_buttons):
             btn.setChecked(i == idx)
         if hasattr(self, "btn_calendar"):
             self.btn_calendar.setChecked(idx == 8)
+        self._refresh_sidebar_icons()
         if idx == 0:
             self.home_page.refresh_all()
         elif idx == 1:
@@ -742,6 +787,30 @@ class MainWindow(QMainWindow):
         else:
             self.btn_toggle_float.setText("Show Flow Bar")
 
+    def _on_float_btn_signal(self, *_args) -> None:
+        try:
+            self._update_float_btn_text()
+        except RuntimeError:
+            pass
+
+    def _on_entitlement_changed_slot(self, ent: object = None) -> None:
+        try:
+            self._update_plan_card(entitlement_data=ent)
+        except RuntimeError:
+            pass
+
+    def _on_usage_updated_slot(self, usg: object = None) -> None:
+        try:
+            self._update_plan_card(usage_data=usg)
+        except RuntimeError:
+            pass
+
+    def _on_auth_state_changed_slot(self, *_args) -> None:
+        try:
+            self._update_plan_card()
+        except RuntimeError:
+            pass
+
     # ------------------------------------------------------------------
     # Compatibility Ask-VOX Stream Handlers
     # ------------------------------------------------------------------
@@ -773,7 +842,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Theme & Toast Notifications
     # ------------------------------------------------------------------
-    def apply_theme(self, theme_name: str) -> None:
+    def apply_theme(self, theme_name: str, skip_pages: bool = False) -> None:
         self._theme = "dark" if (theme_name or "").lower() == "dark" else "light"
         t = get_theme_tokens(self._theme)
         self.setWindowIcon(create_app_icon(size=64, theme=self._theme))
@@ -782,12 +851,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, "theme_toggle"):
             self.theme_toggle.set_theme(self._theme)
 
-        self.setStyleSheet(
-            f"""
-            QMainWindow {{ background-color: {t['bg']}; color: {t['text']}; }}
-            QWidget {{ color: {t['text']}; }}
-            """
-        )
+        pal = self.palette()
+        pal.setColor(pal.ColorRole.Window, QColor(t["bg"]))
+        pal.setColor(pal.ColorRole.WindowText, QColor(t["text"]))
+        pal.setColor(pal.ColorRole.Text, QColor(t["text"]))
+        pal.setColor(pal.ColorRole.ButtonText, QColor(t["text"]))
+        self.setPalette(pal)
+
+        self.setStyleSheet(get_chrome_stylesheet(self._theme))
         self.sidebar.setStyleSheet(
             f"""
             QFrame#leftSidebar {{ background-color: {t['sidebar_bg']}; border-right: 1px solid {t['line']}; }}
@@ -804,7 +875,7 @@ class MainWindow(QMainWindow):
             QPushButton {{
                 text-align: left;
                 padding: 7px 12px;
-                border-radius: 8px;
+                border-radius: 18px;
                 border: none;
                 background: transparent;
                 color: {t['text_secondary']};
@@ -814,8 +885,8 @@ class MainWindow(QMainWindow):
             QPushButton:hover {{ background-color: {t['sidebar_hover']}; color: {t['text']}; }}
             QPushButton:checked {{
                 background-color: {t['sidebar_active']};
-                color: {t['text']};
-                font-weight: 700;
+                color: {t['accent_dawn_text']};
+                font-weight: 600;
             }}
             QPushButton#sbSearchBtn {{
                 background-color: {t['surface']};
@@ -920,21 +991,43 @@ class MainWindow(QMainWindow):
             """
         )
 
-        for page in (
-            self.home_page,
-            self.notetaker_page,
-            self.dictionary_page,
-            self.snippets_page,
-            self.style_page,
-            self.scratchpad_page,
-            self.insights_page,
-            self.settings_page,
-            self.calendar_page,
-        ):
-            if hasattr(page, "apply_theme"):
-                page.apply_theme(self._theme)
+        if not skip_pages:
+            active_page = self.workspace_stack.currentWidget()
+            for page in (
+                self.home_page,
+                self.notetaker_page,
+                self.dictionary_page,
+                self.snippets_page,
+                self.style_page,
+                self.scratchpad_page,
+                self.insights_page,
+                self.settings_page,
+                self.calendar_page,
+            ):
+                if page is active_page:
+                    self._pending_theme_pages.discard(page)
+                    if hasattr(page, "apply_theme"):
+                        page.apply_theme(self._theme)
+                else:
+                    self._pending_theme_pages.add(page)
 
+        self._refresh_sidebar_icons()
         self._update_plan_card()
+
+    def _refresh_sidebar_icons(self) -> None:
+        t = get_theme_tokens(self._theme)
+        idle_col = t.get("text_secondary", "#475569")
+        act_col = t.get("accent_dawn_text", t.get("accent", "#1967D2"))
+        if hasattr(self, "btn_global_search"):
+            self.btn_global_search.setIcon(get_icon("search", t.get("text_muted", "#64748B"), 14))
+        all_nav = list(getattr(self, "nav_buttons", []))
+        if hasattr(self, "btn_calendar"):
+            all_nav.append(self.btn_calendar)
+        for btn in all_nav:
+            iname = btn.property("vox_icon_name")
+            if iname:
+                checked = bool(btn.isChecked())
+                btn.setIcon(get_icon(str(iname), act_col if checked else idle_col, 16, filled=checked))
 
     set_theme = apply_theme
     _apply_theme = apply_theme
@@ -1077,11 +1170,12 @@ class MainWindow(QMainWindow):
         import json
         import shutil
         import sys
-        from voxlocal.core.logger import get_app_root
+        from voxlocal.core.logger import get_app_root, get_user_data_root
 
         candidates: List[Path] = []
         if getattr(sys, "frozen", False):
             candidates.append(Path(sys.executable).resolve().parent / "data" / "logs" / "update_status.json")
+        candidates.append(get_user_data_root() / "logs" / "update_status.json")
         cfg = getattr(self.controller, "config", None)
         if cfg is not None and getattr(cfg, "logs_dir", None):
             candidates.append(Path(cfg.logs_dir) / "update_status.json")
@@ -1147,14 +1241,19 @@ class MainWindow(QMainWindow):
             notes = "\n".join(f"• {str(n)}" for n in raw_notes[:4] if str(n).strip())
         else:
             notes = str(raw_notes or "New performance improvements and features.")
+        size_b = int(manifest.get("installer_size_bytes") or 0)
+        size_line = f"Download Size: {size_b / (1024 * 1024):.1f} MB  ·  " if size_b > 0 else ""
+        rel_date = str(manifest.get("release_date") or "").strip()
+        date_line = f"Released: {rel_date}\n" if rel_date else "\n"
         from PyQt6.QtWidgets import QMessageBox
         box = QMessageBox(self)
         box.setWindowTitle(f"VOX Update Available (v{version})")
         box.setText(f"A new version of VOX (v{version}) is ready to install!")
         box.setInformativeText(
-            f"Current: v{__version__}  \u2192  Latest: v{version}\n\n"
+            f"Current: v{__version__}  \u2192  Latest: v{version}\n"
+            f"{size_line}{date_line}\n"
             f"{notes}\n\n"
-            "Would you like to download and install the update now?"
+            "Your recordings, transcripts, knowledge base, models, and settings are preserved automatically."
         )
         btn_update = box.addButton("⚡ Update Now", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
@@ -1168,7 +1267,7 @@ class MainWindow(QMainWindow):
             self.btn_check_updates.setText("Updates")
 
     def _start_in_app_update(self, manifest: Dict[str, Any]) -> None:
-        """Downloads the cryptographically verified installer in background and restarts."""
+        """Downloads the cryptographically verified installer in background and restarts safely."""
         if getattr(self.controller, "capture_state", "idle") in ("recording", "paused"):
             defer_msg = (
                 "An active meeting recording is currently in progress. "
@@ -1182,6 +1281,53 @@ class MainWindow(QMainWindow):
             box.setText(defer_msg)
             self._style_message_box(box)
             box.exec()
+            self.btn_check_updates.setEnabled(True)
+            self.btn_check_updates.setText("Updates")
+            return
+
+        finalizing_jobs = getattr(self.controller, "_finalizing_jobs", None)
+        dict_state = str(getattr(self.controller, "dictation_state", "idle") or "idle").lower()
+        if (finalizing_jobs and len(finalizing_jobs) > 0) or dict_state in ("listening", "speaking", "processing"):
+            defer_msg = (
+                "VOX is currently finalizing a meeting transcript or processing dictation. "
+                "Update deferred safely until background AI work finishes."
+            )
+            self.show_toast("Update Deferred", defer_msg)
+            from PyQt6.QtWidgets import QMessageBox
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("Background Processing Active")
+            box.setText(defer_msg)
+            self._style_message_box(box)
+            box.exec()
+            self.btn_check_updates.setEnabled(True)
+            self.btn_check_updates.setText("Updates")
+            return
+
+        auth_token: Optional[str] = None
+        broker = getattr(self.controller, "desktop_auth_broker", None) or getattr(self.controller, "auth_broker", None)
+        if broker and hasattr(broker, "load_session"):
+            try:
+                sess = broker.load_session()
+                if isinstance(sess, dict) and sess.get("access_token"):
+                    auth_token = str(sess["access_token"])
+            except Exception:
+                auth_token = None
+
+        inst_url = str(manifest.get("installer_url") or "")
+        if "/api/download/" in inst_url and not auth_token:
+            from PyQt6.QtWidgets import QMessageBox
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("Sign In Required for Update")
+            box.setText("Please sign in with your Google account to authorize and download this VOX update.")
+            box.setInformativeText("Your offline recordings and local tools remain accessible without signing in.")
+            btn_login = box.addButton("Sign In with Google", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            self._style_message_box(box)
+            box.exec()
+            if box.clickedButton() == btn_login:
+                self._on_google_signin_clicked()
             self.btn_check_updates.setEnabled(True)
             self.btn_check_updates.setText("Updates")
             return
@@ -1224,6 +1370,7 @@ class MainWindow(QMainWindow):
             ok, dl_msg = mgr.download_and_verify(
                 manifest,
                 installer_dest,
+                auth_token=auth_token,
                 progress_callback=_on_progress,
             )
             if ok and installer_dest.exists():
@@ -1299,6 +1446,23 @@ class MainWindow(QMainWindow):
         self.lbl_update_status.setText(f"Installing VOX v{ver} & restarting...")
         self.btn_check_updates.setText("Restarting...")
         self.show_toast("Installing Update", f"Installing VOX v{ver} and restarting...")
+
+        # Non-destructive SQLite backup prior to installer handoff
+        try:
+            db_obj = getattr(self.controller, "db", None)
+            cfg_obj = getattr(self.controller, "config", None)
+            if db_obj is not None and hasattr(db_obj, "db_path") and Path(db_obj.db_path).is_file():
+                import sqlite3
+                bk_root = (Path(cfg_obj.storage_dir) if cfg_obj else Path(db_obj.db_path).parent) / "backups"
+                bk_root.mkdir(parents=True, exist_ok=True)
+                bk_path = bk_root / f"voxlocal_pre_inapp_update_v{ver}.db"
+                sc = sqlite3.connect(f"file:{db_obj.db_path}?mode=ro", uri=True)
+                dc = sqlite3.connect(str(bk_path))
+                sc.backup(dc)
+                sc.close()
+                dc.close()
+        except Exception as bk_exc:
+            logger.debug("Pre-update DB backup notice: %s", bk_exc)
 
         try:
             subprocess.Popen(cmd_args, creationflags=creation_flags, close_fds=True)
@@ -1531,6 +1695,17 @@ class MainWindow(QMainWindow):
             if timer is not None and timer.isActive():
                 timer.stop()
         nt = getattr(self, "notetaker_page", None)
+        if nt is not None and hasattr(nt, "teardown"):
+            try:
+                nt.teardown()
+            except Exception:
+                pass
+        sp = getattr(self, "settings_page", None)
+        if sp is not None and hasattr(sp, "teardown"):
+            try:
+                sp.teardown()
+            except Exception:
+                pass
         studio = getattr(nt, "studio", None) if nt is not None else None
         if studio is not None:
             tab_sum = getattr(studio, "tab_summary", None)

@@ -238,35 +238,29 @@ class StartupManagerStressTestSuite(unittest.TestCase):
             None,  # Success simulation
         ]
 
-        def worker_task(thread_id: int) -> None:
-            mock_key = MagicMock()
-            for _ in range(25):
-                fault = random.choice(possible_faults)
-                if fault is not None:
-                    with patch("winreg.OpenKey", side_effect=fault):
-                        try:
-                            StartupManager.is_available()
-                            StartupManager.is_enabled()
-                            StartupManager.set_enabled(True)
-                            StartupManager.set_enabled(False)
-                        except Exception as e:
-                            errors.append(e)
-                else:
-                    with patch("winreg.OpenKey", return_value=mock_key), \
-                         patch("winreg.SetValueEx"), \
-                         patch("winreg.DeleteValue"), \
-                         patch("winreg.QueryValueEx", return_value=('"test.exe"', winreg.REG_SZ)):
-                        try:
-                            StartupManager.is_available()
-                            StartupManager.is_enabled()
-                            StartupManager.set_enabled(True)
-                            StartupManager.set_enabled(False)
-                        except Exception as e:
-                            errors.append(e)
+        def _thread_safe_open_key(*args, **kwargs):
+            fault = random.choice(possible_faults)
+            if fault is not None:
+                raise fault
+            return MagicMock()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(worker_task, tid) for tid in range(10)]
-            concurrent.futures.wait(futures)
+        def worker_task(thread_id: int) -> None:
+            for _ in range(25):
+                try:
+                    StartupManager.is_available()
+                    StartupManager.is_enabled()
+                    StartupManager.set_enabled(True)
+                    StartupManager.set_enabled(False)
+                except Exception as e:
+                    errors.append(e)
+
+        with patch("winreg.OpenKey", side_effect=_thread_safe_open_key), \
+             patch("winreg.SetValueEx"), \
+             patch("winreg.DeleteValue"), \
+             patch("winreg.QueryValueEx", return_value=('"test.exe"', winreg.REG_SZ)):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(worker_task, tid) for tid in range(10)]
+                concurrent.futures.wait(futures)
 
         self.assertEqual(
             len(errors),

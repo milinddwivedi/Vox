@@ -1,594 +1,614 @@
 """
-VOX Local LLM Engine — 100% Offline Cognitive Synthesis & Meeting Intelligence.
+VOX Local LLM Engine — 100% Offline Meeting Intelligence & Knowledge Extraction.
 
-Powered by CTranslate2 and Tokenizers for ultra-fast, local INT8 inference
-on NVIDIA GPUs (CUDA) with graceful, automatic multi-threaded CPU fallback.
-Never connects to external clouds or third-party APIs.
+Powered by `Qwen3.5-4B-Q4_K_M.gguf` served locally via isolated `llama-server.exe`
+(Vulkan GPU acceleration by default with explicit, non-silent CPU fallback).
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-import sys
-import time
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
-from voxlocal.core.logger import get_app_root, get_logger
+from voxlocal.core.logger import get_app_root, get_logger, get_user_models_root
+from voxlocal.engine.llama_server_engine import LlamaServerManager, _strip_think_blocks
 
 logger = get_logger("llm_engine")
 
 
-def _setup_cuda_dll_directories() -> None:
-    """Ensure NVIDIA CUDA runtime DLLs (cuBLAS, cuDNN, etc.) are discoverable by Windows."""
-    if sys.platform != "win32":
-        return
+def _compact_transcript_lines(segments: List[Dict[str, Any]], max_words: int = 12500) -> str:
+    """Format segments compactly as `[MM:SS|Speaker] text` fitting inside 24k context."""
+    lines: List[str] = []
+    for s in segments or []:
+        txt = str(s.get("text") or "").strip()
+        if not txt:
+            continue
+        st = max(0, int(float(s.get("start_time") or 0.0)))
+        mm, ss = divmod(st, 60)
+        spk = str(s.get("speaker") or "Speaker").strip()
+        lines.append(f"[{mm:02d}:{ss:02d}|{spk}] {txt}")
 
-    # Check PyInstaller bundle
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        p = Path(meipass)
-        for cand in [p, p / "nvidia" / "cublas" / "bin", p / "nvidia" / "cudnn" / "bin"]:
-            if cand.is_dir():
-                try:
-                    os.add_dll_directory(str(cand))
-                    os.environ["PATH"] = str(cand) + os.pathsep + os.environ.get("PATH", "")
-                except Exception:
-                    pass
+    if not lines:
+        return ""
 
-    # Check local virtual environment site-packages
-    root = get_app_root()
-    venv_nvidia = root / ".venv" / "Lib" / "site-packages" / "nvidia"
-    if venv_nvidia.is_dir():
-        for sub in venv_nvidia.glob("*/bin"):
-            if sub.is_dir():
-                try:
-                    os.add_dll_directory(str(sub))
-                    os.environ["PATH"] = str(sub) + os.pathsep + os.environ.get("PATH", "")
-                except Exception:
-                    pass
+    full = "\n".join(lines)
+    words = full.split()
+    if len(words) <= max_words:
+        return full
+
+    # Stratified head + cue-preserving middle + tail for > 2-hour transcripts
+    n = len(lines)
+    h_end = max(1, int(n * 0.28))
+    t_start = min(n - 1, int(n * 0.72))
+    cue_pat = re.compile(
+        r"\b(decided|agreed|approved|confirmed|will|action|deadline|follow up|risk|blocker|issue|\?)\b",
+        re.IGNORECASE,
+    )
+    mid = [
+        ln for i, ln in enumerate(lines[h_end:t_start], h_end)
+        if cue_pat.search(ln) or (i % 2 == 0)
+    ]
+    head_lines = lines[:h_end]
+    tail_lines = lines[t_start:]
+    fixed_words = len("\n".join(head_lines).split()) + len("\n".join(tail_lines).split()) + 8
+    rem_budget = max(0, max_words - fixed_words)
+    kept_mid: List[str] = []
+    mid_words = 0
+    for ln in mid:
+        w = len(ln.split())
+        if mid_words + w > rem_budget:
+            break
+        kept_mid.append(ln)
+        mid_words += w
+
+    combined = (
+        "\n".join(head_lines)
+        + "\n\n[... middle discussion ...]\n\n"
+        + ("\n".join(kept_mid) if kept_mid else "[omitted to fit context window]")
+        + "\n\n[... concluding section ...]\n\n"
+        + "\n".join(tail_lines)
+    )
+    c_words = combined.split()
+    if len(c_words) > max_words:
+        # Preserve newlines while trimming excess lines proportionally from head/tail if extreme
+        trimmed: List[str] = []
+        w_cnt = 0
+        for ln in combined.splitlines():
+            lw = len(ln.split())
+            if w_cnt + lw > max_words and trimmed:
+                break
+            trimmed.append(ln)
+            w_cnt += lw
+        combined = "\n".join(trimmed)
+    return combined
 
 
-# Initialize DLL paths immediately
-_setup_cuda_dll_directories()
+_SHARED_MEETING_SYSTEM_PROMPT = (
+    "You are VOX Local Meeting Intelligence. Respond strictly with valid JSON grounded ONLY in the provided meeting transcript.\n"
+    "Never invent people, metrics, deadlines, owners, or facts not explicitly stated in the transcript.\n"
+    "Distinguish real commitments/decisions from casual greetings, farewells, holiday wishes, small talk, or generic walkthroughs.\n"
+    "Use exact [MM:SS] timestamps when citing moments."
+)
+
+_GREETING_FAREWELL_RE = re.compile(
+    r"^(?:review and address:\s*)?(?:all\s+right,?\s*|okay,?\s*)?(?:hi|hello|hey|good morning|good afternoon|good evening|"
+    r"bye|goodbye|see you|have a (?:good|great|wonderful|happy) (?:holiday|weekend|day|evening)|"
+    r"take care|be safe|thanks? everyone|thank you|appreciate your work)\b",
+    re.IGNORECASE,
+)
+
+_NULL_FIELD_TOKENS = {
+    "",
+    "none",
+    "null",
+    "n/a",
+    "na",
+    "unknown",
+    "unassigned",
+    "unassigned — confirmation required",
+    "owner unknown",
+    "not specified",
+    "no due date",
+    "tbd",
+}
 
 
 class LocalLLMEngine:
     """
-    Production-grade local LLM engine for VOX.
-    Wraps CTranslate2 Generator and HuggingFace Tokenizers with INT8 quantization.
+    Production Local LLM Engine wrapping Qwen3.5-4B-Q4_K_M via LlamaServerManager.
     Features:
-    - Lazy loading: zero impact on cold startup time.
-    - Automatic device detection: CUDA acceleration with automatic CPU fallback.
-    - Structured MoM generation: extracts genuine decisions, actions, and summaries.
-    - Grounded Q&A for Ask Vox: answers questions citing verified timestamps and speakers.
+    - Lazy loopback server startup (zero cold-start penalty)
+    - Vulkan GPU default with automatic CPU fallback and explicit fallback reason
+    - Two-call Meeting Intelligence extraction (Summary/Detailed/Points/Follow-ups + Decisions/Action Items)
+    - Strict null preservation (`owner=None`, `due_date=None` when unstated)
+    - Structured Knowledge Extraction (`extract_meeting_knowledge`)
+    - Grounded single-meeting & cross-meeting Ask VOX Q&A with absent-fact refusal
     """
+
+    DEFAULT_MODEL = "Qwen3.5-4B-Q4_K_M.gguf"
 
     def __init__(
         self,
         model_dir: Optional[str | Path] = None,
         device: str = "auto",
-        compute_type: str = "int8",
-        intra_threads: int = 4,
+        compute_type: str = "q4_k_m",
+        intra_threads: int = 8,
+        idle_timeout_sec: int = 300,
     ) -> None:
         if model_dir is None:
-            root = get_app_root()
-            self.model_dir = root / "data" / "models" / "llm" / "Llama-3.2-1B-Instruct-ct2-int8"
+            target_path = get_user_models_root() / "meeting_llm" / self.DEFAULT_MODEL
         else:
-            self.model_dir = Path(model_dir)
+            p = Path(model_dir)
+            target_path = (p / self.DEFAULT_MODEL) if p.is_dir() else p
+            # Seamless fallback if legacy CT2 directory path was passed
+            if not target_path.exists() and "Llama-3.2-1B" in str(target_path):
+                cand = get_user_models_root() / "meeting_llm" / self.DEFAULT_MODEL
+                if cand.exists():
+                    target_path = cand
 
-        self.requested_device = device
+        self.model_path = target_path
+        self.model_dir = target_path.parent
+        self.requested_device = str(device or "auto")
         self.compute_type = compute_type
-        self.intra_threads = max(1, intra_threads)
+        self.intra_threads = intra_threads
+        self._server = LlamaServerManager(
+            model_path=target_path,
+            device=self.requested_device,
+            ctx_size=24576,
+            idle_timeout_sec=idle_timeout_sec,
+        )
+        self._last_reliability_telemetry: Dict[str, Any] = {}
+        self._last_usage_log: List[Dict[str, Any]] = []
 
-        self._generator: Optional[Any] = None
-        self._tokenizer: Optional[Any] = None
-        self._active_device: Optional[str] = None
-        self._load_failed: bool = False
-        self._load_error_msg: str = ""
-        self._is_loading: bool = False
+    def get_last_reliability_telemetry(self) -> Dict[str, Any]:
+        return dict(self._last_reliability_telemetry)
+
+    def get_last_usage_log(self) -> List[Dict[str, Any]]:
+        return list(self._last_usage_log)
+
+    def _chat_json_with_retry(
+        self,
+        *,
+        call_name: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+        required_keys: Tuple[str, ...],
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """Execute a structured JSON call with raw-vs-repaired tracking and one clean retry on parse miss."""
+        tel: Dict[str, Any] = {
+            "call": call_name,
+            "attempts": 0,
+            "raw_json_valid": False,
+            "post_repair_valid": False,
+            "repaired_used": False,
+            "thinking_disabled_verified": None,
+        }
+        for attempt in (1, 2):
+            tel["attempts"] = attempt
+            eff_msgs = list(messages)
+            if attempt == 2:
+                eff_msgs = list(messages[:-1]) + [
+                    {
+                        "role": "user",
+                        "content": messages[-1]["content"]
+                        + "\n\nIMPORTANT: Output ONLY a single compact, valid JSON object matching the schema with all brackets closed.",
+                    }
+                ]
+            raw = self._server.chat(
+                eff_msgs,
+                max_tokens=max_tokens if attempt == 1 else min(max_tokens + 250, 2200),
+                temperature=temperature if attempt == 1 else 0.0,
+                json_mode=True,
+            )
+            usage = self._server.get_last_usage() if hasattr(self._server, "get_last_usage") else {}
+            if usage:
+                usage_rec = {"call": call_name, "attempt": attempt, **usage}
+                self._last_usage_log.append(usage_rec)
+                tel["thinking_disabled_verified"] = usage.get("thinking_disabled_verified")
+                tel["completion_tokens"] = usage.get("completion_tokens")
+                tel["prompt_tokens"] = usage.get("prompt_tokens")
+            if not raw:
+                continue
+            raw_clean = _strip_think_blocks(raw).strip()
+            try:
+                direct = json.loads(raw_clean)
+                if isinstance(direct, dict) and any(k in direct for k in required_keys):
+                    tel["raw_json_valid"] = True
+                    tel["post_repair_valid"] = True
+                    return self._sanitize_semantic_mom(direct), tel
+            except Exception:
+                pass
+            parsed = self._parse_json_safely(raw_clean)
+            if isinstance(parsed, dict) and any(k in parsed for k in required_keys):
+                tel["post_repair_valid"] = True
+                tel["repaired_used"] = True
+                return parsed, tel
+        return None, tel
 
     @staticmethod
     def _get_free_vram_mb() -> Optional[int]:
-        """Query available GPU VRAM in megabytes using nvidia-smi with a strict timeout."""
-        try:
-            import subprocess
-            res = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,nounits,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=1.2,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if res.returncode == 0 and res.stdout.strip():
-                vals = [int(line.strip()) for line in res.stdout.strip().splitlines() if line.strip().isdigit()]
-                return max(vals) if vals else None
-        except Exception:
-            pass
-        return None
-
-    def _fallback_to_cpu(self) -> bool:
-        """Dynamically unload CUDA generator and reload on multi-threaded CPU."""
-        try:
-            logger.warning("Unloading CUDA Local LLM Generator and falling back to multi-threaded CPU...")
-            self._generator = None
-            self._active_device = None
-            import ctranslate2
-            cpu_threads = min(8, max(2, os.cpu_count() or 4))
-            self._generator = ctranslate2.Generator(
-                str(self.model_dir),
-                device="cpu",
-                compute_type="int8",
-                intra_threads=cpu_threads,
-            )
-            self._active_device = "cpu"
-            self._load_failed = False
-            logger.info("Local LLM successfully recovered on CPU (threads=%d)", cpu_threads)
-            return True
-        except Exception as exc:
-            self._load_failed = True
-            self._load_error_msg = str(exc)
-            logger.error("Failed fallback to CPU for Local LLM: %s", exc, exc_info=True)
-            return False
+        return LlamaServerManager._get_free_vram_mb()
 
     def is_available(self) -> bool:
-        """Check if model weights and tokenizer exist on disk and model didn't fatally fail to load."""
-        if self._load_failed:
-            return False
-        if not self.model_dir.is_dir():
-            return False
-        model_bin = self.model_dir / "model.bin"
-        tok_file = self.model_dir / "tokenizer.json"
-        return model_bin.is_file() and tok_file.is_file()
+        return self._server.is_available()
 
     def get_model_info(self) -> Dict[str, Any]:
-        """Return diagnostic metadata about the active LLM engine."""
-        return {
-            "name": self.model_dir.name,
-            "path": str(self.model_dir),
-            "available": self.is_available(),
-            "loaded": self._generator is not None,
-            "active_device": self._active_device or "unloaded",
-            "requested_device": self.requested_device,
-            "compute_type": self.compute_type,
-            "threads": self.intra_threads,
-            "error": self._load_error_msg if self._load_failed else None,
-        }
+        info = self._server.get_info()
+        info["compute_type"] = self.compute_type
+        info["threads"] = self.intra_threads
+        return info
 
-    def _ensure_loaded(self) -> bool:
-        """Lazily load generator and tokenizer into RAM/VRAM on first request."""
-        if self._generator is not None and self._tokenizer is not None:
-            return True
+    def unload(self) -> None:
+        self._server.stop()
 
-        if not self.is_available():
-            logger.warning("Local LLM model files not found at %s", self.model_dir)
-            return False
-
-        if self._is_loading:
-            return False
-
-        self._is_loading = True
-        t0 = time.perf_counter()
-
-        try:
-            import ctranslate2
-            from tokenizers import Tokenizer
-
-            # 1. Load Tokenizer
-            tok_path = self.model_dir / "tokenizer.json"
-            self._tokenizer = Tokenizer.from_file(str(tok_path))
-
-            # 2. Determine target device
-            use_cuda = False
-            if self.requested_device.lower() in ("auto", "cuda"):
-                try:
-                    cuda_count = ctranslate2.get_cuda_device_count()
-                    if cuda_count > 0:
-                        if self.requested_device.lower() == "auto":
-                            free_mb = self._get_free_vram_mb()
-                            if free_mb is not None and free_mb < 1800:
-                                logger.info(
-                                    "Low available GPU VRAM (%d MB free < 1800 MB). Selecting multi-threaded CPU for LLM to avoid CUDA out-of-memory.",
-                                    free_mb,
-                                )
-                                use_cuda = False
-                            else:
-                                use_cuda = True
-                        else:
-                            use_cuda = True
-                except Exception as exc:
-                    logger.debug("CUDA check returned: %s", exc)
-
-            # 3. Load Generator with CUDA or CPU fallback
-            if use_cuda:
-                try:
-                    logger.info("Loading Local LLM on CUDA (compute_type=%s)...", self.compute_type)
-                    self._generator = ctranslate2.Generator(
-                        str(self.model_dir),
-                        device="cuda",
-                        compute_type=self.compute_type,
-                        inter_threads=1,
-                        intra_threads=self.intra_threads,
-                    )
-                    self._active_device = "cuda"
-                    logger.info("Local LLM successfully initialized on CUDA in %.2fs", time.perf_counter() - t0)
-                    self._load_failed = False
-                    return True
-                except Exception as cuda_exc:
-                    logger.warning("CUDA initialization failed (%s). Falling back to multi-threaded CPU...", cuda_exc)
-
-            # Fallback to CPU
-            cpu_threads = min(8, max(2, os.cpu_count() or 4))
-            logger.info("Loading Local LLM on CPU (compute_type=int8, threads=%d)...", cpu_threads)
-            self._generator = ctranslate2.Generator(
-                str(self.model_dir),
-                device="cpu",
-                compute_type="int8",
-                intra_threads=cpu_threads,
-            )
-            self._active_device = "cpu"
-            logger.info("Local LLM successfully initialized on CPU in %.2fs", time.perf_counter() - t0)
-            self._load_failed = False
-            return True
-
-        except Exception as exc:
-            self._load_failed = True
-            self._load_error_msg = str(exc)
-            logger.error("Failed to initialize Local LLM Generator: %s", exc, exc_info=True)
-            return False
-        finally:
-            self._is_loading = False
+    def shutdown(self) -> None:
+        self._server.shutdown()
 
     def generate(
         self,
         prompt: str,
-        max_tokens: int = 512,
-        temperature: float = 0.2,
+        max_tokens: int = 1200,
+        temperature: float = 0.1,
         top_p: float = 0.9,
         stop_tokens: Optional[List[str]] = None,
+        json_mode: bool = False,
     ) -> Optional[str]:
-        """Low-level text generation from a formatted prompt string."""
-        if not self._ensure_loaded():
-            return None
-
-        if stop_tokens is None:
-            stop_tokens = ["<|eot_id|>", "<|end_of_text|>"]
-
-        try:
-            tokens = self._tokenizer.encode(prompt).tokens
-            results = self._generator.generate_batch(
-                [tokens],
-                max_length=max_tokens,
-                sampling_topp=top_p,
-                sampling_temperature=temperature,
-                include_prompt_in_result=False,
-                end_token=stop_tokens,
-            )
-            out_tokens = results[0].sequences[0]
-            out_ids = [self._tokenizer.token_to_id(t) for t in out_tokens if self._tokenizer.token_to_id(t) is not None]
-            generated_text = self._tokenizer.decode(out_ids)
-            return generated_text.strip()
-        except Exception as exc:
-            err_str = str(exc).lower()
-            if self._active_device == "cuda" and ("out of memory" in err_str or "cuda" in err_str):
-                logger.warning("CUDA runtime failure during LLM generation (%s). Triggering automatic CPU recovery...", exc)
-                if self._fallback_to_cpu():
-                    try:
-                        results = self._generator.generate_batch(
-                            [tokens],
-                            max_length=max_tokens,
-                            sampling_topp=top_p,
-                            sampling_temperature=temperature,
-                            include_prompt_in_result=False,
-                            end_token=stop_tokens,
-                        )
-                        out_tokens = results[0].sequences[0]
-                        out_ids = [self._tokenizer.token_to_id(t) for t in out_tokens if self._tokenizer.token_to_id(t) is not None]
-                        generated_text = self._tokenizer.decode(out_ids)
-                        return generated_text.strip()
-                    except Exception as cpu_exc:
-                        logger.error("CPU fallback generation also failed: %s", cpu_exc, exc_info=True)
-            logger.error("Generation error in LocalLLMEngine: %s", exc, exc_info=True)
-            return None
+        return self._server.chat(
+            [{"role": "user", "content": str(prompt or "")}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            json_mode=json_mode,
+        )
 
     def generate_stream(
         self,
         prompt: str,
-        max_tokens: int = 512,
-        temperature: float = 0.2,
+        max_tokens: int = 700,
+        temperature: float = 0.15,
         top_p: float = 0.9,
         stop_tokens: Optional[List[str]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Iterator[str]:
-        """
-        Stream generated tokens in real time from a prompt string.
-        Yields incremental decoded string chunks as each token is produced.
-        """
-        if not self._ensure_loaded():
-            return
-
-        if stop_tokens is None:
-            stop_tokens = ["<|eot_id|>", "<|end_of_text|>"]
-
-        try:
-            tokens = self._tokenizer.encode(prompt).tokens
-            step_results = self._generator.generate_tokens(
-                tokens,
-                max_length=max_tokens,
-                sampling_topp=top_p,
-                sampling_temperature=temperature,
-                end_token=stop_tokens,
-            )
-            accumulated_ids: List[int] = []
-            accumulated_text = ""
-            for step in step_results:
-                if step.token_id is not None:
-                    accumulated_ids.append(step.token_id)
-                    decoded = self._tokenizer.decode(accumulated_ids)
-                    if len(decoded) > len(accumulated_text):
-                        chunk = decoded[len(accumulated_text):]
-                        accumulated_text = decoded
-                        yield chunk
-        except Exception as exc:
-            err_str = str(exc).lower()
-            if self._active_device == "cuda" and ("out of memory" in err_str or "cuda" in err_str):
-                logger.warning("CUDA runtime failure during streaming LLM generation (%s). Triggering automatic CPU recovery...", exc)
-                if self._fallback_to_cpu():
-                    try:
-                        step_results = self._generator.generate_tokens(
-                            tokens,
-                            max_length=max_tokens,
-                            sampling_topp=top_p,
-                            sampling_temperature=temperature,
-                            end_token=stop_tokens,
-                        )
-                        accumulated_ids = []
-                        accumulated_text = ""
-                        for step in step_results:
-                            if step.token_id is not None:
-                                accumulated_ids.append(step.token_id)
-                                decoded = self._tokenizer.decode(accumulated_ids)
-                                if len(decoded) > len(accumulated_text):
-                                    chunk = decoded[len(accumulated_text):]
-                                    accumulated_text = decoded
-                                    yield chunk
-                        return
-                    except Exception as cpu_exc:
-                        logger.error("CPU fallback streaming also failed: %s", cpu_exc, exc_info=True)
-            logger.error("Streaming generation error in LocalLLMEngine: %s", exc, exc_info=True)
+        return self._server.chat_stream(
+            [{"role": "user", "content": str(prompt or "")}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            cancel_check=cancel_check,
+        )
 
     def generate_meeting_analysis(
         self,
         segments: List[Dict[str, Any]],
         title: str = "Meeting Notes",
-        platform: str = "Microsoft Teams",
+        platform: str = "Zoom",
         duration_sec: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
         """
-        Analyze meeting transcript evidence and extract structured intelligence:
-        - Executive Summary
-        - Discussion Topics
-        - Decisions (with category, rationale, and quote)
-        - Action Items (with owner, task, due date, and quote)
-        - Open Questions
-        - Risks and Blockers
+        Two-call grounded meeting intelligence extraction:
+        Call 1: Overview (purpose/outcome), Brief & Detailed Summaries, Key Takeaways, Topics, Follow-ups, Risks, Open Questions
+        Call 2: Confirmed Decisions & Actionable Tasks with strict commitment filtering & null preservation
         """
-        if not segments:
+        if not self.is_available():
+            return None
+        self._server.ensure_started()
+        ctx_now = int(getattr(self._server, "active_ctx_size", 16384) or 16384)
+        is_cpu = self._server.active_device == "cpu"
+        max_words = 3200 if ctx_now <= 8192 else (5800 if (is_cpu or ctx_now <= 16384) else 10500)
+        call_max_tokens = 1200 if ctx_now <= 8192 else (1600 if is_cpu else 2000)
+        transcript = _compact_transcript_lines(segments, max_words=max_words)
+        if not transcript:
             return None
 
-        # Build chronological dialogue transcript
-        dialogue_lines: List[str] = []
-        for s in segments:
-            st = float(s.get("start_time", 0.0))
-            mm, ss = divmod(int(st), 60)
-            spk = str(s.get("speaker", "Speaker")).strip()
-            txt = str(s.get("text", "")).strip()
-            if txt:
-                dialogue_lines.append(f"[{mm:02d}:{ss:02d}] {spk}: {txt}")
+        dur_min, dur_rem = divmod(max(0, int(duration_sec)), 60)
+        dur_str = f"{dur_min}m {dur_rem}s" if dur_min > 0 else f"{dur_rem}s"
 
-        if not dialogue_lines:
-            return None
+        base_prefix = f"Meeting: {title}\n\nTRANSCRIPT:\n{transcript}"
 
-        full_dialogue = "\n".join(dialogue_lines)
-
-        # For long transcripts (> 6,000 words), use stratified chronological sampling with cue preservation
-        # so middle segments of long meetings are never omitted
-        words = full_dialogue.split()
-        if len(words) > 6000:
-            head_lines = []
-            tail_lines = []
-            mid_lines = []
-            n_lines = len(dialogue_lines)
-            idx_head_end = max(1, int(n_lines * 0.25))
-            idx_tail_start = min(n_lines - 1, int(n_lines * 0.75))
-
-            cue_pattern = re.compile(
-                r"\b(decided|agreed|approved|confirmed|concluded|settled|will|action|task|deadline|owner|risk|blocker|\?)\b",
-                re.IGNORECASE,
-            )
-
-            for i, line in enumerate(dialogue_lines):
-                if i < idx_head_end:
-                    head_lines.append(line)
-                elif i >= idx_tail_start:
-                    tail_lines.append(line)
-                else:
-                    if cue_pattern.search(line) or (i % 2 == 0):
-                        mid_lines.append(line)
-
-            analysis_transcript = (
-                "\n".join(head_lines)
-                + "\n\n[... middle discussion section ...]\n\n"
-                + "\n".join(mid_lines)
-                + "\n\n[... concluding section ...]\n\n"
-                + "\n".join(tail_lines)
-            )
-            w_split = analysis_transcript.split()
-            if len(w_split) > 7500:
-                analysis_transcript = " ".join(w_split[:7500])
-        else:
-            analysis_transcript = full_dialogue
-
-        dur_min, dur_sec = divmod(int(duration_sec), 60)
-        dur_str = f"{dur_min}m {dur_sec}s" if dur_min > 0 else f"{dur_sec}s"
-
-        prompt = (
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-            "You are an expert executive meeting intelligence analyst for VOX.\n"
-            "Analyze the meeting transcript below and extract structured, verified meeting intelligence.\n"
-            "Strictly adhere to the facts stated in the transcript. Do NOT hallucinate or extrapolate.\n"
-            "Respond ONLY with a valid JSON object matching this schema:\n"
+        task1_summary = (
+            f"TASK:\nExtract structured minutes for this {platform} meeting (Duration: {dur_str}).\n"
+            "Rules:\n"
+            "- Write brief_summary so it can be read in 30 seconds (2-4 sharp factual sentences).\n"
+            "- Write detailed_summary as well-organized sections covering context, objectives, key topics, agreements, disagreements, dependencies, and next steps — NEVER repeat transcript lines verbatim.\n"
+            "- Populate follow_ups with pending confirmations, future discussion topics, dependencies, or promised follow-ups explicitly mentioned (e.g. sharing files later, checking back, revisiting next week).\n"
+            "- Keep key_discussion_points <= 7, topics <= 6, follow_ups <= 7, open_questions <= 6, risks <= 5.\n"
+            "Schema:\n"
             "{\n"
-            '  "executive_summary": "2 to 3 concise paragraphs summarizing the primary purpose, discussions, and outcomes.",\n'
-            '  "topics": [\n'
-            '    {"title": "Topic title", "summary": "Key discussion summary"}\n'
+            '  "meeting_purpose": "One sentence stating the primary purpose of this meeting.",\n'
+            '  "overall_outcome": "One sentence stating the main outcome achieved.",\n'
+            '  "brief_summary": "Concise 30-second executive brief covering purpose, outcomes, critical decisions/actions, and blockers.",\n'
+            '  "detailed_summary": "Comprehensive structured multi-paragraph synthesis with clear plain headings covering objectives, topic-by-topic clarifications, agreements, dependencies, and next steps.",\n'
+            '  "key_discussion_points": [\n'
+            '    {"topic": "Short topic", "summary": "Specific factual takeaway", "timestamp_str": "MM:SS", "speakers": ["Speaker"]}\n'
             "  ],\n"
-            '  "decisions": [\n'
-            '    {"decision": "Clear statement of decision", "category": "Strategic" | "Technical" | "Product" | "Budget" | "Process" | "General", "status": "confirmed" | "proposed" | "rejected" | "unresolved" | "unclassified", "evolution_relationship": "new" | "repeated" | "superseded" | "reversed", "rationale": "Why it was decided", "evidence_quote": "Verbatim quote or close excerpt", "timestamp_str": "MM:SS"}\n'
-            "  ],\n"
-            '  "action_items": [\n'
-            '    {"description": "Clear action verb initiated task", "owner": "Person name or Role", "due_date": "Exact date, spoken relative phrase e.g. \'by Friday\' or \'in 2 weeks\', or \'Not specified\'", "priority": "High" | "Medium" | "Low", "evidence_quote": "Excerpt", "timestamp_str": "MM:SS"}\n'
-            "  ],\n"
-            '  "open_questions": [\n'
-            '    {"question": "Unresolved question", "asked_by": "Speaker name", "timestamp_str": "MM:SS"}\n'
-            "  ],\n"
-            '  "risks": [\n'
-            '    {"risk": "Identified risk or obstacle", "impact": "Potential consequence", "mitigation": "Proposed solution or None", "timestamp_str": "MM:SS"}\n'
-            "  ]\n"
-            "}<|eot_id|>"
-            "<|start_header_id|>user<|end_header_id|>\n\n"
-            f"Meeting: {title}\n"
-            f"Platform: {platform}\n"
-            f"Duration: {dur_str}\n\n"
-            f"TRANSCRIPT:\n{analysis_transcript}\n<|eot_id|>"
-            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            '  "topics": [{"title": "Topic title", "summary": "Concise topic summary", "details": ["Specific factual detail"], "participants": ["Speaker"], "timestamp_str": "MM:SS"}],\n'
+            '  "follow_ups": [{"item": "Concrete follow-up item", "category": "pending_confirmation|question|future_discussion|dependency|promised_followup", "owner": null, "timestamp_str": "MM:SS", "evidence_quote": "Short quote"}],\n'
+            '  "open_questions": [{"question": "Unresolved question", "asked_by": "Speaker", "context": "Short context", "timestamp_str": "MM:SS"}],\n'
+            '  "risks": [{"type": "risk|blocker", "risk": "Risk or blocker mentioned", "impact": "Stated consequence", "mitigation": "Mentioned mitigation or None", "timestamp_str": "MM:SS", "evidence_quote": "Short quote"}]\n'
+            "}"
         )
 
-        raw_output = self.generate(prompt, max_tokens=2048, temperature=0.2, top_p=0.9)
-        if not raw_output:
+        summary_data, tel1 = self._chat_json_with_retry(
+            call_name="call1_summary",
+            messages=[
+                {"role": "system", "content": _SHARED_MEETING_SYSTEM_PROMPT},
+                {"role": "user", "content": f"{base_prefix}\n\n{task1_summary}"},
+            ],
+            max_tokens=call_max_tokens,
+            temperature=0.1,
+            required_keys=("brief_summary", "executive_summary", "detailed_summary", "topics", "key_discussion_points"),
+        )
+
+        task2_actions = (
+            "TASK:\nExtract ONLY genuine decisions and genuine actionable commitments/next steps from the transcript above.\n"
+            "CRITICAL RULES:\n"
+            "1. STRICT FILTERING: NEVER include greetings, farewells, holiday wishes (e.g. 'have a good holiday', 'be safe on the road'), small talk, or casual explanations without a clear commitment or decision.\n"
+            "2. Each action_items description MUST be written as a concise verb-led task (max 22 words), NOT a copied conversational quote.\n"
+            "3. Set \"owner\": null whenever a single specific participant/speaker name is NOT explicitly committed. NEVER guess or write 'Unassigned'.\n"
+            "4. Set \"due_date\": null whenever a calendar date or timeframe (e.g. Friday, tomorrow, next week) is NOT explicitly spoken. NEVER write 'Not specified' or invent dates.\n"
+            "5. Set \"priority\": \"High\"|\"Medium\"|\"Low\" ONLY when urgency/priority is supported; otherwise null.\n"
+            "6. Extract up to 10 real decisions and up to 14 real action_items; keep verbatim evidence_quote <= 22 words with MM:SS timestamp_str.\n"
+            "Respond strictly with valid JSON matching:\n"
+            "{\n"
+            '  "decisions": [\n'
+            '    {"decision": "Clear decision statement", "category": "Strategic|Technical|Product|Budget|Process|General", "status": "confirmed|proposed|rejected|unresolved", "evolution_relationship": "new|repeated|superseded|reversed", "context": "Why this came up", "rationale": "Reasoning or context", "speaker": "ExactSpeaker", "participants": ["ExactSpeaker"], "evidence_quote": "Short verbatim quote", "timestamp_str": "MM:SS"}\n'
+            "  ],\n"
+            '  "action_items": [\n'
+            '    {"description": "Concise verb-led action", "owner": null, "due_date": null, "priority": null, "commitment_type": "confirmed_commitment|suggested_action|needs_confirmation", "related_topic": "Short topic", "context": "Brief context", "evidence_quote": "Short verbatim quote", "timestamp_str": "MM:SS"}\n'
+            "  ]\n"
+            "}"
+        )
+        actions_data, tel2 = self._chat_json_with_retry(
+            call_name="call2_decisions_actions",
+            messages=[
+                {"role": "system", "content": _SHARED_MEETING_SYSTEM_PROMPT},
+                {"role": "user", "content": f"{base_prefix}\n\n{task2_actions}"},
+            ],
+            max_tokens=call_max_tokens,
+            temperature=0.05,
+            required_keys=("decisions", "action_items"),
+        )
+
+        self._last_reliability_telemetry = {
+            "call1_summary": tel1,
+            "call2_decisions_actions": tel2,
+        }
+
+        if not summary_data and not actions_data:
             return None
 
-        parsed_json = self._parse_json_safely(raw_output)
-        return parsed_json
+        merged: Dict[str, Any] = dict(summary_data or {})
+        if not merged.get("executive_summary") and merged.get("brief_summary"):
+            merged["executive_summary"] = merged["brief_summary"]
+        if not merged.get("brief_summary") and merged.get("executive_summary"):
+            merged["brief_summary"] = merged["executive_summary"]
+        if actions_data:
+            merged["decisions"] = actions_data.get("decisions", [])
+            merged["action_items"] = actions_data.get("action_items", [])
+            merged["call2_ok"] = True
+        else:
+            merged["call2_ok"] = False
+        merged["llm_model"] = self.model_path.name
+        merged["llm_device"] = self._server.active_device
+        merged["llm_fallback_reason"] = self._server.fallback_reason
+        merged["llm_reliability"] = dict(self._last_reliability_telemetry)
+        return self._sanitize_semantic_mom(merged)
+
+    def extract_meeting_knowledge(
+        self,
+        segments: List[Dict[str, Any]],
+        title: str = "Meeting Notes",
+        meeting_date: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Extract typed reusable durable knowledge items while filtering out transient chatter."""
+        if not self.is_available():
+            return []
+        self._server.ensure_started()
+        ctx_now = int(getattr(self._server, "active_ctx_size", 16384) or 16384)
+        is_cpu = self._server.active_device == "cpu"
+        max_words = 3200 if ctx_now <= 8192 else (5800 if (is_cpu or ctx_now <= 16384) else 10500)
+        call_max_tokens = 1400 if ctx_now <= 8192 else (1800 if is_cpu else 2048)
+        transcript = _compact_transcript_lines(segments, max_words=max_words)
+        if not transcript:
+            return []
+
+        base_prefix = f"Meeting: {title}\n\nTRANSCRIPT:\n{transcript}"
+        date_info = f" (Meeting date: {meeting_date})" if meeting_date else ""
+        task3_knowledge = (
+            f"TASK:\nExtract durable, reusable knowledge items from the meeting transcript above{date_info}.\n"
+            "Allowed item_type values ONLY: entity, acronym, glossary, participant, project, fact, decision, open_issue.\n"
+            "Allowed subcategory values ONLY: person, company, project, system, acronym, terminology, process, workflow, decision, policy, fact, context.\n"
+            "Rules:\n"
+            "- Extract 8 to 18 high-value durable facts (team roles/ownership, client requirements, confirmed workflows, systems/ERPs, acronyms defined or used, architectural constraints, persistent facts).\n"
+            "- REJECT greetings, farewells, holiday chatter, speculation, and raw conversational fragments.\n"
+            "- Never invent expansions for acronyms if not defined or clearly established in the transcript.\n"
+            "- Keep canonical_key lowercase concise identifier; entity_name optional related organization/system; evidence_quote <= 22 words.\n"
+            "Respond strictly with JSON:\n"
+            "{\n"
+            '  "knowledge_items": [\n'
+            '    {"item_type": "entity|acronym|glossary|participant|project|fact|decision|open_issue", "subcategory": "person|company|project|system|acronym|terminology|process|workflow|decision|policy|fact|context", "canonical_key": "short key", "title": "Display Title", "entity_name": "", "content": "Concise grounded description useful in future meetings", "aliases": [], "speaker": "ExactSpeaker", "timestamp_str": "MM:SS", "evidence_quote": "Short verbatim excerpt"}\n'
+            "  ]\n"
+            "}"
+        )
+        parsed, tel3 = self._chat_json_with_retry(
+            call_name="call3_knowledge",
+            messages=[
+                {"role": "system", "content": _SHARED_MEETING_SYSTEM_PROMPT},
+                {"role": "user", "content": f"{base_prefix}\n\n{task3_knowledge}"},
+            ],
+            max_tokens=call_max_tokens,
+            temperature=0.05,
+            required_keys=("knowledge_items",),
+        )
+        self._last_reliability_telemetry["call3_knowledge"] = tel3
+        if not parsed:
+            return []
+        items = parsed.get("knowledge_items") or []
+        out: List[Dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            ttl = str(it.get("title") or "").strip()
+            cnt = str(it.get("content") or "").strip()
+            if not ttl or not cnt:
+                continue
+            if _GREETING_FAREWELL_RE.search(ttl) or _GREETING_FAREWELL_RE.search(cnt):
+                continue
+            out.append(it)
+        return out
+
+    @staticmethod
+    def _build_ask_messages(
+        question: str,
+        citations: List[Dict[str, Any]],
+        context_meeting_title: Optional[str] = None,
+        knowledge_items: Optional[List[Dict[str, Any]]] = None,
+        max_citations: int = 12,
+        conversation_history: Optional[List[Tuple[str, str]]] = None,
+        answer_depth: str = "detailed",
+    ) -> List[Dict[str, str]]:
+        excerpts: List[str] = []
+        for i, c in enumerate(citations[:max(1, int(max_citations))], 1):
+            m_title = c.get("meeting_title") or "Meeting"
+            m_date = str(c.get("meeting_date") or "")[:10]
+            date_tag = f" {m_date}" if m_date else ""
+            ts = c.get("timestamp_formatted")
+            if not ts:
+                st = int(float(c.get("timestamp_sec") or 0.0))
+                mm, ss = divmod(max(0, st), 60)
+                ts = f"{mm:02d}:{ss:02d}"
+            spks_list = c.get("speakers")
+            if isinstance(spks_list, list) and spks_list:
+                spk_display = " / ".join(str(s) for s in spks_list if str(s).strip())
+            else:
+                spk_display = str(c.get("speaker") or "Speaker").replace(", ", " / ")
+            txt = c.get("quote") or c.get("text") or ""
+            excerpts.append(f"[{i}] ({m_title}{date_tag} @ {ts} | Speakers in excerpt: {spk_display}):\n{txt}")
+
+        k_block = ""
+        if knowledge_items:
+            k_lines = [
+                f"- [{k.get('item_type', 'fact')}] {k.get('title', '')}: {k.get('content', '')}"
+                for k in knowledge_items[:6]
+            ]
+            k_block = "\n\nVERIFIED KNOWLEDGE MEMORY:\n" + "\n".join(k_lines)
+
+        hist_block = ""
+        if conversation_history:
+            hist_lines: List[str] = []
+            for hq, ha in list(conversation_history)[-4:]:
+                hq_s = str(hq or "").strip()
+                ha_s = str(ha or "").strip()[:320]
+                if hq_s and ha_s:
+                    hist_lines.append(f"User: {hq_s}\nAssistant: {ha_s}")
+            if hist_lines:
+                hist_block = "\n\nPRIOR CONVERSATION IN THIS SCOPE:\n" + "\n---\n".join(hist_lines)
+
+        excerpts_text = "\n\n".join(excerpts)
+        scope_info = f" (scoped ONLY to '{context_meeting_title}')" if context_meeting_title else " (across all matching meetings)"
+        depth_rule = (
+            "6. Keep the answer crisp and concise (3-5 bullet points max) unless multiple citations are needed."
+            if str(answer_depth or "detailed").lower() == "concise"
+            else "6. Structure helpful answers clearly with **Facts Supported by Sources** (and **Unknowns / Not Discussed** when part of the question is missing)."
+        )
+
+        sys_msg = (
+            "You are VOX, a strictly grounded offline meeting intelligence assistant.\n"
+            "Rules:\n"
+            "1. Answer ONLY from the provided Meeting Excerpts and Verified Knowledge Memory.\n"
+            "2. Always cite meeting title, exact speaker name, and exact timestamp `[MM:SS]` for factual claims.\n"
+            "3. CRITICAL SPEAKER ATTRIBUTION: Each transcript line is tagged `[MM:SS|ExactSpeaker]`. Attribute every statement strictly to the ExactSpeaker tag on that line. NEVER merge two different speaker names into one person.\n"
+            "4. CRITICAL REFUSAL RULE: If the answer or requested detail (number, budget, date, decision, owner, topic) is NOT present in the provided excerpts, state explicitly: 'This was not discussed in the provided meeting excerpts.' NEVER guess or extrapolate.\n"
+            "5. If excerpts span multiple meetings, distinguish each meeting clearly.\n"
+            f"{depth_rule}"
+        )
+        usr_msg = (
+            f"MEETING EXCERPTS:\n{excerpts_text}{k_block}{hist_block}\n\n"
+            f"QUESTION{scope_info}: {question}"
+        )
+        return [
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": usr_msg},
+        ]
 
     def answer_query(
         self,
         question: str,
         citations: List[Dict[str, Any]],
         context_meeting_title: Optional[str] = None,
+        knowledge_items: Optional[List[Dict[str, Any]]] = None,
+        conversation_history: Optional[List[Tuple[str, str]]] = None,
+        answer_depth: str = "detailed",
     ) -> Optional[str]:
-        """
-        Synthesize a fluent, grounded natural language answer to an Ask Vox query
-        using retrieved citations and verbatim meeting evidence.
-        """
-        if not citations:
+        if not citations and not knowledge_items:
             return None
-
-        # Format citations
-        formatted_excerpts: List[str] = []
-        for i, c in enumerate(citations[:8], 1):
-            m_title = c.get("meeting_title", "Meeting")
-            st = c.get("timestamp_sec", 0.0)
-            mm, ss = divmod(int(st), 60)
-            spk = c.get("speaker", "Speaker")
-            txt = c.get("quote") or c.get("text", "")
-            formatted_excerpts.append(f"[{i}] ({m_title} at {mm:02d}:{ss:02d}) {spk}: \"{txt}\"")
-
-        excerpts_text = "\n\n".join(formatted_excerpts)
-        scope_info = f" in meeting '{context_meeting_title}'" if context_meeting_title else ""
-
-        prompt = (
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-            "You are Vox, a professional and completely local AI voice and meeting assistant.\n"
-            "Answer the user's question directly, clearly, and concisely based strictly on the provided meeting excerpts.\n"
-            "Rules:\n"
-            "1. Be helpful, precise, and professional.\n"
-            "2. Cite the relevant speaker and timestamp [MM:SS] when stating facts.\n"
-            "3. If the excerpts do not contain enough information to answer, state that honestly without making things up.\n"
-            "4. Format your answer with clean Markdown (bullet points, bold highlights).<|eot_id|>"
-            "<|start_header_id|>user<|end_header_id|>\n\n"
-            f"Meeting Excerpts:\n{excerpts_text}\n\n"
-            f"Question{scope_info}: {question}<|eot_id|>"
-            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        self._server.ensure_started()
+        ctx_now = int(getattr(self._server, "active_ctx_size", 16384) or 16384)
+        max_cit = 5 if ctx_now <= 8192 else (8 if self._server.active_device == "cpu" else 12)
+        msgs = self._build_ask_messages(
+            question=question,
+            citations=citations,
+            context_meeting_title=context_meeting_title,
+            knowledge_items=knowledge_items,
+            max_citations=max_cit,
+            conversation_history=conversation_history,
+            answer_depth=answer_depth,
         )
-
-        answer = self.generate(prompt, max_tokens=400, temperature=0.3, top_p=0.9)
-        return answer
+        return self._server.chat(msgs, max_tokens=900, temperature=0.1)
 
     def answer_query_stream(
         self,
         question: str,
         citations: List[Dict[str, Any]],
         context_meeting_title: Optional[str] = None,
+        knowledge_items: Optional[List[Dict[str, Any]]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        conversation_history: Optional[List[Tuple[str, str]]] = None,
+        answer_depth: str = "detailed",
     ) -> Iterator[str]:
-        """
-        Synthesize a fluent, grounded natural language answer to an Ask Vox query
-        streaming tokens incrementally in real time.
-        """
-        if not citations:
+        if not citations and not knowledge_items:
             return
-
-        # Format citations
-        formatted_excerpts: List[str] = []
-        for i, c in enumerate(citations[:8], 1):
-            m_title = c.get("meeting_title", "Meeting")
-            st = c.get("timestamp_sec", 0.0)
-            mm, ss = divmod(int(st), 60)
-            spk = c.get("speaker", "Speaker")
-            txt = c.get("quote") or c.get("text", "")
-            formatted_excerpts.append(f"[{i}] ({m_title} at {mm:02d}:{ss:02d}) {spk}: \"{txt}\"")
-
-        excerpts_text = "\n\n".join(formatted_excerpts)
-        scope_info = f" in meeting '{context_meeting_title}'" if context_meeting_title else ""
-
-        prompt = (
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-            "You are Vox, a professional and completely local AI voice and meeting assistant.\n"
-            "Answer the user's question directly, clearly, and concisely based strictly on the provided meeting excerpts.\n"
-            "Rules:\n"
-            "1. Be helpful, precise, and professional.\n"
-            "2. Cite the relevant speaker and timestamp [MM:SS] when stating facts.\n"
-            "3. If the excerpts do not contain enough information to answer, state that honestly without making things up.\n"
-            "4. Format your answer with clean Markdown (bullet points, bold highlights).<|eot_id|>"
-            "<|start_header_id|>user<|end_header_id|>\n\n"
-            f"Meeting Excerpts:\n{excerpts_text}\n\n"
-            f"Question{scope_info}: {question}<|eot_id|>"
-            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        self._server.ensure_started()
+        ctx_now = int(getattr(self._server, "active_ctx_size", 16384) or 16384)
+        max_cit = 5 if ctx_now <= 8192 else (8 if self._server.active_device == "cpu" else 12)
+        msgs = self._build_ask_messages(
+            question=question,
+            citations=citations,
+            context_meeting_title=context_meeting_title,
+            knowledge_items=knowledge_items,
+            max_citations=max_cit,
+            conversation_history=conversation_history,
+            answer_depth=answer_depth,
         )
-
-        for chunk in self.generate_stream(prompt, max_tokens=400, temperature=0.3, top_p=0.9):
+        for chunk in self._server.chat_stream(
+            msgs, max_tokens=900, temperature=0.1, cancel_check=cancel_check
+        ):
             yield chunk
 
     @staticmethod
     def _parse_json_safely(raw_text: str) -> Optional[Dict[str, Any]]:
-        """Extract and parse JSON object from model generation defensively,
-        with automatic repair for truncated or trailing-comma JSON."""
-        text = raw_text.strip()
-
-        # Strip markdown fences if present
+        """Extract and parse JSON object defensively with truncation repair."""
+        text = _strip_think_blocks(raw_text)
         if text.startswith("```"):
             lines = text.splitlines()
-            if lines[0].startswith("```"):
+            if lines and lines[0].startswith("```"):
                 lines = lines[1:]
             if lines and lines[-1].startswith("```"):
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
 
-        # Locate the opening brace
         start_idx = text.find("{")
         if start_idx == -1:
             return None
 
-        # Build candidates: full text from first { to EOF first (to capture all fields if truncated),
-        # then bounded substring from first { to last }
         candidates: List[str] = [text[start_idx:]]
         end_idx = text.rfind("}")
         if end_idx != -1 and end_idx > start_idx and (end_idx + 1) < len(text):
             candidates.append(text[start_idx : end_idx + 1])
 
         for cand in candidates:
-            # 1. Direct parse
             try:
                 data = json.loads(cand)
                 if isinstance(data, dict):
@@ -596,7 +616,6 @@ class LocalLLMEngine:
             except json.JSONDecodeError:
                 pass
 
-            # 2. Trailing comma cleanup
             cleaned = re.sub(r",\s*([\]}])", r"\1", cand)
             try:
                 data = json.loads(cleaned)
@@ -605,7 +624,6 @@ class LocalLLMEngine:
             except Exception:
                 pass
 
-            # 3. Truncated recovery (closing unclosed quotes and brackets)
             repaired = LocalLLMEngine._repair_truncated_json(cleaned)
             if repaired:
                 try:
@@ -619,88 +637,107 @@ class LocalLLMEngine:
 
     @staticmethod
     def _sanitize_semantic_mom(data: Dict[str, Any]) -> Dict[str, Any]:
-        """Distinguish syntactic from semantic JSON completion by purging truncated tail fragments."""
+        """Sanitize extracted MoM fields, filter farewell/chatter noise, and keep unstated fields as None."""
         if not isinstance(data, dict):
             return data
 
-        # Sanitize action items: require a non-empty description
         if "action_items" in data and isinstance(data["action_items"], list):
             cleaned_actions = []
+            seen_act: set[str] = set()
             for a in data["action_items"]:
-                if isinstance(a, dict) and str(a.get("description", "")).strip():
-                    a["description"] = str(a["description"]).strip()
-                    if not a.get("owner") or not str(a["owner"]).strip():
-                        a["owner"] = "Unassigned — confirmation required"
-                    if not a.get("due_date") or not str(a["due_date"]).strip():
-                        a["due_date"] = "Not specified"
-                    prio = str(a.get("priority", "Medium")).strip().capitalize()
-                    a["priority"] = prio if prio in ("High", "Medium", "Low") else "Medium"
+                if isinstance(a, dict) and str(a.get("description") or "").strip():
+                    desc = re.sub(r"^review and address:\s*", "", str(a["description"]).strip(), flags=re.IGNORECASE).strip()
+                    if not desc or _GREETING_FAREWELL_RE.search(desc):
+                        continue
+                    norm_k = " ".join(desc.lower().split())
+                    if norm_k in seen_act:
+                        continue
+                    seen_act.add(norm_k)
+                    a["description"] = desc
+
+                    raw_owner = a.get("owner")
+                    owner_s = str(raw_owner).strip() if raw_owner is not None else ""
+                    a["owner"] = None if owner_s.lower() in _NULL_FIELD_TOKENS else owner_s
+
+                    raw_due = a.get("due_date")
+                    due_s = str(raw_due).strip() if raw_due is not None else ""
+                    a["due_date"] = None if due_s.lower() in _NULL_FIELD_TOKENS else due_s
+
+                    raw_prio = a.get("priority")
+                    prio_s = str(raw_prio).strip().capitalize() if raw_prio is not None else ""
+                    a["priority"] = prio_s if prio_s in ("High", "Medium", "Low") else None
+
+                    ctype = str(a.get("commitment_type") or ("confirmed_commitment" if a["owner"] else "suggested_action")).strip().lower()
+                    if ctype not in ("confirmed_commitment", "suggested_action", "needs_confirmation"):
+                        ctype = "confirmed_commitment" if a["owner"] else "needs_confirmation"
+                    a["commitment_type"] = ctype
                     cleaned_actions.append(a)
             data["action_items"] = cleaned_actions
 
-        # Sanitize decisions: require a non-empty decision, normalize decoupled fields
         if "decisions" in data and isinstance(data["decisions"], list):
             cleaned_decisions = []
+            seen_dec: set[str] = set()
+            valid_cats = ("Strategic", "Technical", "Product", "Budget", "Process", "General")
             for d in data["decisions"]:
-                if isinstance(d, dict) and str(d.get("decision", "")).strip():
-                    d["decision"] = str(d["decision"]).strip()
-
-                    # Normalize category: 'Strategic', 'Technical', 'Product', 'Budget', 'Process', 'General'
-                    cat = str(d.get("category", "General")).strip().capitalize()
-                    valid_cats = ("Strategic", "Technical", "Product", "Budget", "Process", "General")
-                    if cat not in valid_cats:
-                        cat = "General"
-                    d["category"] = cat
-
-                    # Normalize status: 'unclassified', 'proposed', 'confirmed', 'rejected', 'unresolved'
-                    stat = str(d.get("status", "")).strip().lower()
-                    if stat not in ("proposed", "confirmed", "rejected", "unresolved", "unclassified"):
-                        legacy_val = str(d.get("category", "")).lower()
-                        if "unresolved" in legacy_val:
-                            stat = "unresolved"
-                        elif "tentative" in legacy_val or "proposed" in legacy_val:
-                            stat = "proposed"
-                        elif "rejected" in legacy_val:
-                            stat = "rejected"
-                        else:
-                            stat = "confirmed"
-                    d["status"] = stat
-
-                    # Normalize evolution_relationship: 'new', 'repeated', 'superseded', 'reversed'
-                    evo = str(d.get("evolution_relationship", "new")).strip().lower()
-                    if evo not in ("new", "repeated", "superseded", "reversed"):
-                        evo = "new"
-                    d["evolution_relationship"] = evo
-
+                if isinstance(d, dict) and str(d.get("decision") or "").strip():
+                    dec_txt = str(d["decision"]).strip()
+                    if _GREETING_FAREWELL_RE.search(dec_txt):
+                        continue
+                    ev_txt = str(d.get("evidence_quote") or "").strip()
+                    if ev_txt and _GREETING_FAREWELL_RE.search(ev_txt):
+                        continue
+                    norm_d = " ".join(dec_txt.lower().split())
+                    if norm_d in seen_dec:
+                        continue
+                    seen_dec.add(norm_d)
+                    d["decision"] = dec_txt
+                    cat = str(d.get("category") or "General").strip().capitalize()
+                    d["category"] = cat if cat in valid_cats else "General"
+                    stat = str(d.get("status") or "confirmed").strip().lower()
+                    d["status"] = stat if stat in ("proposed", "confirmed", "rejected", "unresolved", "unclassified") else "confirmed"
+                    evo = str(d.get("evolution_relationship") or "new").strip().lower()
+                    d["evolution_relationship"] = evo if evo in ("new", "repeated", "superseded", "reversed") else "new"
                     cleaned_decisions.append(d)
             data["decisions"] = cleaned_decisions
 
-        # Sanitize topics: require title or summary
+        if "key_discussion_points" in data and isinstance(data["key_discussion_points"], list):
+            data["key_discussion_points"] = [
+                k for k in data["key_discussion_points"]
+                if isinstance(k, dict) and (str(k.get("topic") or "").strip() or str(k.get("summary") or "").strip())
+            ]
+
         if "topics" in data and isinstance(data["topics"], list):
             data["topics"] = [
                 t for t in data["topics"]
-                if isinstance(t, dict) and (str(t.get("title", "")).strip() or str(t.get("summary", "")).strip())
+                if isinstance(t, dict) and (str(t.get("title") or "").strip() or str(t.get("summary") or "").strip())
             ]
 
-        # Sanitize open_questions: require question
+        if "follow_ups" in data and isinstance(data["follow_ups"], list):
+            cleaned_fu = []
+            for f in data["follow_ups"]:
+                if isinstance(f, dict) and str(f.get("item") or "").strip():
+                    raw_own = f.get("owner")
+                    own_s = str(raw_own).strip() if raw_own is not None else ""
+                    f["owner"] = None if own_s.lower() in _NULL_FIELD_TOKENS else own_s
+                    cleaned_fu.append(f)
+            data["follow_ups"] = cleaned_fu
+
         if "open_questions" in data and isinstance(data["open_questions"], list):
             data["open_questions"] = [
                 q for q in data["open_questions"]
-                if isinstance(q, dict) and str(q.get("question", "")).strip()
+                if isinstance(q, dict) and str(q.get("question") or "").strip()
             ]
 
-        # Sanitize risks: require risk
         if "risks" in data and isinstance(data["risks"], list):
             data["risks"] = [
                 r for r in data["risks"]
-                if isinstance(r, dict) and str(r.get("risk", "")).strip()
+                if isinstance(r, dict) and str(r.get("risk") or "").strip()
             ]
 
         return data
 
     @staticmethod
     def _repair_truncated_json(text: str) -> Optional[str]:
-        """Attempt to close unclosed strings, objects, and arrays from truncated output."""
         in_string = False
         escape = False
         stack: List[str] = []
@@ -722,29 +759,23 @@ class LocalLLMEngine:
             if not in_string:
                 if ch in ("{", "["):
                     stack.append(ch)
-                elif ch == "}":
-                    if stack and stack[-1] == "{":
-                        stack.pop()
-                elif ch == "]":
-                    if stack and stack[-1] == "[":
-                        stack.pop()
+                elif ch == "}" and stack and stack[-1] == "{":
+                    stack.pop()
+                elif ch == "]" and stack and stack[-1] == "[":
+                    stack.pop()
             cleaned_chars.append(ch)
 
         if in_string:
             cleaned_chars.append('"')
 
         reconstructed = "".join(cleaned_chars).rstrip()
-        # Clean up dangling colons or incomplete keys before closing
-        reconstructed = re.sub(r',\s*"[^"]*"\s*:\s*$', '', reconstructed)
-        reconstructed = re.sub(r'\{\s*"[^"]*"\s*:\s*$', '{', reconstructed)
-        reconstructed = re.sub(r',\s*"[^"]*"\s*$', '', reconstructed)
-        reconstructed = re.sub(r',\s*$', '', reconstructed)
+        reconstructed = re.sub(r',\s*"[^"]*"\s*:\s*$', "", reconstructed)
+        reconstructed = re.sub(r'\{\s*"[^"]*"\s*:\s*$', "{", reconstructed)
+        reconstructed = re.sub(r',\s*"[^"]*"\s*$', "", reconstructed)
+        reconstructed = re.sub(r",\s*$", "", reconstructed)
 
         while stack:
             top = stack.pop()
-            if top == "{":
-                reconstructed += "}"
-            elif top == "[":
-                reconstructed += "]"
+            reconstructed += "}" if top == "{" else "]"
 
         return reconstructed

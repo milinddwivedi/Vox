@@ -229,7 +229,7 @@ class LiveMeetingStreamingTranscriber:
             return prov
 
     def get_stream_telemetry(self) -> Dict[str, Any]:
-        """Return complete live streaming completeness and latency telemetry."""
+        """Return complete live streaming completeness and latency metrics."""
         with self._lock:
             elapsed_wall = max(0.001, time.monotonic() - self._session_start_mono) if self._session_start_mono > 0 else 0.001
             eot_arr = sorted(self._end_of_turn_latencies_ms)

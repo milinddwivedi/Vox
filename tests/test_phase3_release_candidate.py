@@ -88,6 +88,7 @@ def _fake_hw_profile(
 def test_hardware_tier_selection_across_tiers_and_fallbacks():
     cfg = AppConfig(
         enable_phase2_asr_pipeline=False,
+        enable_hardware_adaptive_asr=False,
         enable_hf_asr_rc=True,
         hf_asr_model_id="Qwen/Qwen3-ASR-0.6B-hf",
     )
@@ -480,6 +481,8 @@ def test_controller_finalize_enforces_honest_completeness_and_verbatim_split():
                     }
                 ]
 
+                from unittest.mock import MagicMock
+
                 # Case A: 50% sample coverage -> MUST be saved as "incomplete"
                 m_partial = ctrl.db.create_meeting(title="Partial Coverage Test", capture_mode="both")
 
@@ -490,7 +493,7 @@ def test_controller_finalize_enforces_honest_completeness_and_verbatim_split():
                     }
                     return [dict(s) for s in seg_list]
 
-                ctrl.transcriber.transcribe_meeting_dual_track = _partial_dt
+                ctrl.transcriber.transcribe_meeting_dual_track = MagicMock(side_effect=_partial_dt)
                 ctrl._finalize_meeting_worker(m_partial, res, "")
                 rec_a = ctrl.db.get_meeting(m_partial)
                 assert rec_a is not None
@@ -509,12 +512,14 @@ def test_controller_finalize_enforces_honest_completeness_and_verbatim_split():
                     }
                     return [dict(s) for s in seg_list]
 
-                ctrl.transcriber.transcribe_meeting_dual_track = _full_dt
+                ctrl.transcriber.transcribe_meeting_dual_track = MagicMock(side_effect=_full_dt)
                 ctrl._finalize_meeting_worker(m_full, res, "")
                 rec_b = ctrl.db.get_meeting(m_full)
                 assert rec_b is not None
                 assert rec_b["status"] == "completed"
-                assert "uhh" in rec_b["full_transcript"].lower()
+                segs_b = ctrl.db.get_meeting_segments(m_full)
+                assert len(segs_b) == 1
+                assert "uhh" in segs_b[0]["raw_text"].lower()
                 assert "uhh" not in rec_b["cleaned_transcript"].lower()
                 assert "wfx" in rec_b["cleaned_transcript"].lower()
             finally:
@@ -623,8 +628,16 @@ def test_rapid_call_switch_recorder_isolation_and_retranscribe_path_update():
                     side_effect=lambda m_id, res, vp: captured_results.append((m_id, res.mixed_wav_path, res.mic_wav_path, res.sys_wav_path)),
                 ):
                     ctrl.re_transcribe_meeting(mid_b)
-                    if ctrl._finalize_thread:
+                    wait_ev = ctrl._retrans_wait_events.get(int(mid_b))
+                    if wait_ev is not None:
+                        wait_ev.wait(timeout=5.0)
+                    elif ctrl._finalize_thread:
                         ctrl._finalize_thread.join(timeout=5.0)
+                    else:
+                        import time as _t
+                        deadline = _t.monotonic() + 5.0
+                        while not captured_results and _t.monotonic() < deadline:
+                            _t.sleep(0.05)
                 assert len(captured_results) == 1
                 assert captured_results[0][1] == str(mix_wav)
                 assert captured_results[0][2] == str(mic_wav)

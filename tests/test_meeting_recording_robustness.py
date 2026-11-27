@@ -59,6 +59,11 @@ class TestMeetingRobustness(unittest.TestCase):
 
         # Stop recording
         self.controller.stop_meeting_recording()
+        self.assertEqual(self.controller.capture_state, "idle")
+        import time
+        deadline = time.monotonic() + 2.0
+        while self.controller.meeting_state != "idle" and time.monotonic() < deadline:
+            time.sleep(0.02)
         self.assertEqual(self.controller.meeting_state, "idle")
 
     def test_start_meeting_with_empty_title(self) -> None:

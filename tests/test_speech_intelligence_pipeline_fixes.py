@@ -521,7 +521,7 @@ def test_finalize_worker_always_runs_offline_and_preserves_raw_wavs_and_vram():
                 ctrl.transcriber.unload_model = MagicMock()
                 ctrl.transcriber.transcribe_meeting_dual_track = MagicMock(return_value=offline_segs)
                 ctrl.transcriber.reconcile_meeting_transcript = MagicMock(return_value=offline_segs)
-                ctrl.llm_engine._get_free_vram_mb = MagicMock(return_value=1200)
+                ctrl.llm_engine._server._get_free_vram_mb = MagicMock(return_value=1200)
 
                 replace_spy = MagicMock(wraps=ctrl.db.replace_meeting_segments)
                 ctrl.db.replace_meeting_segments = replace_spy
@@ -558,24 +558,55 @@ def test_llm_engine_vram_threshold_1800mb():
     with tempfile.TemporaryDirectory(prefix="vox_llm_vram_") as td:
         mdir = Path(td) / "model"
         mdir.mkdir(parents=True, exist_ok=True)
-        (mdir / "model.bin").write_bytes(b"stub")
-        (mdir / "tokenizer.json").write_text("{}", encoding="utf-8")
+        model_file = mdir / LocalLLMEngine.DEFAULT_MODEL
+        model_file.write_bytes(b"GGUF" + b"\x00" * 1024)
 
-        engine_low = LocalLLMEngine(model_dir=mdir, device="auto")
-        with patch.object(LocalLLMEngine, "_get_free_vram_mb", return_value=1500), \
-             patch("ctranslate2.get_cuda_device_count", return_value=1), \
-             patch("ctranslate2.Generator") as mock_gen_low, \
-             patch("tokenizers.Tokenizer.from_file"):
-            assert engine_low._ensure_loaded()
-            assert mock_gen_low.call_args.kwargs.get("device") == "cpu"
+        def _fake_resolve(prefer_gpu: bool = True):
+            return (Path("fake_vulkan.exe"), "vulkan") if prefer_gpu else (Path("fake_cpu.exe"), "cpu")
 
-        engine_hi = LocalLLMEngine(model_dir=mdir, device="auto")
-        with patch.object(LocalLLMEngine, "_get_free_vram_mb", return_value=2200), \
-             patch("ctranslate2.get_cuda_device_count", return_value=1), \
-             patch("ctranslate2.Generator") as mock_gen_hi, \
-             patch("tokenizers.Tokenizer.from_file"):
-            assert engine_hi._ensure_loaded()
-            assert mock_gen_hi.call_args.kwargs.get("device") == "cuda"
+        engine_low = LocalLLMEngine(model_dir=model_file, device="auto")
+        low_variants = []
+
+        def _launch_low(bin_path, variant):
+            low_variants.append(variant)
+            engine_low._server._active_device = "cpu"
+            fake_p = MagicMock()
+            fake_p.poll.return_value = None
+            engine_low._server._proc = fake_p
+            return True, "ok"
+
+        try:
+            with patch.object(engine_low._server, "_get_free_vram_mb", return_value=1500), \
+                 patch.object(engine_low._server, "_get_memory_mb", return_value=(16384, 8192)), \
+                 patch("voxlocal.engine.llama_server_engine.resolve_llama_server_bin", side_effect=_fake_resolve), \
+                 patch.object(engine_low._server, "_launch_variant", side_effect=_launch_low):
+                assert engine_low._server.ensure_started()
+                assert low_variants == ["cpu"]
+                assert engine_low._server.active_device == "cpu"
+        finally:
+            engine_low._server._proc = None
+
+        engine_hi = LocalLLMEngine(model_dir=model_file, device="auto")
+        hi_variants = []
+
+        def _launch_hi(bin_path, variant):
+            hi_variants.append(variant)
+            engine_hi._server._active_device = "vulkan_gpu"
+            fake_p = MagicMock()
+            fake_p.poll.return_value = None
+            engine_hi._server._proc = fake_p
+            return True, "ok"
+
+        try:
+            with patch.object(engine_hi._server, "_get_free_vram_mb", return_value=2200), \
+                 patch.object(engine_hi._server, "_get_memory_mb", return_value=(16384, 8192)), \
+                 patch("voxlocal.engine.llama_server_engine.resolve_llama_server_bin", side_effect=_fake_resolve), \
+                 patch.object(engine_hi._server, "_launch_variant", side_effect=_launch_hi):
+                assert engine_hi._server.ensure_started()
+                assert hi_variants == ["vulkan"]
+                assert engine_hi._server.active_device == "vulkan_gpu"
+        finally:
+            engine_hi._server._proc = None
 
 
 def test_hindi_decode_receives_null_hotwords_while_english_gets_hotwords():

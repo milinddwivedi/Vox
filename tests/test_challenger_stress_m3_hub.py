@@ -480,12 +480,12 @@ class TestNotetakerDrawerAndScratchpadStress(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_drawer_geometry_and_toggle_expand_stress(self):
-        """Verify Notetaker Drawer geometry transitions: compact 500x420 vs expanded 920x660."""
+        """Verify Notetaker Drawer geometry transitions: compact 540x680 vs expanded 960x720."""
         # Initial compact state
-        self.assertEqual(self.drawer.width(), 500)
-        self.assertEqual(self.drawer.height(), 420)
+        self.assertEqual(self.drawer.width(), 540)
+        self.assertEqual(self.drawer.height(), 680)
         self.assertFalse(self.drawer._is_expanded)
-        self.assertEqual(self.drawer.btn_expand.text(), "Expand")
+        self.assertEqual(self.drawer.btn_expand.text(), "□")
 
         # Minimum size constraint
         min_size = self.drawer.minimumSize()
@@ -498,18 +498,17 @@ class TestNotetakerDrawerAndScratchpadStress(unittest.TestCase):
             expected_expanded = (i % 2 == 0)
             self.assertEqual(self.drawer._is_expanded, expected_expanded)
             if expected_expanded:
-                self.assertEqual(self.drawer.width(), 920)
-                self.assertEqual(self.drawer.height(), 660)
-                self.assertEqual(self.drawer.btn_expand.text(), "Compact")
+                self.assertEqual(self.drawer.width(), 960)
+                self.assertEqual(self.drawer.height(), 720)
+                self.assertEqual(self.drawer.btn_expand.text(), "❐")
             else:
-                self.assertEqual(self.drawer.width(), 500)
-                self.assertEqual(self.drawer.height(), 420)
-                self.assertEqual(self.drawer.btn_expand.text(), "Expand")
+                self.assertEqual(self.drawer.width(), 540)
+                self.assertEqual(self.drawer.height(), 680)
+                self.assertEqual(self.drawer.btn_expand.text(), "□")
 
     def test_drawer_section_pills_navigation(self):
-        """Navigate across all 5 drawer section tabs."""
-        # 0: My Notes, 1: Transcript, 2: Summary, 3: Tasks, 4: Ask AI
-        for idx in range(5):
+        """Navigate across all 3 drawer section tabs (My Notes, Transcript, Summary)."""
+        for idx in range(3):
             self.drawer._switch_section(idx)
             self.assertEqual(self.drawer._active_tab, idx)
             self.assertEqual(self.drawer.stack.currentIndex(), idx)
@@ -615,6 +614,8 @@ class TestFloatingFlowBarAdversarialStress(unittest.TestCase):
 
     def test_flowbar_win32_non_activating_extended_styles(self):
         """Verify FlowBar and PreviewBubble have WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW."""
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            self.skipTest("Win32 GWL_EXSTYLE flags require native Windows QPA platform")
         self.flow_bar.show()
         self.preview_bubble.show()
         app.processEvents()
@@ -692,6 +693,10 @@ class TestSQLiteWALStorageConcurrentStress(unittest.TestCase):
         self.db = LocalDatabase(self.db_path)
 
     def tearDown(self):
+        try:
+            self.db.close()
+        except Exception:
+            pass
         self.temp_dir.cleanup()
 
     def test_storage_sqlite_wal_mode_active(self):

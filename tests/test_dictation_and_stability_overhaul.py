@@ -152,9 +152,9 @@ def test_standalone_f_key_swallow_behavior():
 
 
 def test_base_model_caching_and_fast_resolution():
-    """Verify that 'base' model resolves to local cached snapshot without network access."""
-    transcriber = LocalWhisperTranscriber(model_name="base")
-    path, dl_root, cached = transcriber.resolve_model_path("base")
+    """Verify that cached English dictation model resolves locally without network access."""
+    transcriber = LocalWhisperTranscriber(model_name="small")
+    path, dl_root, cached = transcriber.resolve_model_path("small")
     assert cached is True
-    assert "models--Systran--faster-whisper-base" in path or Path(path).exists()
+    assert "models--Systran--faster-whisper-small" in path or Path(path).exists()
 

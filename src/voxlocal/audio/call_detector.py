@@ -13,12 +13,14 @@ Features:
 - 100% offline, local Windows APIs (zero cloud dependency).
 """
 from __future__ import annotations
+import atexit
 import ctypes
 from ctypes import wintypes
 from enum import Enum
 import json
 import re
 import time
+import weakref
 import winreg
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -27,6 +29,55 @@ logger = get_logger("audio.calls")
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None,
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.HWND,
+    wintypes.LONG,
+    wintypes.LONG,
+    wintypes.DWORD,
+    wintypes.DWORD,
+)
+
+user32.SetWinEventHook.argtypes = [
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HMODULE,
+    WINEVENTPROC,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD,
+]
+user32.SetWinEventHook.restype = wintypes.HANDLE
+user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+user32.UnhookWinEvent.restype = wintypes.BOOL
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
+
+_ACTIVE_WINEVENT_HOOKS: Dict[int, object] = {}
+_ACTIVE_CALL_DETECTORS: "weakref.WeakSet[CallDetector]" = weakref.WeakSet()
+
+
+def _cleanup_all_winevent_hooks() -> None:
+    """Safely unhook any registered WinEvent listeners before process/test teardown."""
+    for det in list(_ACTIVE_CALL_DETECTORS):
+        try:
+            det.stop_winevent_listener()
+        except Exception:
+            pass
+    for h_val in list(_ACTIVE_WINEVENT_HOOKS.keys()):
+        try:
+            ok = bool(user32.UnhookWinEvent(wintypes.HANDLE(h_val)))
+            if ok:
+                _ACTIVE_WINEVENT_HOOKS.pop(h_val, None)
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_all_winevent_hooks)
 
 def is_pid_alive(pid: Optional[int]) -> bool:
     if not pid or pid <= 0:
@@ -206,6 +257,13 @@ def list_all_meeting_windows(
     def _enum_proc(hwnd, _lparam):
         if not user32.IsWindowVisible(hwnd):
             return True
+        if dwmapi:
+            try:
+                cloaked = ctypes.c_int(0)
+                if dwmapi.DwmGetWindowAttribute(wintypes.HWND(hwnd), wintypes.DWORD(14), ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0 and cloaked.value:
+                    return True
+            except Exception:
+                pass
         is_iconic = bool(user32.IsIconic(hwnd))
         if is_iconic and not include_minimized:
             return True
@@ -513,48 +571,71 @@ class CallDetector:
         # WinEvent Hook handles
         self._winevent_hook = None
         self._winevent_cb = None
+        self._winevent_stopped = False
         self._last_winevent_time = 0.0
+        _ACTIVE_CALL_DETECTORS.add(self)
+
+    def __del__(self) -> None:
+        try:
+            self.stop_winevent_listener()
+        except Exception:
+            pass
 
     def start_winevent_listener(self, on_change_callback) -> None:
         """Register OS WinEvent hook for instant, event-driven detection of call window creation/titles."""
+        self.stop_winevent_listener()
+        self._winevent_stopped = False
+        det_ref = weakref.ref(self)
         try:
-            WINEVENTPROC = ctypes.WINFUNCTYPE(
-                None,
-                wintypes.HANDLE,
-                wintypes.DWORD,
-                wintypes.HWND,
-                wintypes.LONG,
-                wintypes.LONG,
-                wintypes.DWORD,
-                wintypes.DWORD,
-            )
             def _hook_proc(hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
+                det = det_ref()
+                if det is None or getattr(det, "_winevent_stopped", False):
+                    return
                 if idObject == 0:  # OBJID_WINDOW
                     now = time.monotonic()
                     # Throttle hook events to max once every 0.8s so UI isn't flooded
-                    if now - getattr(self, "_last_winevent_time", 0.0) >= 0.8:
-                        self._last_winevent_time = now
+                    if now - getattr(det, "_last_winevent_time", 0.0) >= 0.8:
+                        det._last_winevent_time = now
                         try:
                             on_change_callback()
                         except Exception:
                             pass
-            self._winevent_cb = WINEVENTPROC(_hook_proc)
-            self._winevent_hook = user32.SetWinEventHook(
+            cb = WINEVENTPROC(_hook_proc)
+            hook = user32.SetWinEventHook(
                 0x8000, 0x800C,  # EVENT_OBJECT_CREATE to EVENT_OBJECT_NAMECHANGE
-                0, self._winevent_cb, 0, 0,
+                None, cb, 0, 0,
                 0,  # WINEVENT_OUTOFCONTEXT
             )
+            if hook:
+                self._winevent_cb = cb
+                self._winevent_hook = hook
+                try:
+                    h_int = int(hook.value if hasattr(hook, "value") else hook)
+                    _ACTIVE_WINEVENT_HOOKS[h_int] = cb
+                except Exception:
+                    pass
         except Exception as exc:
             logger.debug("WinEvent hook registration skipped: %s", exc)
 
     def stop_winevent_listener(self) -> None:
         """Safely unhook WinEvent listener on shutdown."""
-        if self._winevent_hook:
+        self._winevent_stopped = True
+        hook = getattr(self, "_winevent_hook", None)
+        self._winevent_hook = None
+        if hook:
+            ok = False
             try:
-                user32.UnhookWinEvent(self._winevent_hook)
+                ok = bool(user32.UnhookWinEvent(hook))
             except Exception:
-                pass
-            self._winevent_hook = None
+                ok = False
+            if ok:
+                try:
+                    h_int = int(hook.value if hasattr(hook, "value") else hook)
+                    _ACTIVE_WINEVENT_HOOKS.pop(h_int, None)
+                except Exception:
+                    pass
+                self._winevent_cb = None
+        else:
             self._winevent_cb = None
 
     def set_recording_active(self, is_recording: bool) -> None:

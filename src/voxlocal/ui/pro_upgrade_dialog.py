@@ -74,7 +74,7 @@ class VoxProUpgradeDialog(QDialog):
                 pass
         if hasattr(self.controller, "auth_state_changed"):
             try:
-                self.controller.auth_state_changed.connect(lambda *_: self._refresh_user_account_bar())
+                self.controller.auth_state_changed.connect(self._on_auth_state_changed_slot)
             except Exception:
                 pass
 
@@ -502,6 +502,12 @@ class VoxProUpgradeDialog(QDialog):
                 )
         else:
             self._show_status("Synchronization service unavailable.", is_error=True)
+
+    def _on_auth_state_changed_slot(self, *_args) -> None:
+        try:
+            self._refresh_user_account_bar()
+        except RuntimeError:
+            pass
 
     def _on_entitlement_changed(self, ent_dict: dict) -> None:
         """Handle incoming entitlement update from background cloud sync."""

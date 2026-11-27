@@ -480,7 +480,7 @@ class TestTier1Feature05GuardedUiSignalRouting:
         # Controller and Drawer MUST stay in recording state for meeting 2
         assert isolated_controller.capture_state == "recording"
         assert isolated_controller.active_meeting_id == m2_id
-        assert drawer.btn_stop.text() == "Stop"
+        assert "Stop" in drawer.btn_universal_stop.text()
 
         isolated_controller.stop_meeting_recording()
 
@@ -984,7 +984,7 @@ class TestTier3PairwiseMeetingLifecycle:
         isolated_controller.meeting_state_changed.emit("idle", "Prior meeting saved")
 
         # Drawer must retain active recording controls
-        assert drawer.btn_stop.text() == "Stop"
+        assert "Stop" in drawer.btn_universal_stop.text()
         assert isolated_controller.capture_state == "recording"
         isolated_controller.stop_meeting_recording()
 

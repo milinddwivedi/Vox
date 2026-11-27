@@ -12,11 +12,13 @@ Features:
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import threading
 import time
 import wave
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -29,10 +31,22 @@ from voxlocal.audio.devices import (
     normalize_speech_audio,
     resample_audio_to_16k_mono,
 )
-from voxlocal.core.logger import get_app_root, get_logger
+from voxlocal.core.logger import get_app_root, get_logger, get_user_data_root, get_user_models_root
 from voxlocal.engine.dictation_processor import DictationProcessor
 
 logger = get_logger("engine.transcriber")
+_ACTIVE_TRANSCRIBERS: "weakref.WeakSet[LocalWhisperTranscriber]" = weakref.WeakSet()
+
+
+def _unload_active_transcribers() -> None:
+    for tr in list(_ACTIVE_TRANSCRIBERS):
+        try:
+            tr.unload_model()
+        except Exception:
+            pass
+
+
+atexit.register(_unload_active_transcribers)
 
 
 @dataclass
@@ -577,7 +591,7 @@ class LocalSpeakerProfileStore:
     """
 
     def __init__(self, path: Optional[Path] = None) -> None:
-        self.path = path or (get_app_root() / "data" / "speaker_profiles.json")
+        self.path = path or (get_user_data_root() / "speaker_profiles.json")
         self._lock = threading.RLock()
         self.profiles: Dict[str, np.ndarray] = {}
         self.load()
@@ -1115,7 +1129,7 @@ class LocalWhisperTranscriber:
         profile: str = TranscribeProfile.BALANCED,
         model_size: Optional[str] = None,
     ) -> None:
-        self.models_dir = Path(models_dir) if models_dir else (get_app_root() / "data" / "models")
+        self.models_dir = Path(models_dir) if models_dir else get_user_models_root()
         os.makedirs(self.models_dir, exist_ok=True)
         self.model_name = model_size or model_name
         self.compute_device = compute_device
@@ -1134,6 +1148,7 @@ class LocalWhisperTranscriber:
         self._readiness_message: str = ""
         self._last_track_stats: Dict[str, Dict[str, Any]] = {}
         self.speaker_profile_store = LocalSpeakerProfileStore()
+        _ACTIVE_TRANSCRIBERS.add(self)
 
     def get_active_asr_provenance(self) -> Dict[str, str]:
         """Return actual active ASR model/backend/device/compute_type metadata (truthful provenance)."""
@@ -1214,19 +1229,22 @@ class LocalWhisperTranscriber:
         else:
             slug = f"models--Systran--faster-whisper-{repo_id}"
 
-        canonical_app_models = get_app_root() / "data" / "models"
+        canonical_app_models = get_user_models_root()
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        vox_user_models = (Path(local_app_data) / "VOX" / "models") if local_app_data else (Path.home() / "AppData" / "Local" / "VOX" / "models")
         local_app_data_models = Path(os.path.expandvars(r"%LOCALAPPDATA%\Programs\VOX\data\models"))
-        dev_ws_models = Path(r"D:\Milind\Voice Assistant\data\models")
         search_dirs = [
             self.models_dir / slug / "snapshots",
             canonical_app_models / slug / "snapshots",
+            vox_user_models / slug / "snapshots",
+            vox_user_models / "dictation" / slug / "snapshots",
             local_app_data_models / slug / "snapshots",
-            dev_ws_models / slug / "snapshots",
             Path.home() / ".cache" / "huggingface" / "hub" / slug / "snapshots",
             self.models_dir / slug,
             canonical_app_models / slug,
+            vox_user_models / slug,
+            vox_user_models / "dictation" / slug,
             local_app_data_models / slug,
-            dev_ws_models / slug,
         ]
         for folder in search_dirs:
             if folder.exists() and folder.is_dir():
@@ -1294,6 +1312,7 @@ class LocalWhisperTranscriber:
     def unload_model(self) -> None:
         """Unload the Whisper/CTranslate2 model and reclaim GPU VRAM / RAM."""
         with self._lock:
+            self._interim_model = None
             self._model = None
             self._loaded_model_name = None
             self._readiness_state = (
@@ -1376,6 +1395,21 @@ class LocalWhisperTranscriber:
                 preferred_dev = "cpu"
             elif preferred_dev == "auto":
                 preferred_dev = "cuda"
+
+            # Avoid loading heavy large-v3-turbo/large-v3/medium on CPU only to immediately replace it with 'small'
+            if (
+                preferred_dev == "cpu"
+                and self.compute_device.lower() == "auto"
+                and target_model in ("large-v3-turbo", "large-v3", "medium")
+                and self.is_model_cached("small")
+            ):
+                logger.info(
+                    "CUDA runtime unavailable in 'auto' mode; selecting cached 'small' on CPU int8 instead of '%s'.",
+                    target_model,
+                )
+                target_model = "small"
+                model_identifier, dl_root, cached = self.resolve_model_path(target_model)
+                needs_bootstrap = False
 
             import gc
             gc.collect()
