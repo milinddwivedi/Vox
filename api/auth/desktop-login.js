@@ -1,5 +1,15 @@
 module.exports = async function handler(req, res) {
-  const { redirect_uri = 'http://127.0.0.1:8400/callback', code_challenge = '', state = '', auto = 'true' } = (req.query || {});
+  const { code_challenge = '', state = '', auto = 'true' } = (req.query || {});
+  let redirect_uri = String((req.query && req.query.redirect_uri) || 'http://127.0.0.1:8400/callback');
+  try {
+    const parsedRedir = new URL(redirect_uri);
+    if (parsedRedir.protocol !== 'http:' || (parsedRedir.hostname !== '127.0.0.1' && parsedRedir.hostname !== 'localhost')) {
+      redirect_uri = 'http://127.0.0.1:8400/callback';
+    }
+  } catch (e) {
+    redirect_uri = 'http://127.0.0.1:8400/callback';
+  }
+  const safeJson = (v) => JSON.stringify(v).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
 
   // Supabase Project URL for Google OAuth
   const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://qiigoipgoedexmdowtvj.supabase.co';
@@ -160,10 +170,10 @@ module.exports = async function handler(req, res) {
   </div>
 
   <script>
-    const redirectUri = "${redirect_uri}";
-    const codeChallenge = "${code_challenge}";
-    const state = "${state}";
-    const supabaseUrl = "${supabaseUrl}";
+    const redirectUri = ${safeJson(redirect_uri)};
+    const codeChallenge = ${safeJson(String(code_challenge || ''))};
+    const state = ${safeJson(String(state || ''))};
+    const supabaseUrl = ${safeJson(supabaseUrl)};
 
     function initiateOAuth() {
       try {

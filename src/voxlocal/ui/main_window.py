@@ -1599,10 +1599,8 @@ class MainWindow(QMainWindow):
                 else:
                     is_pro = False
             words_used = int(usage.get("dictation_words", 0))
-
-            limits = ent.get("limits") or {}
-            raw_word_limit = limits.get("dictation_words_weekly")
-            word_limit = int(raw_word_limit) if raw_word_limit is not None else 3000
+            trial_active = bool(ent.get("trial_active", False)) and not is_pro
+            days_rem = int(ent.get("trial_days_remaining", 0) or 0)
 
             t = get_theme_tokens(self._theme)
 
@@ -1613,7 +1611,7 @@ class MainWindow(QMainWindow):
                     f"border: 1px solid {t['accent_emerald']}; border-radius: 999px; "
                     f"padding: 2px 8px; font-size: 11px; font-weight: 700;"
                 )
-                self.lbl_quota_words.setText("Words: Unlimited")
+                self.lbl_quota_words.setText("Typing & AI: Unlimited")
                 self.bar_quota_words.setRange(0, 100)
                 self.bar_quota_words.setValue(100)
                 self.bar_quota_words.setStyleSheet(
@@ -1632,29 +1630,52 @@ class MainWindow(QMainWindow):
                     f"background: {t['accent_emerald_tint']}; "
                     f"}}"
                 )
+            elif signed_in and trial_active:
+                self.lbl_plan_badge.setText(f"✦ 10-Day Trial ({days_rem}d left)")
+                self.lbl_plan_badge.setStyleSheet(
+                    f"background: {t['accent_emerald_tint']}; color: {t['accent_emerald']}; "
+                    f"border: 1px solid {t['accent_emerald']}; border-radius: 999px; "
+                    f"padding: 2px 8px; font-size: 11px; font-weight: 700;"
+                )
+                self.lbl_quota_words.setText(f"Full AI & Typing · {words_used:,}w typed")
+                self.bar_quota_words.setRange(0, 10)
+                self.bar_quota_words.setValue(max(1, min(10, days_rem)))
+                self.bar_quota_words.setStyleSheet(
+                    f"QProgressBar {{ border: none; background: {t['surface_well']}; border-radius: 3px; }} "
+                    f"QProgressBar::chunk {{ background: {t['accent_emerald']}; border-radius: 3px; }}"
+                )
+                self.btn_plan_upgrade.setText("⚡ Upgrade to Pro")
+                self.btn_plan_upgrade.setStyleSheet(
+                    f"QPushButton#planUpgradeBtn {{ "
+                    f"text-align: center; "
+                    f"background: {t['accent']}; color: #FFFFFF; "
+                    f"border: none; border-radius: 6px; "
+                    f"font-size: 11.5px; font-weight: 700; padding: 4px 8px; "
+                    f"}} "
+                    f"QPushButton#planUpgradeBtn:hover {{ "
+                    f"background: {t.get('accent_fathom_hover', '#4338CA')}; "
+                    f"}}"
+                )
             else:
-                self.lbl_plan_badge.setText("VOX Free")
+                self.lbl_plan_badge.setText("VOX Free" if signed_in else "Guest Mode")
                 self.lbl_plan_badge.setStyleSheet(
                     f"background: {t['surface_secondary']}; color: {t['text_muted']}; "
                     f"border: 1px solid {t['border']}; border-radius: 999px; "
                     f"padding: 2px 8px; font-size: 11px; font-weight: 700;"
                 )
-                self.lbl_quota_words.setText(f"Words: {words_used:,} / {word_limit:,}")
-                self.bar_quota_words.setRange(0, word_limit)
-                self.bar_quota_words.setValue(min(word_limit, words_used))
-
-                if words_used >= word_limit:
-                    chunk_color = "#EF4444"
-                elif words_used >= word_limit * 0.8:
-                    chunk_color = t.get("accent_gold", "#D97706")
-                else:
-                    chunk_color = t["accent"]
-
+                self.lbl_quota_words.setText(
+                    "Typing & Transcripts: Unlimited"
+                    if signed_in
+                    else "Sign in for 10-Day AI Trial"
+                )
+                self.bar_quota_words.setRange(0, 100)
+                self.bar_quota_words.setValue(100 if signed_in else 0)
+                chunk_color = t["accent"]
                 self.bar_quota_words.setStyleSheet(
                     f"QProgressBar {{ border: none; background: {t['surface_well']}; border-radius: 3px; }} "
                     f"QProgressBar::chunk {{ background: {chunk_color}; border-radius: 3px; }}"
                 )
-                self.btn_plan_upgrade.setText("⚡ Upgrade to Pro")
+                self.btn_plan_upgrade.setText("⚡ Upgrade to Pro" if signed_in else "Sign In for Trial")
                 self.btn_plan_upgrade.setStyleSheet(
                     f"QPushButton#planUpgradeBtn {{ "
                     f"text-align: center; "

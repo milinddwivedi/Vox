@@ -25,6 +25,8 @@ from PyQt6.QtCore import QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -32,6 +34,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMenu,
     QPushButton,
     QScrollArea,
@@ -84,6 +87,10 @@ class VoxNotetakerDrawer(QWidget):
         self._last_summary_finalized: bool = False
         self._notes_dirty: bool = False
         self._notes_meeting_id: Optional[int] = None
+        self._current_drawer_mode: str = "live"  # 'live' | 'prep' | 'workspace'
+        self._is_pinned_on_top: bool = False
+        self._prep_meeting: Optional[Any] = None
+        self._quick_note_id: Optional[int] = None
 
         self._notes_save_timer = QTimer(self)
         self._notes_save_timer.setSingleShot(True)
@@ -114,7 +121,7 @@ class VoxNotetakerDrawer(QWidget):
         root.setSpacing(10)
 
         # ---------------------------------------------------------------------
-        # 1. Top Window Controls Bar: [ < ] ... [ Share ] [ 🔗 ] [ — ] [ □ ] [ ✕ ]
+        # 1. Top Window Controls Bar: [ < ] [ Live | Prep | Workspace ] ... [ Pin ] [ Share ] [ 🔗 ] [ — ] [ □ ] [ ✕ ]
         # ---------------------------------------------------------------------
         top_bar = QHBoxLayout()
         top_bar.setSpacing(6)
@@ -129,7 +136,28 @@ class VoxNotetakerDrawer(QWidget):
         self.btn_back.clicked.connect(self.hide)
         top_bar.addWidget(self.btn_back)
 
+        self._mode_buttons: Dict[str, QPushButton] = {}
+        for m_key, m_lbl in (("live", "Live"), ("prep", "Prep"), ("workspace", "Workspace")):
+            mb = QPushButton(m_lbl)
+            mb.setObjectName("drawerModeBtn")
+            mb.setCheckable(True)
+            mb.setFixedHeight(26)
+            mb.setCursor(Qt.CursorShape.PointingHandCursor)
+            mb.clicked.connect(lambda _c=False, mk=m_key: self.select_dynamic_mode(mk))
+            top_bar.addWidget(mb)
+            self._mode_buttons[m_key] = mb
+
         top_bar.addStretch()
+
+        self.btn_pin_top = QPushButton("Pin")
+        self.btn_pin_top.setObjectName("drawerShareBtn")
+        self.btn_pin_top.setCheckable(True)
+        self.btn_pin_top.setFixedHeight(26)
+        self.btn_pin_top.setToolTip("Keep drawer pinned above other windows")
+        self.btn_pin_top.setAccessibleName("Pin drawer on top")
+        self.btn_pin_top.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pin_top.clicked.connect(self._toggle_pin_on_top)
+        top_bar.addWidget(self.btn_pin_top)
 
         self.btn_more = QPushButton("")
         self.btn_more.setObjectName("drawerIconBtn")
@@ -187,8 +215,34 @@ class VoxNotetakerDrawer(QWidget):
         root.addLayout(top_bar)
 
         # ---------------------------------------------------------------------
-        # 2. Meeting Title Header: Clean Material 3 Google Sans Typography
+        # 3-Mode Dynamic Drawer Container ('live' | 'prep' | 'workspace')
         # ---------------------------------------------------------------------
+        self.mode_stack = QStackedWidget()
+        root.addWidget(self.mode_stack, 1)
+
+        # === MODE 0: LIVE / SELECTED MEETING COMPANION ===
+        self.page_mode_live = QWidget()
+        live_lay = QVBoxLayout(self.page_mode_live)
+        live_lay.setContentsMargins(0, 0, 0, 0)
+        live_lay.setSpacing(8)
+
+        # Recent Meeting Selector + Title
+        sel_row = QHBoxLayout()
+        sel_row.setSpacing(6)
+        self.combo_recent_meetings = QComboBox()
+        self.combo_recent_meetings.setObjectName("drawerMeetingSelector")
+        self.combo_recent_meetings.setToolTip("Switch meeting viewed in drawer")
+        self.combo_recent_meetings.setFixedHeight(26)
+        self.combo_recent_meetings.currentIndexChanged.connect(self._on_recent_combo_changed)
+        sel_row.addWidget(self.combo_recent_meetings, 1)
+        self.btn_open_studio = QPushButton("Open Studio")
+        self.btn_open_studio.setObjectName("quickChipBtn")
+        self.btn_open_studio.setFixedHeight(26)
+        self.btn_open_studio.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_studio.clicked.connect(self._open_current_in_studio)
+        sel_row.addWidget(self.btn_open_studio)
+        live_lay.addLayout(sel_row)
+
         self.txt_title = QLineEdit("")
         self.txt_title.setPlaceholderText("Untitled Meeting")
         self.txt_title.setObjectName("drawerMeetingTitle")
@@ -197,11 +251,8 @@ class VoxNotetakerDrawer(QWidget):
             "QLineEdit#drawerMeetingTitle { background: transparent; border: none; padding: 2px 0px; font-size: 20px; }"
         )
         self.txt_title.editingFinished.connect(self._save_meeting_title)
-        root.addWidget(self.txt_title)
+        live_lay.addWidget(self.txt_title)
 
-        # ---------------------------------------------------------------------
-        # 3. Meeting Metadata Pills: [ VOX ]  [ Today ]  [ Add folder ]
-        # ---------------------------------------------------------------------
         meta_row = QHBoxLayout()
         meta_row.setSpacing(6)
 
@@ -226,17 +277,13 @@ class VoxNotetakerDrawer(QWidget):
 
         meta_row.addStretch()
 
-        # Telemetry indicator (Audio active)
         self.lbl_tele_status = QLabel("● Recording · Live Preview")
         self.lbl_tele_status.setObjectName("teleStatusLabel")
         self.lbl_tele_status.setStyleSheet("color: #10B981; font-size: 11px; font-weight: 600;")
         meta_row.addWidget(self.lbl_tele_status)
 
-        root.addLayout(meta_row)
+        live_lay.addLayout(meta_row)
 
-        # ---------------------------------------------------------------------
-        # 4. 3 Clean Tabs: [ My thoughts ]  [ Transcript ]  [ ★ Summary ]
-        # ---------------------------------------------------------------------
         tabs_bar = QHBoxLayout()
         tabs_bar.setSpacing(20)
 
@@ -252,23 +299,51 @@ class VoxNotetakerDrawer(QWidget):
             self._tab_buttons.append(b)
 
         tabs_bar.addStretch()
-        root.addLayout(tabs_bar)
+        live_lay.addLayout(tabs_bar)
 
         tab_divider = QFrame()
         tab_divider.setObjectName("tabDivider")
         tab_divider.setFrameShape(QFrame.Shape.HLine)
         tab_divider.setFixedHeight(1)
-        root.addWidget(tab_divider)
+        live_lay.addWidget(tab_divider)
 
-        # ---------------------------------------------------------------------
-        # 5. Stacked Pages
-        # ---------------------------------------------------------------------
         self.stack = QStackedWidget()
 
-        # --- Page 0: My Thoughts (Private scratchpad during call) ---
+        # --- Page 0: My Thoughts (Private scratchpad + voice dictation) ---
         page_thoughts = QWidget()
         lay_thoughts = QVBoxLayout(page_thoughts)
         lay_thoughts.setContentsMargins(0, 4, 0, 0)
+        lay_thoughts.setSpacing(6)
+
+        notes_tb = QHBoxLayout()
+        notes_tb.setSpacing(6)
+        self.btn_drawer_dictate_notes = QPushButton("Dictate")
+        self.btn_drawer_dictate_notes.setObjectName("quickChipBtn")
+        self.btn_drawer_dictate_notes.setCheckable(True)
+        self.btn_drawer_dictate_notes.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_drawer_dictate_notes.clicked.connect(self._toggle_drawer_notes_dictation)
+        notes_tb.addWidget(self.btn_drawer_dictate_notes)
+
+        self.btn_drawer_stamp = QPushButton("+ Timestamp")
+        self.btn_drawer_stamp.setObjectName("quickChipBtn")
+        self.btn_drawer_stamp.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_drawer_stamp.clicked.connect(self._insert_drawer_timestamp)
+        notes_tb.addWidget(self.btn_drawer_stamp)
+
+        self.btn_drawer_action = QPushButton("+ Action")
+        self.btn_drawer_action.setObjectName("quickChipBtn")
+        self.btn_drawer_action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_drawer_action.clicked.connect(lambda: self.notes_editor.insertPlainText("- [ ] "))
+        notes_tb.addWidget(self.btn_drawer_action)
+        notes_tb.addStretch()
+        lay_thoughts.addLayout(notes_tb)
+
+        self.lbl_notes_live_interim = QLabel("")
+        self.lbl_notes_live_interim.setObjectName("livePartialBadge")
+        self.lbl_notes_live_interim.setWordWrap(True)
+        self.lbl_notes_live_interim.setVisible(False)
+        lay_thoughts.addWidget(self.lbl_notes_live_interim)
+
         self.notes_editor = QTextEdit()
         self.notes_editor.setObjectName("notesEditor")
         self.notes_editor.setFont(get_ui_font(13.5, 400))
@@ -277,7 +352,7 @@ class VoxNotetakerDrawer(QWidget):
             "(These notes are saved privately with this meeting and auto-synced.)"
         )
         self.notes_editor.textChanged.connect(self._save_meeting_notes)
-        lay_thoughts.addWidget(self.notes_editor)
+        lay_thoughts.addWidget(self.notes_editor, 1)
         self.stack.addWidget(page_thoughts)
 
         # --- Page 1: Transcript (WhisperFlow Conversational View) ---
@@ -286,7 +361,6 @@ class VoxNotetakerDrawer(QWidget):
         lay_tx.setContentsMargins(0, 0, 0, 0)
         lay_tx.setSpacing(6)
 
-        # Stats Sub-Header: 🕒 2 SPEAKERS · 41:04  |  🔍  📋  👥
         tx_stats = QHBoxLayout()
         tx_stats.setSpacing(8)
 
@@ -325,7 +399,6 @@ class VoxNotetakerDrawer(QWidget):
 
         lay_tx.addLayout(tx_stats)
 
-        # Collapsible search bar
         self.txt_tx_search = QLineEdit()
         self.txt_tx_search.setObjectName("txSearchInput")
         self.txt_tx_search.setPlaceholderText("Search in transcript...")
@@ -333,7 +406,6 @@ class VoxNotetakerDrawer(QWidget):
         self.txt_tx_search.setVisible(False)
         lay_tx.addWidget(self.txt_tx_search)
 
-        # Conversational HTML Browser (Bubble turns + Play buttons)
         self.tx_browser = QTextBrowser()
         self.tx_browser.setObjectName("txConversationalBrowser")
         self.tx_browser.setOpenExternalLinks(False)
@@ -342,7 +414,6 @@ class VoxNotetakerDrawer(QWidget):
             self.tx_browser.verticalScrollBar().valueChanged.connect(self._on_tx_scrolled)
         lay_tx.addWidget(self.tx_browser, 1)
 
-        # Synchronized chronological QListWidget backing store for transcript feed
         self.list_transcript = QListWidget(self)
         self.list_transcript.setObjectName("drawerTranscriptListCompat")
         self.list_transcript.setVisible(False)
@@ -355,7 +426,6 @@ class VoxNotetakerDrawer(QWidget):
         self.btn_jump_live.clicked.connect(self._jump_to_live_bottom)
         lay_tx.addWidget(self.btn_jump_live, 0, Qt.AlignmentFlag.AlignRight)
 
-        # Real-time streaming provisional speech line at bottom
         self.lbl_live_partial = QLabel("")
         self.lbl_live_partial.setObjectName("livePartialBadge")
         self.lbl_live_partial.setWordWrap(True)
@@ -370,7 +440,6 @@ class VoxNotetakerDrawer(QWidget):
         lay_summary.setContentsMargins(0, 0, 0, 0)
         lay_summary.setSpacing(8)
 
-        # Post-Processing Progress Banner Card
         self.progress_banner = QFrame()
         self.progress_banner.setObjectName("summaryProgressBanner")
         prog_lay = QVBoxLayout(self.progress_banner)
@@ -387,14 +456,12 @@ class VoxNotetakerDrawer(QWidget):
         self.lbl_prog_step.setFont(get_ui_font(11.5, 400))
         prog_lay.addWidget(self.lbl_prog_step)
 
-        # Skeleton placeholder lines
         self.skeleton_bar = QFrame()
         self.skeleton_bar.setObjectName("skeletonBar")
         self.skeleton_bar.setFixedHeight(6)
         prog_lay.addWidget(self.skeleton_bar)
         lay_summary.addWidget(self.progress_banner)
 
-        # Formatted HTML Executive Summary View
         self.summary_browser = QTextBrowser()
         self.summary_browser.setObjectName("summaryBrowser")
         self.summary_browser.setOpenExternalLinks(True)
@@ -402,18 +469,14 @@ class VoxNotetakerDrawer(QWidget):
 
         self.stack.addWidget(page_summary)
 
-        root.addWidget(self.stack, 1)
+        live_lay.addWidget(self.stack, 1)
 
-        # ---------------------------------------------------------------------
-        # 6. Bottom Action Bar: [ ■ Stop / ▶ Resume ]  [ Ask anything, or type / for Skills ]
-        # ---------------------------------------------------------------------
         bottom_box = QFrame()
         bottom_box.setObjectName("drawerBottomBar")
         bot_lay = QVBoxLayout(bottom_box)
         bot_lay.setContentsMargins(0, 8, 0, 0)
         bot_lay.setSpacing(6)
 
-        # Quick prompt chip row
         chip_row = QHBoxLayout()
         chip_row.setSpacing(6)
         self.btn_what_did_i_miss = QPushButton("What did I miss?")
@@ -425,7 +488,6 @@ class VoxNotetakerDrawer(QWidget):
         chip_row.addStretch()
         bot_lay.addLayout(chip_row)
 
-        # Collapsible Slash Skills Row (shown when user types '/')
         self.slash_skills_bar = QFrame()
         self.slash_skills_bar.setObjectName("slashSkillsBar")
         self.slash_skills_bar.setVisible(False)
@@ -462,10 +524,141 @@ class VoxNotetakerDrawer(QWidget):
         action_row.addWidget(self.txt_ask_anything, 1)
 
         bot_lay.addLayout(action_row)
-        root.addWidget(bottom_box)
+        live_lay.addWidget(bottom_box)
 
-        # Set default tab to Transcript
+        self.mode_stack.addWidget(self.page_mode_live)
+
+        # === MODE 1: PRE-CALL LAUNCHPAD ('prep') ===
+        self.page_mode_prep = QWidget()
+        prep_lay = QVBoxLayout(self.page_mode_prep)
+        prep_lay.setContentsMargins(0, 4, 0, 0)
+        prep_lay.setSpacing(10)
+
+        self.prep_card = QFrame()
+        self.prep_card.setObjectName("summaryProgressBanner")
+        p_in = QVBoxLayout(self.prep_card)
+        p_in.setContentsMargins(16, 14, 16, 14)
+        p_in.setSpacing(6)
+        prep_kicker = QLabel("UPCOMING MEETING PREP")
+        prep_kicker.setObjectName("progStep")
+        prep_kicker.setFont(get_ui_font(10.5, 700))
+        p_in.addWidget(prep_kicker)
+        self.prep_title_lbl = QLabel("No upcoming meeting within 30 minutes")
+        self.prep_title_lbl.setObjectName("progTitle")
+        self.prep_title_lbl.setFont(get_ui_font(16, 600))
+        self.prep_title_lbl.setWordWrap(True)
+        p_in.addWidget(self.prep_title_lbl)
+        self.prep_meta_lbl = QLabel("Connect Google, Outlook, or Zoom calendar to see live briefings.")
+        self.prep_meta_lbl.setObjectName("progStep")
+        self.prep_meta_lbl.setWordWrap(True)
+        p_in.addWidget(self.prep_meta_lbl)
+
+        prep_btns = QHBoxLayout()
+        prep_btns.setSpacing(8)
+        self.btn_prep_join = QPushButton("▶ Join & Start Notes")
+        self.btn_prep_join.setObjectName("universalStopBtn")
+        self.btn_prep_join.setFixedHeight(34)
+        self.btn_prep_join.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_prep_join.clicked.connect(self._on_prep_join_clicked)
+        prep_btns.addWidget(self.btn_prep_join)
+        self.btn_prep_adhoc = QPushButton("Start Ad-hoc Notes")
+        self.btn_prep_adhoc.setObjectName("quickChipBtn")
+        self.btn_prep_adhoc.setFixedHeight(34)
+        self.btn_prep_adhoc.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_prep_adhoc.clicked.connect(self._start_adhoc_notetaker)
+        prep_btns.addWidget(self.btn_prep_adhoc)
+        prep_btns.addStretch()
+        p_in.addLayout(prep_btns)
+        prep_lay.addWidget(self.prep_card)
+
+        self.prep_context_browser = QTextBrowser()
+        self.prep_context_browser.setObjectName("summaryBrowser")
+        self.prep_context_browser.setOpenExternalLinks(False)
+        prep_lay.addWidget(self.prep_context_browser, 1)
+        self.mode_stack.addWidget(self.page_mode_prep)
+
+        # === MODE 2: IDLE ACTION HUB ('workspace') ===
+        self.page_mode_workspace = QWidget()
+        ws_lay = QVBoxLayout(self.page_mode_workspace)
+        ws_lay.setContentsMargins(0, 4, 0, 0)
+        ws_lay.setSpacing(10)
+
+        ws_actions = QHBoxLayout()
+        ws_actions.setSpacing(8)
+        self.btn_ws_start_rec = QPushButton("▶ Start Notetaker")
+        self.btn_ws_start_rec.setObjectName("universalStopBtn")
+        self.btn_ws_start_rec.setFixedHeight(32)
+        self.btn_ws_start_rec.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ws_start_rec.clicked.connect(self._start_adhoc_notetaker)
+        ws_actions.addWidget(self.btn_ws_start_rec)
+
+        self.btn_ws_open_studio = QPushButton("Open Full Studio")
+        self.btn_ws_open_studio.setObjectName("quickChipBtn")
+        self.btn_ws_open_studio.setFixedHeight(32)
+        self.btn_ws_open_studio.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ws_open_studio.clicked.connect(self._open_current_in_studio)
+        ws_actions.addWidget(self.btn_ws_open_studio)
+        ws_actions.addStretch()
+        ws_lay.addLayout(ws_actions)
+
+        # Quick Voice Scratchpad Card
+        self.ws_scratch_card = QFrame()
+        self.ws_scratch_card.setObjectName("summaryProgressBanner")
+        sc_lay = QVBoxLayout(self.ws_scratch_card)
+        sc_lay.setContentsMargins(12, 10, 12, 10)
+        sc_lay.setSpacing(6)
+        sc_hdr = QHBoxLayout()
+        sc_lbl = QLabel("Quick Voice Scratchpad")
+        sc_lbl.setObjectName("progTitle")
+        sc_lbl.setFont(get_ui_font(12.5, 600))
+        sc_hdr.addWidget(sc_lbl)
+        sc_hdr.addStretch()
+        self.btn_quick_dictate = QPushButton("Dictate")
+        self.btn_quick_dictate.setObjectName("quickChipBtn")
+        self.btn_quick_dictate.setCheckable(True)
+        self.btn_quick_dictate.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_quick_dictate.clicked.connect(self._toggle_quick_scratchpad_dictation)
+        sc_hdr.addWidget(self.btn_quick_dictate)
+        self.btn_quick_save = QPushButton("Save Note")
+        self.btn_quick_save.setObjectName("quickChipBtn")
+        self.btn_quick_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_quick_save.clicked.connect(self._save_quick_scratchpad_note)
+        sc_hdr.addWidget(self.btn_quick_save)
+        sc_lay.addLayout(sc_hdr)
+
+        self.quick_scratchpad_editor = QTextEdit()
+        self.quick_scratchpad_editor.setObjectName("notesEditor")
+        self.quick_scratchpad_editor.setFixedHeight(88)
+        self.quick_scratchpad_editor.setPlaceholderText("Dictate or type a quick note or follow-up...")
+        sc_lay.addWidget(self.quick_scratchpad_editor)
+        ws_lay.addWidget(self.ws_scratch_card)
+
+        lbl_open_acts = QLabel("Open Action Items")
+        lbl_open_acts.setObjectName("txStatsLabel")
+        lbl_open_acts.setFont(get_ui_font(11.5, 700))
+        ws_lay.addWidget(lbl_open_acts)
+
+        self.workspace_actions_list = QListWidget()
+        self.workspace_actions_list.setObjectName("drawerWorkspaceList")
+        self.workspace_actions_list.setMaximumHeight(140)
+        self.workspace_actions_list.itemChanged.connect(self._on_workspace_action_toggled)
+        ws_lay.addWidget(self.workspace_actions_list)
+
+        lbl_recent_mtgs = QLabel("Recent Meetings (Click to open)")
+        lbl_recent_mtgs.setObjectName("txStatsLabel")
+        lbl_recent_mtgs.setFont(get_ui_font(11.5, 700))
+        ws_lay.addWidget(lbl_recent_mtgs)
+
+        self.workspace_recent_list = QListWidget()
+        self.workspace_recent_list.setObjectName("drawerWorkspaceList")
+        self.workspace_recent_list.itemClicked.connect(self._on_workspace_recent_clicked)
+        ws_lay.addWidget(self.workspace_recent_list, 1)
+
+        self.mode_stack.addWidget(self.page_mode_workspace)
+
+        # Set default tab to Transcript inside Live mode
         self._switch_section(self._active_tab)
+        self.select_dynamic_mode("live")
 
     def _switch_section(self, idx: int) -> None:
         self._active_tab = idx
@@ -506,14 +699,309 @@ class VoxNotetakerDrawer(QWidget):
         self.controller.meeting_state_changed.connect(self._on_meeting_state_changed)
         self.controller.meeting_tick.connect(self._on_meeting_tick)
         self.controller.meeting_saved_and_transcribed.connect(self._on_meeting_finalized)
+        if hasattr(self.controller, "dictation_state_changed"):
+            self.controller.dictation_state_changed.connect(self._on_drawer_dictation_state)
+        if hasattr(self.controller, "dictation_interim_updated"):
+            self.controller.dictation_interim_updated.connect(self._on_drawer_dictation_interim)
+        if hasattr(self.controller, "dictation_completed"):
+            self.controller.dictation_completed.connect(self._on_drawer_dictation_completed)
+
+    def _toggle_pin_on_top(self) -> None:
+        self._is_pinned_on_top = bool(self.btn_pin_top.isChecked())
+        was_visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self._is_pinned_on_top)
+        if was_visible:
+            self.show()
+            self.raise_()
+        self.btn_pin_top.setText("Pinned" if self._is_pinned_on_top else "Pin")
+
+    def _toggle_drawer_notes_dictation(self) -> None:
+        if not self.controller:
+            return
+        self.notes_editor.setFocus()
+        if hasattr(self.controller, "toggle_in_app_dictation"):
+            self.controller.toggle_in_app_dictation(self.notes_editor, title="VOX — Drawer Notes")
+        elif hasattr(self.controller, "toggle_dictation"):
+            self.controller.toggle_dictation()
+
+    def _toggle_quick_scratchpad_dictation(self) -> None:
+        if not self.controller:
+            return
+        self.quick_scratchpad_editor.setFocus()
+        if hasattr(self.controller, "toggle_in_app_dictation"):
+            self.controller.toggle_in_app_dictation(self.quick_scratchpad_editor, title="VOX — Quick Scratchpad")
+        elif hasattr(self.controller, "toggle_dictation"):
+            self.controller.toggle_dictation()
+
+    def _insert_drawer_timestamp(self) -> None:
+        sec = int(max(0.0, float(getattr(self, "_elapsed_sec", 0.0) or 0.0)))
+        m, s = divmod(sec, 60)
+        self.notes_editor.insertPlainText(f"[{m:02d}:{s:02d}] ")
+        self.notes_editor.setFocus()
+
+    def _save_quick_scratchpad_note(self) -> None:
+        if not self.controller or not getattr(self.controller, "db", None):
+            return
+        txt = self.quick_scratchpad_editor.toPlainText().strip()
+        if not txt:
+            return
+        title = txt.splitlines()[0][:60].strip() or "Quick Drawer Note"
+        try:
+            if self._quick_note_id is not None:
+                self.controller.db.update_note(self._quick_note_id, title=title, content=txt, plain_text=txt)
+            else:
+                self._quick_note_id = int(self.controller.db.create_note(title, txt, txt))
+            if hasattr(self.controller, "notes_updated"):
+                self.controller.notes_updated.emit()
+            if hasattr(self.controller, "notification_requested"):
+                self.controller.notification_requested.emit("Scratchpad Saved", f"Saved '{title}' to Scratchpad.")
+        except Exception as exc:
+            logger.debug("Quick drawer scratchpad save failed: %s", exc)
+
+    def _on_drawer_dictation_state(self, state: str, _msg: str = "") -> None:
+        if not self.controller:
+            return
+        s = (state or "").strip().lower()
+        explicit = getattr(self.controller, "_explicit_in_app_widget_ref", None)
+        notes_active = explicit is self.notes_editor and self.notes_editor.isVisible() and s in ("starting", "listening", "speaking")
+        quick_active = explicit is self.quick_scratchpad_editor and self.quick_scratchpad_editor.isVisible() and s in ("starting", "listening", "speaking")
+        self.btn_drawer_dictate_notes.blockSignals(True)
+        self.btn_drawer_dictate_notes.setChecked(notes_active)
+        self.btn_drawer_dictate_notes.setText("⏹ Stop" if notes_active else "Dictate")
+        self.btn_drawer_dictate_notes.blockSignals(False)
+        self.btn_quick_dictate.blockSignals(True)
+        self.btn_quick_dictate.setChecked(quick_active)
+        self.btn_quick_dictate.setText("⏹ Stop" if quick_active else "Dictate")
+        self.btn_quick_dictate.blockSignals(False)
+        if not notes_active:
+            self.lbl_notes_live_interim.setVisible(False)
+            self.lbl_notes_live_interim.setText("")
+
+    def _on_drawer_dictation_interim(self, provisional: str, stable: str) -> None:
+        if not self.controller:
+            return
+        explicit = getattr(self.controller, "_explicit_in_app_widget_ref", None)
+        if explicit is not self.notes_editor or not self.notes_editor.isVisible():
+            self.lbl_notes_live_interim.setVisible(False)
+            return
+        combined = " ".join(x for x in (stable.strip(), provisional.strip()) if x).strip()
+        if combined:
+            self.lbl_notes_live_interim.setText(f"🎙️ Live: {combined}")
+            self.lbl_notes_live_interim.setVisible(True)
+        else:
+            self.lbl_notes_live_interim.setVisible(False)
+
+    def _on_drawer_dictation_completed(self, text: str, _target: str = "", method: str = "") -> None:
+        self.lbl_notes_live_interim.setVisible(False)
+        self.lbl_notes_live_interim.setText("")
+        explicit = getattr(self.controller, "_explicit_in_app_widget_ref", None) if self.controller else None
+        if explicit is self.notes_editor:
+            self._save_meeting_notes()
+
+    def _open_current_in_studio(self) -> None:
+        m_id = self.current_meeting_id
+        if callable(self.on_open_meeting_studio):
+            self.on_open_meeting_studio(m_id)
+
+    def _start_adhoc_notetaker(self) -> None:
+        if not self.controller:
+            return
+        if hasattr(self.controller, "start_meeting_recording"):
+            self.controller.start_meeting_recording(title="Ad-hoc Meeting")
+            self.select_dynamic_mode("live")
+
+    def _on_prep_join_clicked(self) -> None:
+        if not self.controller:
+            return
+        mtg = self._prep_meeting
+        if mtg is not None and hasattr(self.controller, "start_meeting_from_calendar"):
+            self.controller.start_meeting_from_calendar(mtg)
+            self.select_dynamic_mode("live")
+        else:
+            self._start_adhoc_notetaker()
+
+    def _on_recent_combo_changed(self, idx: int) -> None:
+        if idx < 0:
+            return
+        mid = self.combo_recent_meetings.itemData(idx)
+        if mid is not None and int(mid) != (self._active_displayed_meeting_id or -1):
+            self._display_meeting(int(mid))
+
+    def _on_workspace_recent_clicked(self, item: QListWidgetItem) -> None:
+        mid = item.data(Qt.ItemDataRole.UserRole)
+        if mid is not None:
+            self._display_meeting(int(mid))
+            self.select_dynamic_mode("live")
+
+    def _on_workspace_action_toggled(self, item: QListWidgetItem) -> None:
+        payload = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict) or not self.controller or not getattr(self.controller, "db", None):
+            return
+        aid = payload.get("id")
+        if aid is None:
+            return
+        checked = item.checkState() == Qt.CheckState.Checked
+        new_status = "completed" if checked else "open"
+        try:
+            db = self.controller.db
+            if hasattr(db, "update_action_item_status"):
+                db.update_action_item_status(int(aid), new_status)
+            elif hasattr(db, "update_action_item"):
+                db.update_action_item(int(aid), status=new_status)
+        except Exception as exc:
+            logger.debug("Drawer workspace action toggle failed: %s", exc)
+
+    def _refresh_dynamic_context_panels(self) -> None:
+        if not self.controller:
+            return
+        db = getattr(self.controller, "db", None)
+        # 1. Populate recent meetings combo + workspace recent list
+        recent: List[Dict[str, Any]] = []
+        if db and hasattr(db, "list_meetings"):
+            try:
+                recent = list(db.list_meetings(limit=8) or [])
+            except Exception:
+                recent = []
+        self.combo_recent_meetings.blockSignals(True)
+        self.combo_recent_meetings.clear()
+        self.workspace_recent_list.clear()
+        for m in recent:
+            mid = int(m.get("id") or 0)
+            mtitle = str(m.get("title") or "Untitled Meeting").strip()
+            self.combo_recent_meetings.addItem(mtitle[:52], mid)
+            it = QListWidgetItem(f"{mtitle} ({format_seconds_hms(float(m.get('duration_sec') or 0.0))})")
+            it.setData(Qt.ItemDataRole.UserRole, mid)
+            self.workspace_recent_list.addItem(it)
+        if self._active_displayed_meeting_id is not None:
+            idx = self.combo_recent_meetings.findData(int(self._active_displayed_meeting_id))
+            if idx >= 0:
+                self.combo_recent_meetings.setCurrentIndex(idx)
+        self.combo_recent_meetings.blockSignals(False)
+
+        # 2. Populate Open Action Items checklist + Prep carry-over context
+        open_actions: List[Dict[str, Any]] = []
+        if db and hasattr(db, "list_action_items"):
+            try:
+                open_actions = [a for a in (db.list_action_items(limit=25) or []) if str(a.get("status", "open")).lower() not in ("done", "completed")]
+            except Exception:
+                open_actions = []
+        elif db and recent and hasattr(db, "get_meeting_action_items"):
+            for rm in recent[:3]:
+                try:
+                    for a in db.get_meeting_action_items(int(rm["id"])) or []:
+                        if str(a.get("status", "open")).lower() not in ("done", "completed"):
+                            open_actions.append(a)
+                except Exception:
+                    pass
+
+        self.workspace_actions_list.blockSignals(True)
+        self.workspace_actions_list.clear()
+        for act in open_actions[:12]:
+            desc = str(act.get("description") or act.get("title") or "").strip()
+            if not desc:
+                continue
+            owner = str(act.get("assignee") or act.get("owner") or "").strip()
+            label = f"{desc} ({owner})" if owner else desc
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, {"id": act.get("id")})
+            self.workspace_actions_list.addItem(item)
+        if self.workspace_actions_list.count() == 0:
+            empty_it = QListWidgetItem("No pending action items across recent meetings.")
+            empty_it.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.workspace_actions_list.addItem(empty_it)
+        self.workspace_actions_list.blockSignals(False)
+
+        # 3. Prep card (upcoming meeting within 30 mins or next today)
+        upcoming = []
+        try:
+            cal = getattr(self.controller, "calendar_engine", None) or getattr(self.controller, "calendar_manager", None)
+            if cal and hasattr(cal, "get_upcoming_meetings"):
+                upcoming = list(cal.get_upcoming_meetings(limit=3) or [])
+        except Exception:
+            upcoming = []
+        self._prep_meeting = upcoming[0] if upcoming else None
+        if self._prep_meeting is not None:
+            ptitle = str(getattr(self._prep_meeting, "title", "Upcoming Meeting") or "Upcoming Meeting")
+            plat = str(getattr(self._prep_meeting, "meeting_platform_label", "") or getattr(self._prep_meeting, "platform", "") or "Meeting")
+            mins = int(getattr(self._prep_meeting, "minutes_until_start", 0) or 0)
+            when_str = "Starting now" if mins <= 0 else f"Starts in {mins} min"
+            org = str(getattr(self._prep_meeting, "organizer", "") or "").strip()
+            self.prep_title_lbl.setText(ptitle)
+            self.prep_meta_lbl.setText(f"{plat} · {when_str}" + (f" · Organizer: {org}" if org else ""))
+        else:
+            self.prep_title_lbl.setText("No meeting starting in the next 30 minutes")
+            self.prep_meta_lbl.setText("Review carry-over items below or start an ad-hoc notetaker anytime.")
+
+        ctx_parts: List[str] = ["<h4>Carry-Over Action Items</h4>"]
+        if open_actions:
+            ctx_parts.append("<ul>" + "".join(
+                f"<li>{html.escape(str(a.get('description') or a.get('title') or ''))}</li>" for a in open_actions[:6]
+            ) + "</ul>")
+        else:
+            ctx_parts.append("<p>No open carry-over tasks.</p>")
+        if recent:
+            ctx_parts.append(f"<h4>Last Meeting Highlight: {html.escape(str(recent[0].get('title') or 'Recent'))}</h4>")
+            last_dec = str(recent[0].get("decisions") or "").strip()
+            if last_dec:
+                ctx_parts.append(f"<p>{html.escape(last_dec[:380])}</p>")
+            else:
+                ctx_parts.append("<p>Ready for your next conversation.</p>")
+        self.prep_context_browser.setHtml("".join(ctx_parts))
+
+    def select_dynamic_mode(self, mode: Optional[str] = None, auto: bool = False) -> str:
+        """Select Drawer mode dynamically ('live' | 'prep' | 'workspace') based on call & calendar state."""
+        chosen = (mode or "").strip().lower()
+        if auto or chosen not in ("live", "prep", "workspace"):
+            is_active_call = False
+            imminent_call = False
+            if self.controller:
+                m_state = str(getattr(self.controller, "meeting_state", "idle") or "idle").lower()
+                is_active_call = bool(
+                    getattr(self.controller, "is_meeting_recording", False)
+                    or m_state in ("recording", "paused", "processing", "transcribing")
+                    or getattr(self.controller, "active_meeting_id", None) is not None
+                )
+                try:
+                    cal = getattr(self.controller, "calendar_engine", None) or getattr(self.controller, "calendar_manager", None)
+                    if cal and hasattr(cal, "get_upcoming_meetings"):
+                        ups = list(cal.get_upcoming_meetings(limit=1) or [])
+                        if ups:
+                            mins = int(getattr(ups[0], "minutes_until_start", 999) or 999)
+                            if -10 <= mins <= 30:
+                                imminent_call = True
+                except Exception:
+                    pass
+            if is_active_call:
+                chosen = "live"
+            elif imminent_call:
+                chosen = "prep"
+            else:
+                chosen = "workspace"
+
+        self._current_drawer_mode = chosen
+        idx_map = {"live": 0, "prep": 1, "workspace": 2}
+        self.mode_stack.setCurrentIndex(idx_map.get(chosen, 0))
+        for k, btn in self._mode_buttons.items():
+            is_cur = (k == chosen)
+            btn.blockSignals(True)
+            btn.setChecked(is_cur)
+            btn.blockSignals(False)
+            btn.setProperty("active", "true" if is_cur else "false")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        return chosen
 
     def refresh_from_active_meeting(self) -> None:
         m_id = self.controller.active_meeting_id if self.controller else None
-        if m_id is None and self.controller:
+        if m_id is None and self.controller and getattr(self.controller, "db", None):
             recent = self.controller.db.list_meetings(limit=1)
             if recent:
                 m_id = int(recent[0]["id"])
         self._display_meeting(m_id)
+        self._refresh_dynamic_context_panels()
+        self.select_dynamic_mode(auto=True)
         self._sync_controls_state(self.controller.meeting_state if self.controller else "idle")
 
     def _clear_live_transcript(self, meeting_id: Optional[int] = None) -> None:
@@ -916,6 +1404,8 @@ class VoxNotetakerDrawer(QWidget):
             return
         self._sync_controls_state(state)
         self.update_processing_stage(state, msg)
+        if s in ("recording", "paused"):
+            self.select_dynamic_mode("live")
         if s == "recording":
             m_id = self.controller.active_meeting_id if self.controller else None
             self._clear_live_transcript(m_id)
@@ -999,10 +1489,16 @@ class VoxNotetakerDrawer(QWidget):
 
     def hideEvent(self, event: Any) -> None:
         self.flush_pending_notes()
+        if self.controller and hasattr(self.controller, "clear_in_app_dictation_target"):
+            self.controller.clear_in_app_dictation_target(self.notes_editor)
+            self.controller.clear_in_app_dictation_target(self.quick_scratchpad_editor)
         super().hideEvent(event)
 
     def closeEvent(self, event: Any) -> None:
         self.flush_pending_notes()
+        if self.controller and hasattr(self.controller, "clear_in_app_dictation_target"):
+            self.controller.clear_in_app_dictation_target(self.notes_editor)
+            self.controller.clear_in_app_dictation_target(self.quick_scratchpad_editor)
         super().closeEvent(event)
 
     def _copy_meeting_transcript(self) -> None:
@@ -1160,6 +1656,21 @@ class VoxNotetakerDrawer(QWidget):
         self._on_ask_anything_submitted()
 
     def _on_ask_anything_submitted(self) -> None:
+        if hasattr(self.controller, "can_use_ask_vox_feature"):
+            allowed, gate_reason, gate_msg = self.controller.can_use_ask_vox_feature()
+            if not allowed:
+                t = get_theme_tokens(self._theme)
+                self.summary_browser.append(
+                    f"<div style='margin-top:12px; padding:12px 14px; background:{t['surface_secondary']}; "
+                    f"border:1px solid {t['border']}; border-radius:10px; font-size:12.5px;'>"
+                    f"<b>{'Google Sign-In Required' if gate_reason == 'auth_required' else '10-Day Trial Ended — VOX Pro Required'}</b>"
+                    f"<br><br>{html.escape(gate_msg)}</div>"
+                )
+                if gate_reason == "auth_required" and hasattr(self.controller, "login_with_google"):
+                    self.controller.request_upgrade_dialog(gate_msg) if hasattr(self.controller, "request_upgrade_dialog") else None
+                elif hasattr(self.controller, "request_upgrade_dialog"):
+                    self.controller.request_upgrade_dialog(gate_msg)
+                return
         raw = self.txt_ask_anything.text().strip()
         if not raw or not self.controller:
             return
@@ -1330,6 +1841,28 @@ class VoxNotetakerDrawer(QWidget):
             QFrame#skeletonBar {{
                 background: {t['border']};
                 border-radius: 3px;
+            }}
+            QPushButton#drawerModeBtn {{
+                background: transparent;
+                color: {t['text_muted']};
+                border: 1px solid transparent;
+                border-radius: 13px;
+                padding: 2px 10px;
+                font-size: 11.5px;
+                font-weight: 600;
+            }}
+            QPushButton#drawerModeBtn[active="true"] {{
+                background: {t.get('accent_fathom_tint', '#1E3A5F' if is_dark else '#E8F0FE')};
+                color: {t.get('accent_fathom', '#8AB4F8' if is_dark else '#1967D2')};
+                border-color: {t.get('accent_fathom', '#1967D2')};
+            }}
+            QComboBox#drawerMeetingSelector, QListWidget#drawerWorkspaceList {{
+                background: {t['surface_secondary']};
+                color: {t['text']};
+                border: 1px solid {t['border']};
+                border-radius: 8px;
+                padding: 3px 8px;
+                font-size: 12px;
             }}
             QPushButton#quickChipBtn {{
                 background: {t['surface_secondary']};

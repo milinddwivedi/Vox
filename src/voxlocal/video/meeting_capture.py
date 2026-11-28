@@ -1175,6 +1175,9 @@ class TeamsDesktopCaptureProvider(MeetingCaptureProvider):
     EXCLUDED_HUB_PREFIXES = (
         "chat |", "activity |", "calendar |", "teams |", "calls |",
         "onedrive |", "files |", "approvals |", "shifts |", "settings |",
+        "meet |", "apps |", "search |", "copilot |", "planner |",
+        "people |", "notifications |", "workflows |", "community |",
+        "home |", "feed |", "notes |", "whiteboard |",
     )
 
     def __init__(self) -> None:
@@ -1648,21 +1651,13 @@ class GoogleMeetTabCaptureProvider(MeetingCaptureProvider):
         if not t_low:
             return False
         try:
-            from voxlocal.audio.call_detector import _is_non_meeting_document_window
-            if _is_non_meeting_document_window(t_low, ""):
-                return False
+            from voxlocal.audio.call_detector import is_live_google_meet_title
+            return bool(is_live_google_meet_title(title))
         except Exception:
             if any(ext in t_low for ext in (".pdf", ".html", ".htm", ".md", ".docx", ".xlsx")):
                 return False
-        if "meet.google.com" in t_low:
-            return True
-        if extract_google_meet_slug(t_low) and "meet" in t_low:
-            return True
-        if t_low.startswith("meet - ") or " - meet - " in t_low or "| meet" in t_low:
-            return True
-        if t_low in ("google meet", "google meet - google chrome", "google meet - microsoft edge") or t_low.endswith("- google meet"):
-            return True
-        return False
+            slug = extract_google_meet_slug(t_low)
+            return bool(slug and "meet" in t_low)
 
     def inspect_window(
         self,
@@ -1829,7 +1824,23 @@ class GenericCallWindowCaptureProvider(MeetingCaptureProvider):
 
         BROWSER_EXES = {"chrome.exe", "msedge.exe", "brave.exe", "firefox.exe", "opera.exe", "comet.exe", "vivaldi.exe", "arc.exe"}
         if proc_low in BROWSER_EXES:
-            if any(tok in t_low for tok in ("teams.microsoft.com", "teams.live.com", "| microsoft teams")):
+            try:
+                from voxlocal.audio.call_detector import (
+                    is_live_teams_browser_title,
+                    is_live_zoom_browser_title,
+                    is_non_meeting_web_portal,
+                    is_pre_join_or_non_live_title,
+                )
+            except Exception:
+                is_live_teams_browser_title = None
+                is_live_zoom_browser_title = None
+                is_non_meeting_web_portal = None
+                is_pre_join_or_non_live_title = None
+            if is_non_meeting_web_portal and is_non_meeting_web_portal(title):
+                return None
+            if is_pre_join_or_non_live_title and is_pre_join_or_non_live_title(title):
+                return None
+            if is_live_teams_browser_title and is_live_teams_browser_title(title):
                 return MeetingSourceDescriptor(
                     provider_id="generic_call",
                     platform_name="Microsoft Teams (Browser)",
@@ -1843,7 +1854,7 @@ class GenericCallWindowCaptureProvider(MeetingCaptureProvider):
                     score=195,
                     is_call_stage=True,
                 )
-            if "zoom.us" in t_low or "zoom workplace" in t_low:
+            if is_live_zoom_browser_title and is_live_zoom_browser_title(title):
                 return MeetingSourceDescriptor(
                     provider_id="generic_call",
                     platform_name="Zoom (Browser)",

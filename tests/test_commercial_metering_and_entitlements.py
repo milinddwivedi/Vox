@@ -91,35 +91,32 @@ class TestMeteringEngine:
         usage = temp_metering.get_weekly_usage()
         assert usage["dictation_words"] == 10
 
-    def test_dictation_quota_enforcement(self, temp_metering):
-        ent_mgr = EntitlementManager()
-        # Free tier has 3,000 words limit
+    def test_dictation_and_meetings_are_unlimited_forever(self, temp_metering):
+        ent_mgr = EntitlementManager(cache_file=temp_metering.db_path.parent / "ent.vault")
+        # Voice typing and meeting recording/transcription have no weekly or session caps
+        temp_metering.record_committed_dictation("word " * 5000)
         can_start, reason = temp_metering.can_start_dictation(ent_mgr)
         assert can_start is True
+        assert reason == ""
 
-        # Simulate recording 3,000 words
-        big_text = "word " * 3000
-        temp_metering.record_committed_dictation(big_text)
+        for i in range(8):
+            temp_metering.record_completed_meeting(1800.0, meeting_id=i + 1)
+        can_start_m, reason_m = temp_metering.can_start_meeting(ent_mgr)
+        assert can_start_m is True
+        assert reason_m == ""
 
-        can_start, reason = temp_metering.can_start_dictation(ent_mgr)
-        assert can_start is False
-        assert "3,000 words" in reason
-
-    def test_80_percent_early_warning_threshold(self, temp_metering):
-        ent_mgr = EntitlementManager()
-        # 80% of 3000 is 2400 words
-        text_2400 = "word " * 2400
-        temp_metering.record_committed_dictation(text_2400)
+    def test_no_day7_or_quota_early_warning_banners(self, temp_metering):
+        ent_mgr = EntitlementManager(cache_file=temp_metering.db_path.parent / "ent.vault")
+        temp_metering.record_committed_dictation("word " * 3000)
         warnings = temp_metering.check_early_warnings(ent_mgr)
-        assert any("dictation_words" in w.get("metric", "") for w in warnings)
+        assert warnings == []
 
-    def test_meeting_overrun_non_terminating_policy(self, temp_metering):
-        ent_mgr = EntitlementManager()
-        # Free cap is 5400s (90m). Active meeting at 5500s should warn but NOT terminate
-        status = temp_metering.evaluate_live_meeting_overrun(5500, ent_mgr)
-        assert status["warning"] is True
-        assert status["overrun"] is True
-        assert "90-minute" in status["message"]
+    def test_no_meeting_overrun_warning_or_interruption(self, temp_metering):
+        ent_mgr = EntitlementManager(cache_file=temp_metering.db_path.parent / "ent.vault")
+        status = temp_metering.evaluate_live_meeting_overrun(7200, ent_mgr)
+        assert status["warning"] is False
+        assert status["overrun"] is False
+        assert status["message"] == ""
 
     def test_record_completed_meeting(self, temp_metering):
         temp_metering.record_completed_meeting(120.5, meeting_id=1)
@@ -127,17 +124,12 @@ class TestMeteringEngine:
         assert usage["meeting_count"] == 1
         assert usage["meeting_duration_sec"] == 120.5
 
-    def test_ask_vox_query_metering(self, temp_metering):
-        ent_mgr = EntitlementManager()
-        for i in range(10):
-            can_ask, _ = temp_metering.can_ask_vox(ent_mgr)
-            assert can_ask is True
-            temp_metering.record_ask_vox_query(f"Question {i}")
-
-        # 11th query on Free tier should be blocked
+    def test_ask_vox_requires_trial_or_pro(self, temp_metering):
+        ent_mgr = EntitlementManager(cache_file=temp_metering.db_path.parent / "ent.vault")
+        # Unauthenticated Guest cannot use Ask VOX
         can_ask, reason = temp_metering.can_ask_vox(ent_mgr)
         assert can_ask is False
-        assert "10 queries" in reason
+        assert "Sign in with Google" in reason
 
 
 class TestEntitlementsAndOfflineGrace:
@@ -253,6 +245,7 @@ class TestEntitlementsAndOfflineGrace:
         metering = UsageMeteringEngine(db_path)
         vault_path = Path(temp_dir) / "test_entitlement.vault"
         mgr = EntitlementManager(cache_file=vault_path, verify_key=self.TEST_PUB_KEY)
+        mgr.set_user_context("usr_offline_exp", email="customer@example.com")
 
         # Set up expired offline state (verified 73 hours ago)
         now_utc = datetime.now(timezone.utc)
@@ -264,28 +257,20 @@ class TestEntitlementsAndOfflineGrace:
         }
         mgr._apply_payload(payload, (now_utc - timedelta(hours=73)).isoformat())
 
-        # 1. Dictation boundary under expired offline: Free cap is 3,000 words
+        # 1. Dictation and Meetings remain unlimited even after offline expiry
+        metering.record_committed_dictation("word " * 4000)
         can_start, _ = metering.can_start_dictation(mgr)
         assert can_start is True
 
-        metering.record_committed_dictation("word " * 3000)
-        can_start, reason = metering.can_start_dictation(mgr)
-        assert can_start is False
-        assert "3,000 words" in reason
+        for i in range(6):
+            metering.record_completed_meeting(60.0, meeting_id=i + 1)
+        can_start_m, _ = metering.can_start_meeting(mgr)
+        assert can_start_m is True
 
-        # 2. Ask VOX boundary under expired offline: Free cap is 10 queries
-        for i in range(10):
-            metering.record_ask_vox_query(f"Q{i}")
+        # 2. Ask VOX / AI Summaries are gated when offline grace expired
         can_ask, reason = metering.can_ask_vox(mgr)
         assert can_ask is False
-        assert "10 queries" in reason
-
-        # 3. Meeting session boundary under expired offline: Free cap is 5 sessions
-        for i in range(5):
-            metering.record_completed_meeting(60.0, meeting_id=i + 1)
-        can_start_m, reason_m = metering.can_start_meeting(mgr)
-        assert can_start_m is False
-        assert "5 meetings" in reason_m
+        assert "10-day free trial" in reason or "VOX Pro" in reason
 
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -297,7 +282,6 @@ class TestEntitlementsAndOfflineGrace:
         vault_path = Path(temp_dir) / "test_entitlement.vault"
         mgr = EntitlementManager(cache_file=vault_path, verify_key=self.TEST_PUB_KEY)
 
-        # Meeting has been running for 5500 seconds (~91 mins) while offline grace expires
         now_utc = datetime.now(timezone.utc)
         payload = {
             "user_id": "usr_active_mtg",
@@ -307,13 +291,9 @@ class TestEntitlementsAndOfflineGrace:
         }
         mgr._apply_payload(payload, (now_utc - timedelta(hours=74)).isoformat())
 
-        # Evaluate overrun during live meeting
         overrun = metering.evaluate_live_meeting_overrun(5500.0, mgr)
-        assert overrun["warning"] is True
-        assert overrun["overrun"] is True
-        assert "90-minute" in overrun["message"]
-        # Policy guarantee: message explicitly informs call continues uninterrupted
-        assert "continue recording uninterrupted" in overrun["message"]
+        assert overrun["warning"] is False
+        assert overrun["overrun"] is False
 
         shutil.rmtree(temp_dir, ignore_errors=True)
 

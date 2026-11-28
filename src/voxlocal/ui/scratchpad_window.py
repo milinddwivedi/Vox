@@ -341,11 +341,16 @@ class VoxScratchpadWindow(QWidget):
         else:
             self.controller.toggle_dictation()
 
-    def _on_dictation_interim_updated(self, provisional: str, stable: str) -> None:
+    def _is_window_dictation_target(self) -> bool:
+        explicit = getattr(self.controller, "_explicit_in_app_widget_ref", None)
+        if explicit is not None:
+            return explicit is self.editor
         app = QApplication.instance()
         active_win = app.activeWindow() if app else None
-        is_target = (active_win is self) or self.isActiveWindow() or self.editor.hasFocus()
-        if not is_target:
+        return (active_win is self) or self.isActiveWindow() or self.editor.hasFocus()
+
+    def _on_dictation_interim_updated(self, provisional: str, stable: str) -> None:
+        if not self._is_window_dictation_target():
             if hasattr(self, "lbl_live_interim"):
                 self.lbl_live_interim.setText("")
                 self.lbl_live_interim.setVisible(False)
@@ -360,11 +365,9 @@ class VoxScratchpadWindow(QWidget):
             self.lbl_live_interim.setVisible(False)
 
     def _on_dictation_state(self, state: str, _msg: str = "") -> None:
-        if state in ("listening", "speaking") and (
-            self.isActiveWindow() or self.editor.hasFocus()
-        ):
+        if state in ("listening", "speaking") and self._is_window_dictation_target():
             self.btn_dictate.setText("⏹ Stop Dictating")
-        elif state in ("processing", "stopping"):
+        elif state in ("processing", "stopping") and self._is_window_dictation_target():
             self.btn_dictate.setText("Transcribing...")
         else:
             self.btn_dictate.setText("Dictate Here")
@@ -379,15 +382,18 @@ class VoxScratchpadWindow(QWidget):
         if not final_text or not final_text.strip():
             return
 
-        app = QApplication.instance()
-        active_win = app.activeWindow() if app else None
-        is_target = (
-            (active_win is self)
-            or self.isActiveWindow()
-            or self.editor.hasFocus()
-            or (method_used == "in_app_qt" and self.isVisible())
-            or ("scratchpad" in _target.lower() if _target else False)
-        )
+        explicit = getattr(self.controller, "_explicit_in_app_widget_ref", None)
+        if explicit is not None:
+            is_target = explicit is self.editor
+        else:
+            app = QApplication.instance()
+            active_win = app.activeWindow() if app else None
+            is_target = (
+                (active_win is self)
+                or self.isActiveWindow()
+                or self.editor.hasFocus()
+                or ("scratchpad" in _target.lower() if _target else False)
+            )
         if not is_target:
             return
 

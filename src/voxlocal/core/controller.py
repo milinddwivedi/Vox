@@ -180,6 +180,7 @@ class AppController(QObject):
     dictation_level_changed = pyqtSignal(float)     # mic RMS level [0..1]
     dictation_completed = pyqtSignal(str, str, str) # (final_text, target_window, method_used)
     dictation_interim_updated = pyqtSignal(str, str) # (provisional_text, stable_prefix)
+    _in_app_insert_requested = pyqtSignal(object, str)  # (widget, text_to_insert) -> GUI thread only
     transcribe_profile_changed = pyqtSignal(str)     # (profile: 'fast' | 'balanced' | 'max_accuracy')
     writing_mode_changed = pyqtSignal(str)           # (mode: 'verbatim' | 'clean' | 'polished' | 'structured' | 'email')
 
@@ -440,6 +441,7 @@ class AppController(QObject):
         self._interim_worker_thread.start()
 
         # Wire callbacks
+        self._in_app_insert_requested.connect(self._apply_in_app_dictation_insert)
         self.dictation_recorder.on_level_change = self._on_dictation_level_change
         self.dictation_recorder.on_error = self._on_dictation_error
         self.dictation_recorder.on_interim_audio = self._on_streaming_interim_audio
@@ -535,8 +537,12 @@ class AppController(QObject):
                     plan_code = "pro_annual" if is_master else (user_info.get("plan") or session.get("plan_code") or "free")
                     if hasattr(self, "metering") and self.metering is not None:
                         self.metering.set_user_context(user_id, plan_code, email=user_email)
-                    if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
-                        self.entitlement.set_user_context(user_id, email=user_email, plan_code=plan_code)
+                    if hasattr(self, "entitlement") and self.entitlement is not None:
+                        if hasattr(self.entitlement, "set_user_context"):
+                            self.entitlement.set_user_context(user_id, email=user_email, plan_code=plan_code)
+                        ent_tok = str(session.get("entitlement_token") or "").strip()
+                        if ent_tok and hasattr(self.entitlement, "save_entitlement_token"):
+                            self.entitlement.save_entitlement_token(ent_tok, expected_user_id=user_id)
                     # Non-blocking cloud entitlement sync to immediately pull website plan updates on launch
                     threading.Thread(target=self._sync_commercial_worker, name="StartupEntitlementSync", daemon=True).start()
                     return
@@ -554,11 +560,15 @@ class AppController(QObject):
             user_id = getattr(profile, "user_id", "default")
             user_email = getattr(profile, "email", "")
             plan_code = getattr(profile, "plan_code", "free")
+            ent_tok = str(getattr(profile, "entitlement_token", "") or "").strip()
             logger.info("SSO Session synchronized for user: %s (%s)", user_email, plan_code)
             if hasattr(self, "metering") and self.metering is not None:
                 self.metering.set_user_context(user_id, plan_code, email=user_email)
-            if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
-                self.entitlement.set_user_context(user_id, email=user_email, plan_code=plan_code)
+            if hasattr(self, "entitlement") and self.entitlement is not None:
+                if hasattr(self.entitlement, "set_user_context"):
+                    self.entitlement.set_user_context(user_id, email=user_email, plan_code=plan_code)
+                if ent_tok and hasattr(self.entitlement, "save_entitlement_token"):
+                    self.entitlement.save_entitlement_token(ent_tok, expected_user_id=user_id)
             self._safe_emit(self.auth_state_changed, self.get_account_status())
             if hasattr(self, "entitlement") and self.entitlement is not None:
                 self._safe_emit(self.entitlement_changed, self.entitlement.get_effective_entitlement())
@@ -2286,12 +2296,18 @@ class AppController(QObject):
                     if active_win is not None and active_win.isVisible():
                         fw = app.focusWidget()
                         editor_widget = None
-                        if isinstance(fw, (QTextEdit, QPlainTextEdit, QLineEdit)):
+                        if isinstance(fw, (QTextEdit, QPlainTextEdit, QLineEdit)) and fw.isVisible() and not (hasattr(fw, "isReadOnly") and fw.isReadOnly()):
                             editor_widget = fw
                         else:
-                            editors = active_win.findChildren((QTextEdit, QPlainTextEdit, QLineEdit))
-                            if editors:
-                                editor_widget = editors[0]
+                            visible_editors = [
+                                ed for ed in active_win.findChildren((QTextEdit, QPlainTextEdit, QLineEdit))
+                                if ed.isVisible() and ed.isEnabled() and not (hasattr(ed, "isReadOnly") and ed.isReadOnly())
+                            ]
+                            rich_editors = [ed for ed in visible_editors if isinstance(ed, (QTextEdit, QPlainTextEdit))]
+                            if rich_editors:
+                                editor_widget = rich_editors[0]
+                            elif visible_editors:
+                                editor_widget = visible_editors[0]
 
                         if editor_widget is not None or active_win.objectName() == "voxOnboardingWizard":
                             self._explicit_in_app_widget_ref = editor_widget
@@ -2529,6 +2545,86 @@ class AppController(QObject):
             self.transcribe_profile_changed.emit(profile)
             logger.info("Transcribe profile switched to: %s", profile)
 
+    @staticmethod
+    def _is_usable_in_app_widget(widget: Any) -> bool:
+        if widget is None:
+            return False
+        try:
+            if hasattr(widget, "isVisible") and not widget.isVisible():
+                return False
+            if hasattr(widget, "isEnabled") and not widget.isEnabled():
+                return False
+            if hasattr(widget, "isReadOnly") and widget.isReadOnly():
+                return False
+            return True
+        except RuntimeError:
+            return False
+
+    def _apply_in_app_dictation_insert(self, widget: Any, text_to_insert: str) -> None:
+        """Execute in-app Qt text insertion safely on the GUI main thread."""
+        if not text_to_insert or not self._is_usable_in_app_widget(widget):
+            return
+        try:
+            from PyQt6.QtWidgets import QLineEdit, QPlainTextEdit, QTextEdit
+            if isinstance(widget, (QTextEdit, QPlainTextEdit)):
+                cursor = widget.textCursor()
+                existing = widget.toPlainText()
+                pos = cursor.position()
+                prefix = (
+                    " "
+                    if (
+                        text_to_insert != "\n"
+                        and existing
+                        and pos > 0
+                        and not existing[pos - 1].isspace()
+                        and not text_to_insert.startswith((" ", "\n"))
+                    )
+                    else ""
+                )
+                cursor.insertText(prefix + text_to_insert)
+                widget.setTextCursor(cursor)
+                widget.ensureCursorVisible()
+            elif isinstance(widget, QLineEdit):
+                widget.insert(text_to_insert)
+        except Exception as in_app_err:
+            logger.debug("Direct in-app widget insertion error: %s", in_app_err)
+
+    def _dispatch_in_app_insert(self, widget: Any, text_to_insert: str) -> None:
+        """Route Qt widget mutation onto the main GUI thread (direct if already on main thread)."""
+        try:
+            from PyQt6.QtCore import QThread
+            from PyQt6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is None or QThread.currentThread() == app.thread():
+                self._apply_in_app_dictation_insert(widget, text_to_insert)
+            else:
+                self._in_app_insert_requested.emit(widget, text_to_insert)
+        except Exception:
+            self._in_app_insert_requested.emit(widget, text_to_insert)
+
+    def _resolve_active_in_app_widget(self) -> Any:
+        w = getattr(self, "_explicit_in_app_widget_ref", None)
+        if self._is_usable_in_app_widget(w):
+            return w
+        try:
+            from PyQt6.QtWidgets import QApplication, QLineEdit, QPlainTextEdit, QTextEdit
+            app = QApplication.instance()
+            if app is not None:
+                fw = app.focusWidget()
+                if self._is_usable_in_app_widget(fw) and isinstance(fw, (QTextEdit, QPlainTextEdit, QLineEdit)):
+                    return fw
+                active_win = app.activeWindow()
+                if active_win is not None and active_win.isVisible():
+                    visible_editors = [
+                        ed for ed in active_win.findChildren((QTextEdit, QPlainTextEdit, QLineEdit))
+                        if self._is_usable_in_app_widget(ed)
+                    ]
+                    rich = [ed for ed in visible_editors if isinstance(ed, (QTextEdit, QPlainTextEdit))]
+                    return rich[0] if rich else (visible_editors[0] if visible_editors else None)
+        except Exception as focus_err:
+            logger.debug("Failed resolving focused in-app editor: %s", focus_err)
+        return None
+
     def _format_and_commit_dictation(
         self,
         raw_text: str,
@@ -2610,39 +2706,9 @@ class AppController(QObject):
 
         if self._is_in_app_target(target):
             ok, method_used = True, "in_app_qt"
-            w = getattr(self, "_explicit_in_app_widget_ref", None)
-            if w is None:
-                try:
-                    from PyQt6.QtWidgets import QApplication, QLineEdit, QPlainTextEdit, QTextEdit
-                    app = QApplication.instance()
-                    if app is not None:
-                        fw = app.focusWidget()
-                        if isinstance(fw, (QTextEdit, QPlainTextEdit, QLineEdit)):
-                            w = fw
-                        else:
-                            active_win = app.activeWindow()
-                            if active_win is not None:
-                                editors = active_win.findChildren((QTextEdit, QPlainTextEdit, QLineEdit))
-                                if editors:
-                                    w = editors[0]
-                except Exception as focus_err:
-                    logger.debug("Failed resolving focused in-app editor: %s", focus_err)
-
+            w = self._resolve_active_in_app_widget()
             if w is not None:
-                try:
-                    from PyQt6.QtWidgets import QTextEdit, QPlainTextEdit, QLineEdit
-                    if isinstance(w, (QTextEdit, QPlainTextEdit)):
-                        cursor = w.textCursor()
-                        existing = w.toPlainText()
-                        pos = cursor.position()
-                        prefix = " " if (existing and pos > 0 and not existing[pos - 1].isspace() and not text_to_insert.startswith(" ")) else ""
-                        cursor.insertText(prefix + text_to_insert)
-                        w.setTextCursor(cursor)
-                        w.ensureCursorVisible()
-                    elif isinstance(w, QLineEdit):
-                        w.insert(text_to_insert)
-                except Exception as in_app_err:
-                    logger.debug("Direct in-app widget insertion error: %s", in_app_err)
+                self._dispatch_in_app_insert(w, text_to_insert)
             else:
                 ok, method_used = self.text_inserter.insert_text(
                     text_to_insert,
@@ -4594,7 +4660,11 @@ class AppController(QObject):
                 topics_str = "General Meeting"
                 smart_folder_id = meeting_obj.get("folder_id") if meeting_obj else None
 
-                if self.config.auto_summarize_meeting:
+                ai_allowed, ai_gate_reason, _ai_gate_msg = self.can_use_ai_summary_feature()
+                if self.config.auto_summarize_meeting and not ai_allowed:
+                    llm_fallback_reason = f"ai_summary_locked:{ai_gate_reason}"
+
+                if self.config.auto_summarize_meeting and ai_allowed:
                     try:
                         if not self._wait_for_live_work_idle(is_cancelled):
                             self._handle_finalization_cancelled(meeting_id, current_stage=4)
@@ -4796,7 +4866,8 @@ class AppController(QObject):
                             "Stage 5/5: Extracting durable knowledge & updating local RAG index...",
                         )
                         if (
-                            self.llm_engine is not None
+                            ai_allowed
+                            and self.llm_engine is not None
                             and hasattr(self.llm_engine, "extract_meeting_knowledge")
                             and self.llm_engine.is_available()
                         ):
@@ -4887,7 +4958,11 @@ class AppController(QObject):
                     topics=topics_str,
                     folder_id=smart_folder_id,
                     post_call_stage=("completed" if final_status == "completed" else final_status),
-                    post_call_status_message=("Final transcript & knowledge ready" if final_status == "completed" else final_reason),
+                    post_call_status_message=(
+                        "Transcript saved (AI Summary requires Google Sign-In or VOX Pro)"
+                        if (final_status == "completed" and not ai_allowed)
+                        else ("Final transcript & knowledge ready" if final_status == "completed" else final_reason)
+                    ),
                     post_call_engine_summary=engine_summary,
                 )
                 if hasattr(self.db, "update_finalization_job"):
@@ -5444,7 +5519,12 @@ class AppController(QObject):
         if fp is not None and hasattr(fp, "set_pill_state"):
             title = getattr(session_info, "clean_title", None) or getattr(session_info, "title", "Call")
             plat = getattr(session_info, "platform", "Call")
-            fp.set_pill_state("CARD_NOTIFICATION", metadata={"title": title, "platform": plat, "session": session_info})
+            cfg = getattr(self, "config", None)
+            allow_auto_start = bool(getattr(cfg, "auto_record_calls", True)) and not bool(getattr(cfg, "prompt_on_call", True))
+            fp.set_pill_state(
+                "CARD_NOTIFICATION",
+                metadata={"title": title, "platform": plat, "session": session_info, "auto_start": allow_auto_start},
+            )
             return
         # Deprecated fallback if FlowBar is not active
         try:
@@ -5816,6 +5896,10 @@ class AppController(QObject):
 
     def reanalyze_meeting_intelligence(self, meeting_id: int) -> Tuple[bool, str]:
         """Re-run Stages 4 & 5 intelligence extraction for an existing meeting without touching audio or transcript."""
+        allowed, gate_reason, gate_msg = self.can_use_ai_summary_feature()
+        if not allowed:
+            self._safe_emit(self.upgrade_dialog_requested, gate_msg)
+            return False, gate_msg
         mid = int(meeting_id)
         with self._state_lock:
             active_reanalysis = getattr(self, "_active_reanalysis_ids", set())
@@ -5948,6 +6032,32 @@ class AppController(QObject):
         threading.Thread(target=_worker, name=f"ReanalyzeMeeting_{mid}", daemon=True).start()
         return True, "Re-running AI insights on preserved transcript."
 
+    def _is_user_signed_in(self) -> bool:
+        broker = getattr(self, "desktop_auth_broker", None) or getattr(self, "auth_broker", None)
+        if broker is None:
+            return False
+        if getattr(broker, "_explicitly_signed_out", False):
+            return False
+        session = broker.load_session() if hasattr(broker, "load_session") else None
+        if not isinstance(session, dict):
+            return False
+        user_info = session.get("user") if isinstance(session.get("user"), dict) else {}
+        uid = str(session.get("user_id") or user_info.get("id") or "").strip()
+        email = str(session.get("email") or user_info.get("email") or "").strip()
+        return bool((uid and uid not in ("default", "guest-device")) or email)
+
+    def can_use_ai_summary_feature(self) -> Tuple[bool, str, str]:
+        """Check whether AI Meeting Summary generation is permitted (active 10-day Trial or Pro)."""
+        if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "can_use_ai_summary_and_ask"):
+            return self.entitlement.can_use_ai_summary_and_ask(signed_in=self._is_user_signed_in())
+        return False, "auth_required", "Sign in with Google to activate your 10-day free trial for AI Meeting Summaries."
+
+    def can_use_ask_vox_feature(self) -> Tuple[bool, str, str]:
+        """Check whether Ask VOX queries are permitted (active 10-day Trial or Pro)."""
+        if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "can_use_ai_summary_and_ask"):
+            return self.entitlement.can_use_ai_summary_and_ask(signed_in=self._is_user_signed_in())
+        return False, "auth_required", "Sign in with Google to activate your 10-day free trial for Ask VOX."
+
     def query_meeting_memory(
         self,
         question: str,
@@ -5960,18 +6070,18 @@ class AppController(QObject):
         Ask Vox: Comprehensive 100% offline local AI & algorithmic cognitive reasoning
         across recorded meetings (or scoped to meeting_id) with grounded citations.
         """
-        if hasattr(self, "metering") and hasattr(self, "entitlement"):
-            can_ask, reason = self.metering.can_ask_vox(self.entitlement)
-            if not can_ask:
-                msg = reason or "Weekly Ask VOX query quota reached (10/10). Upgrade to VOX Pro for unlimited cognitive queries."
-                self.upgrade_dialog_requested.emit(msg)
-                return {
-                    "question": question,
-                    "answer": f"### ⚠️ Ask VOX Weekly Limit Reached\n\n{msg}\n\nUpgrade to **VOX Pro** (₹199/mo) for unlimited cognitive queries across all your recorded meetings.",
-                    "citations": [],
-                    "intent": "quota_exceeded",
-                    "suggestions": ["Upgrade to VOX Pro (₹199/mo)", "View weekly usage"],
-                }
+        can_ask, gate_reason, gate_msg = self.can_use_ask_vox_feature()
+        if not can_ask:
+            msg = gate_msg or "Sign in with Google for your 10-day free trial or upgrade to VOX Pro to use Ask VOX."
+            self.upgrade_dialog_requested.emit(msg)
+            hdr = "Google Sign-In Required" if gate_reason == "auth_required" else "10-Day Trial Ended"
+            return {
+                "question": question,
+                "answer": f"### {hdr}\n\n{msg}",
+                "citations": [],
+                "intent": gate_reason or "trial_expired",
+                "suggestions": ["Sign in with Google" if gate_reason == "auth_required" else "Upgrade to VOX Pro (₹199/mo)"],
+            }
 
         local_user_name = self._resolve_local_user_name()
         try:
@@ -6035,23 +6145,22 @@ class AppController(QObject):
         current_qid = self._ask_vox_query_id
         self._cancel_ask_vox = False
 
-        if hasattr(self, "metering") and hasattr(self, "entitlement"):
-            can_ask, reason = self.metering.can_ask_vox(self.entitlement)
-            if not can_ask:
-                msg = reason or "Weekly Ask VOX query quota reached (10/10). Upgrade to VOX Pro for unlimited cognitive queries."
-                self.upgrade_dialog_requested.emit(msg)
-                err_dict = {
-                    "question": question,
-                    "answer": f"Weekly Ask VOX limit reached: {msg}",
-                    "citations": [],
-                    "intent": "quota_exceeded",
-                    "error": True,
-                    "suggestions": ["Upgrade to VOX Pro (₹199/mo)", "View weekly usage"],
-                }
-                if hasattr(self, "ask_vox_status_changed"):
-                    self.ask_vox_status_changed.emit(current_qid, "failed")
-                self.ask_vox_stream_finished.emit(current_qid, err_dict)
-                return current_qid
+        can_ask, gate_reason, gate_msg = self.can_use_ask_vox_feature()
+        if not can_ask:
+            msg = gate_msg or "Sign in with Google for your 10-day free trial or upgrade to VOX Pro to use Ask VOX."
+            self.upgrade_dialog_requested.emit(msg)
+            err_dict = {
+                "question": question,
+                "answer": msg,
+                "citations": [],
+                "intent": gate_reason or "trial_expired",
+                "error": True,
+                "suggestions": ["Sign in with Google" if gate_reason == "auth_required" else "Upgrade to VOX Pro (₹199/mo)"],
+            }
+            if hasattr(self, "ask_vox_status_changed"):
+                self.ask_vox_status_changed.emit(current_qid, "failed")
+            self.ask_vox_stream_finished.emit(current_qid, err_dict)
+            return current_qid
 
         local_user_name = self._resolve_local_user_name()
         if hasattr(self, "ask_vox_status_changed"):
@@ -6240,6 +6349,11 @@ class AppController(QObject):
                 "plan": "free",
                 "plan_name": "VOX Free",
                 "is_pro": False,
+                "trial_active": False,
+                "trial_days_remaining": 0,
+                "trial_started_at_utc": "",
+                "trial_ends_at_utc": "",
+                "allow_ai_summary_and_ask": False,
                 "usage": usage,
                 "limits": dict(FREE_DEFAULT_LIMITS),
                 "days_until_reset": days_until_reset,
@@ -6280,6 +6394,11 @@ class AppController(QObject):
             "plan": ent.get("plan", "free") if isinstance(ent, dict) else "free",
             "plan_name": ent.get("plan_name", "VOX Free") if isinstance(ent, dict) else "VOX Free",
             "is_pro": ent.get("is_pro", False) if isinstance(ent, dict) else False,
+            "trial_active": bool(ent.get("trial_active", False)) if isinstance(ent, dict) else False,
+            "trial_days_remaining": int(ent.get("trial_days_remaining", 0) or 0) if isinstance(ent, dict) else 0,
+            "trial_started_at_utc": str(ent.get("trial_started_at_utc") or "") if isinstance(ent, dict) else "",
+            "trial_ends_at_utc": str(ent.get("trial_ends_at_utc") or "") if isinstance(ent, dict) else "",
+            "allow_ai_summary_and_ask": bool(ent.get("allow_ai_summary_and_ask", False)) if isinstance(ent, dict) else False,
             "usage": usage,
             "limits": limits,
             "days_until_reset": days_until_reset,
@@ -6304,8 +6423,12 @@ class AppController(QObject):
                     plan_code = "pro_annual" if is_master else (user_info.get("plan") or session.get("plan_code") or (data.get("plan_code") if isinstance(data, dict) else "free"))
                     if hasattr(self, "metering") and self.metering is not None:
                         self.metering.set_user_context(user_id, plan_code, email=user_email)
-                    if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
-                        self.entitlement.set_user_context(user_id, email=user_email, plan_code=plan_code)
+                    if hasattr(self, "entitlement") and self.entitlement is not None:
+                        if hasattr(self.entitlement, "set_user_context"):
+                            self.entitlement.set_user_context(user_id, email=user_email, plan_code=plan_code)
+                        ent_tok = str(session.get("entitlement_token") or (data.get("entitlement_token") if isinstance(data, dict) else "") or "").strip()
+                        if ent_tok and hasattr(self.entitlement, "save_entitlement_token"):
+                            self.entitlement.save_entitlement_token(ent_tok, expected_user_id=user_id)
                 self.sync_entitlements_with_cloud()
             self._safe_emit(self.auth_state_changed, self.get_account_status())
             if hasattr(self, "entitlement") and self.entitlement is not None:
@@ -6335,8 +6458,12 @@ class AppController(QObject):
         if ok and profile:
             if hasattr(self, "metering") and self.metering is not None:
                 self.metering.set_user_context(profile.user_id, profile.plan_code, email=profile.email)
-            if hasattr(self, "entitlement") and self.entitlement is not None and hasattr(self.entitlement, "set_user_context"):
-                self.entitlement.set_user_context(profile.user_id, email=profile.email, plan_code=profile.plan_code)
+            if hasattr(self, "entitlement") and self.entitlement is not None:
+                if hasattr(self.entitlement, "set_user_context"):
+                    self.entitlement.set_user_context(profile.user_id, email=profile.email, plan_code=profile.plan_code)
+                ent_tok = str(getattr(profile, "entitlement_token", "") or "").strip()
+                if ent_tok and hasattr(self.entitlement, "save_entitlement_token"):
+                    self.entitlement.save_entitlement_token(ent_tok, expected_user_id=profile.user_id)
             self._safe_emit(self.auth_state_changed, self.get_account_status())
             if hasattr(self, "entitlement") and self.entitlement is not None:
                 self._safe_emit(self.entitlement_changed, self.entitlement.get_effective_entitlement())
@@ -6383,13 +6510,6 @@ class AppController(QObject):
             headers = {"Content-Type": "application/json"}
             if token:
                 headers["Authorization"] = f"Bearer {token}"
-            if isinstance(session, dict):
-                uid_hdr = str(session.get("user_id") or (session.get("user") or {}).get("id") or "").strip()
-                em_hdr = str((session.get("user") or {}).get("email") or "").strip()
-                if uid_hdr:
-                    headers["X-Vox-User-Id"] = uid_hdr
-                if em_hdr:
-                    headers["X-Vox-User-Email"] = em_hdr
 
             # 1. Sync unsynced usage events (idempotent UUIDs, aggregate counters only)
             unsynced = self.metering.get_unsynced_events(limit=50)
@@ -6407,29 +6527,43 @@ class AppController(QObject):
                         if acked_ids and getattr(self, "_auth_generation", 0) == gen:
                             self.metering.mark_events_synced(acked_ids)
 
-            # 2. Refresh active entitlement token
+            # 2. Refresh active entitlement token (retry once with Supabase refresh_token if 401)
             if token and hasattr(self, "entitlement"):
-                req_ent = urllib.request.Request(
-                    "https://vox-voice-assistant.vercel.app/api/entitlements",
-                    headers=headers,
-                    method="GET",
-                )
-                with urllib.request.urlopen(req_ent, timeout=10) as resp:
-                    if resp.status == 200:
-                        ent_data = json.loads(resp.read().decode("utf-8"))
-                        if getattr(self, "_auth_generation", 0) != gen or (hasattr(broker, "is_authenticated") and not broker.is_authenticated()):
-                            return
-                        raw_jwt = ent_data.get("token")
-                        if raw_jwt:
-                            self.entitlement.save_token_to_vault(raw_jwt)
-                            self.entitlement_changed.emit(self.entitlement.get_effective_entitlement())
-                            self.auth_state_changed.emit(self.get_account_status())
-                        elif ent_data.get("is_pro") or ent_data.get("plan"):
-                            plan_code = ent_data.get("plan", "free")
-                            user_id = session.get("user_id") if session else "default"
-                            if hasattr(self, "metering") and self.metering is not None:
-                                self.metering.set_user_context(user_id, plan_code)
-                            self.auth_state_changed.emit(self.get_account_status())
+                import urllib.error
+                ent_data = None
+                for attempt in range(2):
+                    req_ent = urllib.request.Request(
+                        "https://vox-voice-assistant.vercel.app/api/entitlements",
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+                        method="GET",
+                    )
+                    try:
+                        with urllib.request.urlopen(req_ent, timeout=10) as resp:
+                            if resp.status == 200:
+                                ent_data = json.loads(resp.read().decode("utf-8"))
+                        break
+                    except urllib.error.HTTPError as http_err:
+                        if http_err.code == 401 and attempt == 0 and hasattr(broker, "refresh_access_token"):
+                            ref_ok, _ = broker.refresh_access_token()
+                            if ref_ok:
+                                refreshed_sess = broker.load_session() or {}
+                                token = refreshed_sess.get("access_token") or token
+                                continue
+                        raise
+                if isinstance(ent_data, dict):
+                    if getattr(self, "_auth_generation", 0) != gen or (hasattr(broker, "is_authenticated") and not broker.is_authenticated()):
+                        return
+                    raw_jwt = ent_data.get("token")
+                    if raw_jwt:
+                        self.entitlement.save_token_to_vault(raw_jwt)
+                        self._safe_emit(self.entitlement_changed, self.entitlement.get_effective_entitlement())
+                        self._safe_emit(self.auth_state_changed, self.get_account_status())
+                    elif ent_data.get("is_pro") or ent_data.get("plan"):
+                        plan_code = ent_data.get("plan", "free")
+                        user_id = session.get("user_id") if session else "default"
+                        if hasattr(self, "metering") and self.metering is not None:
+                            self.metering.set_user_context(user_id, plan_code)
+                        self._safe_emit(self.auth_state_changed, self.get_account_status())
         except Exception as exc:
             logger.debug("Cloud commercial sync warning (offline or warming): %s", exc)
 

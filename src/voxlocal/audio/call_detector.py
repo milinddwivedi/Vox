@@ -267,7 +267,113 @@ _NON_MEETING_DOC_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_MEET_CODE_TITLE_RE = re.compile(r"\bmeet\s*-\s*[a-z]{3}-[a-z]{4}-[a-z]{3}\b", re.IGNORECASE)
+_NON_MEETING_WEB_PORTAL_RE = re.compile(
+    r"(?:developers?\.zoom\.us|marketplace\.zoom\.us|support\.zoom\.(?:us|com)|"
+    r"\bapp\s+marketplace\b|\bzoom\s+(?:marketplace|developers?|docs?)\b|"
+    r"docs\.zoom\.us|zoom\.us/docs\b|/build-flow/|/app-credentials/|"
+    r"zoom\.us/(?:signin|signup|profile|account|billing|meeting(?:/schedule)?|download|pricing|plans|support|contact|test|postattendee|webclient)(?:[/?#\s]|$)|"
+    r"zoom\.us/j/\d+\?.*status=|"
+    r"\b(?:developer\s+portal|api\s+reference|documentation|build\s+flow|admin\s+center|admin\s+portal)\b|"
+    r"\bapp\s+credentials\b|\boauth\b.*\bzoom\b|\bzoom\b.*\bdeveloper\b|"
+    r"learn\.microsoft\.com|support\.google\.com|workspace\.google\.com/products|"
+    r"docs\.google\.com|drive\.google\.com|mail\.google\.com|github\.com|"
+    r"console\.cloud\.google\.com|supabase\.com/dashboard|vercel\.com)",
+    re.IGNORECASE,
+)
+
+_PRE_JOIN_OR_NON_LIVE_RE = re.compile(
+    r"(?:\bready\s+to\s+join\b|\bgetting\s+ready\b|\bask\s+to\s+join\b|"
+    r"\bjoin\s+(?:a\s+|this\s+)?meeting\b|\blaunch\s+meeting\b|\bopen\s+zoom\b|\bzoom\s+launcher\b|"
+    r"\bchoose\s+your\s+video\b|\bwaiting\s+in\s+the\s+lobby\b|\bin\s+the\s+lobby\b|"
+    r"\bwaiting\s+for\s+(?:the\s+)?host\b|\bwaiting\s+room\b|\bwaiting\s+for\s+others\b|"
+    r"\bbefore\s+you\s+join\b|\bcheck\s+your\s+audio\b|\btest\s+(?:speaker|mic)\b|"
+    r"\bsign\s+in\b|\blog\s+in\b|\bschedule\s+(?:a\s+)?meeting\b|\bnew\s+meeting\b|"
+    r"\bmeeting\s+details\b|\bmeeting\s+link\b|\bcreate\s+(?:a\s+)?meeting\b|"
+    r"\bpost\s*attendee\b|\byou\s+left\s+the\s+meeting\b|\breturning\s+to\s+home\s+screen\b|"
+    r"\bjoining\s+meeting\b|\bconnecting\.\.\.)",
+    re.IGNORECASE,
+)
+
+_LIVE_ZOOM_BROWSER_PATH_RE = re.compile(
+    r"(?:zoom\.us/wc/\d+/(?:start|join)\b|"
+    r"\bzoom\s+meeting\b|"
+    r"\bzoom\s+webinar\b)",
+    re.IGNORECASE,
+)
+
+_MEET_SLUG_RE = re.compile(r"\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b", re.IGNORECASE)
+_MEET_CODE_TITLE_RE = re.compile(r"\bmeet\s*[-:/]\s*[a-z]{3}-[a-z]{4}-[a-z]{3}\b", re.IGNORECASE)
+
+_ZOOM_NATIVE_CALL_CLASSES: Set[str] = {
+    "zpcontentviewwndclass",
+    "zpptmainfrmwndclassex",
+    "confmultitabcontentwndclass",
+}
+
+
+def is_pre_join_or_non_live_title(title: str) -> bool:
+    """Return True when a title indicates pre-join, lobby, launcher, auth, or scheduler UI."""
+    t = (title or "").strip()
+    if not t:
+        return False
+    return bool(_PRE_JOIN_OR_NON_LIVE_RE.search(t))
+
+
+def is_non_meeting_web_portal(title: str) -> bool:
+    """Return True when a browser window title points to docs, admin, or marketplace portals."""
+    t = (title or "").strip()
+    if not t:
+        return False
+    return bool(_NON_MEETING_WEB_PORTAL_RE.search(t))
+
+
+def is_live_zoom_browser_title(title: str) -> bool:
+    """Return True only when a browser window clearly represents a live Zoom Web Client call."""
+    t = (title or "").strip()
+    if not t or _NON_MEETING_DOC_TITLE_RE.search(t) or is_non_meeting_web_portal(t) or is_pre_join_or_non_live_title(t):
+        return False
+    t_low = t.lower()
+    if _LIVE_ZOOM_BROWSER_PATH_RE.search(t):
+        return True
+    # Only accept Zoom Workplace when paired with explicit active-call indicators, never hub/portal tabs.
+    if "zoom workplace" in t_low and any(k in t_low for k in ("meeting", "webinar", "screen sharing", "huddle")):
+        return True
+    return False
+
+
+def is_live_google_meet_title(title: str) -> bool:
+    """Return True only when a browser window shows an active 3-4-3 Google Meet call (never landing/pre-join)."""
+    t = (title or "").strip()
+    if not t or _NON_MEETING_DOC_TITLE_RE.search(t) or is_non_meeting_web_portal(t) or is_pre_join_or_non_live_title(t):
+        return False
+    t_low = t.lower()
+    if "meet.google.com/" in t_low and _MEET_SLUG_RE.search(t_low):
+        return True
+    if _MEET_CODE_TITLE_RE.search(t_low):
+        return True
+    if _MEET_SLUG_RE.search(t_low) and "meet" in t_low:
+        return True
+    return False
+
+
+def is_live_teams_browser_title(title: str) -> bool:
+    """Return True only when a browser window is a Microsoft Teams web call stage (not Chat/Calendar/Home)."""
+    t = (title or "").strip()
+    if not t or _NON_MEETING_DOC_TITLE_RE.search(t) or is_non_meeting_web_portal(t) or is_pre_join_or_non_live_title(t):
+        return False
+    t_low = t.lower()
+    if t_low in (
+        "microsoft teams",
+        "microsoft teams - google chrome",
+        "microsoft teams - microsoft edge",
+        "microsoft teams - brave",
+        "microsoft teams - firefox",
+        "microsoft teams - opera",
+    ):
+        return False
+    if is_non_call_hub("Microsoft Teams", t):
+        return False
+    return any(tok in t_low for tok in ("teams.microsoft.com", "teams.live.com", "| microsoft teams"))
 
 
 def _is_non_meeting_document_window(title_lower: str, proc_name: str = "") -> bool:
@@ -348,8 +454,8 @@ def list_all_meeting_windows(
             # Reject windows smaller than minimum call stage canvas (toasts, mini-prompts)
             if w < 480 or h < 340:
                 return True
-        # Reject notification toasts, lobby alerts, waiting rooms, and incoming call prompts
-        if any(skip in title_lower for skip in (
+        # Reject notification toasts, pre-join/lobby prompts, portals, and scheduler pages
+        if is_pre_join_or_non_live_title(title) or is_non_meeting_web_portal(title) or any(skip in title_lower for skip in (
             "waiting in the lobby",
             "in the lobby",
             "waiting for host",
@@ -377,6 +483,13 @@ def list_all_meeting_windows(
                 return True
         except Exception:
             pass
+        cls_low = ""
+        try:
+            cls_buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, cls_buf, 256)
+            cls_low = cls_buf.value.strip().lower()
+        except Exception:
+            cls_low = ""
         platform = ""
         proc_name = ""
         try:
@@ -388,18 +501,22 @@ def list_all_meeting_windows(
         if _is_non_meeting_document_window(title_lower, proc_low):
             return True
         is_browser = proc_low in _BROWSER_EXES
-        # Check Zoom (never match arbitrary browser tabs/PDFs starting with 'Zoom...')
+        if is_browser and is_non_meeting_web_portal(title):
+            return True
+        # Check Zoom (never match Zoom Workplace launcher/home or arbitrary browser tabs/portals)
         if proc_low in ("zoom.exe", "cpthost.exe"):
-            platform = "Zoom"
+            if cls_low in _ZOOM_NATIVE_CALL_CLASSES or any(
+                kw in title_lower for kw in ("zoom meeting", "zoom webinar", "zoom share", "screen sharing")
+            ):
+                platform = "Zoom"
         elif not is_browser and (
             "zoom meeting" in title_lower
             or "zoom webinar" in title_lower
-            or (title_lower.startswith("zoom") and "update" not in title_lower)
         ):
             platform = "Zoom"
-        elif is_browser and ("zoom.us" in title_lower or "zoom workplace" in title_lower):
+        elif is_browser and is_live_zoom_browser_title(title):
             platform = "Zoom"
-        # Check Microsoft Teams (strict URL/stage check on browsers to avoid PDFs/articles)
+        # Check Microsoft Teams (strict URL/stage check on browsers to avoid hubs/chats/PDFs)
         elif proc_low in ("ms-teams.exe", "teams.exe", "msteams.exe"):
             if any(skip in title_lower for skip in ("sharing control bar", "microsoft teams notification")):
                 return True
@@ -411,12 +528,12 @@ def list_all_meeting_windows(
             if any(skip in title_lower for skip in ("sharing control bar", "microsoft teams notification")):
                 return True
             platform = "Microsoft Teams"
-        elif is_browser and any(tok in title_lower for tok in ("teams.microsoft.com", "teams.live.com", "| microsoft teams")):
+        elif is_browser and is_live_teams_browser_title(title):
             if any(skip in title_lower for skip in ("sharing control bar", "microsoft teams notification")):
                 return True
             platform = "Microsoft Teams"
-        # Check Google Meet (require explicit meet.google.com or 3-4-3 meeting code)
-        elif "meet.google.com" in title_lower or _MEET_CODE_TITLE_RE.search(title_lower):
+        # Check Google Meet (require explicit 3-4-3 active meeting code; never landing/pre-join)
+        elif is_live_google_meet_title(title):
             platform = "Google Meet"
         # Check Webex
         elif proc_low in ("atmgr.exe", "ciscocollabhost.exe") or (
@@ -452,9 +569,9 @@ def list_all_meeting_windows(
     return candidates
 
 def is_non_call_hub(plat: str, t_title: str) -> bool:
-    """True if window is a main hub/launcher/chat/waiting-room or document/PDF rather than a live active call stage."""
+    """True if window is a main hub/launcher/chat/waiting-room, web portal, or document/PDF rather than a live active call stage."""
     tl = (t_title or "").strip().lower()
-    if _is_non_meeting_document_window(tl, ""):
+    if _is_non_meeting_document_window(tl, "") or is_non_meeting_web_portal(t_title) or is_pre_join_or_non_live_title(t_title):
         return True
     plat_norm = (plat or "").strip().lower()
     if any(skip in tl for skip in (
@@ -476,8 +593,17 @@ def is_non_call_hub(plat: str, t_title: str) -> bool:
     )):
         return True
     # Microsoft Teams hub detection (works whether plat is "Microsoft Teams" or generic "Call")
-    if plat_norm in ("microsoft teams", "teams", "call", "") or "teams" in tl:
-        if tl in ("microsoft teams", "microsoft teams classic", "teams"):
+    if plat_norm in ("microsoft teams", "microsoft teams (browser)", "teams", "call", "") or "teams" in tl:
+        if tl in (
+            "microsoft teams",
+            "microsoft teams classic",
+            "teams",
+            "microsoft teams - google chrome",
+            "microsoft teams - microsoft edge",
+            "microsoft teams - brave",
+            "microsoft teams - firefox",
+            "microsoft teams - opera",
+        ):
             return True
         if tl.startswith((
             "chat |",
@@ -490,24 +616,48 @@ def is_non_call_hub(plat: str, t_title: str) -> bool:
             "approvals |",
             "shifts |",
             "settings |",
+            "meet |",
+            "apps |",
+            "search |",
+            "copilot |",
+            "planner |",
+            "people |",
+            "notifications |",
+            "workflows |",
+            "community |",
+            "home |",
+            "feed |",
+            "notes |",
+            "whiteboard |",
         )):
             return True
-    # Zoom hub detection
-    if plat_norm in ("zoom", "call", "") or "zoom" in tl:
-        if tl in ("zoom workplace", "zoom - free account", "zoom - pro account", "zoom cloud meetings", "zoom"):
+    # Zoom hub / portal detection
+    if plat_norm in ("zoom", "zoom (browser)", "call", "") or "zoom" in tl:
+        if tl in (
+            "zoom workplace",
+            "zoom - free account",
+            "zoom - pro account",
+            "zoom cloud meetings",
+            "zoom",
+            "zoom - sign in",
+            "zoom - home",
+            "zoom - meetings",
+            "zoom - team chat",
+            "zoom - mail",
+            "zoom - calendar",
+            "zoom - contacts",
+            "zoom - clips",
+            "zoom - notes",
+            "schedule meeting",
+        ):
             return True
         if plat_norm == "zoom" and ("update" in tl or "settings" in tl):
             return True
-    # Google Meet hub detection
-    if plat_norm in ("google meet", "meet", "browser call (meet/web)", "call", "") or "meet" in tl:
-        if tl in (
-            "google meet",
-            "meet",
-            "meet - google chrome",
-            "google meet - google chrome",
-            "meet - microsoft edge",
-            "google meet - microsoft edge",
-        ):
+        if re.search(r"zoom\.us/[jsw]/", tl) and not is_live_zoom_browser_title(t_title):
+            return True
+    # Google Meet hub / landing detection (require actual 3-4-3 meeting code)
+    if plat_norm in ("google meet", "meet", "browser call (meet/web)") or ("meet.google.com" in tl or tl in ("google meet", "meet")):
+        if not is_live_google_meet_title(t_title):
             return True
     return False
 _is_non_call_hub = is_non_call_hub
@@ -603,6 +753,47 @@ def classify(key: str) -> Optional[Tuple[str, bool]]:
         if needle in key:
             return name, is_browser
     return None
+
+_BROWSER_TITLE_SUFFIXES = (
+    " - google chrome",
+    " - microsoft edge",
+    " - brave",
+    " - firefox",
+    " - opera",
+    " - vivaldi",
+    " - arc",
+)
+
+
+def _is_browser_meeting_window(platform: str, title: str, proc_name: str) -> bool:
+    """True when a detected window lives inside a web browser rather than a dedicated native call window."""
+    proc_low = (proc_name or "").strip().lower()
+    if proc_low:
+        if proc_low in _BROWSER_EXES:
+            return True
+    plat_low = (platform or "").strip().lower()
+    if "(browser)" in plat_low:
+        return True
+    tl = (title or "").strip().lower()
+    return any(tl.endswith(sfx) for sfx in _BROWSER_TITLE_SUFFIXES)
+
+
+def _is_live_native_teams_window(title: str, pid: Optional[int], candidates: Dict[str, Tuple[str, bool]]) -> bool:
+    """Verify a real ms-teams.exe/teams.exe window is actually in a live call (not a popped-out chat window)."""
+    if any("teams" in str(nm or "").lower() for nm, _ in candidates.values()):
+        return True
+    tl = (title or "").strip().lower()
+    if any(tok in tl for tok in ("(meeting)", "(call)", "(in call)", "meeting in progress", "screen sharing", "presentation")):
+        return True
+    if pid and pid > 0:
+        try:
+            from voxlocal.video.meeting_capture import find_teams_call_monitor_window, find_teams_sharing_session
+            if find_teams_call_monitor_window(pid) is not None or find_teams_sharing_session(pid) is not None:
+                return True
+        except Exception:
+            pass
+    return False
+
 
 class CallDetector:
     """
@@ -888,7 +1079,7 @@ class CallDetector:
                         self.prompted_session_ids.add(sess_id)
                         logger.info("Google Meet tab detected via bridge: session_id=%s ('%s')", sess_id, clean_title_str)
                         return "started"
-            # PRIMARY DIRECT SIGNAL: Check verified call stage windows
+            # PRIMARY DIRECT SIGNAL: Check verified call stage windows with live call verification
             if verified_call_stages:
                 hwnd, app_name, w_title, bounds = verified_call_stages[0]
                 clean_title_str = clean_meeting_title(w_title, app_name)
@@ -897,43 +1088,65 @@ class CallDetector:
                 plat_slug = app_name.lower().replace(" ", "_")
                 sess_id = f"{plat_slug}_{title_slug}_{hwnd}_{epoch}"
                 if sess_id not in self.ignored_session_ids and sess_id not in self.dismissed_session_ids:
-                    # Debounce: ensure call window is visible and stable for at least 1.0s
-                    self._window_first_seen.setdefault(sess_id, now)
-                    if (now - self._window_first_seen[sess_id]) >= 1.0:
-                        if sess_id not in self.prompted_session_ids:
-                            pid = None
-                            try:
-                                from voxlocal.video.meeting_capture import get_window_pid_and_process_name
-                                pid, _ = get_window_pid_and_process_name(hwnd)
-                            except Exception:
-                                pid = None
-                            sess = MeetingSessionInfo(
-                                session_id=sess_id,
-                                platform=app_name,
-                                window_hwnd=hwnd,
-                                window_title=w_title,
-                                clean_title=clean_title_str,
-                                bounds=bounds,
-                                is_call_stage=True,
-                                mic_active=bool(candidates),
-                                pid=pid,
-                                first_detected_at=self._window_first_seen[sess_id],
-                                confirmed_at=now,
-                            )
-                            self.active_session = sess
-                            self.active = ActiveCall(
-                                app_name=app_name,
-                                key=sess_id,
-                                since=now,
-                                window_hwnd=hwnd,
-                                window_title=clean_title_str,
-                                session_id=sess_id,
-                            )
-                            self._released_at = None
-                            self.state = MeetingDetectorState.AWAITING_USER_DECISION
-                            self.prompted_session_ids.add(sess_id)
-                            logger.info("Meeting confirmed: %s session_id=%s, hwnd=%s ('%s')", app_name, sess_id, hwnd, clean_title_str)
-                            return "started"
+                    pid = None
+                    proc_name = ""
+                    try:
+                        from voxlocal.video.meeting_capture import get_window_pid_and_process_name
+                        pid, proc_name = get_window_pid_and_process_name(hwnd)
+                    except Exception:
+                        pid, proc_name = None, ""
+                    proc_low = (proc_name or "").strip().lower()
+
+                    # Strict live-call verification:
+                    # 1) Browser call tabs (Google Meet / Zoom Web / Teams Web) MUST have an active browser microphone session
+                    #    so silent landing pages, docs URLs, or pre-join tabs never falsely trigger auto-recording.
+                    # 2) Live native Teams windows (with an actual running teams PID) must show call mic/monitor/sharing/in-call cues
+                    #    so popped-out 1:1 chat windows don't false-trigger.
+                    can_confirm_window = True
+                    if _is_browser_meeting_window(app_name, w_title, proc_low):
+                        browser_mic_active = any(is_b for _, is_b in candidates.values())
+                        if not browser_mic_active:
+                            can_confirm_window = False
+                    elif proc_low in ("ms-teams.exe", "teams.exe", "msteams.exe"):
+                        if not _is_live_native_teams_window(w_title, pid, candidates):
+                            can_confirm_window = False
+
+                    if not can_confirm_window:
+                        self._window_first_seen.pop(sess_id, None)
+                        if self.state == MeetingDetectorState.NOT_RUNNING:
+                            self.state = MeetingDetectorState.MEETING_SUSPECTED
+                    else:
+                        # Debounce: ensure live call window is visible and stable for at least 1.0s
+                        self._window_first_seen.setdefault(sess_id, now)
+                        if (now - self._window_first_seen[sess_id]) >= 1.0:
+                            if sess_id not in self.prompted_session_ids:
+                                sess = MeetingSessionInfo(
+                                    session_id=sess_id,
+                                    platform=app_name,
+                                    window_hwnd=hwnd,
+                                    window_title=w_title,
+                                    clean_title=clean_title_str,
+                                    bounds=bounds,
+                                    is_call_stage=True,
+                                    mic_active=bool(candidates),
+                                    pid=pid,
+                                    first_detected_at=self._window_first_seen[sess_id],
+                                    confirmed_at=now,
+                                )
+                                self.active_session = sess
+                                self.active = ActiveCall(
+                                    app_name=app_name,
+                                    key=sess_id,
+                                    since=now,
+                                    window_hwnd=hwnd,
+                                    window_title=clean_title_str,
+                                    session_id=sess_id,
+                                )
+                                self._released_at = None
+                                self.state = MeetingDetectorState.AWAITING_USER_DECISION
+                                self.prompted_session_ids.add(sess_id)
+                                logger.info("Meeting confirmed: %s session_id=%s, hwnd=%s ('%s')", app_name, sess_id, hwnd, clean_title_str)
+                                return "started"
             # SUPPORTING SIGNAL: Check candidate windows and mic consent
             for u, (app_name, is_browser) in candidates.items():
                 min_sec = BROWSER_MIN_SEC if is_browser else NATIVE_MIN_SEC

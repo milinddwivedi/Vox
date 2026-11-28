@@ -176,10 +176,10 @@ class VoxProUpgradeDialog(QDialog):
         feats_lay.setSpacing(8)
 
         features = [
-            ("⚡", "Unlimited Voice Typing", "No 3,000 weekly word cap — type continuously at 220+ WPM"),
-            ("🎙️", "Unlimited Meeting Studio", "Dual-track mic + system audio, 1080p video sync, no duration limits"),
-            ("🧠", "Unlimited Cognitive Ask VOX", "Query across all past meetings with grounded citations"),
-            ("📑", "Executive MoM & Deliverable Exports", "Export in Markdown, PDF, HTML, JSON, and clean action items"),
+            ("✨", "Unlimited AI Meeting Summaries", "Executive MoM, decisions, action items, risks & follow-ups after your 10-day trial"),
+            ("🧠", "Unlimited Ask VOX Intelligence", "Cross-meeting conversational Q&A with timestamp-grounded citations"),
+            ("⚡", "Unlimited Voice Typing (Always Free)", "Fast offline dictation stays free forever across every signed-in & guest account"),
+            ("🎙️", "Unlimited Meeting Transcription (Always Free)", "Dual-track mic + system audio recording and transcripts remain free forever"),
             ("🔒", "100% Local PC Privacy", "Zero audio uploads to cloud servers — runs offline on your machine"),
         ]
 

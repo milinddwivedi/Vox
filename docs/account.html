@@ -252,64 +252,65 @@
           document.getElementById('barMeetings').style.background = '#10B981';
           document.getElementById('barQueries').style.background = '#10B981';
         } else {
+          const trialActive = Boolean(user.trial_active);
+          const daysLeft = Number(user.trial_days_remaining || 0);
           if (elBadge) {
-            elBadge.className = 'plan-badge free';
-            elBadge.innerText = 'VOX Free (₹0/mo)';
+            elBadge.className = trialActive ? 'plan-badge pro' : 'plan-badge free';
+            elBadge.innerText = trialActive
+              ? ('10-Day Trial (' + daysLeft + ' day' + (daysLeft === 1 ? '' : 's') + ' left)')
+              : 'Trial Ended · Typing & Recording Free Forever';
           }
           if (btnUpgrade) {
             btnUpgrade.innerText = 'Upgrade to VOX Pro (₹199/mo) →';
             btnUpgrade.href = 'pricing.html';
           }
 
-          const pctWords = Math.min(100, Math.round((words / 3000) * 100));
-          const pctMinutes = Math.min(100, Math.round((minutes / 180) * 100));
-          const pctMeetings = Math.min(100, Math.round((meetings / 5) * 100));
-          const pctQueries = Math.min(100, Math.round((queries / 10) * 100));
+          document.getElementById('txtWords').innerText = words.toLocaleString() + ' words (Unlimited Forever)';
+          document.getElementById('txtMinutes').innerText = minutes.toLocaleString() + ' mins (Unlimited Forever)';
+          document.getElementById('txtMeetings').innerText = meetings.toLocaleString() + ' sessions (Unlimited Transcription)';
+          document.getElementById('txtQueries').innerText = trialActive
+            ? (queries.toLocaleString() + ' queries (Included in 10-Day Trial)')
+            : 'Locked (Upgrade to VOX Pro for Ask VOX & AI Summaries)';
 
-          document.getElementById('txtWords').innerText = words.toLocaleString() + ' / 3,000 words (' + pctWords + '%)';
-          document.getElementById('txtMinutes').innerText = minutes.toLocaleString() + ' / 180 mins (' + pctMinutes + '%)';
-          document.getElementById('txtMeetings').innerText = meetings.toLocaleString() + ' / 5 sessions (' + pctMeetings + '%)';
-          document.getElementById('txtQueries').innerText = queries.toLocaleString() + ' / 10 queries (' + pctQueries + '%)';
+          document.getElementById('barWords').style.width = '100%';
+          document.getElementById('barMinutes').style.width = '100%';
+          document.getElementById('barMeetings').style.width = '100%';
+          document.getElementById('barQueries').style.width = trialActive ? '100%' : '15%';
 
-          document.getElementById('barWords').style.width = pctWords + '%';
-          document.getElementById('barMinutes').style.width = pctMinutes + '%';
-          document.getElementById('barMeetings').style.width = pctMeetings + '%';
-          document.getElementById('barQueries').style.width = pctQueries + '%';
-
-          document.getElementById('barWords').style.background = '';
-          document.getElementById('barMinutes').style.background = '';
-          document.getElementById('barMeetings').style.background = '';
-          document.getElementById('barQueries').style.background = '';
+          document.getElementById('barWords').style.background = '#10B981';
+          document.getElementById('barMinutes').style.background = '#10B981';
+          document.getElementById('barMeetings').style.background = '#10B981';
+          document.getElementById('barQueries').style.background = trialActive ? '#10B981' : '#F59E0B';
         }
       } else {
         // Clean Guest state
         if (elAvatar) elAvatar.innerText = 'G';
         if (elName) elName.innerText = 'Guest User';
-        if (elEmail) elEmail.innerText = 'Local PC Mode · Not synced to cloud';
+        if (elEmail) elEmail.innerText = 'Sign in with Google to activate your 10-day full AI trial';
         if (btnAuthText) btnAuthText.innerText = 'Sign In with Google';
 
         if (elBadge) {
           elBadge.className = 'plan-badge free';
-          elBadge.innerText = 'VOX Free (₹0/mo)';
+          elBadge.innerText = 'Guest · Sign In for 10-Day AI Trial';
         }
         if (btnUpgrade) {
           btnUpgrade.innerText = 'Upgrade to VOX Pro (₹199/mo) →';
           btnUpgrade.href = 'pricing.html';
         }
 
-        document.getElementById('txtWords').innerText = '0 / 3,000 words (0%)';
-        document.getElementById('txtMinutes').innerText = '0 / 180 mins (0%)';
-        document.getElementById('txtMeetings').innerText = '0 / 5 sessions (0%)';
-        document.getElementById('txtQueries').innerText = '0 / 10 queries (0%)';
+        document.getElementById('txtWords').innerText = 'Unlimited Forever';
+        document.getElementById('txtMinutes').innerText = 'Unlimited Forever';
+        document.getElementById('txtMeetings').innerText = 'Unlimited Transcription';
+        document.getElementById('txtQueries').innerText = 'Google Sign-In Required for 10-Day Trial';
 
-        document.getElementById('barWords').style.width = '0%';
-        document.getElementById('barMinutes').style.width = '0%';
-        document.getElementById('barMeetings').style.width = '0%';
+        document.getElementById('barWords').style.width = '100%';
+        document.getElementById('barMinutes').style.width = '100%';
+        document.getElementById('barMeetings').style.width = '100%';
         document.getElementById('barQueries').style.width = '0%';
 
-        document.getElementById('barWords').style.background = '';
-        document.getElementById('barMinutes').style.background = '';
-        document.getElementById('barMeetings').style.background = '';
+        document.getElementById('barWords').style.background = '#10B981';
+        document.getElementById('barMinutes').style.background = '#10B981';
+        document.getElementById('barMeetings').style.background = '#10B981';
         document.getElementById('barQueries').style.background = '';
       }
     }

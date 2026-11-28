@@ -1291,36 +1291,48 @@ class SettingsWorkspaceWidget(QWidget):
                 self.bar_ask_vox.setMaximum(100)
                 self.bar_ask_vox.setValue(100)
             else:
-                self.lbl_plan_badge.setText("VOX FREE TIER · ₹0/mo")
-                self.lbl_plan_badge.setStyleSheet("color: #f59e0b; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(245, 158, 11, 0.12);")
+                trial_active = bool(status.get("trial_active", False)) and signed_in
+                days_rem = int(status.get("trial_days_remaining", 0) or 0)
+                if not signed_in:
+                    self.lbl_plan_badge.setText("GUEST · Sign in with Google for 10-Day AI Trial")
+                    self.lbl_plan_badge.setStyleSheet("color: #64748b; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(100, 116, 139, 0.12);")
+                elif trial_active:
+                    self.lbl_plan_badge.setText(f"✦ 10-DAY FULL TRIAL ({days_rem} day{'s' if days_rem != 1 else ''} left)")
+                    self.lbl_plan_badge.setStyleSheet("color: #10b981; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(16, 185, 129, 0.12);")
+                else:
+                    self.lbl_plan_badge.setText("TRIAL ENDED · Typing & Recording Free Forever")
+                    self.lbl_plan_badge.setStyleSheet("color: #f59e0b; font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; background: rgba(245, 158, 11, 0.12);")
                 self.btn_upgrade_pro.setVisible(True)
 
                 w_used = int(usage.get("dictation_words") or 0)
-                w_lim = int(limits.get("dictation_words_weekly") or limits.get("dictation_words_per_week") or 3000)
-                self.lbl_usage_words.setText(f"Voice Typing: {w_used:,} / {w_lim:,} words this week")
-                self.bar_words.setMaximum(w_lim)
-                self.bar_words.setValue(min(w_used, w_lim))
+                self.lbl_usage_words.setText(f"Voice Typing: {w_used:,} words this week (Unlimited Forever)")
+                self.bar_words.setMaximum(100)
+                self.bar_words.setValue(100)
 
                 m_sec = float(usage.get("meeting_duration_sec") or 0.0)
                 m_min = int(m_sec / 60)
-                raw_m_sec = limits.get("meeting_duration_sec_per_week")
-                raw_m_min = limits.get("meeting_minutes_weekly")
-                m_lim = int(raw_m_min) if raw_m_min is not None else (int(raw_m_sec / 60) if raw_m_sec is not None else 180)
-                self.lbl_usage_minutes.setText(f"Meeting Audio: {m_min} / {m_lim} mins this week")
-                self.bar_minutes.setMaximum(m_lim)
-                self.bar_minutes.setValue(min(m_min, m_lim))
+                self.lbl_usage_minutes.setText(f"Meeting Audio: {m_min} mins this week (Unlimited Forever)")
+                self.bar_minutes.setMaximum(100)
+                self.bar_minutes.setValue(100)
 
                 c_used = int(usage.get("meeting_count") or 0)
-                c_lim = int(limits.get("meeting_sessions_weekly") or limits.get("meeting_count_per_week") or 5)
-                self.lbl_usage_meetings.setText(f"Meetings Recorded: {c_used} / {c_lim} sessions this week")
-                self.bar_meetings.setMaximum(c_lim)
-                self.bar_meetings.setValue(min(c_used, c_lim))
+                self.lbl_usage_meetings.setText(f"Meetings Recorded: {c_used} sessions this week (Unlimited Transcription)")
+                self.bar_meetings.setMaximum(100)
+                self.bar_meetings.setValue(100)
 
                 q_used = int(usage.get("ask_vox_count") or 0)
-                q_lim = int(limits.get("ask_vox_queries_weekly") or limits.get("ask_vox_queries_per_week") or 10)
-                self.lbl_usage_ask_vox.setText(f"Ask VOX Queries: {q_used} / {q_lim} queries this week")
-                self.bar_ask_vox.setMaximum(q_lim)
-                self.bar_ask_vox.setValue(min(q_used, q_lim))
+                if not signed_in:
+                    self.lbl_usage_ask_vox.setText("AI Summaries & Ask VOX: Sign in with Google for 10-Day Free Trial")
+                    self.bar_ask_vox.setMaximum(100)
+                    self.bar_ask_vox.setValue(0)
+                elif trial_active:
+                    self.lbl_usage_ask_vox.setText(f"AI Summaries & Ask VOX: {q_used} queries (Active in 10-Day Trial)")
+                    self.bar_ask_vox.setMaximum(10)
+                    self.bar_ask_vox.setValue(max(1, min(10, days_rem)))
+                else:
+                    self.lbl_usage_ask_vox.setText("AI Summaries & Ask VOX: Locked (Upgrade to VOX Pro)")
+                    self.bar_ask_vox.setMaximum(100)
+                    self.bar_ask_vox.setValue(0)
         except RuntimeError:
             self._disconnect_controller_signals()
             return

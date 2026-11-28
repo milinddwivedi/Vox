@@ -1,5 +1,15 @@
 {
   "buildCommand": "",
   "outputDirectory": "docs",
-  "cleanUrls": true
+  "cleanUrls": true,
+  "rewrites": [
+    {
+      "source": "/api/calendar/oauth/:action",
+      "destination": "/api/calendar/zoom?action=:action"
+    },
+    {
+      "source": "/v1/calendar/oauth/:action",
+      "destination": "/api/calendar/zoom?action=:action"
+    }
+  ]
 }

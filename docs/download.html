@@ -342,7 +342,7 @@
         <div>
           <div style="font-weight:700; font-size:20px; margin-bottom:4px; display:flex; align-items:center; gap:10px;">
             <span>VoxLocal-Setup.exe</span>
-            <span class="version-badge" id="relVersionBadge">Latest v2.3.0</span>
+            <span class="version-badge" id="relVersionBadge">Latest v2.4.0</span>
           </div>
           <div id="relMetaLine" style="font-size:13px; color:var(--text-muted);">
             Windows 10 / 11 (64-bit x64) · 216.9 MB · Released 2026-11-28
@@ -412,7 +412,7 @@
       </div>
 
       <div class="checksum-bar">
-        <span>Installer SHA-256 Digest:</span><span id="relSha256" style="font-family:inherit; color:var(--text-dim); font-weight:400;">4944fb00abe36499619c5fa44d15a040695bd57afa07a7082eb944a7d163e5aa</span>
+        <span>Installer SHA-256 Digest:</span><span id="relSha256" style="font-family:inherit; color:var(--text-dim); font-weight:400;">0f7a36b3d470efddf8247b25daed39bd9c9ae4e09c8378f350ffe4ba17878ad4</span>
       </div>
 
       <div class="meta-grid">
@@ -431,11 +431,11 @@
       </div>
 
       <div class="notes-box">
-        <b style="color:var(--text);">What's New in <span id="relNotesVersion">v2.3.0</span></b>
+        <b style="color:var(--text);">What's New in <span id="relNotesVersion">v2.4.0</span></b>
         <ul id="relNotesList">
-          <li>Unified Meeting Intelligence &amp; Editorial Summary Box: Clean single-document Brief and Detailed summary views with section-level and full-summary copy controls and LLM-authored insights free of raw transcript clutter.</li>
-          <li>Executive PDF Export &amp; Ask VOX Polish: Clean multi-section PDF export, instant Ask VOX question visibility, calm processing state, and reliable scrolling.</li>
-          <li>Theme Cohesion, Scrollbars, Bulk Delete &amp; Cleaner Detection: Fixed Light/Dark mode overlap and adaptive confirmation dialogs, restored visible scrollbars, added multi-select bulk meeting delete, stopped false PDF browser detection, and removed Slack UI.</li>
+          <li>Bulletproof Automatic Call Detection: Stopped false auto-starts on browser docs/developer portals, Google Meet/Teams landing &amp; pre-join tabs, and silent browser pages without active mic audio; consent prompt cards now wait for explicit user approval.</li>
+          <li>Redesigned Meetings Sidebar &amp; Full Folder Controls: Flat Material 3 dropdown controls without native bevels, Create / Rename / Delete folders (preserving all meetings), working Comfortable vs Compact library density views, and dynamic Rescued filter.</li>
+          <li>10-Day Free Trial, In-App Dictation, Dynamic Drawer &amp; Zoom OAuth: Server-verified 10-day Google trial with Pro upgrade gating, voice dictation inside My Notes &amp; Scratchpad, dynamic 3-mode Meeting Drawer, auto-dismissing Upcoming popover, and Zoom Calendar OAuth.</li>
         </ul>
       </div>
     </div>
@@ -465,7 +465,7 @@
 
   <script>
     let _currentUserSession = null;
-    let _latestManifest = { version: '2.3.0', artifact: 'releases/2.3.0/VoxLocal-Setup.exe' };
+    let _latestManifest = { version: '2.4.0', artifact: 'releases/2.4.0/VoxLocal-Setup.exe' };
 
     function handleGoogleSignIn() {
       const btn = document.getElementById('btnGoogleAuth');
@@ -514,7 +514,7 @@
       _setDownloadStatus('ok', 'Verifying Google account authorization...');
 
       try {
-        const artifact = 'releases/' + (_latestManifest.version || '2.3.0') + '/VoxLocal-Setup.exe';
+        const artifact = 'releases/' + (_latestManifest.version || '2.4.0') + '/VoxLocal-Setup.exe';
         const res = await fetch('/api/download/authorize', {
           method: 'POST',
           headers: {
@@ -535,7 +535,7 @@
           return;
         }
         if (btnText) btnText.textContent = 'Downloading VoxLocal-Setup.exe...';
-        _setDownloadStatus('ok', 'Authorized ticket issued (' + (data.version || '2.3.0') + '). Starting browser download...');
+        _setDownloadStatus('ok', 'Authorized ticket issued (' + (data.version || '2.4.0') + '). Starting browser download...');
         window.location.href = data.download_url;
       } catch (err) {
         _setDownloadStatus('err', 'Network error authorizing download. Please check your connection and retry.');

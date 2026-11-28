@@ -12,8 +12,8 @@ module.exports = async function handler(req, res) {
 
   const manifest = {
     "product_id": "vox-desktop-win64",
-    "version": "2.3.0",
-    "build_number": 230,
+    "version": "2.4.0",
+    "build_number": 240,
     "min_supported_version": "1.0.0",
     "channel": "stable",
     "platform": "win32",
@@ -21,8 +21,8 @@ module.exports = async function handler(req, res) {
     "product_name": "VOX \u2014 Local AI Voice Assistant",
     "release_date": "2026-11-28",
     "installer_url": "https://vox-voice-assistant.vercel.app/api/download/file",
-    "installer_size_bytes": 227427919,
-    "sha256": "4944fb00abe36499619c5fa44d15a040695bd57afa07a7082eb944a7d163e5aa",
+    "installer_size_bytes": 227483814,
+    "sha256": "0f7a36b3d470efddf8247b25daed39bd9c9ae4e09c8378f350ffe4ba17878ad4",
     "signature_algorithm": "Ed25519",
     "model_manifest_version": "2.1.0",
     "required_model_changes": [],
@@ -35,9 +35,9 @@ module.exports = async function handler(req, res) {
     "min_os_version": "Windows 10 Build 19041 (64-bit)",
     "mandatory": false,
     "release_notes": [
-      "Unified Meeting Intelligence & Editorial Summary Box: Clean single-document Brief and Detailed summary views with section-level and full-summary copy controls and LLM-authored insights free of raw transcript clutter.",
-      "Executive PDF Export & Ask VOX Polish: Clean multi-section PDF export, instant Ask VOX question visibility, calm processing state, and reliable scrolling.",
-      "Theme Cohesion, Scrollbars, Bulk Delete & Cleaner Detection: Fixed Light/Dark mode overlap and adaptive confirmation dialogs, restored visible scrollbars, added multi-select bulk meeting delete, stopped false PDF browser detection, and removed Slack UI."
+      "Bulletproof Automatic Call Detection: Stopped false auto-starts on browser docs/developer portals, Google Meet/Teams landing & pre-join tabs, and silent browser pages without active mic audio; consent prompt cards now wait for explicit user approval.",
+      "Redesigned Meetings Sidebar & Full Folder Controls: Flat Material 3 dropdown controls without native bevels, Create / Rename / Delete folders (preserving all meetings), working Comfortable vs Compact library density views, and dynamic Rescued filter.",
+      "10-Day Free Trial, In-App Dictation, Dynamic Drawer & Zoom OAuth: Server-verified 10-day Google trial with Pro upgrade gating, voice dictation inside My Notes & Scratchpad, dynamic 3-mode Meeting Drawer, auto-dismissing Upcoming popover, and Zoom Calendar OAuth."
     ]
   };
 

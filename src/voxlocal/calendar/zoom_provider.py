@@ -207,14 +207,24 @@ class ZoomCalendarProvider(BaseCalendarProvider):
         creds = f"{self.client_id}:{self.client_secret}".encode("utf-8")
         return f"Basic {base64.b64encode(creds).decode('ascii')}"
 
+    def _use_hosted_backend(self) -> bool:
+        if self.client_id:
+            return False
+        if self._auth_broker is None:
+            return False
+        if hasattr(self._auth_broker, "is_backend_configured_for"):
+            return bool(self._auth_broker.is_backend_configured_for("zoom"))
+        return bool(self._auth_broker.is_backend_configured())
+
     def refresh_token(self) -> bool:
-        """Refresh Zoom OAuth access token via hosted backend or refresh_token."""
-        if self._auth_broker is not None and self._auth_broker.is_backend_configured():
+        """Refresh Zoom OAuth access token via hosted backend or direct/PKCE refresh_token."""
+        if self._use_hosted_backend() or (not self.client_id and self._auth_broker is not None and self._auth_broker.is_backend_configured()):
             try:
                 token_resp = self._auth_broker.refresh_backend_token(
                     CalendarProviderType.ZOOM.value,
                     self.user_id,
                     self._account_id,
+                    refresh_token=self._refresh_token or "",
                 )
                 if token_resp.get("access_token"):
                     self._access_token = token_resp["access_token"]
@@ -234,17 +244,21 @@ class ZoomCalendarProvider(BaseCalendarProvider):
                 self._status["connection_state"] = AccountConnectionState.EXPIRED.value
                 return False
 
-        if not self._refresh_token or not self.client_id or not self.client_secret:
+        if not self._refresh_token or not self.client_id:
             self._status["error_state"] = "NO_REFRESH_TOKEN"
             self._status["connection_state"] = AccountConnectionState.EXPIRED.value
             return False
 
-        data = urllib.parse.urlencode({
+        form = {
             "grant_type": "refresh_token",
             "refresh_token": self._refresh_token,
-        }).encode("utf-8")
+        }
+        if not self.client_secret:
+            form["client_id"] = self.client_id
+        data = urllib.parse.urlencode(form).encode("utf-8")
         req = urllib.request.Request(self.TOKEN_ENDPOINT, data=data, method="POST")
-        req.add_header("Authorization", self._get_basic_auth_header())
+        if self.client_secret:
+            req.add_header("Authorization", self._get_basic_auth_header())
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
         try:
@@ -306,9 +320,9 @@ class ZoomCalendarProvider(BaseCalendarProvider):
         """
         Interactive Zoom OAuth callback on http://localhost:{port}/zoom_callback with PKCE S256.
         """
-        use_backend = self._auth_broker is not None and self._auth_broker.is_backend_configured()
-        if (not self.client_id or not self.client_secret) and not use_backend:
-            msg = "Zoom Client ID and Client Secret are required. Enter them in VOX Settings or configure hosted sign-in."
+        use_backend = self._use_hosted_backend()
+        if not self.client_id and not use_backend:
+            msg = "Zoom Client ID is required (leave Client Secret blank for PKCE public client, or configure hosted sign-in)."
             self._status["error_state"] = "OAUTH_CONFIG_ERROR"
             self._status["friendly_error"] = msg
             return False, msg
@@ -380,13 +394,26 @@ class ZoomCalendarProvider(BaseCalendarProvider):
             actual_port = int(server.server_address[1])
             redirect_uri = f"http://localhost:{actual_port}/zoom_callback"
             if use_backend:
-                start_resp = self._auth_broker.start_backend_oauth(
-                    provider=CalendarProviderType.ZOOM.value,
-                    user_id=self.user_id,
-                    scopes=[],
-                    redirect_uri=redirect_uri,
-                    code_challenge=code_challenge,
-                )
+                try:
+                    start_resp = self._auth_broker.start_backend_oauth(
+                        provider=CalendarProviderType.ZOOM.value,
+                        user_id=self.user_id,
+                        scopes=[],
+                        redirect_uri=redirect_uri,
+                        code_challenge=code_challenge,
+                    )
+                except urllib.error.HTTPError as http_err:
+                    raw_b = http_err.read().decode("utf-8", errors="replace")
+                    if http_err.code == 503 or "ZOOM_HOSTED_OAUTH_NOT_CONFIGURED" in raw_b:
+                        friendly = (
+                            "Hosted 1-click Zoom OAuth is not configured on the VOX server yet. "
+                            "Enter your Zoom App's Client ID in the Zoom tab (Client Secret optional for PKCE) "
+                            "with Redirect URL http://localhost:8080/zoom_callback."
+                        )
+                        self._status["error_state"] = "ZOOM_HOSTED_OAUTH_NOT_CONFIGURED"
+                        self._status["friendly_error"] = friendly
+                        return False, friendly
+                    raise
                 auth_url = str(start_resp.get("authorization_url") or "")
                 if start_resp.get("state"):
                     expected_state = str(start_resp["state"])
@@ -435,7 +462,7 @@ class ZoomCalendarProvider(BaseCalendarProvider):
                     pass
 
     def _exchange_code_for_tokens(self, code: str, redirect_uri: str, code_verifier: str = "") -> Tuple[bool, str]:
-        if self._auth_broker is not None and self._auth_broker.is_backend_configured():
+        if self._use_hosted_backend():
             try:
                 token_resp = self._auth_broker.exchange_backend_code(
                     provider=CalendarProviderType.ZOOM.value,
@@ -470,10 +497,13 @@ class ZoomCalendarProvider(BaseCalendarProvider):
         }
         if code_verifier:
             form["code_verifier"] = code_verifier
+        if not self.client_secret:
+            form["client_id"] = self.client_id
         data = urllib.parse.urlencode(form).encode("utf-8")
 
         req = urllib.request.Request(self.TOKEN_ENDPOINT, data=data, method="POST")
-        req.add_header("Authorization", self._get_basic_auth_header())
+        if self.client_secret:
+            req.add_header("Authorization", self._get_basic_auth_header())
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
         try:

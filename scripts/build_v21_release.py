@@ -136,9 +136,9 @@ def main() -> int:
 
     notes = (
         f"# VOX v{version} Release Notes ({ver_data['release_date']})\n\n"
-        "- **Professional Windows Setup Wizard**: Guided 4-step installer with genuine extraction/download progress bar, SHA-256 model verification, automatic retry/cancel recovery, Start Menu & Desktop shortcuts, Add/Remove Programs uninstaller preserving user data by default, and immediate auto-launch.\n"
-        "- **Unified Model Provisioner & Canonical Manifest**: Authoritative `model_manifest.json` (`v2.1.0`) managing Cohere Transcribe 2B INT8, PyAnnote + WeSpeaker diarization, Qwen3.5-4B GGUF (Vulkan + CPU fallback), BGE-Small-EN embeddings, and Whisper Large-v3-Turbo/Small dictation models.\n"
-        "- **Authenticated Website Distribution & In-App Updates**: Backend-enforced Google sign-in authorization for installer downloads, Ed25519-signed release manifests, SQLite backup before upgrades, and safe update deferral during active recording or post-call finalization.\n"
+        "- **Bulletproof Automatic Call Detection**: Eliminated false meeting triggers from browser developer/docs portals (`developers.zoom.us`, `marketplace.zoom.us`), landing pages, pre-join/waiting rooms, Teams Chat/Calendar tabs, and silent tabs without an active microphone call; disabled silent auto-start countdowns when consent prompts are enabled.\n"
+        "- **Redesigned Meetings Library & Full Folder Controls**: Clean Material 3 dropdown controls without native bevels, full Create / Rename / Delete folder management (keeping all meetings intact), working Comfortable vs Compact density views inside the library menu, and dynamic Rescued filter visibility.\n"
+        "- **10-Day Free Trial, In-App Dictation, Dynamic Drawer & Zoom OAuth**: Server-enforced 10-day Google trial with Pro upgrade flow, live voice dictation in My Notes and Scratchpad, context-aware 3-mode Meeting Drawer (`live` / `prep` / `workspace`), auto-dismissing Upcoming popover, and one-click Zoom Calendar OAuth.\n"
         f"\n**Installer Size:** {setup_size:,} bytes ({setup_size/(1024*1024):.1f} MB)  \n"
         f"**Installer SHA-256:** `{setup_sha}`\n"
     )

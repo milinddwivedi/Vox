@@ -1712,6 +1712,12 @@ class ScratchpadHubPage(QWidget):
         self.apply_theme(self._theme)
         if hasattr(self.controller, "notes_updated"):
             self.controller.notes_updated.connect(self.refresh_notes)
+        if hasattr(self.controller, "dictation_interim_updated"):
+            self.controller.dictation_interim_updated.connect(self._on_dictation_interim_updated)
+        if hasattr(self.controller, "dictation_state_changed"):
+            self.controller.dictation_state_changed.connect(self._on_dictation_state)
+        if hasattr(self.controller, "dictation_completed"):
+            self.controller.dictation_completed.connect(self._on_dictation_completed)
         self.refresh_notes()
 
     def _build_ui(self) -> None:
@@ -1788,6 +1794,15 @@ class ScratchpadHubPage(QWidget):
         self.btn_pin.clicked.connect(self._toggle_pin)
         t_row.addWidget(self.btn_pin)
 
+        self.btn_dictate = QPushButton("Dictate")
+        self.btn_dictate.setObjectName("dawnBtn")
+        self.btn_dictate.setCheckable(True)
+        self.btn_dictate.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_dictate.setToolTip("Voice dictate directly into this Scratchpad note")
+        self.btn_dictate.setAccessibleName("Dictate into Scratchpad")
+        self.btn_dictate.clicked.connect(self._toggle_dictation_into_note)
+        t_row.addWidget(self.btn_dictate)
+
         self.btn_transform = QPushButton("AI Transform")
         self.btn_transform.clicked.connect(self._show_transform_menu)
         t_row.addWidget(self.btn_transform)
@@ -1796,6 +1811,12 @@ class ScratchpadHubPage(QWidget):
         btn_del.clicked.connect(self._delete_current)
         t_row.addWidget(btn_del)
         rl.addLayout(t_row)
+
+        self.lbl_live_interim = QLabel("")
+        self.lbl_live_interim.setVisible(False)
+        self.lbl_live_interim.setWordWrap(True)
+        self.lbl_live_interim.setStyleSheet("color: #64748B; font-style: italic; font-size: 12px; padding: 2px 4px;")
+        rl.addWidget(self.lbl_live_interim)
 
         self.editor = QTextEdit()
         self.editor.setPlaceholderText("Write or dictate notes here...")
@@ -1866,6 +1887,74 @@ class ScratchpadHubPage(QWidget):
             return
         self.controller.db.update_note(self._current_note_id, is_pinned=1 if self.btn_pin.isChecked() else 0, save_version=False)
         self.refresh_notes()
+
+    def _is_scratchpad_dictation_target(self) -> bool:
+        if not self.isVisible() or not self.editor.isVisible():
+            return False
+        explicit = getattr(self.controller, "_explicit_in_app_widget_ref", None)
+        if explicit is not None:
+            return explicit is self.editor
+        return bool(self.editor.hasFocus())
+
+    def _toggle_dictation_into_note(self) -> None:
+        if self._current_note_id is None:
+            self._create_note()
+        self.editor.setFocus()
+        if hasattr(self.controller, "toggle_in_app_dictation"):
+            self.controller.toggle_in_app_dictation(self.editor, title="VOX — Scratchpad")
+        elif hasattr(self.controller, "toggle_dictation"):
+            self.controller.toggle_dictation()
+
+    def _on_dictation_state(self, state: str, _msg: str = "") -> None:
+        s = (state or "").strip().lower()
+        is_target = self._is_scratchpad_dictation_target()
+        if is_target and s in ("starting", "listening", "speaking"):
+            self.btn_dictate.blockSignals(True)
+            self.btn_dictate.setChecked(True)
+            self.btn_dictate.blockSignals(False)
+            self.btn_dictate.setText("⏹ Stop Dictating")
+        elif is_target and s in ("processing", "stopping"):
+            self.btn_dictate.blockSignals(True)
+            self.btn_dictate.setChecked(False)
+            self.btn_dictate.blockSignals(False)
+            self.btn_dictate.setText("Transcribing...")
+        else:
+            self.btn_dictate.blockSignals(True)
+            self.btn_dictate.setChecked(False)
+            self.btn_dictate.blockSignals(False)
+            self.btn_dictate.setText("Dictate")
+            self.lbl_live_interim.setText("")
+            self.lbl_live_interim.setVisible(False)
+
+    def _on_dictation_interim_updated(self, provisional: str, stable: str) -> None:
+        if not self._is_scratchpad_dictation_target():
+            self.lbl_live_interim.setText("")
+            self.lbl_live_interim.setVisible(False)
+            return
+        combined = " ".join(x for x in (stable.strip(), provisional.strip()) if x).strip()
+        if combined:
+            self.lbl_live_interim.setText(f"🎙️ Live: {combined}")
+            self.lbl_live_interim.setVisible(True)
+        else:
+            self.lbl_live_interim.setText("")
+            self.lbl_live_interim.setVisible(False)
+
+    def _on_dictation_completed(self, text: str, _target: str = "", method: str = "") -> None:
+        self.lbl_live_interim.setText("")
+        self.lbl_live_interim.setVisible(False)
+        if not self._is_scratchpad_dictation_target():
+            return
+        if text and text.strip() and "in_app" not in (method or ""):
+            current = self.editor.toPlainText()
+            tail = current[-max(40, len(text) + 10) :] if current else ""
+            if text.strip() not in tail:
+                self.editor.insertPlainText(text + " ")
+        self._schedule_save()
+
+    def hideEvent(self, event) -> None:
+        if hasattr(self.controller, "clear_in_app_dictation_target"):
+            self.controller.clear_in_app_dictation_target(self.editor)
+        super().hideEvent(event)
 
     def _show_transform_menu(self) -> None:
         if self._current_note_id is None:

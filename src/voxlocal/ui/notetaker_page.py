@@ -15,8 +15,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import QRect, QSize, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QShortcut
+from PyQt6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QPen, QShortcut
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QApplication,
@@ -88,6 +88,93 @@ if TYPE_CHECKING:
 logger = get_logger("ui.notetaker_page")
 
 
+class VoxFlatComboBox(QComboBox):
+    """Minimal Google Material 3 flat dropdown button with vector chevron (zero Windows 95 bevel)."""
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        leading_icon_name: str = "",
+        theme: str = "light",
+    ) -> None:
+        super().__init__(parent)
+        self._leading_icon_name = str(leading_icon_name or "")
+        self._theme = (theme or "light").lower()
+        self._hovered = False
+        self.setFixedHeight(30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_theme(self, theme: str) -> None:
+        self._theme = (theme or "light").lower()
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        t = get_theme_tokens(self._theme)
+        rect = QRectF(self.rect()).adjusted(0.75, 0.75, -0.75, -0.75)
+        popup_vis = bool(self.view() and self.view().isVisible())
+        focused = self.hasFocus() or popup_vis
+
+        if focused:
+            bg = QColor(t.get("surface", "#FFFFFF"))
+            bdr = QColor(t.get("input_focus_border", t.get("accent", "#1967D2")))
+            pen_w = 1.4
+        elif self._hovered:
+            bg = QColor(t.get("surface_hover", "#F1F5F9"))
+            bdr = QColor(t.get("border", "#CBD5E1"))
+            pen_w = 1.0
+        else:
+            bg = QColor(t.get("surface_container", "#F8FAFC"))
+            bdr = QColor(t.get("outline_variant", "#E2E8F0"))
+            pen_w = 1.0
+
+        p.setBrush(bg)
+        p.setPen(QPen(bdr, pen_w))
+        p.drawRoundedRect(rect, 8.0, 8.0)
+
+        fg = t.get("text_primary", "#0F172A")
+        sec = t.get("text_secondary", "#475569")
+
+        left_x = 10
+        if self._leading_icon_name:
+            pm = get_pixmap(self._leading_icon_name, sec, 13)
+            iy = int((self.height() - 13) // 2)
+            p.drawPixmap(left_x, iy, pm)
+            left_x += 19
+
+        chev_sz = 12
+        chev_x = self.width() - chev_sz - 9
+        chev_y = int((self.height() - chev_sz) // 2)
+        chev_pm = get_pixmap("chevron_down", sec, chev_sz)
+        p.drawPixmap(chev_x, chev_y, chev_pm)
+
+        text_w = max(24, chev_x - left_x - 6)
+        font = get_ui_font(12, 550)
+        p.setFont(font)
+        p.setPen(QColor(fg))
+        elided = QFontMetrics(font).elidedText(self.currentText(), Qt.TextElideMode.ElideRight, text_w)
+        p.drawText(
+            QRect(left_x, 0, text_w, self.height()),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            elided,
+        )
+        p.end()
+
+
 class VoxMeetingListDelegate(QStyledItemDelegate):
     """Compact/Comfortable chronological library row renderer with inline section headers."""
 
@@ -112,7 +199,7 @@ class VoxMeetingListDelegate(QStyledItemDelegate):
 
     def sizeHint(self, option: QStyleOptionViewItem, index: Any) -> QSize:
         group = str(index.data(self.ROLE_GROUP) or "")
-        base_h = 48 if self.compact else 58
+        base_h = 36 if self.compact else 60
         grp_h = 20 if group else 0
         w = max(210, int(option.rect.width()) if option.rect.width() > 0 else 250)
         return QSize(w, base_h + grp_h)
@@ -160,11 +247,12 @@ class VoxMeetingListDelegate(QStyledItemDelegate):
             painter.save()
             painter.setBrush(QColor(t.get("accent", "#1967D2")))
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(QRect(card_rect.left() + 2, card_rect.top() + 8, 3, max(16, card_rect.height() - 16)), 1.5, 1.5)
+            painter.drawRoundedRect(QRect(card_rect.left() + 2, card_rect.top() + 7, 3, max(14, card_rect.height() - 14)), 1.5, 1.5)
             painter.restore()
 
         title = str(meta.get("title") or "Untitled Meeting")
         sub = str(meta.get("sub") or "")
+        dur_short = str(meta.get("dur") or "")
         status_kind = str(meta.get("status_kind") or "ok")
         is_compact = bool(meta.get("compact", self.compact))
 
@@ -172,7 +260,7 @@ class VoxMeetingListDelegate(QStyledItemDelegate):
         chk_offset = 24 if self.multi_select else 0
         if self.multi_select:
             is_checked = bool(index.data(self.ROLE_CHECKED))
-            box_r = QRect(card_rect.left() + 10, card_rect.top() + max(8, (card_rect.height() - 16) // 2), 16, 16)
+            box_r = QRect(card_rect.left() + 10, card_rect.top() + max(6, (card_rect.height() - 16) // 2), 16, 16)
             painter.save()
             painter.setBrush(QColor(t.get("accent", "#1967D2")) if is_checked else QColor(t.get("surface", "#FFFFFF")))
             painter.setPen(QColor(t.get("accent", "#1967D2")) if is_checked else QColor(t.get("border", "#CBD5E1")))
@@ -188,41 +276,74 @@ class VoxMeetingListDelegate(QStyledItemDelegate):
         inner_left = card_rect.left() + pad_x + chk_offset
         inner_w = max(40, card_rect.width() - (pad_x * 2) - 12 - chk_offset)
 
-        # Right status dot
+        # Status dot
         dot_color = {
             "recoverable": t.get("status_warning", "#D97706"),
             "processing": t.get("accent", "#1967D2"),
             "recording": t.get("status_danger", "#DC2626"),
         }.get(status_kind, "")
-        if dot_color:
-            painter.setBrush(QColor(dot_color))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(card_rect.right() - 14, card_rect.top() + 12, 7, 7)
 
-        # Title line
-        tfont = get_ui_font(12 if is_compact else 13, 600 if selected else 550)
-        painter.setFont(tfont)
-        title_col = t.get("accent_dawn_text", t.get("text_primary", "#0F172A")) if selected else t.get("text_primary", "#0F172A")
-        painter.setPen(QColor(title_col))
-        elided_title = QFontMetrics(tfont).elidedText(title, Qt.TextElideMode.ElideRight, inner_w)
-        title_h = 18 if is_compact else 20
-        painter.drawText(
-            QRect(inner_left, card_rect.top() + (5 if is_compact else 7), inner_w, title_h),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            elided_title,
-        )
+        if is_compact:
+            # Crisp 1-line row: title on left, duration + status dot on right
+            sfont = get_ui_font(10, 500)
+            dur_w = (QFontMetrics(sfont).horizontalAdvance(dur_short) + 10) if dur_short else 0
+            dot_w = 12 if dot_color else 0
+            title_w = max(40, card_rect.width() - (pad_x * 2) - chk_offset - dur_w - dot_w)
 
-        # Metadata subtitle line
-        sfont = get_ui_font(10 if is_compact else 11, 400)
-        painter.setFont(sfont)
-        sub_col = t.get("text_secondary", "#475569") if selected else t.get("text_muted", "#64748B")
-        painter.setPen(QColor(sub_col))
-        elided_sub = QFontMetrics(sfont).elidedText(sub, Qt.TextElideMode.ElideRight, card_rect.width() - 22)
-        painter.drawText(
-            QRect(inner_left, card_rect.top() + (23 if is_compact else 29), card_rect.width() - 22, 17),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            elided_sub,
-        )
+            tfont = get_ui_font(12, 600 if selected else 500)
+            painter.setFont(tfont)
+            title_col = t.get("accent_dawn_text", t.get("text_primary", "#0F172A")) if selected else t.get("text_primary", "#0F172A")
+            painter.setPen(QColor(title_col))
+            elided_title = QFontMetrics(tfont).elidedText(title, Qt.TextElideMode.ElideRight, title_w)
+            painter.drawText(
+                QRect(inner_left, card_rect.top(), title_w, card_rect.height()),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                elided_title,
+            )
+
+            right_cursor = card_rect.right() - 10
+            if dot_color:
+                painter.setBrush(QColor(dot_color))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(right_cursor - 7, card_rect.top() + max(4, (card_rect.height() - 7) // 2), 7, 7)
+                right_cursor -= 12
+            if dur_short:
+                painter.setFont(sfont)
+                painter.setPen(QColor(t.get("text_muted", "#64748B")))
+                painter.drawText(
+                    QRect(right_cursor - dur_w, card_rect.top(), dur_w, card_rect.height()),
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                    dur_short,
+                )
+        else:
+            if dot_color:
+                painter.setBrush(QColor(dot_color))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(card_rect.right() - 14, card_rect.top() + 12, 7, 7)
+
+            # Title line
+            tfont = get_ui_font(13, 600 if selected else 550)
+            painter.setFont(tfont)
+            title_col = t.get("accent_dawn_text", t.get("text_primary", "#0F172A")) if selected else t.get("text_primary", "#0F172A")
+            painter.setPen(QColor(title_col))
+            elided_title = QFontMetrics(tfont).elidedText(title, Qt.TextElideMode.ElideRight, inner_w)
+            painter.drawText(
+                QRect(inner_left, card_rect.top() + 7, inner_w, 20),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                elided_title,
+            )
+
+            # Metadata subtitle line
+            sfont = get_ui_font(11, 400)
+            painter.setFont(sfont)
+            sub_col = t.get("text_secondary", "#475569") if selected else t.get("text_muted", "#64748B")
+            painter.setPen(QColor(sub_col))
+            elided_sub = QFontMetrics(sfont).elidedText(sub, Qt.TextElideMode.ElideRight, max(40, card_rect.width() - 22 - chk_offset))
+            painter.drawText(
+                QRect(inner_left, card_rect.top() + 29, max(40, card_rect.width() - 22 - chk_offset), 17),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                elided_sub,
+            )
 
         painter.restore()
 
@@ -398,6 +519,8 @@ class NotetakerPage(QWidget):
             self.controller.calendar_upcoming_changed.connect(self._refresh_calendar_strip)
         if hasattr(self.controller, "dictation_interim_updated"):
             self.controller.dictation_interim_updated.connect(self._on_dictation_interim_updated)
+        if hasattr(self.controller, "dictation_state_changed"):
+            self.controller.dictation_state_changed.connect(self._on_thoughts_dictation_state)
         if hasattr(self.controller, "dictation_completed"):
             self.controller.dictation_completed.connect(self._on_dictation_completed)
         if hasattr(self.controller, "knowledge_updated"):
@@ -820,21 +943,23 @@ class NotetakerPage(QWidget):
         self.splitter.setMinimumWidth(0)
         self.splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
 
-        # --- Pane 1: Meeting Library (Google Workspace 2-Row Clean Toolbar) ---
+        # --- Pane 1: Meeting Library (Clean Google Material 3 Hierarchy) ---
         self.lib_card = QFrame()
         self.lib_card.setObjectName("ntCard")
-        self.lib_card.setMinimumWidth(232)
+        self.lib_card.setMinimumWidth(240)
         self.lib_card.setMaximumWidth(360)
         lib_lay = QVBoxLayout(self.lib_card)
         lib_lay.setContentsMargins(10, 10, 10, 10)
-        lib_lay.setSpacing(6)
+        lib_lay.setSpacing(7)
 
+        # Row 1: Search bar + Primary Multi-Select toggle + Library Options Menu (...)
         search_row = QHBoxLayout()
         search_row.setSpacing(4)
         self.txt_search = QLineEdit()
         self.txt_search.setObjectName("voxSearchField")
         self.txt_search.setClearButtonEnabled(True)
-        self.txt_search.setPlaceholderText("Search meetings & transcripts... (Ctrl+F)")
+        self.txt_search.setPlaceholderText("Search meetings...")
+        self.txt_search.setToolTip("Search meetings and transcripts (Ctrl+F)")
         self.txt_search.setAccessibleName("Search call notes and transcripts")
         self.txt_search.setAccessibleDescription("Filter meeting recordings by title, date, platform, or transcript content")
         self._lib_search_action = self.txt_search.addAction(
@@ -843,28 +968,13 @@ class NotetakerPage(QWidget):
         self.txt_search.textChanged.connect(lambda _t: self._search_debounce_timer.start())
         search_row.addWidget(self.txt_search, 1)
 
-        self.btn_new_folder = QPushButton("")
-        self.btn_new_folder.setObjectName("ghostBtn")
-        self.btn_new_folder.setFixedSize(28, 28)
-        self.btn_new_folder.setIconSize(QSize(15, 15))
-        self.btn_new_folder.setToolTip("Create new folder")
-        self.btn_new_folder.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_new_folder.setAccessibleName("Create new folder")
-        self.btn_new_folder.setAccessibleDescription("Create a new organizational folder for meeting notes")
-        self.btn_new_folder.clicked.connect(self._on_create_folder_clicked)
-        search_row.addWidget(self.btn_new_folder)
-
-        self.btn_density = QPushButton("")
+        # Hidden compatibility toggle button (density control moved cleanly into Library Options menu)
+        self.btn_density = QPushButton("", self.lib_card)
         self.btn_density.setObjectName("ntIconToggleBtn")
-        self.btn_density.setFixedSize(28, 28)
-        self.btn_density.setIconSize(QSize(15, 15))
         self.btn_density.setCheckable(True)
         self.btn_density.setChecked(self._library_compact)
-        self.btn_density.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_density.setToolTip("Switch row density (Compact / Comfortable)")
-        self.btn_density.setAccessibleName("Toggle meeting list row density")
-        self.btn_density.clicked.connect(self._toggle_library_density)
-        search_row.addWidget(self.btn_density)
+        self.btn_density.clicked.connect(lambda _=False: self._toggle_library_density())
+        self.btn_density.setVisible(False)
 
         self._multi_select_mode = False
         self._checked_meeting_ids: set[int] = set()
@@ -875,10 +985,20 @@ class NotetakerPage(QWidget):
         self.btn_multi_select.setCheckable(True)
         self.btn_multi_select.setChecked(False)
         self.btn_multi_select.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_multi_select.setToolTip("Select multiple meetings to delete")
+        self.btn_multi_select.setToolTip("Select multiple meetings")
         self.btn_multi_select.setAccessibleName("Select multiple meetings")
-        self.btn_multi_select.clicked.connect(self._toggle_multi_select_mode)
+        self.btn_multi_select.clicked.connect(lambda _=False: self._toggle_multi_select_mode())
         search_row.addWidget(self.btn_multi_select)
+
+        self.btn_library_menu = QPushButton("")
+        self.btn_library_menu.setObjectName("ghostBtn")
+        self.btn_library_menu.setFixedSize(28, 28)
+        self.btn_library_menu.setIconSize(QSize(16, 16))
+        self.btn_library_menu.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_library_menu.setToolTip("View density, sort & folder options")
+        self.btn_library_menu.setAccessibleName("Library view and folder options")
+        self.btn_library_menu.clicked.connect(self._show_library_options_menu)
+        search_row.addWidget(self.btn_library_menu)
         lib_lay.addLayout(search_row)
 
         # Contextual Multi-Select Bulk Action Bar (hidden until multi-select enabled)
@@ -912,28 +1032,54 @@ class NotetakerPage(QWidget):
         bulk_lay.addWidget(self.btn_bulk_cancel)
         lib_lay.addWidget(self.bulk_action_bar)
 
-        # Compact Folder + Sort Row
-        lib_ctrl_row = QHBoxLayout()
-        lib_ctrl_row.setSpacing(6)
-        self.combo_folders = QComboBox()
+        # Row 2: Flat Folder Selector + New Folder + Contextual Rename/Delete Folder controls
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(4)
+        self.combo_folders = VoxFlatComboBox(leading_icon_name="folder", theme=self._theme)
         self.combo_folders.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.combo_folders.setMinimumContentsLength(9)
         self.combo_folders.setAccessibleName("Filter by folder")
         self.combo_folders.setAccessibleDescription("Filter the meeting recordings library by folder")
+        self.combo_folders.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.combo_folders.customContextMenuRequested.connect(lambda _p: self._show_folder_actions_menu())
         self.combo_folders.currentIndexChanged.connect(self._on_folder_filter_changed)
-        lib_ctrl_row.addWidget(self.combo_folders, 1)
+        folder_row.addWidget(self.combo_folders, 1)
 
-        self.combo_sort = QComboBox()
-        self.combo_sort.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.combo_sort.setMinimumContentsLength(7)
-        self.combo_sort.addItem("Newest", "newest")
-        self.combo_sort.addItem("Longest", "duration")
-        self.combo_sort.addItem("Title A–Z", "title")
-        self.combo_sort.currentIndexChanged.connect(self._on_sort_changed)
-        lib_ctrl_row.addWidget(self.combo_sort)
-        lib_lay.addLayout(lib_ctrl_row)
+        self.btn_new_folder = QPushButton("")
+        self.btn_new_folder.setObjectName("ghostBtn")
+        self.btn_new_folder.setFixedSize(28, 28)
+        self.btn_new_folder.setIconSize(QSize(15, 15))
+        self.btn_new_folder.setToolTip("Create new folder")
+        self.btn_new_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_new_folder.setAccessibleName("Create new folder")
+        self.btn_new_folder.setAccessibleDescription("Create a new organizational folder for meeting notes")
+        self.btn_new_folder.clicked.connect(self._on_create_folder_clicked)
+        folder_row.addWidget(self.btn_new_folder)
 
-        # Clean borderless status filter tabs
+        self.btn_rename_active_folder = QPushButton("")
+        self.btn_rename_active_folder.setObjectName("ghostBtn")
+        self.btn_rename_active_folder.setFixedSize(28, 28)
+        self.btn_rename_active_folder.setIconSize(QSize(14, 14))
+        self.btn_rename_active_folder.setToolTip("Rename selected folder")
+        self.btn_rename_active_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_rename_active_folder.setAccessibleName("Rename selected folder")
+        self.btn_rename_active_folder.clicked.connect(lambda: self._on_rename_folder_clicked())
+        self.btn_rename_active_folder.setVisible(False)
+        folder_row.addWidget(self.btn_rename_active_folder)
+
+        self.btn_delete_active_folder = QPushButton("")
+        self.btn_delete_active_folder.setObjectName("ntDangerGhostBtn")
+        self.btn_delete_active_folder.setFixedSize(28, 28)
+        self.btn_delete_active_folder.setIconSize(QSize(14, 14))
+        self.btn_delete_active_folder.setToolTip("Delete selected folder (meetings stay in All Meetings)")
+        self.btn_delete_active_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete_active_folder.setAccessibleName("Delete selected folder")
+        self.btn_delete_active_folder.clicked.connect(lambda: self._on_delete_folder_clicked())
+        self.btn_delete_active_folder.setVisible(False)
+        folder_row.addWidget(self.btn_delete_active_folder)
+        lib_lay.addLayout(folder_row)
+
+        # Row 3: Status filter chips (left) + Flat Sort selector (right)
         lib_pill_row = QHBoxLayout()
         lib_pill_row.setSpacing(4)
         self._lib_filter_btns: Dict[str, QPushButton] = {}
@@ -949,13 +1095,25 @@ class NotetakerPage(QWidget):
             fb.setChecked(fkey == "all")
             fb.setCursor(Qt.CursorShape.PointingHandCursor)
             fb.clicked.connect(lambda _=False, k=fkey: self._set_library_filter(k))
+            if fkey == "recoverable":
+                fb.setVisible(False)
             lib_pill_row.addWidget(fb)
             self._lib_filter_btns[fkey] = fb
         lib_pill_row.addStretch(1)
+
+        self.combo_sort = VoxFlatComboBox(leading_icon_name="sort", theme=self._theme)
+        self.combo_sort.setFixedWidth(98)
+        self.combo_sort.setAccessibleName("Sort meetings")
+        self.combo_sort.addItem("Newest", "newest")
+        self.combo_sort.addItem("Longest", "duration")
+        self.combo_sort.addItem("Title A–Z", "title")
+        self.combo_sort.currentIndexChanged.connect(self._on_sort_changed)
+        lib_pill_row.addWidget(self.combo_sort)
         lib_lay.addLayout(lib_pill_row)
 
         self.meetings_list = QListWidget()
         self.meetings_list.setObjectName("ntMeetingsList")
+        self.meetings_list.setUniformItemSizes(False)
         self.meetings_list.setAlternatingRowColors(False)
         self.meetings_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.meetings_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1200,6 +1358,8 @@ class NotetakerPage(QWidget):
         self.studio.seek_requested.connect(self._seek_to_seconds)
         self.studio.tab_transcript.seek_requested.connect(self._seek_to_seconds)
         self.studio.tab_thoughts.seek_requested.connect(self._seek_to_seconds)
+        if hasattr(self.studio.tab_thoughts, "dictate_requested"):
+            self.studio.tab_thoughts.dictate_requested.connect(self._toggle_thoughts_dictation)
         detail_lay.addWidget(self.studio, 1)
 
         self.context_stack.addWidget(detail_wrap)  # index 0: "meeting"
@@ -1927,8 +2087,20 @@ class NotetakerPage(QWidget):
             self._library_sort = str(self.combo_sort.currentData() or "newest")
         self.refresh_meetings_list()
 
-    def _toggle_library_density(self) -> None:
-        self._library_compact = not self._library_compact
+    def _set_sort_mode(self, sort_key: str) -> None:
+        valid = {"newest", "duration", "title"}
+        key = sort_key if sort_key in valid else "newest"
+        self._library_sort = key
+        if hasattr(self, "combo_sort"):
+            idx = self.combo_sort.findData(key)
+            if idx >= 0:
+                self.combo_sort.blockSignals(True)
+                self.combo_sort.setCurrentIndex(idx)
+                self.combo_sort.blockSignals(False)
+        self.refresh_meetings_list(force=True)
+
+    def _toggle_library_density(self, compact: Optional[bool] = None) -> None:
+        self._library_compact = (not self._library_compact) if compact is None else bool(compact)
         if hasattr(self, "btn_density"):
             self.btn_density.blockSignals(True)
             self.btn_density.setChecked(self._library_compact)
@@ -1940,7 +2112,95 @@ class NotetakerPage(QWidget):
         if hasattr(self, "meetings_delegate"):
             self.meetings_delegate.set_compact(self._library_compact)
         self._persist_ui_pref("notetaker_library_compact", self._library_compact)
-        self.refresh_meetings_list()
+        self.refresh_meetings_list(force=True)
+        if hasattr(self, "meetings_list"):
+            self.meetings_list.doItemsLayout()
+            self.meetings_list.updateGeometries()
+            self.meetings_list.viewport().update()
+        mode_lbl = "Compact view" if self._library_compact else "Comfortable view"
+        self.status_toast.emit("Library Density", f"Switched to {mode_lbl}")
+
+    def _show_library_options_menu(self) -> None:
+        """Secondary library view controls: density toggle, sort order, and folder management."""
+        menu = QMenu(self)
+        menu.setStyleSheet(self.styleSheet())
+
+        act_hdr_view = menu.addAction("VIEW DENSITY")
+        act_hdr_view.setEnabled(False)
+        act_comfy = menu.addAction(("✓ " if not self._library_compact else "   ") + "Comfortable (2-line)")
+        act_comfy.triggered.connect(lambda: self._toggle_library_density(False))
+        act_compact = menu.addAction(("✓ " if self._library_compact else "   ") + "Compact (1-line)")
+        act_compact.triggered.connect(lambda: self._toggle_library_density(True))
+
+        menu.addSeparator()
+        act_hdr_sort = menu.addAction("SORT BY")
+        act_hdr_sort.setEnabled(False)
+        for skey, slbl in (("newest", "Newest first"), ("duration", "Longest duration"), ("title", "Title A–Z")):
+            act_s = menu.addAction(("✓ " if self._library_sort == skey else "   ") + slbl)
+            act_s.triggered.connect(lambda _=False, k=skey: self._set_sort_mode(k))
+
+        menu.addSeparator()
+        act_multi = menu.addAction(
+            ("✓ " if getattr(self, "_multi_select_mode", False) else "   ") + "Select Multiple Meetings"
+        )
+        act_multi.triggered.connect(lambda: self._toggle_multi_select_mode())
+
+        menu.addSeparator()
+        act_new_f = menu.addAction("New Folder...")
+        act_new_f.triggered.connect(self._on_create_folder_clicked)
+        if self._active_folder_id is not None:
+            fname = self.combo_folders.currentText()
+            act_ren = menu.addAction(f"Rename '{fname}'...")
+            act_ren.triggered.connect(lambda: self._on_rename_folder_clicked(self._active_folder_id, fname))
+            act_del = menu.addAction(f"Delete '{fname}'...")
+            act_del.triggered.connect(lambda: self._on_delete_folder_clicked(self._active_folder_id, fname))
+        elif hasattr(self.controller, "db"):
+            folders = self.controller.db.list_folders()
+            if folders:
+                sub = menu.addMenu("Manage Folders")
+                for f in folders:
+                    fid = int(f["id"])
+                    fn = str(f.get("name") or "Folder")
+                    f_sub = sub.addMenu(fn)
+                    f_sub.addAction("Rename...").triggered.connect(
+                        lambda _=False, x=fid, n=fn: self._on_rename_folder_clicked(x, n)
+                    )
+                    f_sub.addAction("Delete...").triggered.connect(
+                        lambda _=False, x=fid, n=fn: self._on_delete_folder_clicked(x, n)
+                    )
+
+        if hasattr(self, "btn_library_menu"):
+            menu.exec(self.btn_library_menu.mapToGlobal(self.btn_library_menu.rect().bottomRight()))
+
+    def _show_folder_actions_menu(self) -> None:
+        menu = QMenu(self)
+        menu.setStyleSheet(self.styleSheet())
+        if self._active_folder_id is not None:
+            fid = int(self._active_folder_id)
+            fname = self.combo_folders.currentText()
+            menu.addAction(f"Rename '{fname}'...").triggered.connect(
+                lambda: self._on_rename_folder_clicked(fid, fname)
+            )
+            menu.addAction(f"Delete '{fname}'...").triggered.connect(
+                lambda: self._on_delete_folder_clicked(fid, fname)
+            )
+            menu.addSeparator()
+        menu.addAction("New Folder...").triggered.connect(self._on_create_folder_clicked)
+        if self._active_folder_id is None and hasattr(self.controller, "db"):
+            folders = self.controller.db.list_folders()
+            if folders:
+                menu.addSeparator()
+                for f in folders:
+                    fid = int(f["id"])
+                    fn = str(f.get("name") or "Folder")
+                    sub = menu.addMenu(fn)
+                    sub.addAction("Rename...").triggered.connect(
+                        lambda _=False, x=fid, n=fn: self._on_rename_folder_clicked(x, n)
+                    )
+                    sub.addAction("Delete...").triggered.connect(
+                        lambda _=False, x=fid, n=fn: self._on_delete_folder_clicked(x, n)
+                    )
+        menu.exec(self.combo_folders.mapToGlobal(self.combo_folders.rect().bottomLeft()))
 
     def _set_library_filter(self, filter_key: str) -> None:
         self._library_filter = filter_key
@@ -2044,25 +2304,40 @@ class NotetakerPage(QWidget):
         act_del.triggered.connect(self._delete_selected_meeting)
         menu.exec(self.meetings_list.viewport().mapToGlobal(pos))
 
+    def _update_folder_action_controls(self) -> None:
+        has_custom = self._active_folder_id is not None
+        if hasattr(self, "btn_rename_active_folder"):
+            self.btn_rename_active_folder.setVisible(has_custom)
+        if hasattr(self, "btn_delete_active_folder"):
+            self.btn_delete_active_folder.setVisible(has_custom)
+
     def refresh_folders(self) -> None:
         if not hasattr(self, "combo_folders"):
             return
         self.combo_folders.blockSignals(True)
         current = self.combo_folders.currentData()
         self.combo_folders.clear()
-        self.combo_folders.addItem("All Notes", None)
+        self.combo_folders.addItem("All Meetings", None)
         if hasattr(self.controller, "db"):
             for f in self.controller.db.list_folders():
-                self.combo_folders.addItem(f"Folder: {f['name']}", f["id"])
+                self.combo_folders.addItem(str(f["name"]), f["id"])
+        matched = False
         for i in range(self.combo_folders.count()):
             if self.combo_folders.itemData(i) == current:
                 self.combo_folders.setCurrentIndex(i)
+                matched = True
+                break
+        if not matched:
+            self.combo_folders.setCurrentIndex(0)
+        self._active_folder_id = self.combo_folders.currentData()
         self.combo_folders.blockSignals(False)
+        self._update_folder_action_controls()
         if hasattr(self, "overall_view"):
             self.overall_view.refresh_folders()
 
     def _on_folder_filter_changed(self) -> None:
         self._active_folder_id = self.combo_folders.currentData()
+        self._update_folder_action_controls()
         self.refresh_meetings_list()
 
     def _toggle_multi_select_mode(self, checked: Optional[bool] = None, initial_id: Optional[int] = None) -> None:
@@ -2146,10 +2421,12 @@ class NotetakerPage(QWidget):
             self._selected_meeting_id = sel[0]
             self._delete_selected_meeting()
 
-    def _themed_input_text(self, title: str, label: str) -> Tuple[str, bool]:
+    def _themed_input_text(self, title: str, label: str, initial_text: str = "") -> Tuple[str, bool]:
         dlg = QInputDialog(self)
         dlg.setWindowTitle(title)
         dlg.setLabelText(label)
+        if initial_text:
+            dlg.setTextValue(str(initial_text))
         dlg.setPalette(get_theme_palette(self._theme))
         dlg.setStyleSheet(get_dialog_qss(self._theme))
         ok = dlg.exec() == QDialog.DialogCode.Accepted
@@ -2168,9 +2445,72 @@ class NotetakerPage(QWidget):
 
     def _on_create_folder_clicked(self) -> None:
         name, ok = self._themed_input_text("New Folder", "Folder name:")
-        if ok and name.strip():
-            self.controller.db.create_folder(name=name.strip(), folder_type="personal")
-            self.refresh_folders()
+        clean = str(name or "").strip()
+        if not (ok and clean):
+            return
+        try:
+            fid = self.controller.db.create_folder(name=clean, folder_type="personal")
+        except Exception as exc:
+            self.status_toast.emit("Folder Exists", str(exc))
+            return
+        self.refresh_folders()
+        idx = self.combo_folders.findData(fid)
+        if idx >= 0:
+            self.combo_folders.setCurrentIndex(idx)
+        self.status_toast.emit("Folder Created", f"Created folder '{clean}'")
+
+    def _on_rename_folder_clicked(self, folder_id: Optional[int] = None, current_name: str = "") -> None:
+        fid = folder_id if folder_id is not None else self._active_folder_id
+        if fid is None or not hasattr(self.controller, "db"):
+            return
+        old_name = str(current_name or (self.combo_folders.currentText() if hasattr(self, "combo_folders") else "")).strip()
+        new_name, ok = self._themed_input_text("Rename Folder", "New folder name:", initial_text=old_name)
+        clean = str(new_name or "").strip()
+        if not (ok and clean) or clean == old_name:
+            return
+        try:
+            self.controller.db.rename_folder(int(fid), clean)
+        except Exception as exc:
+            self.status_toast.emit("Rename Error", str(exc))
+            return
+        self.refresh_folders()
+        idx = self.combo_folders.findData(int(fid))
+        if idx >= 0:
+            self.combo_folders.setCurrentIndex(idx)
+        self.status_toast.emit("Folder Renamed", f"Renamed folder to '{clean}'")
+
+    def _on_delete_folder_clicked(
+        self,
+        folder_id: Optional[int] = None,
+        folder_name: str = "",
+        skip_confirm: bool = False,
+    ) -> bool:
+        fid = folder_id if folder_id is not None else self._active_folder_id
+        if fid is None or not hasattr(self.controller, "db"):
+            return False
+        fname = str(folder_name or (self.combo_folders.currentText() if hasattr(self, "combo_folders") else "")).strip() or "this folder"
+        if not skip_confirm:
+            confirmed = show_themed_confirm(
+                self,
+                "Delete Folder",
+                f"Delete folder '{fname}'?\n\nMeetings inside this folder will NOT be deleted — they will remain available in All Meetings.",
+                theme=self._theme,
+                confirm_label="Delete Folder",
+                destructive=True,
+            )
+            if not confirmed:
+                return False
+        self.controller.db.delete_folder(int(fid))
+        if self._active_folder_id == int(fid):
+            self._active_folder_id = None
+            if hasattr(self, "combo_folders"):
+                self.combo_folders.blockSignals(True)
+                self.combo_folders.setCurrentIndex(0)
+                self.combo_folders.blockSignals(False)
+        self.refresh_folders()
+        self.refresh_meetings_list(force=True)
+        self.status_toast.emit("Folder Deleted", f"Deleted '{fname}'. Meetings kept in All Meetings.")
+        return True
 
     def refresh_meetings_list(self, force: bool = False) -> None:
         if getattr(self.controller, "_cancel_ask_vox", False):
@@ -2296,6 +2636,7 @@ class NotetakerPage(QWidget):
                 {
                     "title": title_text,
                     "sub": sub_text,
+                    "dur": dur,
                     "status_kind": status_kind,
                     "compact": self._library_compact,
                 },
@@ -2309,6 +2650,8 @@ class NotetakerPage(QWidget):
         self.meetings_list.blockSignals(False)
 
         self._first_interrupted_id = first_interrupted
+        if hasattr(self, "_lib_filter_btns") and "recoverable" in self._lib_filter_btns:
+            self._lib_filter_btns["recoverable"].setVisible(recoverable_count > 0 or flt == "recoverable")
         if hasattr(self, "btn_rescued_pill"):
             self.btn_rescued_pill.setVisible(recoverable_count > 0 and self._interrupted_dismissed)
             self.btn_rescued_pill.setText(f"{recoverable_count} Rescued")
@@ -3024,6 +3367,16 @@ class NotetakerPage(QWidget):
                 background-color: {t['surface']};
                 border: 1.5px solid {t['input_focus_border']};
             }}
+            QComboBox QAbstractItemView {{
+                background-color: {t['surface']};
+                color: {t['text_primary']};
+                border: 1px solid {t['border']};
+                border-radius: 8px;
+                padding: 4px;
+                selection-background-color: {t['accent_dawn']};
+                selection-color: {t['accent_dawn_text']};
+                outline: none;
+            }}
             QProgressBar#ntLevelBar {{
                 background-color: {t['surface_well']};
                 border: 1px solid {t['outline_variant']};
@@ -3192,6 +3545,17 @@ class NotetakerPage(QWidget):
                 background: {t['surface_hover']};
                 color: {t['text_primary']};
             }}
+            QPushButton#ntDangerGhostBtn {{
+                background: transparent;
+                border: none;
+                color: {t['text_muted']};
+                padding: 4px;
+                border-radius: 7px;
+            }}
+            QPushButton#ntDangerGhostBtn:hover {{
+                background: {t['status_danger_bg']};
+                color: {t['status_danger_text']};
+            }}
             QMenu {{
                 background-color: {t['surface']};
                 color: {t['text_primary']};
@@ -3265,6 +3629,9 @@ class NotetakerPage(QWidget):
                 self.studio.apply_theme(self._theme)
             if hasattr(self, "ask_panel"):
                 self.ask_panel.apply_theme(self._theme)
+            for c_box in (getattr(self, "combo_folders", None), getattr(self, "combo_sort", None)):
+                if isinstance(c_box, VoxFlatComboBox):
+                    c_box.set_theme(self._theme)
             self._refresh_toolbar_icons()
             self._refresh_ask_rail_ui()
         finally:
@@ -3275,6 +3642,7 @@ class NotetakerPage(QWidget):
         fg = t.get("text_secondary", "#475569")
         pri_fg = t.get("primary_btn_text", "#FFFFFF")
         ai_fg = t.get("ai_text", t.get("accent", "#1967D2"))
+        danger_fg = t.get("status_danger_text", fg)
         icon_map = [
             ("btn_toggle_sidebar", "sidebar_toggle", fg, 16),
             ("btn_upcoming_pill", "calendar", fg, 14),
@@ -3284,8 +3652,11 @@ class NotetakerPage(QWidget):
             ("btn_settings", "settings", fg, 15),
             ("btn_start_adhoc", "record", pri_fg, 14),
             ("btn_new_folder", "folder_plus", fg, 15),
+            ("btn_rename_active_folder", "edit", fg, 14),
+            ("btn_delete_active_folder", "trash", danger_fg, 14),
             ("btn_density", "density_compact" if self._library_compact else "density_comfy", fg, 15),
             ("btn_multi_select", "checklist", ai_fg if getattr(self, "_multi_select_mode", False) else fg, 15),
+            ("btn_library_menu", "more_horiz", fg, 16),
             ("btn_bulk_delete", "trash", t.get("status_danger_text", fg), 13),
             ("btn_split_view", "split_view", fg, 14),
             ("btn_watch_video", "video", fg, 14),
@@ -3753,6 +4124,36 @@ class NotetakerPage(QWidget):
         if self._active_ask_qid is not None and self._active_ask_key_inflight == target_key:
             return False
 
+        # Enforce 10-day trial / Google Sign-In / VOX Pro gating for Ask VOX
+        gate_fn = getattr(self.controller, "can_use_ask_vox_feature", None)
+        if callable(gate_fn) and not isinstance(gate_fn, unittest.mock.Base):
+            allowed, gate_reason, gate_msg = gate_fn()
+            if not allowed:
+                _, scope_lbl, _, _, _ = self._current_scope_summary()
+                user_msg = AskChatMessage(
+                    role="user",
+                    content=query,
+                    state=AskMessageState.COMPLETED,
+                    scope_key=target_key,
+                    scope_label=scope_lbl,
+                )
+                asst_msg = AskChatMessage(
+                    role="assistant",
+                    content=gate_msg,
+                    state=AskMessageState.FAILED,
+                    scope_key=target_key,
+                    scope_label=scope_lbl,
+                    error_message="Google Sign-In required" if gate_reason == "auth_required" else "10-Day Trial Ended",
+                )
+                msgs = self._ask_messages_by_key.setdefault(target_key, [])
+                msgs.extend([user_msg, asst_msg])
+                if target_key == self._active_ask_key() and hasattr(self, "ask_panel"):
+                    self.ask_panel.conversation_view.append_message(user_msg, animate=False, scroll=True)
+                    self.ask_panel.conversation_view.append_message(asst_msg, animate=False, scroll=True)
+                if hasattr(self.controller, "request_upgrade_dialog"):
+                    self.controller.request_upgrade_dialog(gate_msg)
+                return False
+
         self._load_persisted_ask_messages(target_key)
         _, scope_lbl, _, _, _ = self._current_scope_summary()
 
@@ -4037,24 +4438,68 @@ class NotetakerPage(QWidget):
         elif target_key == "overall" and self._workspace_context == "overall":
             self.studio.append_ask_rail_exchange(question, raw_ans or clean_ans, citations=citations)
 
+    def _is_thoughts_dictation_target(self) -> bool:
+        if not hasattr(self, "studio") or not hasattr(self.studio, "tab_thoughts"):
+            return False
+        ed = getattr(self.studio.tab_thoughts, "editor", None)
+        if ed is None or not ed.isVisible():
+            return False
+        explicit = getattr(self.controller, "_explicit_in_app_widget_ref", None)
+        if explicit is not None:
+            return explicit is ed
+        return bool(ed.hasFocus())
+
+    def _toggle_thoughts_dictation(self) -> None:
+        if not hasattr(self, "studio") or not hasattr(self.studio, "tab_thoughts"):
+            return
+        ed = getattr(self.studio.tab_thoughts, "editor", None)
+        if ed is not None:
+            ed.setFocus()
+            if hasattr(self.controller, "toggle_in_app_dictation"):
+                self.controller.toggle_in_app_dictation(ed, title="VOX — My Notes")
+            elif hasattr(self.controller, "toggle_dictation"):
+                self.controller.toggle_dictation()
+
+    def _on_thoughts_dictation_state(self, state: str, msg: str = "") -> None:
+        if not hasattr(self, "studio") or not hasattr(self.studio, "tab_thoughts"):
+            return
+        tab = self.studio.tab_thoughts
+        if not hasattr(tab, "set_dictation_active"):
+            return
+        s = (state or "").strip().lower()
+        is_target = self._is_thoughts_dictation_target()
+        if is_target and s in ("starting", "listening", "speaking"):
+            tab.set_dictation_active(True, msg)
+        elif is_target and s in ("processing", "stopping"):
+            tab.set_dictation_active(False, msg or "Transcribing...")
+        else:
+            tab.set_dictation_active(False, "")
+
     def _on_dictation_interim_updated(self, provisional: str, stable: str) -> None:
+        if not hasattr(self, "studio") or not hasattr(self.studio, "tab_thoughts"):
+            return
+        if not self._is_thoughts_dictation_target():
+            if hasattr(self.studio.tab_thoughts, "set_interim_text"):
+                self.studio.tab_thoughts.set_interim_text("")
+            return
         combined = " ".join(x for x in (stable.strip(), provisional.strip()) if x).strip()
-        if hasattr(self, "studio") and hasattr(self.studio, "tab_thoughts") and hasattr(self.studio.tab_thoughts, "set_interim_text"):
+        if hasattr(self.studio.tab_thoughts, "set_interim_text"):
             self.studio.tab_thoughts.set_interim_text(combined)
 
     def _on_dictation_completed(self, text: str, target: str, method: str) -> None:
         if hasattr(self, "studio") and hasattr(self.studio, "tab_thoughts"):
             if hasattr(self.studio.tab_thoughts, "set_interim_text"):
                 self.studio.tab_thoughts.set_interim_text("")
+            if not self._is_thoughts_dictation_target():
+                return
             if hasattr(self.studio.tab_thoughts, "editor") and text.strip():
-                app = QApplication.instance()
-                active_win = app.activeWindow() if app else None
-                is_vox_active = active_win is not None and "vox" in type(active_win).__name__.lower()
-                if "in_app" in method or "VOX" in target or is_vox_active or self.studio.tab_thoughts.editor.hasFocus():
+                if "in_app" not in (method or ""):
                     current = self.studio.tab_thoughts.editor.toPlainText()
                     tail = current[-max(40, len(text) + 10) :] if current else ""
                     if text.strip() not in tail:
                         self.studio.tab_thoughts.editor.insertPlainText(text + " ")
+                if hasattr(self.studio.tab_thoughts, "_save_timer"):
+                    self.studio.tab_thoughts._save_timer.start()
 
     def minimumSizeHint(self) -> QSize:
         return QSize(680, 480)

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import datetime
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import threading
@@ -42,11 +43,14 @@ DEFAULT_ENTITLEMENT_VERIFY_KEY = DEFAULT_ENTITLEMENT_PUBLIC_KEY  # Backward comp
 MAX_OFFLINE_GRACE_HOURS = 72.0
 
 FREE_DEFAULT_LIMITS = {
-    "dictation_words_weekly": 3000,
-    "meeting_minutes_weekly": 180.0,
-    "meeting_sessions_weekly": 5,
-    "meeting_session_cap_min": 90.0,
-    "ask_vox_queries_weekly": 10,
+    "dictation_words_weekly": None,
+    "meeting_minutes_weekly": None,
+    "meeting_sessions_weekly": None,
+    "meeting_session_cap_min": None,
+    "ask_vox_queries_weekly": 0,
+    "allow_meeting_overrun": True,
+    "allow_ai_summary_and_ask": False,
+    "trial_days": 10,
 }
 
 PRO_DEFAULT_LIMITS: Dict[str, Any] = {
@@ -56,12 +60,16 @@ PRO_DEFAULT_LIMITS: Dict[str, Any] = {
     "meeting_session_cap_min": None,
     "ask_vox_queries_weekly": None,
     "allow_meeting_overrun": True,
+    "allow_ai_summary_and_ask": True,
+    "trial_days": 10,
 }
 
 FREE_DEFAULT_FEATURES = [
     "dictation",
+    "unlimited_words",
     "dual_track_recording",
-    "meeting_summaries",
+    "unlimited_meetings",
+    "meeting_transcription",
     "local_vocabulary",
     "grey_text_preview",
 ]
@@ -82,8 +90,8 @@ PRO_DEFAULT_FEATURES = [
 @dataclass
 class EntitlementState:
     user_id: str = "default"
-    plan_code: str = "free"               # "free", "pro_monthly", "pro_annual"
-    status: str = "active"                # "active", "past_due", "expired", "offline_grace"
+    plan_code: str = "free"               # "free", "trial_10d", "free_expired", "pro_monthly", "pro_annual"
+    status: str = "active"                # "active", "past_due", "expired", "offline_grace", "trial"
     is_pro: bool = False
     enabled_features: List[str] = field(default_factory=lambda: list(FREE_DEFAULT_FEATURES))
     usage_limits: Dict[str, Any] = field(default_factory=lambda: dict(FREE_DEFAULT_LIMITS))
@@ -92,6 +100,13 @@ class EntitlementState:
     last_verified_at_utc: str = ""
     offline_hours_remaining: float = MAX_OFFLINE_GRACE_HOURS
     is_offline_expired: bool = False
+    trial_started_at_utc: str = ""
+    trial_ends_at_utc: str = ""
+    trial_active: bool = False
+    trial_days_remaining: int = 0
+    allow_ai_summary_and_ask: bool = False
+    has_verified_token: bool = False
+    max_seen_utc: str = ""
 
 
 def normalize_public_key(key_input: str | bytes) -> bytes:
@@ -228,9 +243,9 @@ MASTER_DEVELOPER_USER_IDS = {
 
 def is_master_developer(user_id: Optional[str] = None, email: Optional[str] = None) -> bool:
     """
-    Check if the given user ID or email belongs to Founder (Milind) or any
-    employee / stakeholder of World Fashion Exchange (worldfashionexchange.com).
-    All these users receive permanent, full Pro access by default.
+    Check if the given user ID or email belongs to Founder (Milind) or an authorized
+    corporate domain user of World Fashion Exchange (worldfashionexchange.com).
+    Only exact emails, exact UUIDs, or exact @worldfashionexchange.com domain qualify.
     """
     if user_id and str(user_id).strip().lower() in MASTER_DEVELOPER_USER_IDS:
         return True
@@ -239,7 +254,7 @@ def is_master_developer(user_id: Optional[str] = None, email: Optional[str] = No
     em = str(email).strip().lower()
     if em in MASTER_DEVELOPER_EMAILS:
         return True
-    if em.endswith("@worldfashionexchange.com") or "worldfashionexchange" in em or em.endswith("wfx@gmail.com"):
+    if "@" in em and em.split("@", 1)[1] == "worldfashionexchange.com":
         return True
     return False
 
@@ -259,6 +274,7 @@ class EntitlementManager:
         env_key = os.environ.get("VOX_ENTITLEMENT_PUBLIC_KEY", os.environ.get("VOX_ENTITLEMENT_VERIFY_KEY"))
         self.verify_key = env_key if env_key else verify_key
 
+        self._use_system_clock_anchor: bool = cache_file is None
         if cache_file is None:
             root = get_app_root()
             self.cache_file = root / "data" / "entitlement.vault"
@@ -267,8 +283,75 @@ class EntitlementManager:
 
         self._active_user_id: str = "default"
         self._active_email: str = ""
+        self._max_seen_utc: str = self._read_registry_clock_anchor() if self._use_system_clock_anchor else ""
         self._current_state = EntitlementState()
         self._load_cached_entitlement()
+
+    @staticmethod
+    def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime.datetime]:
+        s = (raw or "").strip()
+        if not s:
+            return None
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return dt.astimezone(datetime.timezone.utc)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _read_registry_clock_anchor() -> str:
+        if os.name != "nt":
+            return ""
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\VOXLocal", 0, winreg.KEY_READ) as key:
+                val, _ = winreg.QueryValueEx(key, "ClockAnchor")
+                return str(val or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _write_registry_clock_anchor(iso_utc: str) -> None:
+        if os.name != "nt" or not iso_utc:
+            return
+        try:
+            import winreg
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\VOXLocal") as key:
+                winreg.SetValueEx(key, "ClockAnchor", 0, winreg.REG_SZ, str(iso_utc))
+        except Exception:
+            pass
+
+    def _record_clock_observation(self, *candidates: Optional[datetime.datetime]) -> datetime.datetime:
+        best = self._parse_iso_utc(self._max_seen_utc)
+        for cand in candidates:
+            if cand is not None:
+                c = cand.astimezone(datetime.timezone.utc) if cand.tzinfo else cand.replace(tzinfo=datetime.timezone.utc)
+                if best is None or c > best:
+                    best = c
+        if best is None:
+            best = datetime.datetime.now(datetime.timezone.utc)
+        self._max_seen_utc = best.isoformat()
+        if self._use_system_clock_anchor:
+            self._write_registry_clock_anchor(self._max_seen_utc)
+        return best
+
+    def _is_clock_tampered(self, now_dt: Optional[datetime.datetime] = None) -> bool:
+        now = now_dt or datetime.datetime.now(datetime.timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=datetime.timezone.utc)
+        else:
+            now = now.astimezone(datetime.timezone.utc)
+        anchor = self._parse_iso_utc(self._max_seen_utc or self._current_state.max_seen_utc)
+        if anchor is not None and (now - anchor).total_seconds() < -3600.0:
+            return True
+        last_ver = self._parse_iso_utc(self._current_state.last_verified_at_utc)
+        if last_ver is not None and (now - last_ver).total_seconds() < -3600.0:
+            return True
+        return False
 
     def _load_cached_entitlement(self) -> None:
         with self.lock:
@@ -282,6 +365,8 @@ class EntitlementManager:
                 data = json.loads(decrypted.decode("utf-8"))
                 token = data.get("token", "")
                 last_verified_str = data.get("last_verified_at_utc", "")
+                if data.get("max_seen_utc"):
+                    self._record_clock_observation(self._parse_iso_utc(data.get("max_seen_utc")))
 
                 valid, payload, err = verify_and_decode_entitlement_token(token, self.verify_key)
                 if not valid or not payload:
@@ -299,7 +384,6 @@ class EntitlementManager:
         user_id = str(payload.get("user_id", "default"))
         plan = str(payload.get("plan_code", payload.get("plan", "free"))).lower()
 
-        # Handle features field
         features_raw = payload.get("enabled_features")
         if features_raw is not None and isinstance(features_raw, list):
             features = list(features_raw)
@@ -308,11 +392,9 @@ class EntitlementManager:
         else:
             features = list(FREE_DEFAULT_FEATURES)
 
-        # Handle limits field
         limits_raw = payload.get("usage_limits", payload.get("limits", {}))
         limits = dict(limits_raw) if isinstance(limits_raw, dict) else dict(FREE_DEFAULT_LIMITS)
 
-        # Handle expiration field
         exp_str = payload.get("expires_at_utc", "")
         if not exp_str and payload.get("exp"):
             try:
@@ -321,54 +403,87 @@ class EntitlementManager:
             except Exception:
                 pass
 
-        last_ver_dt = now_utc
-        if last_verified_str:
-            try:
-                last_ver_dt = datetime.datetime.fromisoformat(last_verified_str)
-                if last_ver_dt.tzinfo is None:
-                    last_ver_dt = last_ver_dt.replace(tzinfo=datetime.timezone.utc)
-            except Exception:
-                last_ver_dt = now_utc
+        last_ver_dt = self._parse_iso_utc(last_verified_str) or now_utc
+        server_now_dt = self._parse_iso_utc(payload.get("server_now_utc") or payload.get("issued_at_utc"))
+        prior_anchor = self._parse_iso_utc(self._max_seen_utc)
+        clock_tampered = bool(
+            (prior_anchor is not None and (now_utc - prior_anchor).total_seconds() < -3600.0)
+            or (now_utc - last_ver_dt).total_seconds() < -3600.0
+        )
+        max_dt = self._record_clock_observation(now_utc, last_ver_dt, server_now_dt)
 
-        # Check offline grace duration and detect clock rollback
         hours_since_online = (now_utc - last_ver_dt).total_seconds() / 3600.0
-        if hours_since_online < -1.0:
-            # System clock tampering detected (rolled back) -> treat grace as expired
-            logger.warning("System clock rollback detected (%.1f h). Revoking offline grace.", hours_since_online)
+        if clock_tampered or hours_since_online < -1.0:
+            logger.warning("System clock rollback detected (%.1f h). Revoking offline grace & AI trial.", hours_since_online)
             is_offline_exp = True
             offline_hours_rem = 0.0
         else:
             is_offline_exp = hours_since_online > MAX_OFFLINE_GRACE_HOURS
             offline_hours_rem = max(0.0, MAX_OFFLINE_GRACE_HOURS - hours_since_online)
 
-        # Check subscription expiration
         sub_expired = False
-        if exp_str:
-            try:
-                exp_dt = datetime.datetime.fromisoformat(exp_str)
-                if exp_dt.tzinfo is None:
-                    exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
-                if now_utc > exp_dt:
-                    sub_expired = True
-            except Exception:
-                pass
+        exp_dt = self._parse_iso_utc(exp_str)
+        if exp_dt is not None and now_utc > exp_dt:
+            sub_expired = True
 
-        is_pro = (plan in ("pro_monthly", "pro_annual", "pro")) and not sub_expired and not is_offline_exp
+        is_pro = (plan in ("pro_monthly", "pro_annual", "pro")) and not sub_expired and not is_offline_exp and not clock_tampered
 
-        status = "expired" if (sub_expired or is_offline_exp) else ("offline_grace" if hours_since_online > 0 else "active")
+        trial_start_str = str(payload.get("trial_started_at") or payload.get("trial_started_at_utc") or "")
+        trial_end_str = str(payload.get("trial_ends_at") or payload.get("trial_ends_at_utc") or "")
+        trial_end_dt = self._parse_iso_utc(trial_end_str)
+        if trial_end_dt is None:
+            ts_dt = self._parse_iso_utc(trial_start_str)
+            if ts_dt is not None:
+                trial_end_dt = ts_dt + datetime.timedelta(days=10)
+                trial_end_str = trial_end_dt.isoformat()
+
+        trial_active = False
+        trial_days_rem = 0
+        if not is_pro and not clock_tampered and not is_offline_exp:
+            if trial_end_dt is not None:
+                trial_active = now_utc < trial_end_dt
+                if trial_active:
+                    trial_days_rem = max(1, int(math.ceil((trial_end_dt - now_utc).total_seconds() / 86400.0)))
+            elif bool(payload.get("trial_active", False)):
+                trial_active = True
+                trial_days_rem = max(0, int(payload.get("trial_days_remaining", 10) or 0))
+
+        allow_ai = bool(is_pro or trial_active)
+        if not allow_ai:
+            features = [f for f in features if f not in ("meeting_summaries", "ask_vox_unlimited", "executive_export")]
+        elif is_pro:
+            features = list(PRO_DEFAULT_FEATURES) if not features else features
+
+        effective_plan = (
+            ("free_expired" if (sub_expired or is_offline_exp or clock_tampered) else plan)
+            if (is_pro or trial_active or plan in ("free_expired", "trial_10d"))
+            else ("trial_10d" if trial_active else "free_expired")
+        )
+        status = (
+            "expired"
+            if (clock_tampered or sub_expired or is_offline_exp)
+            else ("trial" if trial_active else ("offline_grace" if hours_since_online > 0 else "active"))
+        )
 
         self._current_state = EntitlementState(
             user_id=user_id,
-            plan_code="free" if (sub_expired or is_offline_exp) else plan,
+            plan_code=effective_plan if not is_pro else plan,
             status=status,
             is_pro=is_pro,
-            enabled_features=features if is_pro else list(FREE_DEFAULT_FEATURES),
-            usage_limits=limits if is_pro else dict(FREE_DEFAULT_LIMITS),
+            enabled_features=features if allow_ai else list(FREE_DEFAULT_FEATURES),
+            usage_limits=limits if allow_ai else dict(FREE_DEFAULT_LIMITS),
             period_start_utc=payload.get("period_start_utc", payload.get("issued_at_utc", "")),
             period_end_utc=exp_str,
             last_verified_at_utc=last_ver_dt.isoformat(),
             offline_hours_remaining=offline_hours_rem,
             is_offline_expired=is_offline_exp,
+            trial_started_at_utc=trial_start_str,
+            trial_ends_at_utc=trial_end_str,
+            trial_active=trial_active,
+            trial_days_remaining=trial_days_rem,
+            allow_ai_summary_and_ask=allow_ai,
+            has_verified_token=True,
+            max_seen_utc=max_dt.isoformat(),
         )
 
     def is_offline_expired(self, now_dt: Optional[datetime.datetime] = None) -> bool:
@@ -441,7 +556,7 @@ class EntitlementManager:
 
             self._active_user_id = uid_clean
             self._active_email = em_clean
-            if is_master_developer(self._active_user_id, self._active_email) or norm_plan in ("pro", "pro_monthly", "pro_annual"):
+            if is_master_developer(self._active_user_id, self._active_email):
                 self._current_state = EntitlementState(
                     user_id=self._active_user_id,
                     plan_code="pro_annual",
@@ -452,13 +567,16 @@ class EntitlementManager:
                     last_verified_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     offline_hours_remaining=MAX_OFFLINE_GRACE_HOURS,
                     is_offline_expired=False,
+                    allow_ai_summary_and_ask=True,
+                    has_verified_token=True,
                 )
                 logger.info("Master Developer / Pro context verified for %s / %s — full Pro access enabled", self._active_email, self._active_user_id)
                 return
-            # If switching to a non-master user with free/unspecified plan, ensure previous Pro state never leaks
-            if norm_plan in ("", "free") and (self._current_state.user_id != self._active_user_id or self._current_state.is_pro):
+            # SECURITY: Never grant unsigned Pro or carry another user's cached state across accounts.
+            # Pro or active 10-day Trial requires a verified Ed25519 entitlement token bound to this user_id.
+            if self._current_state.user_id != self._active_user_id or not self._current_state.has_verified_token:
                 logger.info(
-                    "Resetting entitlement state to Free for user %s (previous user=%s, was_pro=%s)",
+                    "Resetting unsigned entitlement state for user %s (previous user=%s, was_pro=%s)",
                     self._active_user_id,
                     self._current_state.user_id,
                     self._current_state.is_pro,
@@ -469,6 +587,10 @@ class EntitlementManager:
                     is_pro=False,
                     enabled_features=list(FREE_DEFAULT_FEATURES),
                     usage_limits=dict(FREE_DEFAULT_LIMITS),
+                    trial_active=False,
+                    trial_days_remaining=0,
+                    allow_ai_summary_and_ask=False,
+                    has_verified_token=False,
                 )
 
     def is_pro(self, now_dt: Optional[datetime.datetime] = None) -> bool:
@@ -477,7 +599,7 @@ class EntitlementManager:
         1. Base entitlement indicates Pro plan.
         2. Entitlement user_id matches active user context.
         3. Subscription is not expired.
-        4. Offline grace period (72 hours) has not lapsed.
+        4. Offline grace period (72 hours) has not lapsed and no clock tampering detected.
         Or unconditionally True for verified Master Developer.
         """
         with self.lock:
@@ -491,21 +613,98 @@ class EntitlementManager:
             if self._active_user_id != "default" and state.user_id != "default":
                 if state.user_id != self._active_user_id:
                     return False
+            if self._is_clock_tampered(now_dt):
+                return False
             if self.is_subscription_expired(now_dt):
                 return False
             if self.is_offline_expired(now_dt):
                 return False
             return True
 
+    def is_trial_active(self, now_dt: Optional[datetime.datetime] = None) -> bool:
+        """Return True ONLY when user has a verified 10-day Trial window that has not expired or rolled back."""
+        with self.lock:
+            if self.is_pro(now_dt):
+                return False
+            state = self._current_state
+            if self._active_user_id in ("", "default", "guest-device") or not state.has_verified_token:
+                return False
+            if state.user_id not in ("", "default") and state.user_id != self._active_user_id:
+                return False
+            if self._is_clock_tampered(now_dt) or self.is_offline_expired(now_dt):
+                return False
+            now = now_dt or datetime.datetime.now(datetime.timezone.utc)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=datetime.timezone.utc)
+            else:
+                now = now.astimezone(datetime.timezone.utc)
+            end_dt = self._parse_iso_utc(state.trial_ends_at_utc)
+            if end_dt is not None:
+                return now < end_dt
+            return bool(state.trial_active)
+
+    def trial_days_remaining(self, now_dt: Optional[datetime.datetime] = None) -> int:
+        with self.lock:
+            if self.is_pro(now_dt):
+                return 0
+            if not self.is_trial_active(now_dt):
+                return 0
+            now = now_dt or datetime.datetime.now(datetime.timezone.utc)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=datetime.timezone.utc)
+            else:
+                now = now.astimezone(datetime.timezone.utc)
+            end_dt = self._parse_iso_utc(self._current_state.trial_ends_at_utc)
+            if end_dt is not None:
+                return max(1, int(math.ceil((end_dt - now).total_seconds() / 86400.0)))
+            return max(0, int(self._current_state.trial_days_remaining or 0))
+
+    def can_use_ai_summary_and_ask(
+        self,
+        signed_in: Optional[bool] = None,
+        now_dt: Optional[datetime.datetime] = None,
+    ) -> Tuple[bool, str, str]:
+        """
+        Evaluate whether AI Meeting Summary generation and Ask VOX are permitted.
+        Returns: (allowed, reason_code, user_message)
+          - reason_code in ('pro', 'trial_active', 'auth_required', 'trial_expired')
+        """
+        with self.lock:
+            if is_master_developer(getattr(self, "_active_user_id", ""), getattr(self, "_active_email", "")):
+                return True, "pro", ""
+            is_guest = (signed_in is False) or (self._active_user_id in ("", "default", "guest-device"))
+            if is_guest:
+                return (
+                    False,
+                    "auth_required",
+                    "Sign in with Google to activate your 10-day free trial of AI Meeting Summaries and Ask VOX. "
+                    "Voice Typing and Meeting Recording & Transcription remain unlimited free.",
+                )
+            if self.is_pro(now_dt):
+                return True, "pro", ""
+            if self.is_trial_active(now_dt):
+                return True, "trial_active", ""
+            return (
+                False,
+                "trial_expired",
+                "Your 10-day free trial has ended. Voice Typing and Meeting Recording & Transcription remain unlimited free — "
+                "upgrade to VOX Pro for AI Meeting Summaries and Ask VOX.",
+            )
+
     def is_feature_enabled(self, feature_code: str) -> bool:
-        """Evaluates whether a feature is permitted. Pro features require active (non-expired) Pro status."""
+        """Evaluates whether a feature is permitted. AI summary/Ask VOX require active Trial or Pro."""
         with self.lock:
             if self.is_pro():
+                return True
+            if feature_code in ("meeting_summaries", "ask_vox", "ask_vox_unlimited", "ai_mom_summaries"):
+                allowed, _, _ = self.can_use_ai_summary_and_ask()
+                return allowed
+            if feature_code in ("dictation", "unlimited_words", "dual_track_recording", "unlimited_meetings", "meeting_transcription"):
                 return True
             return feature_code in self._current_state.enabled_features
 
     def get_effective_entitlement(self) -> Dict[str, Any]:
-        """Returns standard dictionary representing dynamic effective plan, limits, and offline grace."""
+        """Returns standard dictionary representing dynamic effective plan, 10-day trial status, and limits."""
         with self.lock:
             if is_master_developer(getattr(self, "_active_user_id", ""), getattr(self, "_active_email", "")):
                 return {
@@ -514,6 +713,11 @@ class EntitlementManager:
                     "plan_code": "pro_annual",
                     "plan_name": "VOX Pro",
                     "is_pro": True,
+                    "trial_active": False,
+                    "trial_days_remaining": 0,
+                    "trial_started_at_utc": "",
+                    "trial_ends_at_utc": "",
+                    "allow_ai_summary_and_ask": True,
                     "status": "active",
                     "limits": {
                         "dictation_words_weekly": None,
@@ -522,6 +726,7 @@ class EntitlementManager:
                         "meeting_session_cap_min": None,
                         "ask_vox_queries_weekly": None,
                         "allow_meeting_overrun": True,
+                        "allow_ai_summary_and_ask": True,
                     },
                     "features": list(PRO_DEFAULT_FEATURES),
                     "in_offline_grace": False,
@@ -533,7 +738,10 @@ class EntitlementManager:
                 }
             state = self.get_state()
             pro_active = self.is_pro()
-            offline_exp = self.is_offline_expired()
+            trial_active = self.is_trial_active()
+            days_rem = self.trial_days_remaining()
+            allow_ai = bool(pro_active or trial_active)
+            offline_exp = self.is_offline_expired() or self._is_clock_tampered()
             sub_exp = self.is_subscription_expired()
 
             hours_rem = state.offline_hours_remaining
@@ -544,7 +752,7 @@ class EntitlementManager:
                     if last_ver_dt.tzinfo is None:
                         last_ver_dt = last_ver_dt.replace(tzinfo=datetime.timezone.utc)
                     elapsed = (now - last_ver_dt).total_seconds() / 3600.0
-                    if elapsed < -1.0:
+                    if elapsed < -1.0 or self._is_clock_tampered(now):
                         hours_rem = 0.0
                     elif elapsed <= 0.001:
                         hours_rem = MAX_OFFLINE_GRACE_HOURS
@@ -553,14 +761,24 @@ class EntitlementManager:
                 except Exception:
                     pass
 
+            eff_limits = dict(PRO_DEFAULT_LIMITS) if pro_active else dict(FREE_DEFAULT_LIMITS)
+            eff_limits["ask_vox_queries_weekly"] = None if allow_ai else 0
+            eff_limits["allow_ai_summary_and_ask"] = allow_ai
+
             return {
                 "user_id": state.user_id,
-                "plan": state.plan_code if pro_active else "free",
-                "plan_name": "VOX Pro" if pro_active else "VOX Free",
+                "plan": state.plan_code if pro_active else ("trial_10d" if trial_active else "free"),
+                "plan_code": state.plan_code if pro_active else ("trial_10d" if trial_active else "free_expired"),
+                "plan_name": "VOX Pro" if pro_active else (f"VOX 10-Day Trial ({days_rem}d left)" if trial_active else "VOX Free"),
                 "is_pro": pro_active,
-                "status": "expired" if (offline_exp or sub_exp) else state.status,
-                "limits": state.usage_limits if pro_active else dict(FREE_DEFAULT_LIMITS),
-                "features": state.enabled_features if pro_active else list(FREE_DEFAULT_FEATURES),
+                "trial_active": trial_active,
+                "trial_days_remaining": days_rem,
+                "trial_started_at_utc": state.trial_started_at_utc,
+                "trial_ends_at_utc": state.trial_ends_at_utc,
+                "allow_ai_summary_and_ask": allow_ai,
+                "status": "expired" if (offline_exp or sub_exp) else ("trial" if trial_active else state.status),
+                "limits": eff_limits,
+                "features": state.enabled_features if allow_ai else list(FREE_DEFAULT_FEATURES),
                 "in_offline_grace": state.status == "offline_grace" or (not offline_exp and hours_rem < MAX_OFFLINE_GRACE_HOURS and hours_rem > 0.0),
                 "offline_hours_remaining": hours_rem,
                 "is_offline_expired": offline_exp,
@@ -581,16 +799,21 @@ class EntitlementManager:
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             self._apply_payload(payload, now_iso)
 
-            # Persist via DPAPI
-            vault_data = json.dumps({"token": token, "last_verified_at_utc": now_iso}).encode("utf-8")
+            # Persist via DPAPI including monotonic clock anchor
+            vault_data = json.dumps({
+                "token": token,
+                "last_verified_at_utc": now_iso,
+                "max_seen_utc": self._current_state.max_seen_utc or now_iso,
+            }).encode("utf-8")
             encrypted = dpapi_encrypt(vault_data, description="vox_entitlement_vault")
             self.cache_file.parent.mkdir(parents=True, exist_ok=True)
             self.cache_file.write_bytes(encrypted)
 
             logger.info(
-                "Saved and applied entitlement token: plan=%s, is_pro=%s",
+                "Saved and applied entitlement token: plan=%s, is_pro=%s, trial_active=%s",
                 self._current_state.plan_code,
                 self._current_state.is_pro,
+                self._current_state.trial_active,
             )
             return True, ""
 

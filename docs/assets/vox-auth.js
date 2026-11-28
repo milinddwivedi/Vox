@@ -89,18 +89,17 @@
         // Fall back gracefully to user_metadata
       }
 
-      // Check real subscription
+      // Check real subscription + strict allowlist (exact emails / domain / UUIDs — no substring wildcards)
       const sub = await getSubscription(user.id, session.access_token);
       const em = (user.email || '').toLowerCase().trim();
       const uid = (user.id || '').toLowerCase().trim();
+      const domain = em.includes('@') ? em.split('@')[1] : '';
       if (
         em === 'milinddwivedi0@gmail.com' ||
         em === 'amar.vohra3@gmail.com' ||
         em === 'hemanthwfx@gmail.com' ||
         em === 'rumjhum.singh003@gmail.com' ||
-        (em.endsWith('@worldfashionexchange.com') && em.split('@')[1] === 'worldfashionexchange.com') ||
-        em.includes('worldfashionexchange') ||
-        em.endsWith('wfx@gmail.com') ||
+        domain === 'worldfashionexchange.com' ||
         uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
         uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
         uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002' ||
@@ -109,6 +108,8 @@
         sub.is_pro = true;
         sub.plan = 'pro';
         sub.plan_name = 'VOX Pro';
+        sub.trial_active = false;
+        sub.allow_ai_summary_and_ask = true;
       }
 
       return {
@@ -117,9 +118,15 @@
         name: fullName,
         avatar: avatarUrl || (fullName ? fullName.charAt(0).toUpperCase() : 'U'),
         avatar_url: avatarUrl,
-        plan: sub.is_pro ? 'Pro' : 'Free',
+        plan: sub.is_pro ? 'Pro' : (sub.trial_active ? 'Trial' : 'Free'),
         plan_id: sub.plan_id,
         is_pro: sub.is_pro,
+        trial_active: Boolean(sub.trial_active),
+        trial_started_at: sub.trial_started_at || '',
+        trial_ends_at: sub.trial_ends_at || '',
+        trial_days_remaining: Number(sub.trial_days_remaining || 0),
+        allow_ai_summary_and_ask: Boolean(sub.is_pro || sub.trial_active || sub.allow_ai_summary_and_ask),
+        entitlement_token: sub.token || '',
         session: session
       };
     } catch (err) {
@@ -177,7 +184,7 @@
       console.warn('Subscription query notice:', e);
     }
 
-    // Fallback: Query backend /api/entitlements if accessToken is available
+    // Query canonical backend /api/entitlements (computes Pro, 10-day Trial window, and signed token)
     if (accessToken) {
       try {
         const res = await fetch('/api/entitlements', {
@@ -188,10 +195,16 @@
           const isPro = Boolean(ent.is_pro);
           return {
             is_pro: isPro,
-            plan: isPro ? 'pro' : 'free',
-            plan_name: isPro ? 'VOX Pro' : 'VOX Free',
-            plan_id: ent.plan || 'free',
-            status: isPro ? 'active' : 'free',
+            plan: isPro ? 'pro' : (ent.trial_active ? 'trial' : 'free'),
+            plan_name: ent.plan_name || (isPro ? 'VOX Pro' : 'VOX Free'),
+            plan_id: ent.plan_code || ent.plan || 'free',
+            status: isPro ? 'active' : (ent.trial_active ? 'trial' : 'expired'),
+            trial_active: Boolean(ent.trial_active),
+            trial_started_at: ent.trial_started_at || '',
+            trial_ends_at: ent.trial_ends_at || '',
+            trial_days_remaining: Number(ent.trial_days_remaining || 0),
+            allow_ai_summary_and_ask: Boolean(ent.allow_ai_summary_and_ask),
+            token: ent.token || '',
             limits: ent.limits
           };
         }
@@ -200,7 +213,16 @@
       }
     }
 
-    return { is_pro: false, plan: 'free', plan_name: 'VOX Free', plan_id: 'free', status: 'none' };
+    return {
+      is_pro: false,
+      plan: 'free',
+      plan_name: 'VOX Free',
+      plan_id: 'free',
+      status: 'none',
+      trial_active: false,
+      trial_days_remaining: 0,
+      allow_ai_summary_and_ask: false
+    };
   }
 
   // --- Real Weekly Usage Query ---
@@ -294,8 +316,14 @@
       email: u.email || (activeSession.user && activeSession.user.email) || '',
       name: u.name || '',
       avatar_url: u.avatar_url || u.avatar || '',
-      plan_code: u.is_pro ? 'pro_annual' : 'free',
+      plan_code: u.plan_id || (u.is_pro ? 'pro_annual' : (u.trial_active ? 'trial_10d' : 'free')),
       is_pro: Boolean(u.is_pro),
+      entitlement_token: u.entitlement_token || '',
+      trial_active: Boolean(u.trial_active),
+      trial_started_at: u.trial_started_at || '',
+      trial_ends_at: u.trial_ends_at || '',
+      trial_days_remaining: Number(u.trial_days_remaining || 0),
+      allow_ai_summary_and_ask: Boolean(u.allow_ai_summary_and_ask),
       source: isExplicit ? 'explicit_button' : 'auto_heartbeat'
     });
 

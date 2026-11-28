@@ -1,8 +1,8 @@
 {
   "product_id": "vox-desktop-win64",
   "product_name": "VOX Voice Assistant",
-  "version": "2.3.0",
-  "build_number": 230,
+  "version": "2.4.0",
+  "build_number": 240,
   "channel": "stable",
   "model_manifest_version": "2.1.0",
   "release_date": "2026-11-28"

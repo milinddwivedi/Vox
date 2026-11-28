@@ -49,17 +49,20 @@ module.exports = async function handler(req, res) {
     } catch (e) {}
   }
 
-  // Security sanitize target to prevent open redirect
+  // Security sanitize target to prevent open redirect / XSS
   try {
-    const parsedTarget = new URL(target);
-    if (parsedTarget.hostname !== '127.0.0.1' && parsedTarget.hostname !== 'localhost' && !target.includes('/download')) {
-      target = 'http://127.0.0.1:8400/callback';
+    if (typeof target === 'string' && target.startsWith('/download')) {
+      // allowed internal web download return path
+    } else {
+      const parsedTarget = new URL(String(target || ''));
+      if (parsedTarget.protocol !== 'http:' || (parsedTarget.hostname !== '127.0.0.1' && parsedTarget.hostname !== 'localhost')) {
+        target = 'http://127.0.0.1:8400/callback';
+      }
     }
   } catch (e) {
-    if (!target.includes('/download')) {
-      target = 'http://127.0.0.1:8400/callback';
-    }
+    target = 'http://127.0.0.1:8400/callback';
   }
+  const safeJson = (v) => JSON.stringify(v).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
 
   // Supabase & Google OAuth Configuration
   const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || SUPABASE_PROJECT_URL;
@@ -129,14 +132,13 @@ module.exports = async function handler(req, res) {
                                  (em === 'rumjhum.singh003@gmail.com') ? 'ccb6a5b7-246f-4050-832e-bf520c077dc2' :
                                  gUid;
 
+            const emDomain = em.includes('@') ? em.split('@')[1] : '';
             let isMaster =
               em === 'milinddwivedi0@gmail.com' ||
               em === 'amar.vohra3@gmail.com' ||
               em === 'hemanthwfx@gmail.com' ||
               em === 'rumjhum.singh003@gmail.com' ||
-              em.endsWith('@worldfashionexchange.com') ||
-              em.includes('worldfashionexchange') ||
-              em.endsWith('wfx@gmail.com') ||
+              emDomain === 'worldfashionexchange.com' ||
               resolvedUserId === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
               resolvedUserId === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
               resolvedUserId === '029cf21a-9fd2-45a3-af3c-70d0fdea5002' ||
@@ -216,10 +218,24 @@ module.exports = async function handler(req, res) {
             uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002' ||
             uid === 'ccb6a5b7-246f-4050-832e-bf520c077dc2';
 
-          if (!isMaster && em && typeof serverClient.rpc === 'function') {
+          if (!isMaster && em) {
             try {
-              const { data: rpcPro } = await serverClient.rpc('is_company_pro_email', { check_email: em });
-              if (rpcPro) isMaster = true;
+              const emDomain = em.includes('@') ? em.split('@')[1] : '';
+              const { data: rules } = await serverClient
+                .from('company_entitlement_rules')
+                .select('rule_type, rule_value')
+                .eq('is_active', true);
+              if (Array.isArray(rules)) {
+                for (const r of rules) {
+                  const rt = String(r.rule_type || '').toLowerCase().trim();
+                  const rv = String(r.rule_value || '').toLowerCase().trim();
+                  if (!rv) continue;
+                  if ((rt === 'email' && rv === em) || (rt === 'domain' && rv === emDomain)) {
+                    isMaster = true;
+                    break;
+                  }
+                }
+              }
             } catch (_) {}
           }
 
@@ -422,14 +438,14 @@ module.exports = async function handler(req, res) {
   </div>
 
   <script>
-    const TARGET = "${target}";
-    const STATE = "${state}";
-    const SERVER_SESSION = ${JSON.stringify(serverSession)};
-    const SERVER_USER = ${JSON.stringify(serverUser)};
-    const SERVER_PLAN_CODE = "${serverPlanCode}";
-    const SERVER_IS_PRO = ${serverIsPro};
-    const SUPABASE_URL = "${supabaseUrl}";
-    const SUPABASE_ANON_KEY = "${supabaseAnonKey}";
+    const TARGET = ${safeJson(String(target || 'http://127.0.0.1:8400/callback'))};
+    const STATE = ${safeJson(String(state || ''))};
+    const SERVER_SESSION = ${safeJson(serverSession)};
+    const SERVER_USER = ${safeJson(serverUser)};
+    const SERVER_PLAN_CODE = ${safeJson(String(serverPlanCode || 'free'))};
+    const SERVER_IS_PRO = ${serverIsPro ? 'true' : 'false'};
+    const SUPABASE_URL = ${safeJson(String(supabaseUrl || ''))};
+    const SUPABASE_ANON_KEY = ${safeJson(String(supabaseAnonKey || ''))};
 
     async function resolveAndRelay() {
       const searchParams = new URLSearchParams(window.location.search);
@@ -481,6 +497,26 @@ module.exports = async function handler(req, res) {
       let planCode = 'free';
       let isPro = false;
 
+      let entitlementToken = '';
+      let trialStartedAt = '';
+      let trialEndsAt = '';
+      let trialActive = true;
+      let trialDaysRemaining = 10;
+      let allowAiSummaryAndAsk = true;
+
+      const applyEntitlementResponse = (entData) => {
+        if (!entData) return;
+        planCode = entData.plan_code || entData.plan || planCode || 'free';
+        isPro = Boolean(entData.is_pro);
+        if (entData.user_id) userId = entData.user_id;
+        if (entData.token) entitlementToken = String(entData.token);
+        if (entData.trial_started_at) trialStartedAt = String(entData.trial_started_at);
+        if (entData.trial_ends_at) trialEndsAt = String(entData.trial_ends_at);
+        if (typeof entData.trial_active === 'boolean') trialActive = entData.trial_active;
+        if (typeof entData.trial_days_remaining === 'number') trialDaysRemaining = entData.trial_days_remaining;
+        if (typeof entData.allow_ai_summary_and_ask === 'boolean') allowAiSummaryAndAsk = entData.allow_ai_summary_and_ask;
+      };
+
       // Path A: Server-side exchange succeeded
       if (SERVER_SESSION && SERVER_USER) {
         accessToken = SERVER_SESSION.access_token || '';
@@ -491,6 +527,14 @@ module.exports = async function handler(req, res) {
         avatarUrl = SERVER_USER.avatar_url || '';
         planCode = SERVER_PLAN_CODE;
         isPro = SERVER_IS_PRO;
+        if (accessToken) {
+          try {
+            const entRes = await fetch('/api/entitlements', {
+              headers: { 'Authorization': 'Bearer ' + accessToken }
+            });
+            if (entRes.ok) applyEntitlementResponse(await entRes.json());
+          } catch (e) {}
+        }
       } 
       // Path B: Tokens present in URL hash fragment
       else if (hashParams.get('access_token')) {
@@ -509,15 +553,12 @@ module.exports = async function handler(req, res) {
             }
           }
 
-          // Fetch active entitlement from backend
+          // Fetch signed entitlement from backend
           const entRes = await fetch('/api/entitlements', {
             headers: { 'Authorization': 'Bearer ' + accessToken }
           });
           if (entRes.ok) {
-            const entData = await entRes.json();
-            planCode = entData.plan || 'free';
-            isPro = Boolean(entData.is_pro);
-            if (entData.user_id) userId = entData.user_id;
+            applyEntitlementResponse(await entRes.json());
           }
         } catch (e) {
           console.warn('Hash fallback lookup warning:', e);
@@ -540,9 +581,7 @@ module.exports = async function handler(req, res) {
               headers: { 'Authorization': 'Bearer ' + accessToken }
             });
             if (entRes.ok) {
-              const entData = await entRes.json();
-              planCode = entData.plan || 'free';
-              isPro = Boolean(entData.is_pro);
+              applyEntitlementResponse(await entRes.json());
             }
           }
         } catch (e) {
@@ -557,14 +596,13 @@ module.exports = async function handler(req, res) {
 
       const em = (email || '').toLowerCase().trim();
       const uid = (userId || '').toLowerCase().trim();
+      const domain = em.includes('@') ? em.split('@')[1] : '';
       if (
         em === 'milinddwivedi0@gmail.com' ||
         em === 'amar.vohra3@gmail.com' ||
         em === 'hemanthwfx@gmail.com' ||
         em === 'rumjhum.singh003@gmail.com' ||
-        (em.endsWith('@worldfashionexchange.com') && em.split('@')[1] === 'worldfashionexchange.com') ||
-        em.includes('worldfashionexchange') ||
-        em.endsWith('wfx@gmail.com') ||
+        domain === 'worldfashionexchange.com' ||
         uid === '50d9a219-b06d-4fe9-acb3-7e32bf7cec2f' ||
         uid === '09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9' ||
         uid === '029cf21a-9fd2-45a3-af3c-70d0fdea5002' ||
@@ -590,6 +628,12 @@ module.exports = async function handler(req, res) {
       loopbackUrl.searchParams.set('is_pro', isPro ? 'true' : 'false');
       loopbackUrl.searchParams.set('access_token', accessToken);
       loopbackUrl.searchParams.set('refresh_token', refreshToken);
+      if (entitlementToken) loopbackUrl.searchParams.set('entitlement_token', entitlementToken);
+      if (trialStartedAt) loopbackUrl.searchParams.set('trial_started_at', trialStartedAt);
+      if (trialEndsAt) loopbackUrl.searchParams.set('trial_ends_at', trialEndsAt);
+      loopbackUrl.searchParams.set('trial_active', trialActive ? 'true' : 'false');
+      loopbackUrl.searchParams.set('trial_days_remaining', String(trialDaysRemaining));
+      loopbackUrl.searchParams.set('allow_ai_summary_and_ask', allowAiSummaryAndAsk ? 'true' : 'false');
 
       // Deep link URI for protocol fallback
       const deepLink = 'voxlocal://auth/callback?' + loopbackUrl.searchParams.toString();

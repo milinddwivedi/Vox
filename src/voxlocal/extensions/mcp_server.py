@@ -335,6 +335,7 @@ class VoxMcpServer:
             "date": clean_m.get("created_at", ""),
             "duration_sec": clean_m.get("duration_sec", 0.0),
             "platform": clean_m.get("source_platform", "Desktop"),
+            "summary_locked": str(clean_m.get("llm_fallback_reason") or "").startswith("ai_summary_locked:"),
             "executive_summary": clean_m.get("summary", ""),
             "decisions": [
                 {

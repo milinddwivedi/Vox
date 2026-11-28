@@ -172,6 +172,7 @@ class VoxMyThoughtsTab(QWidget):
 
     seek_requested = pyqtSignal(float)
     thoughts_changed = pyqtSignal(str)
+    dictate_requested = pyqtSignal()
     summary_inclusion_changed = pyqtSignal(bool)
     mcp_permission_changed = pyqtSignal(bool)
     convert_to_action_requested = pyqtSignal(str, float)
@@ -400,6 +401,16 @@ class VoxMyThoughtsTab(QWidget):
         self.btn_mark_note.setToolTip("Insert clickable meeting timestamp [MM:SS] at cursor")
         self.btn_mark_note.clicked.connect(self._on_mark_note_clicked)
         fmt_row.addWidget(self.btn_mark_note)
+
+        self.btn_dictate_notes = AnimatedPushButton("Dictate")
+        self.btn_dictate_notes.setObjectName("btnDictateNotes")
+        self.btn_dictate_notes.setFixedHeight(28)
+        self.btn_dictate_notes.setCheckable(True)
+        self.btn_dictate_notes.setIconSize(QSize(13, 13))
+        self.btn_dictate_notes.setToolTip("Voice dictate directly into My Notes")
+        self.btn_dictate_notes.setAccessibleName("Dictate into My Notes")
+        self.btn_dictate_notes.clicked.connect(lambda: self.dictate_requested.emit())
+        fmt_row.addWidget(self.btn_dictate_notes)
 
         self.btn_fmt_link = QPushButton("")
         self.btn_fmt_link.setFixedSize(28, 28)
@@ -641,11 +652,40 @@ class VoxMyThoughtsTab(QWidget):
 
     def set_interim_text(self, text: str) -> None:
         if text and text.strip():
-            self.lbl_live_interim.setText(f"Live dictation preview: {text.strip()}")
+            self.lbl_live_interim.setText(f"🎙️ Live: {text.strip()}")
             self.lbl_live_interim.setVisible(True)
         else:
             self.lbl_live_interim.setText("")
             self.lbl_live_interim.setVisible(False)
+
+    def set_dictation_active(self, active: bool, status_text: str = "") -> None:
+        btn = getattr(self, "btn_dictate_notes", None)
+        if btn is not None:
+            btn.blockSignals(True)
+            btn.setChecked(bool(active))
+            btn.blockSignals(False)
+            if active:
+                btn.setText("⏹ Stop Dictating")
+            elif status_text and "transcrib" in status_text.lower():
+                btn.setText("Transcribing...")
+            else:
+                btn.setText("Dictate")
+            t = get_theme_tokens(self.theme)
+            if active:
+                btn.setStyleSheet(
+                    "QPushButton { background: #DC2626; color: #FFFFFF; border: 1px solid #DC2626; "
+                    "border-radius: 7px; padding: 2px 10px; font-size: 12px; font-weight: 600; }"
+                    "QPushButton:hover { background: #B91C1C; }"
+                )
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background: {t['surface_container_low']}; color: {t['text_primary']}; "
+                    f"border: 1px solid {t['outline_variant']}; border-radius: 7px; padding: 2px 10px; font-size: 12px; font-weight: 500; }} "
+                    f"QPushButton:hover {{ background: {t['surface_hover']}; border-color: {t['border']}; }}"
+                )
+                btn.setIcon(get_icon("mic", t.get("accent", "#1A73E8"), size=13))
+        if not active:
+            self.set_interim_text("")
 
     def apply_theme(self, theme_name: str) -> None:
         self.theme = (theme_name or "dark").lower()
@@ -680,10 +720,10 @@ class VoxMyThoughtsTab(QWidget):
         )
         for bname in (
             "btn_fmt_bold", "btn_fmt_bullet", "btn_fmt_check", "btn_fmt_important",
-            "btn_mark_note", "btn_fmt_link", "btn_convert_menu", "btn_copy_notes", "btn_export_notes",
+            "btn_mark_note", "btn_dictate_notes", "btn_fmt_link", "btn_convert_menu", "btn_copy_notes", "btn_export_notes",
         ):
             b = getattr(self, bname, None)
-            if b is not None:
+            if b is not None and not (bname == "btn_dictate_notes" and b.isChecked()):
                 b.setStyleSheet(btn_css)
         muted_icon = t.get("text_secondary", "#5F6368")
         icon_map = {
@@ -692,6 +732,7 @@ class VoxMyThoughtsTab(QWidget):
             "btn_fmt_check": "checklist",
             "btn_fmt_important": "star",
             "btn_mark_note": "clock",
+            "btn_dictate_notes": "mic",
             "btn_fmt_link": "link",
             "btn_convert_menu": "sparkles",
             "btn_copy_notes": "copy",
@@ -2880,7 +2921,18 @@ class VoxSummaryDeliverablesTab(QWidget):
                 self.engine = engine
 
             fb_reason = str(self.meeting_data.get("llm_fallback_reason") or "").strip()
-            if fb_reason:
+            if fb_reason.startswith("ai_summary_locked:"):
+                lock_code = fb_reason.split(":", 1)[1].strip()
+                if lock_code == "auth_required":
+                    self.lbl_llm_fallback_banner.setText(
+                        "Sign in with Google to activate your 10-day free trial for AI Meeting Summaries & Ask VOX. Your full transcript is saved in the Transcript tab."
+                    )
+                else:
+                    self.lbl_llm_fallback_banner.setText(
+                        "Your 10-day free trial has ended. Your full transcript is saved in the Transcript tab — upgrade to VOX Pro to generate AI summaries and use Ask VOX."
+                    )
+                self.lbl_llm_fallback_banner.setVisible(True)
+            elif fb_reason:
                 llm_m = str(
                     self.meeting_data.get("llm_model_used")
                     or self.meeting_data.get("llm_model")

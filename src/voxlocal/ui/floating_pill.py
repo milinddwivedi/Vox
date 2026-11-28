@@ -20,6 +20,7 @@ import io
 import math
 import struct
 import threading
+import time
 import wave
 from typing import Any, Callable, Dict, List, Optional
 
@@ -1625,17 +1626,26 @@ class VoxDictationCancelledToast(QWidget):
 
 class VoxUpcomingNotesPopover(QWidget):
     """
-    Wispr `03_upcoming_card.png` compact popover (`422x76`, radius `18px`, `#191919` bg):
-    Platform badge + Meeting title + time range + `Start notes` action button.
+    Dynamic upcoming meetings popover anchored above/beside the floating pill.
+    Supports light/dark themes, up to 3 upcoming meetings, an explicit close button,
+    and automatic dismissal on cursor leave, outside click, or Escape.
     """
 
     start_notes_clicked = pyqtSignal(object)  # meeting object or None
     open_vox_clicked = pyqtSignal()
+    closed = pyqtSignal()
 
     def __init__(self, controller: Optional[Any] = None, parent: Optional[QWidget] = None) -> None:
         super().__init__(None)
         self.controller = controller
         self._meeting: Optional[Any] = None
+        self._meetings: List[Any] = []
+        self._theme: str = "dark"
+        self._anchor_bar_rect: QRect = QRect()
+        self._opened_monotonic: float = 0.0
+        self._cursor_entered_popover: bool = False
+        self._outside_ticks: int = 0
+        self._extra_row_widgets: List[QWidget] = []
         self.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
@@ -1645,31 +1655,33 @@ class VoxUpcomingNotesPopover(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setFixedSize(422, 76)
+        self.setFixedWidth(432)
+        self.setFixedHeight(80)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         self.card = QFrame(self)
-        self.card.setStyleSheet(
-            "QFrame { background-color: #191919; border: 1px solid rgba(255, 255, 255, 0.12); "
-            "border-radius: 18px; }"
-        )
-        lay = QHBoxLayout(self.card)
-        lay.setContentsMargins(18, 12, 16, 12)
-        lay.setSpacing(14)
+        self.card.setObjectName("upcomingPopoverCard")
+        card_col = QVBoxLayout(self.card)
+        card_col.setContentsMargins(16, 12, 12, 12)
+        card_col.setSpacing(8)
+
+        # Primary row (preserves legacy lbl_title / lbl_time / btn_start / badge attributes)
+        primary_row = QHBoxLayout()
+        primary_row.setContentsMargins(0, 0, 0, 0)
+        primary_row.setSpacing(12)
 
         self.badge = PlatformBadgeWidget(self.card, badge_size=28)
-        lay.addWidget(self.badge)
+        primary_row.addWidget(self.badge)
 
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(3)
+        text_col.setSpacing(2)
         self.lbl_title = QLabel("Start a New Note", self.card)
         tf = get_ui_font(13, 600)
         tf.setFamilies(["Segoe UI Variable", "Segoe UI"])
         tf.setPixelSize(13)
         self.lbl_title.setFont(tf)
-        self.lbl_title.setStyleSheet("color: #FFFFFF; background: transparent; border: none;")
         text_col.addWidget(self.lbl_title)
 
         self.lbl_time = QLabel("No upcoming calendar meetings", self.card)
@@ -1677,60 +1689,294 @@ class VoxUpcomingNotesPopover(QWidget):
         sf.setFamilies(["Segoe UI Variable", "Segoe UI"])
         sf.setPixelSize(12)
         self.lbl_time.setFont(sf)
-        self.lbl_time.setStyleSheet("color: #8E8E93; background: transparent; border: none;")
         text_col.addWidget(self.lbl_time)
-        lay.addLayout(text_col, 1)
+        primary_row.addLayout(text_col, 1)
 
         self.btn_start = QPushButton("Start notes", self.card)
-        self.btn_start.setFixedHeight(36)
+        self.btn_start.setFixedHeight(34)
         self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_start.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_start.setStyleSheet(
-            "QPushButton { background-color: #2A2A2C; color: #FFFFFF; border: none; "
-            "border-radius: 10px; padding: 0px 15px; font-size: 12.5px; font-weight: 600; }"
-            "QPushButton:hover { background-color: #3A3A3D; }"
-        )
-        self.btn_start.clicked.connect(lambda: (self.hide(), self.start_notes_clicked.emit(self._meeting)))
-        lay.addWidget(self.btn_start)
+        self.btn_start.clicked.connect(lambda: (self.dismiss(), self.start_notes_clicked.emit(self._meeting)))
+        primary_row.addWidget(self.btn_start)
+
+        self.btn_close = QPushButton("×", self.card)
+        self.btn_close.setObjectName("upcomingPopoverCloseBtn")
+        self.btn_close.setFixedSize(26, 26)
+        self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_close.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_close.setToolTip("Close")
+        self.btn_close.setAccessibleName("Close upcoming meetings")
+        self.btn_close.clicked.connect(self.dismiss)
+        primary_row.addWidget(self.btn_close, 0, Qt.AlignmentFlag.AlignTop)
+
+        card_col.addLayout(primary_row)
+
+        self._extra_rows_host = QWidget(self.card)
+        self._extra_rows_layout = QVBoxLayout(self._extra_rows_host)
+        self._extra_rows_layout.setContentsMargins(0, 4, 0, 0)
+        self._extra_rows_layout.setSpacing(6)
+        self._extra_rows_host.setVisible(False)
+        card_col.addWidget(self._extra_rows_host)
 
         outer.addWidget(self.card)
+
+        self._dismiss_poll_timer = QTimer(self)
+        self._dismiss_poll_timer.setInterval(140)
+        self._dismiss_poll_timer.timeout.connect(self._on_dismiss_poll)
+
+        self._leave_dismiss_timer = QTimer(self)
+        self._leave_dismiss_timer.setSingleShot(True)
+        self._leave_dismiss_timer.setInterval(380)
+        self._leave_dismiss_timer.timeout.connect(self._on_leave_timeout)
+
+        self.apply_theme("dark")
+
+    def apply_theme(self, theme_name: str) -> None:
+        self._theme = "dark" if (theme_name or "").lower() == "dark" else "light"
+        if self._theme == "light":
+            bg = "#FFFFFF"
+            border = "rgba(17, 24, 39, 0.14)"
+            fg = "#111827"
+            muted = "#6B7280"
+            btn_bg = "#EEF2FF"
+            btn_hover = "#E0E7FF"
+            btn_fg = "#1E40AF"
+            close_fg = "#6B7280"
+            close_hover = "rgba(17, 24, 39, 0.08)"
+            sep = "rgba(17, 24, 39, 0.08)"
+        else:
+            bg = "#191919"
+            border = "rgba(255, 255, 255, 0.14)"
+            fg = "#FFFFFF"
+            muted = "#9CA3AF"
+            btn_bg = "#2A2A2E"
+            btn_hover = "#3A3A40"
+            btn_fg = "#FFFFFF"
+            close_fg = "#9CA3AF"
+            close_hover = "rgba(255, 255, 255, 0.12)"
+            sep = "rgba(255, 255, 255, 0.09)"
+
+        self.card.setStyleSheet(
+            f"QFrame#upcomingPopoverCard {{ background-color: {bg}; border: 1px solid {border}; border-radius: 18px; }}"
+        )
+        self.lbl_title.setStyleSheet(f"color: {fg}; background: transparent; border: none;")
+        self.lbl_time.setStyleSheet(f"color: {muted}; background: transparent; border: none;")
+        self.btn_start.setStyleSheet(
+            f"QPushButton {{ background-color: {btn_bg}; color: {btn_fg}; border: none; "
+            f"border-radius: 10px; padding: 0px 14px; font-size: 12px; font-weight: 600; }}"
+            f"QPushButton:hover {{ background-color: {btn_hover}; }}"
+        )
+        self.btn_close.setStyleSheet(
+            f"QPushButton#upcomingPopoverCloseBtn {{ background: transparent; color: {close_fg}; border: none; "
+            f"border-radius: 13px; font-size: 15px; font-weight: 600; padding: 0px; }}"
+            f"QPushButton#upcomingPopoverCloseBtn:hover {{ background: {close_hover}; color: {fg}; }}"
+        )
+        for row_w in self._extra_row_widgets:
+            row_w.setStyleSheet(
+                f"QFrame#upcomingExtraRow {{ background: transparent; border-top: 1px solid {sep}; padding-top: 6px; }}"
+            )
+
+    set_theme = apply_theme
+
+    def dismiss(self) -> None:
+        self._dismiss_poll_timer.stop()
+        self._leave_dismiss_timer.stop()
+        if self.isVisible():
+            self.hide()
+        self.closed.emit()
+
+    def _is_offscreen_platform(self) -> bool:
+        try:
+            return QGuiApplication.platformName().lower().startswith("offscreen")
+        except Exception:
+            return False
+
+    def _clear_extra_rows(self) -> None:
+        while self._extra_rows_layout.count():
+            item = self._extra_rows_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._extra_row_widgets.clear()
+        self._extra_rows_host.setVisible(False)
+
+    @staticmethod
+    def _format_meeting_time_label(mtg: Any) -> str:
+        st = getattr(mtg, "local_start_time", None) or getattr(mtg, "start_time", None)
+        et = getattr(mtg, "local_end_time", None) or getattr(mtg, "end_time", None)
+        if st and et:
+            return f"{st.strftime('%I:%M %p').lstrip('0').lower()} - {et.strftime('%I:%M %p').lstrip('0').lower()}"
+        mins = int(getattr(mtg, "minutes_until_start", 0) or 0)
+        return "Starting now" if mins <= 0 else f"Starts in {mins} min"
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         apply_non_activating_floating_style(int(self.winId()))
+        self._opened_monotonic = time.monotonic()
+        self._cursor_entered_popover = False
+        self._outside_ticks = 0
+        if not self._is_offscreen_platform():
+            self._dismiss_poll_timer.start()
+
+    def hideEvent(self, event) -> None:
+        self._dismiss_poll_timer.stop()
+        self._leave_dismiss_timer.stop()
+        super().hideEvent(event)
+
+    def enterEvent(self, event) -> None:
+        self._cursor_entered_popover = True
+        self._outside_ticks = 0
+        self._leave_dismiss_timer.stop()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if self.isVisible() and not self._is_offscreen_platform():
+            self._leave_dismiss_timer.start()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event and event.key() == Qt.Key.Key_Escape:
+            self.dismiss()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _is_cursor_inside_safe_zone(self, gpos: QPoint) -> bool:
+        if self.geometry().adjusted(-14, -14, 14, 14).contains(gpos):
+            self._cursor_entered_popover = True
+            return True
+        if self._anchor_bar_rect.isValid() and self._anchor_bar_rect.adjusted(-16, -16, 16, 16).contains(gpos):
+            return True
+        return False
+
+    def check_auto_dismiss(self, cursor_pos: Optional[QPoint] = None, force_outside: bool = False) -> bool:
+        """Evaluate whether the popover should auto-dismiss; returns True if dismissed."""
+        if not self.isVisible():
+            return False
+        if force_outside:
+            self.dismiss()
+            return True
+        gpos = cursor_pos if cursor_pos is not None else QCursor.pos()
+        if self._is_cursor_inside_safe_zone(gpos):
+            self._outside_ticks = 0
+            return False
+        self._outside_ticks += 1
+        elapsed = time.monotonic() - self._opened_monotonic
+        grace = 0.35 if self._cursor_entered_popover else 0.95
+        if elapsed >= grace and self._outside_ticks >= 3:
+            self.dismiss()
+            return True
+        return False
+
+    def _on_leave_timeout(self) -> None:
+        if not self.isVisible():
+            return
+        try:
+            gpos = QCursor.pos()
+            if not self._is_cursor_inside_safe_zone(gpos):
+                self.dismiss()
+        except Exception:
+            pass
+
+    def _on_dismiss_poll(self) -> None:
+        if not self.isVisible():
+            self._dismiss_poll_timer.stop()
+            return
+        try:
+            user32 = ctypes.windll.user32
+            if user32.GetAsyncKeyState(0x1B) & 0x8000:  # VK_ESCAPE
+                self.dismiss()
+                return
+            gpos = QCursor.pos()
+            elapsed = time.monotonic() - self._opened_monotonic
+            if elapsed > 0.25:
+                l_down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+                r_down = bool(user32.GetAsyncKeyState(0x02) & 0x8000)
+                if (l_down or r_down) and not self._is_cursor_inside_safe_zone(gpos):
+                    self.dismiss()
+                    return
+            self.check_auto_dismiss(gpos)
+        except Exception:
+            pass
 
     def refresh_and_position(self, bar_rect: QRect, dock_edge: str = "bottom") -> None:
-        upcoming = []
+        self._anchor_bar_rect = QRect(bar_rect)
+        upcoming: List[Any] = []
         if self.controller:
             try:
                 if hasattr(self.controller, "calendar_engine") and hasattr(self.controller.calendar_engine, "get_upcoming_meetings"):
-                    upcoming = self.controller.calendar_engine.get_upcoming_meetings(limit=1)
+                    upcoming = list(self.controller.calendar_engine.get_upcoming_meetings(limit=3) or [])
                 elif hasattr(self.controller, "calendar_manager") and hasattr(self.controller.calendar_manager, "get_upcoming_meetings"):
-                    upcoming = self.controller.calendar_manager.get_upcoming_meetings(limit=1)
+                    upcoming = list(self.controller.calendar_manager.get_upcoming_meetings(limit=3) or [])
             except Exception as e:
                 logger.debug("Failed fetching upcoming meeting for popover: %s", e)
                 upcoming = []
 
-        if upcoming:
-            mtg = upcoming[0]
+        self._meetings = upcoming[:3]
+        self._clear_extra_rows()
+
+        if self._meetings:
+            mtg = self._meetings[0]
             self._meeting = mtg
             title = str(getattr(mtg, "title", "Upcoming Meeting") or "Upcoming Meeting")
-            self.lbl_title.setText(self.lbl_title.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, 230))
-            st = getattr(mtg, "local_start_time", None) or getattr(mtg, "start_time", None)
-            et = getattr(mtg, "local_end_time", None) or getattr(mtg, "end_time", None)
-            if st and et:
-                self.lbl_time.setText(f"{st.strftime('%I:%M %p').lstrip('0').lower()} - {et.strftime('%I:%M %p').lstrip('0').lower()}")
-            else:
-                mins = int(getattr(mtg, "minutes_until_start", 0))
-                self.lbl_time.setText("Starting now" if mins <= 0 else f"Starts in {mins} min")
+            self.lbl_title.setText(self.lbl_title.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, 200))
+            self.lbl_time.setText(self._format_meeting_time_label(mtg))
             self.badge.set_platform(resolve_platform_badge(str(getattr(mtg, "platform", "generic"))))
-            self.btn_start.setText("Start notes")
+            has_join = bool(getattr(mtg, "join_url", "") or getattr(mtg, "meeting_url", ""))
+            self.btn_start.setText("Join & notes" if has_join else "Start notes")
+
+            fg = "#111827" if self._theme == "light" else "#FFFFFF"
+            muted = "#6B7280" if self._theme == "light" else "#9CA3AF"
+            btn_bg = "#EEF2FF" if self._theme == "light" else "#2A2A2E"
+            btn_hover = "#E0E7FF" if self._theme == "light" else "#3A3A40"
+            btn_fg = "#1E40AF" if self._theme == "light" else "#FFFFFF"
+            for extra in self._meetings[1:3]:
+                row_f = QFrame(self._extra_rows_host)
+                row_f.setObjectName("upcomingExtraRow")
+                rl = QHBoxLayout(row_f)
+                rl.setContentsMargins(0, 6, 0, 0)
+                rl.setSpacing(10)
+                ebadge = PlatformBadgeWidget(row_f, badge_size=22)
+                ebadge.set_platform(resolve_platform_badge(str(getattr(extra, "platform", "generic"))))
+                rl.addWidget(ebadge)
+                ecol = QVBoxLayout()
+                ecol.setContentsMargins(0, 0, 0, 0)
+                ecol.setSpacing(1)
+                etitle = str(getattr(extra, "title", "Upcoming Meeting") or "Upcoming Meeting")
+                elbl = QLabel(self.lbl_title.fontMetrics().elidedText(etitle, Qt.TextElideMode.ElideRight, 200), row_f)
+                elbl.setStyleSheet(f"color: {fg}; font-size: 12px; font-weight: 600; background: transparent; border: none;")
+                etime = QLabel(self._format_meeting_time_label(extra), row_f)
+                etime.setStyleSheet(f"color: {muted}; font-size: 11px; background: transparent; border: none;")
+                ecol.addWidget(elbl)
+                ecol.addWidget(etime)
+                rl.addLayout(ecol, 1)
+                ebtn = QPushButton("Start notes", row_f)
+                ebtn.setFixedHeight(28)
+                ebtn.setCursor(Qt.CursorShape.PointingHandCursor)
+                ebtn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                ebtn.setStyleSheet(
+                    f"QPushButton {{ background-color: {btn_bg}; color: {btn_fg}; border: none; "
+                    f"border-radius: 8px; padding: 0px 10px; font-size: 11.5px; font-weight: 600; }}"
+                    f"QPushButton:hover {{ background-color: {btn_hover}; }}"
+                )
+                ebtn.clicked.connect(lambda _=False, m=extra: (self.dismiss(), self.start_notes_clicked.emit(m)))
+                rl.addWidget(ebtn)
+                self._extra_rows_layout.addWidget(row_f)
+                self._extra_row_widgets.append(row_f)
+            if self._extra_row_widgets:
+                self._extra_rows_host.setVisible(True)
+                self.setFixedHeight(80 + len(self._extra_row_widgets) * 52)
+            else:
+                self.setFixedHeight(80)
         else:
             self._meeting = None
             self.lbl_title.setText("No meetings for today")
             self.lbl_time.setText("No upcoming meetings scheduled")
             self.badge.set_platform("generic_meeting")
             self.btn_start.setText("Start notes")
+            self.setFixedHeight(80)
+
+        self.apply_theme(self._theme)
 
         edge = (dock_edge or "bottom").lower()
         gap = 8
@@ -3037,8 +3283,13 @@ class VoxFlowBar(QWidget):
             self.pill_stack.setCurrentIndex(2)
             self._update_stack_badge()
             auto_rec = True
-            if self.controller and getattr(self.controller, "config", None):
-                auto_rec = bool(getattr(self.controller.config, "auto_record_calls", True))
+            if "auto_start" in meta:
+                auto_rec = bool(meta["auto_start"])
+            elif self.controller and getattr(self.controller, "config", None):
+                cfg = self.controller.config
+                auto_rec = bool(getattr(cfg, "auto_record_calls", True))
+                if bool(getattr(cfg, "prompt_on_call", True)) and "auto_start_delay" not in meta:
+                    auto_rec = False
             if auto_rec and not self._is_hovered:
                 if not (prev_state == PillState.CARD_NOTIFICATION and self._auto_start_timer.isActive()):
                     self._start_auto_start_countdown(meta.get("auto_start_delay", 5000))
@@ -3872,6 +4123,9 @@ class VoxFlowBar(QWidget):
     def _do_show_tooltip(self) -> None:
         if not self._is_hovered and not self._last_hover_zone:
             return
+        if hasattr(self, "upcoming_popover") and self.upcoming_popover.isVisible():
+            if self._last_hover_zone.startswith("notetaker_"):
+                return
         if self._tooltip_target_html:
             self.hover_tooltip.set_hint(self._tooltip_target_html)
             self.hover_tooltip.show()
@@ -3955,11 +4209,17 @@ class VoxFlowBar(QWidget):
     def _on_notetaker_chevron_clicked(self) -> None:
         if self._was_dragged:
             return
+        self._tooltip_timer.stop()
         self.hover_tooltip.hide()
         try:
             if self.upcoming_popover.isVisible():
-                self.upcoming_popover.hide()
+                self.upcoming_popover.dismiss()
             else:
+                if hasattr(self.upcoming_popover, "apply_theme"):
+                    theme_name = getattr(self, "_theme", None)
+                    if not theme_name and self.controller and getattr(self.controller, "config", None):
+                        theme_name = getattr(self.controller.config, "theme", "dark")
+                    self.upcoming_popover.apply_theme(str(theme_name or "dark"))
                 self.upcoming_popover.refresh_and_position(
                     self._anchor_pill_global_rect(), self._dock_edge
                 )
@@ -3972,6 +4232,10 @@ class VoxFlowBar(QWidget):
         if entered and zone:
             self._hover_leave_timer.stop()
             self._last_hover_zone = f"notetaker_{zone}"
+            if hasattr(self, "upcoming_popover") and self.upcoming_popover.isVisible():
+                self._tooltip_timer.stop()
+                self.hover_tooltip.hide()
+                return
             if zone == "chevron":
                 self._show_tooltip_for_rect("Upcoming meetings", rect)
             else:

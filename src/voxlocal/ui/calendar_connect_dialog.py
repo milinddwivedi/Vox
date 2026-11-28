@@ -300,22 +300,45 @@ class VoxCalendarConnectDialog(QDialog):
         lbl_z_info.setWordWrap(True)
         z_lay.addWidget(lbl_z_info)
 
-        z_creds_lbl = QLabel("Zoom OAuth App Credentials (Optional if pre-configured):")
+        z_creds_lbl = QLabel(
+            "1-Click Hosted OAuth (leave blank when server is configured) or Local PKCE Public Client (Client ID only):"
+        )
+        z_creds_lbl.setWordWrap(True)
         z_creds_lbl.setStyleSheet("font-size: 11px; font-weight: 500;")
         z_lay.addWidget(z_creds_lbl)
 
         z_row1 = QHBoxLayout()
         self.txt_zoom_client_id = QLineEdit(str(getattr(self.controller.config, "zoom_client_id", "") or ""))
-        self.txt_zoom_client_id.setPlaceholderText("Zoom OAuth Client ID")
+        self.txt_zoom_client_id.setPlaceholderText("Zoom OAuth Client ID (Optional for 1-click hosted; required for local PKCE)")
         z_row1.addWidget(self.txt_zoom_client_id)
         z_lay.addLayout(z_row1)
 
         z_row2 = QHBoxLayout()
         self.txt_zoom_client_secret = QLineEdit(str(getattr(self.controller.config, "zoom_client_secret", "") or ""))
         self.txt_zoom_client_secret.setEchoMode(QLineEdit.EchoMode.Password)
-        self.txt_zoom_client_secret.setPlaceholderText("Zoom OAuth Client Secret")
+        self.txt_zoom_client_secret.setPlaceholderText("Zoom OAuth Client Secret (Optional — leave blank for PKCE public client)")
         z_row2.addWidget(self.txt_zoom_client_secret)
         z_lay.addLayout(z_row2)
+
+        z_redir_row = QHBoxLayout()
+        self.lbl_zoom_redirect = QLabel("Redirect URL: http://localhost:8080/zoom_callback")
+        self.lbl_zoom_redirect.setStyleSheet("font-size: 11px;")
+        z_redir_row.addWidget(self.lbl_zoom_redirect, 1)
+
+        self.btn_copy_zoom_redirect = QPushButton("Copy Redirect URI")
+        self.btn_copy_zoom_redirect.setObjectName("calMiniBtn")
+        self.btn_copy_zoom_redirect.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy_zoom_redirect.clicked.connect(self._copy_zoom_redirect_uri)
+        z_redir_row.addWidget(self.btn_copy_zoom_redirect)
+
+        self.btn_zoom_docs = QPushButton("Zoom App Docs ↗")
+        self.btn_zoom_docs.setObjectName("calMiniBtn")
+        self.btn_zoom_docs.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_zoom_docs.clicked.connect(
+            lambda: webbrowser.open("https://developers.zoom.us/docs/build-flow/basic-info/app-credentials/")
+        )
+        z_redir_row.addWidget(self.btn_zoom_docs)
+        z_lay.addLayout(z_redir_row)
 
         z_act = QHBoxLayout()
         self.btn_zoom_start = QPushButton("Connect Zoom Account")
@@ -539,6 +562,12 @@ class VoxCalendarConnectDialog(QDialog):
         )
 
     # --- Zoom Meetings Handlers ---
+    def _copy_zoom_redirect_uri(self) -> None:
+        cb = QApplication.clipboard()
+        if cb:
+            cb.setText("http://localhost:8080/zoom_callback")
+        self._show_status("Copied Redirect URI: http://localhost:8080/zoom_callback", kind="ok")
+
     def _start_zoom_oauth(self) -> None:
         if not hasattr(self.controller, "connect_zoom_calendar"):
             self._show_status("Zoom provider unavailable.", kind="err")

@@ -436,10 +436,10 @@ class UsageMeteringEngine:
             p = self._get_or_create_period_row(con, now_dt)
 
         pro = self.is_pro() if is_pro is None else bool(is_pro)
-        words_limit = 999999999 if pro else FREE_WEEKLY_WORD_LIMIT
-        meeting_mins_limit = 999999.0 if pro else FREE_WEEKLY_MEETING_MINUTES
-        meeting_count_limit = 999999 if pro else FREE_WEEKLY_MEETING_COUNT
-        ask_vox_limit = 999999 if pro else FREE_WEEKLY_ASK_VOX_LIMIT
+        words_limit = 999999999
+        meeting_mins_limit = 999999.0
+        meeting_count_limit = 999999
+        ask_vox_limit = 999999 if pro else 999999
 
         words_used = p["dictation_words"]
         meeting_mins_used = round(p["meeting_seconds"] / 60.0, 2)
@@ -467,33 +467,25 @@ class UsageMeteringEngine:
             dictation_words_used=words_used,
             dictation_words_limit=words_limit,
             dictation_remaining=dictation_remaining,
-            dictation_is_exhausted=(not pro and words_used >= words_limit),
+            dictation_is_exhausted=False,
             meeting_minutes_used=meeting_mins_used,
             meeting_minutes_limit=meeting_mins_limit,
             meeting_minutes_remaining=meeting_mins_remaining,
             meeting_count_used=meeting_count_used,
             meeting_count_limit=meeting_count_limit,
             meeting_count_remaining=meeting_count_remaining,
-            meetings_is_exhausted=(not pro and (meeting_mins_used >= meeting_mins_limit or meeting_count_used >= meeting_count_limit)),
+            meetings_is_exhausted=False,
             ask_vox_used=ask_vox_used,
             ask_vox_limit=ask_vox_limit,
             ask_vox_remaining=ask_vox_remaining,
-            ask_vox_is_exhausted=(not pro and ask_vox_used >= ask_vox_limit),
-            is_dictation_warning=(not pro and words_used >= words_limit * WARNING_THRESHOLD_RATIO),
-            is_meeting_warning=(not pro and (meeting_mins_used >= meeting_mins_limit * WARNING_THRESHOLD_RATIO or meeting_count_used >= meeting_count_limit * WARNING_THRESHOLD_RATIO)),
-            is_ask_vox_warning=(not pro and ask_vox_used >= ask_vox_limit * WARNING_THRESHOLD_RATIO),
+            ask_vox_is_exhausted=False,
+            is_dictation_warning=False,
+            is_meeting_warning=False,
+            is_ask_vox_warning=False,
         )
 
     def can_start_dictation(self, entitlement: Any = None) -> Tuple[bool, str]:
-        if self._resolve_pro_status(entitlement):
-            return True, ""
-        snap = self.get_usage_snapshot(is_pro=False)
-        if snap.dictation_is_exhausted:
-            return (
-                False,
-                f"Weekly dictation allowance reached ({snap.dictation_words_used:,} / {snap.dictation_words_limit:,} words). "
-                f"Quotas reset on {snap.reset_display_ist}, or upgrade to VOX Pro for unlimited voice typing.",
-            )
+        """Voice Typing is unlimited forever across all accounts."""
         return True, ""
 
     def record_committed_dictation(self, text: str, session_id: Optional[str] = None, dictation_id: Optional[int] = None) -> int:
@@ -539,49 +531,11 @@ class UsageMeteringEngine:
         return words
 
     def can_start_meeting(self, entitlement: Any = None) -> Tuple[bool, str]:
-        if self._resolve_pro_status(entitlement):
-            return True, ""
-        snap = self.get_usage_snapshot(is_pro=False)
-        if snap.meeting_count_remaining <= 0:
-            return (
-                False,
-                f"Weekly meeting session limit reached ({snap.meeting_count_used} / {snap.meeting_count_limit} meetings). "
-                f"Resets on {snap.reset_display_ist}, or upgrade to VOX Pro for unlimited meetings.",
-            )
-        if snap.meeting_minutes_remaining <= 0.0:
-            return (
-                False,
-                f"Weekly meeting minutes allowance reached ({snap.meeting_minutes_used:.1f} / {snap.meeting_minutes_limit:.0f} mins). "
-                f"Resets on {snap.reset_display_ist}, or upgrade to VOX Pro for unlimited recording.",
-            )
+        """Meeting recording and transcription remain unlimited forever across all accounts."""
         return True, ""
 
     def evaluate_live_meeting_overrun(self, elapsed_sec: float, entitlement: Any = None) -> OverrunStatus:
-        """
-        Evaluate single-meeting duration during live calls.
-        Policy: 80% (72 min) gives a non-intrusive warning; 90 min explains session cap.
-        Live call is NEVER forcefully killed.
-        """
-        if self._resolve_pro_status(entitlement):
-            return OverrunStatus({"warning": False, "overrun": False, "message": ""})
-
-        mins = elapsed_sec / 60.0
-        if mins >= FREE_SINGLE_MEETING_MIN_LIMIT:
-            return OverrunStatus({
-                "warning": True,
-                "overrun": True,
-                "message": (
-                    "90-minute included meeting session allowance reached. "
-                    "Your call will continue recording uninterrupted to the end; overage will apply against weekly balance."
-                ),
-            })
-        if mins >= FREE_SINGLE_MEETING_MIN_LIMIT * WARNING_THRESHOLD_RATIO:
-            rem = int(FREE_SINGLE_MEETING_MIN_LIMIT - mins)
-            return OverrunStatus({
-                "warning": True,
-                "overrun": False,
-                "message": f"{rem} minutes remaining in standard single-meeting allowance (90 min cap).",
-            })
+        """No single-meeting overrun limits or interruption warnings."""
         return OverrunStatus({"warning": False, "overrun": False, "message": ""})
 
     def record_completed_meeting(self, duration_sec: float, meeting_id: Optional[int] = None) -> Tuple[float, int]:
@@ -641,16 +595,15 @@ class UsageMeteringEngine:
         return dur, new_count
 
     def can_ask_vox(self, entitlement: Any = None) -> Tuple[bool, str]:
+        if entitlement is not None and hasattr(entitlement, "can_use_ai_summary_and_ask"):
+            allowed, _code, msg = entitlement.can_use_ai_summary_and_ask()
+            return bool(allowed), str(msg or "")
         if self._resolve_pro_status(entitlement):
             return True, ""
-        snap = self.get_usage_snapshot(is_pro=False)
-        if snap.ask_vox_is_exhausted:
-            return (
-                False,
-                f"Weekly Ask VOX query allowance reached ({snap.ask_vox_used} / {snap.ask_vox_limit} queries). "
-                f"Resets on {snap.reset_display_ist}, or upgrade to VOX Pro for unlimited intelligence queries.",
-            )
-        return True, ""
+        return (
+            False,
+            "Sign in with Google for your 10-day free trial or upgrade to VOX Pro to use Ask VOX.",
+        )
 
     def get_weekly_usage(self) -> Dict[str, Any]:
         """Convenience method returning a simple dictionary of current weekly usage counters."""
@@ -676,27 +629,8 @@ class UsageMeteringEngine:
         return self.get_pending_sync_events(limit=limit)
 
     def check_early_warnings(self, entitlement: Any = None) -> List[Dict[str, Any]]:
-        """Returns any 80% quota threshold warnings for the active week."""
-        if self._resolve_pro_status(entitlement):
-            return []
-        snap = self.get_usage_snapshot(is_pro=False)
-        warnings = []
-        if snap.is_dictation_warning:
-            warnings.append({
-                "metric": "dictation_words",
-                "message": f"You've used {snap.dictation_words_used:,} of your {snap.dictation_words_limit:,} weekly dictation words (80%+).",
-            })
-        if snap.is_meeting_warning:
-            warnings.append({
-                "metric": "meeting_usage",
-                "message": f"You've used 80%+ of your weekly meeting allowance.",
-            })
-        if snap.is_ask_vox_warning:
-            warnings.append({
-                "metric": "ask_vox",
-                "message": f"You've used 80%+ of your weekly Ask VOX queries.",
-            })
-        return warnings
+        """No early quota/trial-warning banners (full access through Day 10, direct gating Day 11+)."""
+        return []
 
     def record_ask_vox_query(self, query_id: Optional[str] = None) -> int:
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()

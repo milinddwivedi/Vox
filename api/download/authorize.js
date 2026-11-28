@@ -1,9 +1,15 @@
 const { supabase, authenticateUser } = require('../_lib/supabase');
 const { signDownloadTicket } = require('../_lib/token');
 
-const LATEST_ARTIFACT = 'releases/2.3.0/VoxLocal-Setup.exe';
+const LATEST_ARTIFACT = 'releases/2.4.0/VoxLocal-Setup.exe';
 
 const RELEASE_CATALOG = {
+  'releases/2.4.0/VoxLocal-Setup.exe': {
+    version: '2.4.0',
+    filename: 'VoxLocal-Setup.exe',
+    sha256: '0f7a36b3d470efddf8247b25daed39bd9c9ae4e09c8378f350ffe4ba17878ad4',
+    size_bytes: 227483814,
+  },
   'releases/2.3.0/VoxLocal-Setup.exe': {
     version: '2.3.0',
     filename: 'VoxLocal-Setup.exe',
@@ -29,10 +35,10 @@ const RELEASE_CATALOG = {
     size_bytes: 56393405,
   },
   'VoxLocal-Setup.exe': {
-    version: '2.3.0',
+    version: '2.4.0',
     filename: 'VoxLocal-Setup.exe',
-    sha256: '4944fb00abe36499619c5fa44d15a040695bd57afa07a7082eb944a7d163e5aa',
-    size_bytes: 227427919,
+    sha256: '0f7a36b3d470efddf8247b25daed39bd9c9ae4e09c8378f350ffe4ba17878ad4',
+    size_bytes: 227483814,
   },
 };
 
@@ -102,6 +108,7 @@ module.exports = async function handler(req, res) {
     const expiresInSec = 120;
     const skipSupabaseStorage =
       Boolean((process.env.VOX_RELEASE_DOWNLOAD_URL || '').trim()) ||
+      metadata.version === '2.4.0' ||
       metadata.version === '2.3.0' ||
       metadata.version === '2.1.0';
     let downloadUrl = null;

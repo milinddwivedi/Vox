@@ -32,6 +32,15 @@ logger = get_logger("desktop_auth")
 
 DEFAULT_BACKEND_URL = "https://vox-voice-assistant.vercel.app"
 LOOPBACK_PORTS = [8400, 8401, 8402, 8403]
+ALLOWED_LOOPBACK_ORIGINS = {
+    "https://vox-voice-assistant.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8400",
+    "http://127.0.0.1:8400",
+}
+SUPABASE_URL = "https://qiigoipgoedexmdowtvj.supabase.co"
+SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFpaWdvaXBnb2VkZXhtZG93dHZqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ3NTM2NjQsImV4cCI6MjExMDMyOTY2NH0.C9Bz6OYqxB5uBUa0kEBJpiMvwW6SbKYWhAEcVZoFvYM"
 
 
 @dataclass
@@ -45,6 +54,7 @@ class UserProfile:
     access_token: str = ""
     refresh_token: str = ""
     expires_at: float = 0.0
+    entitlement_token: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -92,14 +102,14 @@ SUCCESS_HTML_PAGE = """<!DOCTYPE html>
 
 
 def is_privileged_wfx_user(email: str, user_id: str = "") -> bool:
-    """Check if the user is Founder (Milind) or a World Fashion Exchange employee/account."""
+    """Check if the user is Founder (Milind) or an authorized @worldfashionexchange.com account."""
     em = (email or "").strip().lower()
     uid = (user_id or "").strip().lower()
     if em in ("milinddwivedi0@gmail.com", "amar.vohra3@gmail.com", "hemanthwfx@gmail.com", "rumjhum.singh003@gmail.com"):
         return True
     if uid in ("50d9a219-b06d-4fe9-acb3-7e32bf7cec2f", "09039fd3-2e18-4aaf-a93b-fdd5ef9f0cc9", "029cf21a-9fd2-45a3-af3c-70d0fdea5002", "ccb6a5b7-246f-4050-832e-bf520c077dc2"):
         return True
-    if em.endswith("@worldfashionexchange.com") or "worldfashionexchange" in em or em.endswith("wfx@gmail.com"):
+    if "@" in em and em.split("@", 1)[1] == "worldfashionexchange.com":
         return True
     return False
 
@@ -186,8 +196,8 @@ class DesktopAuthBroker:
                 user_id = data.get("user_id", "default")
                 email = data.get("email", "")
                 is_master = is_privileged_wfx_user(email, user_id)
-                plan_code = "pro_annual" if is_master else data.get("plan_code", "free")
-                is_pro = is_master or bool(data.get("is_pro", False))
+                plan_code = "pro_annual" if is_master else "free"
+                is_pro = bool(is_master)
                 self._current_user = UserProfile(
                     user_id=user_id,
                     email=email,
@@ -198,6 +208,7 @@ class DesktopAuthBroker:
                     access_token=data.get("access_token", ""),
                     refresh_token=data.get("refresh_token", ""),
                     expires_at=float(data.get("expires_at", 0.0)),
+                    entitlement_token=str(data.get("entitlement_token") or ""),
                 )
                 logger.info("Loaded cached desktop user: %s (%s)", self._current_user.email, self._current_user.plan_code)
             except Exception as exc:
@@ -218,6 +229,7 @@ class DesktopAuthBroker:
                 "access_token": profile.access_token,
                 "refresh_token": profile.refresh_token,
                 "expires_at": profile.expires_at,
+                "entitlement_token": profile.entitlement_token,
             }).encode("utf-8")
             encrypted = dpapi_encrypt(raw, description="vox_user_session")
             self.vault_path.parent.mkdir(parents=True, exist_ok=True)
@@ -247,6 +259,7 @@ class DesktopAuthBroker:
                 "access_token": self._current_user.access_token,
                 "refresh_token": self._current_user.refresh_token,
                 "expires_at": self._current_user.expires_at,
+                "entitlement_token": self._current_user.entitlement_token,
                 "user": {
                     "id": self._current_user.user_id,
                     "email": self._current_user.email,
@@ -256,6 +269,43 @@ class DesktopAuthBroker:
                     "is_pro": self._current_user.is_pro,
                 },
             }
+
+    def refresh_access_token(self) -> Tuple[bool, str]:
+        """Refresh expired Supabase access_token using the stored refresh_token."""
+        with self.lock:
+            user = self._current_user
+            if user is None or not user.refresh_token:
+                return False, "No refresh token available"
+            r_tok = user.refresh_token
+
+        try:
+            body = json.dumps({"refresh_token": r_tok}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "apikey": SUPABASE_ANON_KEY,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            new_access = str(data.get("access_token") or "").strip()
+            new_refresh = str(data.get("refresh_token") or r_tok).strip()
+            expires_in = float(data.get("expires_in") or 3600)
+            if not new_access:
+                return False, "Empty access_token in refresh response"
+            with self.lock:
+                if self._current_user is not None:
+                    self._current_user.access_token = new_access
+                    self._current_user.refresh_token = new_refresh
+                    self._current_user.expires_at = time.time() + expires_in
+                    self._save_session(self._current_user)
+            return True, "Refreshed access token"
+        except Exception as exc:
+            logger.debug("Supabase token refresh failed: %s", exc)
+            return False, str(exc)
 
     def is_authenticated(self) -> bool:
         with self.lock:
@@ -419,8 +469,8 @@ class DesktopAuthBroker:
         display_name = callback_result.get("name") or callback_result.get("display_name") or email.split("@")[0]
         avatar_url = callback_result.get("picture") or callback_result.get("avatar_url") or ""
         is_master = is_privileged_wfx_user(email, user_id)
-        plan_code = "pro_annual" if is_master else callback_result.get("plan_code", "free")
-        is_pro = is_master or callback_result.get("is_pro", False) or (plan_code in ("pro_monthly", "pro_annual", "pro"))
+        plan_code = "pro_annual" if is_master else "free"
+        is_pro = bool(is_master)
 
         profile = UserProfile(
             user_id=user_id,
@@ -432,6 +482,7 @@ class DesktopAuthBroker:
             access_token=callback_result.get("access_token", ""),
             refresh_token=callback_result.get("refresh_token", ""),
             expires_at=time.time() + float(callback_result.get("expires_in", 3600 * 24)),
+            entitlement_token=str(callback_result.get("entitlement_token") or ""),
         )
 
         self._save_session(profile)
@@ -485,8 +536,9 @@ class DesktopAuthBroker:
                 return False, "Could not extract user ID or email from authorization payload.", None
 
             is_master = is_privileged_wfx_user(email, user_id)
-            plan_code = "pro_annual" if is_master else params.get("plan_code", ["free"])[0]
-            is_pro = is_master or params.get("is_pro", ["false"])[0].lower() in ("true", "1")
+            plan_code = "pro_annual" if is_master else "free"
+            is_pro = bool(is_master)
+            entitlement_token = params.get("entitlement_token", [""])[0]
 
             profile = UserProfile(
                 user_id=user_id or "default",
@@ -498,6 +550,7 @@ class DesktopAuthBroker:
                 access_token=raw_token,
                 refresh_token=refresh_token,
                 expires_at=time.time() + expires_in,
+                entitlement_token=entitlement_token,
             )
             self._save_session(profile)
             if self.on_session_synced:
@@ -521,9 +574,11 @@ class DesktopAuthBroker:
             user_id = str(data.get("user_id") or "").strip()
             email = str(data.get("email") or "").strip()
             name = str(data.get("name") or data.get("display_name") or "").strip()
-            avatar_url = str(data.get("avatar_url") or data.get("picture") or "").strip()
-            plan_code = str(data.get("plan_code") or "free").strip()
-            is_pro = bool(data.get("is_pro", False))
+            picture = str(data.get("avatar_url") or data.get("picture") or "").strip()
+            entitlement_token = str(data.get("entitlement_token") or "").strip()
+            # Security: never honor unsigned plan_code/is_pro claims from HTTP payloads
+            plan_code = "free"
+            is_pro = False
             expires_at = float(data.get("expires_at") or (time.time() + 86400 * 7))
 
             # Decode JWT claims if token provided and metadata missing
@@ -548,6 +603,7 @@ class DesktopAuthBroker:
             if not user_id and not email:
                 return False, "Missing user_id and email in payload", None
 
+            avatar_url = picture
             is_master = is_privileged_wfx_user(email, user_id)
             if is_master:
                 plan_code = "pro_annual"
@@ -563,6 +619,7 @@ class DesktopAuthBroker:
                 access_token=raw_token,
                 refresh_token=refresh_token,
                 expires_at=expires_at,
+                entitlement_token=entitlement_token,
             )
             self._save_session(profile)
 
@@ -641,7 +698,10 @@ class _AuthLoopbackHandler(BaseHTTPRequestHandler):
         pass  # Suppress default stdout log spam
 
     def _send_cors_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = str(self.headers.get("Origin") or "").strip().rstrip("/")
+        if origin in ALLOWED_LOOPBACK_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("Access-Control-Allow-Private-Network", "true")
@@ -672,6 +732,10 @@ class _AuthLoopbackHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        origin = str(self.headers.get("Origin") or "").strip().rstrip("/")
+        if origin and origin not in ALLOWED_LOOPBACK_ORIGINS:
+            self._send_json(403, json.dumps({"ok": False, "error": "FORBIDDEN_ORIGIN"}).encode("utf-8"))
+            return
         if parsed.path in ("/sync-session", "/api/auth/sync", "/callback"):
             content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len) if content_len > 0 else b"{}"
@@ -859,10 +923,11 @@ class _AuthLoopbackHandler(BaseHTTPRequestHandler):
         holder["email"] = email
         holder["name"] = params.get("name", [""])[0]
         holder["avatar_url"] = params.get("avatar_url", [""])[0]
-        holder["plan_code"] = "pro_annual" if is_master else params.get("plan_code", ["free"])[0]
-        holder["is_pro"] = is_master or params.get("is_pro", ["false"])[0].lower() in ("true", "1")
+        holder["plan_code"] = "pro_annual" if is_master else "free"
+        holder["is_pro"] = bool(is_master)
         holder["access_token"] = raw_access_token
         holder["refresh_token"] = params.get("refresh_token", [""])[0]
+        holder["entitlement_token"] = params.get("entitlement_token", [""])[0]
 
         if broker:
             broker.complete_login_from_payload(holder)

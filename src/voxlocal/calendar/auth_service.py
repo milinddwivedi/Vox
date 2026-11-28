@@ -303,9 +303,12 @@ class CalendarAuthBroker:
     """
     Unified credential & OAuth broker supporting:
     1. Multi-user DPAPI encrypted SQLite credential vault (`calendar_credentials_vault`).
-    2. Optional hosted OAuth backend (`VOX_AUTH_BACKEND_URL`) for server-managed token exchange & refresh
-       so production deployments never ship OAuth client secrets inside desktop binaries or frontend code.
+    2. Optional hosted OAuth backend (`VOX_AUTH_BACKEND_URL`) or provider-specific hosted broker
+       (e.g. Zoom hosted OAuth on VOX backend) so production deployments never ship OAuth secrets
+       inside desktop binaries or frontend code.
     """
+
+    DEFAULT_ZOOM_HOSTED_OAUTH_URL = "https://vox-voice-assistant.vercel.app"
 
     def __init__(self, db: Any = None, backend_url: str = "") -> None:
         self._db = db
@@ -323,6 +326,18 @@ class CalendarAuthBroker:
 
     def is_backend_configured(self) -> bool:
         return bool(self._backend_url and (self._backend_url.startswith("https://") or self._backend_url.startswith("http://localhost") or self._backend_url.startswith("http://127.0.0.1")))
+
+    def _resolve_backend_url_for(self, provider: str = "") -> str:
+        if self.is_backend_configured():
+            return self._backend_url
+        if (provider or "").strip().lower() == "zoom":
+            z_url = os.environ.get("VOX_ZOOM_OAUTH_BACKEND_URL", self.DEFAULT_ZOOM_HOSTED_OAUTH_URL).strip().rstrip("/")
+            if z_url and (z_url.startswith("https://") or z_url.startswith("http://localhost") or z_url.startswith("http://127.0.0.1")):
+                return z_url
+        return ""
+
+    def is_backend_configured_for(self, provider: str = "") -> bool:
+        return bool(self._resolve_backend_url_for(provider))
 
     # --- Vault Operations ---
 
@@ -384,10 +399,11 @@ class CalendarAuthBroker:
 
     # --- Optional Hosted Backend OAuth Broker ---
 
-    def _post_backend_json(self, path: str, body: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
-        if not self._backend_url:
+    def _post_backend_json(self, path: str, body: Dict[str, Any], timeout: int = 15, base_url_override: str = "") -> Dict[str, Any]:
+        base = (base_url_override or self._backend_url).strip().rstrip("/")
+        if not base:
             raise RuntimeError("Hosted auth backend URL is not configured")
-        url = f"{self._backend_url}{path}"
+        url = f"{base}{path}"
         req = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -419,6 +435,7 @@ class CalendarAuthBroker:
                 "tenant": tenant,
                 "login_hint": login_hint,
             },
+            base_url_override=self._resolve_backend_url_for(provider),
         )
 
     def exchange_backend_code(
@@ -440,23 +457,27 @@ class CalendarAuthBroker:
                 "code_verifier": code_verifier,
                 "redirect_uri": redirect_uri,
             },
+            base_url_override=self._resolve_backend_url_for(provider),
         )
 
-    def refresh_backend_token(self, provider: str, user_id: str, account_id: str) -> Dict[str, Any]:
+    def refresh_backend_token(self, provider: str, user_id: str, account_id: str, refresh_token: str = "") -> Dict[str, Any]:
         return self._post_backend_json(
             "/v1/calendar/oauth/refresh",
             {
                 "provider": provider,
                 "user_id": user_id,
                 "account_id": account_id,
+                "refresh_token": refresh_token,
             },
+            base_url_override=self._resolve_backend_url_for(provider),
         )
 
-    def revoke_backend_account(self, provider: str, user_id: str, account_id: str) -> bool:
+    def revoke_backend_account(self, provider: str, user_id: str, account_id: str, token: str = "") -> bool:
         try:
             res = self._post_backend_json(
                 "/v1/calendar/oauth/revoke",
-                {"provider": provider, "user_id": user_id, "account_id": account_id},
+                {"provider": provider, "user_id": user_id, "account_id": account_id, "token": token},
+                base_url_override=self._resolve_backend_url_for(provider),
             )
             return bool(res.get("ok", True))
         except Exception as exc:
