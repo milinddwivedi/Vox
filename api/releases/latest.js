@@ -12,17 +12,17 @@ module.exports = async function handler(req, res) {
 
   const manifest = {
     "product_id": "vox-desktop-win64",
-    "version": "2.1.0",
-    "build_number": 210,
+    "version": "2.3.0",
+    "build_number": 230,
     "min_supported_version": "1.0.0",
     "channel": "stable",
     "platform": "win32",
     "arch": "x64",
     "product_name": "VOX \u2014 Local AI Voice Assistant",
-    "release_date": "2026-11-27",
+    "release_date": "2026-11-28",
     "installer_url": "https://vox-voice-assistant.vercel.app/api/download/file",
-    "installer_size_bytes": 227486842,
-    "sha256": "7ae6361d16fd851b8ef1abace8dba00fbf514f664b04d99abbd7373b840450ad",
+    "installer_size_bytes": 227427919,
+    "sha256": "4944fb00abe36499619c5fa44d15a040695bd57afa07a7082eb944a7d163e5aa",
     "signature_algorithm": "Ed25519",
     "model_manifest_version": "2.1.0",
     "required_model_changes": [],
@@ -35,9 +35,9 @@ module.exports = async function handler(req, res) {
     "min_os_version": "Windows 10 Build 19041 (64-bit)",
     "mandatory": false,
     "release_notes": [
-      "Professional Windows Setup Wizard: 4-step installer with live extraction progress, resilient online AI model provisioning and SHA-256 verification, desktop/start-menu shortcuts, Add/Remove Programs uninstaller preserving user data by default, and automatic launch.",
-      "Canonical Model Manifest & Unified Provisioner: Authoritative model_manifest.json (v2.1.0) covering Cohere Transcribe 2B INT8, PyAnnote + WeSpeaker neural diarization, Qwen3.5-4B GGUF (Vulkan + CPU fallback), BGE-Small-EN embeddings, and Whisper Voice Dictation.",
-      "Authenticated Download & Safe In-App Updates: Enforced Google authentication on installer downloads, signed download tickets, automatic pre-upgrade SQLite backup, and recording/finalization deferral."
+      "Unified Meeting Intelligence & Editorial Summary Box: Clean single-document Brief and Detailed summary views with section-level and full-summary copy controls and LLM-authored insights free of raw transcript clutter.",
+      "Executive PDF Export & Ask VOX Polish: Clean multi-section PDF export, instant Ask VOX question visibility, calm processing state, and reliable scrolling.",
+      "Theme Cohesion, Scrollbars, Bulk Delete & Cleaner Detection: Fixed Light/Dark mode overlap and adaptive confirmation dialogs, restored visible scrollbars, added multi-select bulk meeting delete, stopped false PDF browser detection, and removed Slack UI."
     ]
   };
 

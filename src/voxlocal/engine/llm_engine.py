@@ -13,6 +13,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from voxlocal.core.logger import get_app_root, get_logger, get_user_models_root
+from voxlocal.engine.intelligence_verifier import (
+    CALL1A_SUMMARY_SCHEMA,
+    CALL1B_RISKS_QUESTIONS_SCHEMA,
+    CALL2_DECISIONS_ACTIONS_SCHEMA,
+    CALL3_KNOWLEDGE_SCHEMA,
+    verify_and_normalize_intelligence,
+)
 from voxlocal.engine.llama_server_engine import LlamaServerManager, _strip_think_blocks
 
 logger = get_logger("llm_engine")
@@ -176,14 +183,18 @@ class LocalLLMEngine:
         max_tokens: int,
         temperature: float,
         required_keys: Tuple[str, ...],
+        json_schema: Optional[Dict[str, Any]] = None,
+        schema_name: str = "structured_output",
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        """Execute a structured JSON call with raw-vs-repaired tracking and one clean retry on parse miss."""
+        """Execute a schema-constrained JSON call with raw-vs-repaired tracking and clean retry."""
         tel: Dict[str, Any] = {
             "call": call_name,
             "attempts": 0,
             "raw_json_valid": False,
             "post_repair_valid": False,
             "repaired_used": False,
+            "constrained_decoding_used": False,
+            "schema_fallback_reason": "",
             "thinking_disabled_verified": None,
         }
         for attempt in (1, 2):
@@ -197,12 +208,22 @@ class LocalLLMEngine:
                         + "\n\nIMPORTANT: Output ONLY a single compact, valid JSON object matching the schema with all brackets closed.",
                     }
                 ]
-            raw = self._server.chat(
-                eff_msgs,
-                max_tokens=max_tokens if attempt == 1 else min(max_tokens + 250, 2200),
-                temperature=temperature if attempt == 1 else 0.0,
-                json_mode=True,
-            )
+            try:
+                raw = self._server.chat(
+                    eff_msgs,
+                    max_tokens=max_tokens if attempt == 1 else min(max_tokens + 300, 2200),
+                    temperature=temperature if attempt == 1 else 0.0,
+                    json_mode=True,
+                    json_schema=json_schema,
+                    schema_name=schema_name,
+                )
+            except TypeError:
+                raw = self._server.chat(
+                    eff_msgs,
+                    max_tokens=max_tokens if attempt == 1 else min(max_tokens + 300, 2200),
+                    temperature=temperature if attempt == 1 else 0.0,
+                    json_mode=True,
+                )
             usage = self._server.get_last_usage() if hasattr(self._server, "get_last_usage") else {}
             if usage:
                 usage_rec = {"call": call_name, "attempt": attempt, **usage}
@@ -210,6 +231,8 @@ class LocalLLMEngine:
                 tel["thinking_disabled_verified"] = usage.get("thinking_disabled_verified")
                 tel["completion_tokens"] = usage.get("completion_tokens")
                 tel["prompt_tokens"] = usage.get("prompt_tokens")
+                tel["constrained_decoding_used"] = bool(usage.get("constrained_decoding_used", False))
+                tel["schema_fallback_reason"] = str(usage.get("schema_fallback_reason") or "")
             if not raw:
                 continue
             raw_clean = _strip_think_blocks(raw).strip()
@@ -243,6 +266,11 @@ class LocalLLMEngine:
 
     def unload(self) -> None:
         self._server.stop()
+
+    def cancel_active_stream(self) -> None:
+        """Abort any active Ask VOX token stream immediately."""
+        if hasattr(self._server, "cancel_active_stream"):
+            self._server.cancel_active_stream()
 
     def shutdown(self) -> None:
         self._server.shutdown()
@@ -285,11 +313,14 @@ class LocalLLMEngine:
         title: str = "Meeting Notes",
         platform: str = "Zoom",
         duration_sec: float = 0.0,
+        meeting_timestamp: Optional[str] = None,
+        local_user_name: str = "",
     ) -> Optional[Dict[str, Any]]:
         """
-        Two-call grounded meeting intelligence extraction:
-        Call 1: Overview (purpose/outcome), Brief & Detailed Summaries, Key Takeaways, Topics, Follow-ups, Risks, Open Questions
-        Call 2: Confirmed Decisions & Actionable Tasks with strict commitment filtering & null preservation
+        Three-call schema-constrained grounded meeting intelligence extraction + verification:
+        - Call 1A: Purpose, outcome, brief/detailed summaries, key points, structured topics
+        - Call 1B: Atomic risks/blockers, truly unresolved open questions, explicit follow-ups
+        - Call 2: Semantic decisions (confirmed/proposed/pending_confirmation) & atomic actions
         """
         if not self.is_available():
             return None
@@ -297,68 +328,77 @@ class LocalLLMEngine:
         ctx_now = int(getattr(self._server, "active_ctx_size", 16384) or 16384)
         is_cpu = self._server.active_device == "cpu"
         max_words = 3200 if ctx_now <= 8192 else (5800 if (is_cpu or ctx_now <= 16384) else 10500)
-        call_max_tokens = 1200 if ctx_now <= 8192 else (1600 if is_cpu else 2000)
+        call_max_tokens = 1400 if ctx_now <= 8192 else (1800 if is_cpu else 2300)
         transcript = _compact_transcript_lines(segments, max_words=max_words)
         if not transcript:
             return None
 
         dur_min, dur_rem = divmod(max(0, int(duration_sec)), 60)
         dur_str = f"{dur_min}m {dur_rem}s" if dur_min > 0 else f"{dur_rem}s"
+        date_hint = f"Meeting Date: {str(meeting_timestamp)[:16]}\n" if meeting_timestamp else ""
+        self_hint = f"Local mic speaker ('You (Mic)') is {local_user_name}.\n" if local_user_name else ""
+        base_prefix = f"Meeting: {title}\n{date_hint}{self_hint}\nTRANSCRIPT:\n{transcript}"
 
-        base_prefix = f"Meeting: {title}\n\nTRANSCRIPT:\n{transcript}"
-
-        task1_summary = (
-            f"TASK:\nExtract structured minutes for this {platform} meeting (Duration: {dur_str}).\n"
-            "Rules:\n"
-            "- Write brief_summary so it can be read in 30 seconds (2-4 sharp factual sentences).\n"
-            "- Write detailed_summary as well-organized sections covering context, objectives, key topics, agreements, disagreements, dependencies, and next steps — NEVER repeat transcript lines verbatim.\n"
-            "- Populate follow_ups with pending confirmations, future discussion topics, dependencies, or promised follow-ups explicitly mentioned (e.g. sharing files later, checking back, revisiting next week).\n"
-            "- Keep key_discussion_points <= 7, topics <= 6, follow_ups <= 7, open_questions <= 6, risks <= 5.\n"
-            "Schema:\n"
-            "{\n"
-            '  "meeting_purpose": "One sentence stating the primary purpose of this meeting.",\n'
-            '  "overall_outcome": "One sentence stating the main outcome achieved.",\n'
-            '  "brief_summary": "Concise 30-second executive brief covering purpose, outcomes, critical decisions/actions, and blockers.",\n'
-            '  "detailed_summary": "Comprehensive structured multi-paragraph synthesis with clear plain headings covering objectives, topic-by-topic clarifications, agreements, dependencies, and next steps.",\n'
-            '  "key_discussion_points": [\n'
-            '    {"topic": "Short topic", "summary": "Specific factual takeaway", "timestamp_str": "MM:SS", "speakers": ["Speaker"]}\n'
-            "  ],\n"
-            '  "topics": [{"title": "Topic title", "summary": "Concise topic summary", "details": ["Specific factual detail"], "participants": ["Speaker"], "timestamp_str": "MM:SS"}],\n'
-            '  "follow_ups": [{"item": "Concrete follow-up item", "category": "pending_confirmation|question|future_discussion|dependency|promised_followup", "owner": null, "timestamp_str": "MM:SS", "evidence_quote": "Short quote"}],\n'
-            '  "open_questions": [{"question": "Unresolved question", "asked_by": "Speaker", "context": "Short context", "timestamp_str": "MM:SS"}],\n'
-            '  "risks": [{"type": "risk|blocker", "risk": "Risk or blocker mentioned", "impact": "Stated consequence", "mitigation": "Mentioned mitigation or None", "timestamp_str": "MM:SS", "evidence_quote": "Short quote"}]\n'
-            "}"
+        task1a_summary = (
+            f"TASK:\nWrite an executive, user-perspective synthesis for this {platform} meeting (Duration: {dur_str}).\n"
+            "STRICT QUALITY RULES:\n"
+            "- Write as a senior chief of staff for someone who missed the meeting — NEVER copy raw transcript lines, speaker prefixes, greetings ('Hi Amar', 'Good morning', 'How are you'), or [MM:SS] timestamps into prose.\n"
+            "- brief_summary: 3-4 crisp sentences summarizing the core purpose, key agreements, and primary outcome.\n"
+            "- detailed_summary: 2-4 coherent editorial paragraphs covering context, key discussions, decisions made, risks raised, and next steps — 100% synthesized, never stitched conversation quotes.\n"
+            "- key_discussion_points: 3-6 concise factual takeaways written clearly from the reader's perspective (no greetings, no timestamps, no 'Speaker said' framing).\n"
+            "- topics: 2-5 distinct thematic topics with clean descriptive titles (2-6 words, NEVER sentence fragments like 'Hi Amar' or 'Today's meeting'), a 1-2 sentence synthesized summary, and clean bullets.\n"
+            "- Keep internal timestamp_str in MM:SS format accurately for backend grounding only."
         )
-
-        summary_data, tel1 = self._chat_json_with_retry(
-            call_name="call1_summary",
+        summary_data, tel1a = self._chat_json_with_retry(
+            call_name="call1a_summary",
             messages=[
                 {"role": "system", "content": _SHARED_MEETING_SYSTEM_PROMPT},
-                {"role": "user", "content": f"{base_prefix}\n\n{task1_summary}"},
+                {"role": "user", "content": f"{base_prefix}\n\n{task1a_summary}"},
             ],
             max_tokens=call_max_tokens,
             temperature=0.1,
-            required_keys=("brief_summary", "executive_summary", "detailed_summary", "topics", "key_discussion_points"),
+            required_keys=("brief_summary", "detailed_summary", "topics", "key_discussion_points"),
+            json_schema=CALL1A_SUMMARY_SCHEMA,
+            schema_name="meeting_summary_topics",
         )
 
+        task1b_risks_questions = (
+            "TASK:\nExtract ONLY atomic risks/blockers, truly unresolved open questions, and pending follow-ups.\n"
+            "Rules:\n"
+            "- RISKS/BLOCKERS: Separate EACH risk or blocker into its own individual item cleanly. NEVER merge multiple risks into one paragraph and NEVER include labels like 'RISKImpact:'.\n"
+            "- OPEN QUESTIONS: Include ONLY genuinely unanswered questions, pending external confirmations (e.g., finance/customer approval), or unfulfilled information requests. "
+            "NEVER include greetings ('How are you'), context statements ('For context...'), clarification requests ('can you repeat'), or questions already answered yes/no in the meeting.\n"
+            "- Keep risks <= 6, open_questions <= 6, follow_ups <= 7, with verbatim evidence_quote and MM:SS timestamp_str."
+        )
+        risk_q_data, tel1b = self._chat_json_with_retry(
+            call_name="call1b_risks_questions",
+            messages=[
+                {"role": "system", "content": _SHARED_MEETING_SYSTEM_PROMPT},
+                {"role": "user", "content": f"{base_prefix}\n\n{task1b_risks_questions}"},
+            ],
+            max_tokens=min(call_max_tokens, 1400),
+            temperature=0.05,
+            required_keys=("risks", "open_questions"),
+            json_schema=CALL1B_RISKS_QUESTIONS_SCHEMA,
+            schema_name="meeting_risks_open_questions",
+        )
+
+        owner_rule = (
+            f"3. OWNER RULE: 'You (Mic)' is {local_user_name}. "
+            if local_user_name
+            else "3. OWNER RULE: "
+        ) + (
+            "Assign an explicit single owner ONLY when a participant clearly commits (e.g. 'I will / I'll / Let me...') or explicitly accepts a direct assignment. "
+            "If an action uses collective 'we' without a clear single assignee or no owner is stated, set \"owner\": null. NEVER guess organizer or last speaker.\n"
+        )
         task2_actions = (
             "TASK:\nExtract ONLY genuine decisions and genuine actionable commitments/next steps from the transcript above.\n"
             "CRITICAL RULES:\n"
-            "1. STRICT FILTERING: NEVER include greetings, farewells, holiday wishes (e.g. 'have a good holiday', 'be safe on the road'), small talk, or casual explanations without a clear commitment or decision.\n"
-            "2. Each action_items description MUST be written as a concise verb-led task (max 22 words), NOT a copied conversational quote.\n"
-            "3. Set \"owner\": null whenever a single specific participant/speaker name is NOT explicitly committed. NEVER guess or write 'Unassigned'.\n"
-            "4. Set \"due_date\": null whenever a calendar date or timeframe (e.g. Friday, tomorrow, next week) is NOT explicitly spoken. NEVER write 'Not specified' or invent dates.\n"
-            "5. Set \"priority\": \"High\"|\"Medium\"|\"Low\" ONLY when urgency/priority is supported; otherwise null.\n"
-            "6. Extract up to 10 real decisions and up to 14 real action_items; keep verbatim evidence_quote <= 22 words with MM:SS timestamp_str.\n"
-            "Respond strictly with valid JSON matching:\n"
-            "{\n"
-            '  "decisions": [\n'
-            '    {"decision": "Clear decision statement", "category": "Strategic|Technical|Product|Budget|Process|General", "status": "confirmed|proposed|rejected|unresolved", "evolution_relationship": "new|repeated|superseded|reversed", "context": "Why this came up", "rationale": "Reasoning or context", "speaker": "ExactSpeaker", "participants": ["ExactSpeaker"], "evidence_quote": "Short verbatim quote", "timestamp_str": "MM:SS"}\n'
-            "  ],\n"
-            '  "action_items": [\n'
-            '    {"description": "Concise verb-led action", "owner": null, "due_date": null, "priority": null, "commitment_type": "confirmed_commitment|suggested_action|needs_confirmation", "related_topic": "Short topic", "context": "Brief context", "evidence_quote": "Short verbatim quote", "timestamp_str": "MM:SS"}\n'
-            "  ]\n"
-            "}"
+            "1. DECISIONS vs PROPOSALS: Distinguish 'confirmed' (explicitly agreed) from 'proposed', 'under_discussion', 'pending_confirmation' (subject to validation/approval), or 'rejected'. Never turn individual tasks or general discussion into a confirmed decision.\n"
+            "2. ATOMIC ACTIONS: Each action_items description MUST be a single concise verb-led task (max 22 words), NEVER merged tasks and NEVER greetings/farewells.\n"
+            f"{owner_rule}"
+            "4. DUE DATES: Put the exact spoken deadline phrase into \"due_date_text\" (e.g. 'today EOD', 'Monday', 'Tuesday', 'Wednesday', 'next week Thursday', '4th of December'); set null when not explicitly spoken.\n"
+            "5. Keep rationale, context, and evidence_quote crisp (<= 15 words each). Extract up to 8 decisions and 12 action_items with MM:SS timestamp_str."
         )
         actions_data, tel2 = self._chat_json_with_retry(
             call_name="call2_decisions_actions",
@@ -369,32 +409,54 @@ class LocalLLMEngine:
             max_tokens=call_max_tokens,
             temperature=0.05,
             required_keys=("decisions", "action_items"),
+            json_schema=CALL2_DECISIONS_ACTIONS_SCHEMA,
+            schema_name="meeting_decisions_actions",
         )
 
         self._last_reliability_telemetry = {
-            "call1_summary": tel1,
+            "call1a_summary": tel1a,
+            "call1b_risks_questions": tel1b,
             "call2_decisions_actions": tel2,
         }
 
-        if not summary_data and not actions_data:
+        if not summary_data and not risk_q_data and not actions_data:
             return None
 
         merged: Dict[str, Any] = dict(summary_data or {})
+        merged["call1a_ok"] = bool(summary_data)
         if not merged.get("executive_summary") and merged.get("brief_summary"):
             merged["executive_summary"] = merged["brief_summary"]
         if not merged.get("brief_summary") and merged.get("executive_summary"):
             merged["brief_summary"] = merged["executive_summary"]
+
+        if risk_q_data:
+            merged["risks"] = risk_q_data.get("risks", [])
+            merged["open_questions"] = risk_q_data.get("open_questions", [])
+            merged["follow_ups"] = risk_q_data.get("follow_ups", [])
+            merged["call1b_ok"] = True
+        else:
+            merged["call1b_ok"] = False
+
         if actions_data:
             merged["decisions"] = actions_data.get("decisions", [])
             merged["action_items"] = actions_data.get("action_items", [])
             merged["call2_ok"] = True
         else:
             merged["call2_ok"] = False
+
         merged["llm_model"] = self.model_path.name
         merged["llm_device"] = self._server.active_device
         merged["llm_fallback_reason"] = self._server.fallback_reason
         merged["llm_reliability"] = dict(self._last_reliability_telemetry)
-        return self._sanitize_semantic_mom(merged)
+        sanitized = self._sanitize_semantic_mom(merged)
+        verified, ver_report = verify_and_normalize_intelligence(
+            sanitized,
+            segments,
+            meeting_timestamp=meeting_timestamp,
+            local_user_name=local_user_name,
+        )
+        verified["verification_report"] = ver_report
+        return verified
 
     def extract_meeting_knowledge(
         self,
@@ -441,6 +503,8 @@ class LocalLLMEngine:
             max_tokens=call_max_tokens,
             temperature=0.05,
             required_keys=("knowledge_items",),
+            json_schema=CALL3_KNOWLEDGE_SCHEMA,
+            schema_name="meeting_knowledge",
         )
         self._last_reliability_telemetry["call3_knowledge"] = tel3
         if not parsed:
@@ -466,8 +530,11 @@ class LocalLLMEngine:
         context_meeting_title: Optional[str] = None,
         knowledge_items: Optional[List[Dict[str, Any]]] = None,
         max_citations: int = 12,
-        conversation_history: Optional[List[Tuple[str, str]]] = None,
+        conversation_history: Optional[List[Any]] = None,
         answer_depth: str = "detailed",
+        structured_context: str = "",
+        answer_intent: str = "general",
+        local_user_name: str = "",
     ) -> List[Dict[str, str]]:
         excerpts: List[str] = []
         for i, c in enumerate(citations[:max(1, int(max_citations))], 1):
@@ -476,7 +543,7 @@ class LocalLLMEngine:
             date_tag = f" {m_date}" if m_date else ""
             ts = c.get("timestamp_formatted")
             if not ts:
-                st = int(float(c.get("timestamp_sec") or 0.0))
+                st = int(float(c.get("timestamp_sec") or c.get("start_time") or c.get("start_sec") or 0.0))
                 mm, ss = divmod(max(0, st), 60)
                 ts = f"{mm:02d}:{ss:02d}"
             spks_list = c.get("speakers")
@@ -495,37 +562,89 @@ class LocalLLMEngine:
             ]
             k_block = "\n\nVERIFIED KNOWLEDGE MEMORY:\n" + "\n".join(k_lines)
 
+        struct_block = ""
+        if structured_context and str(structured_context).strip():
+            struct_block = f"\n\nAUTHORITATIVE STRUCTURED MEETING INTELLIGENCE:\n{str(structured_context).strip()[:3500]}"
+
         hist_block = ""
         if conversation_history:
             hist_lines: List[str] = []
-            for hq, ha in list(conversation_history)[-4:]:
-                hq_s = str(hq or "").strip()
-                ha_s = str(ha or "").strip()[:320]
+            for entry in list(conversation_history)[-4:]:
+                if isinstance(entry, dict):
+                    hq_s = str(entry.get("question") or entry.get("q") or "").strip()
+                    ha_s = str(entry.get("answer") or entry.get("a") or "").strip()[:360]
+                elif isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                    hq_s = str(entry[0] or "").strip()
+                    ha_s = str(entry[1] or "").strip()[:360]
+                else:
+                    continue
                 if hq_s and ha_s:
                     hist_lines.append(f"User: {hq_s}\nAssistant: {ha_s}")
             if hist_lines:
                 hist_block = "\n\nPRIOR CONVERSATION IN THIS SCOPE:\n" + "\n---\n".join(hist_lines)
 
         excerpts_text = "\n\n".join(excerpts)
-        scope_info = f" (scoped ONLY to '{context_meeting_title}')" if context_meeting_title else " (across all matching meetings)"
-        depth_rule = (
-            "6. Keep the answer crisp and concise (3-5 bullet points max) unless multiple citations are needed."
-            if str(answer_depth or "detailed").lower() == "concise"
-            else "6. Structure helpful answers clearly with **Facts Supported by Sources** (and **Unknowns / Not Discussed** when part of the question is missing)."
+        scope_info = f" (scoped ONLY to '{context_meeting_title}')" if context_meeting_title else " (across all scoped meetings)"
+        user_ref = f" The local user ('You (Mic)') is {local_user_name}." if local_user_name else ""
+
+        intent_norm = str(answer_intent or "general").strip().lower()
+        format_guides = {
+            "customer_notes": (
+                "6. OUTPUT FORMAT (Customer-Ready Structured Meeting Notes):\n"
+                "   - Start with `### Meeting Notes — <Title>` plus **Date** and **Focus**.\n"
+                "   - Add `### Key Discussion Points` grouped by crisp topic subheadings (`#### Topic`) with concise bullets.\n"
+                "   - Add `### Actions & Target Dates` as a clean Markdown table `| Action | Owner | Target Date |` using 'Owner needed' whenever no single owner was stated.\n"
+                "   - Add `### Open Confirmations & Risks` (strictly grounded; zero filler or raw citation tags)."
+            ),
+            "follow_up_email": (
+                "6. OUTPUT FORMAT (Professional Follow-Up Email):\n"
+                "   - Output **Subject:** line, clean greeting, brief context recap, agreed action items with ONLY verified owners and dates (`Owner needed` / `Date TBD` if omitted), and **Open Confirmations**.\n"
+                "   - Never invent recipients, promises, commercial terms, or unstated deadlines."
+            ),
+            "speaker_qa": (
+                "6. OUTPUT FORMAT (Speaker-Attributed Answer):\n"
+                "   - Use clear natural Markdown with exact speaker attribution.\n"
+                "   - Note clearly if a speaker is labeled generically (e.g. `Speaker 1`) rather than confirmed by name."
+            ),
+            "multi_meeting_recap": (
+                "6. OUTPUT FORMAT (Multi-Meeting Notes & Personal Action Plan):\n"
+                "   - Group concise notes by meeting (`### Meeting Title — Date`).\n"
+                "   - End with a clean Markdown action table `| Meeting | Action | Owner | Target Date |` highlighting tasks for the requested owner/self."
+            ),
+            "action_items": (
+                "6. OUTPUT FORMAT (Action Plan Table):\n"
+                "   - Present a clean Markdown table `| Action | Owner | Target Date | Status |`. Use 'Owner needed' for unassigned tasks."
+            ),
+            "decisions": (
+                "6. OUTPUT FORMAT (Decisions Breakdown):\n"
+                "   - Clearly separate **Confirmed Decisions**, **Proposed / Pending Confirmation**, and **Rejected / Unresolved**."
+            ),
+            "risks_open_items": (
+                "6. OUTPUT FORMAT (Risks, Blockers & Unresolved Items):\n"
+                "   - List each risk/blocker separately (**Description**, **Impact**, **Mitigation**) and then **Unresolved Questions & Pending Confirmations**."
+            ),
+        }
+        format_rule = format_guides.get(
+            intent_norm,
+            (
+                "6. Keep the answer crisp and concise (3-5 bullet points max) with natural conversational Markdown."
+                if str(answer_depth or "detailed").lower() == "concise"
+                else "6. Choose clean structured Markdown (short heading or direct answer, concise bullets/tables when helpful, and clearly state when requested details were not discussed)."
+            ),
         )
 
         sys_msg = (
             "You are VOX, a strictly grounded offline meeting intelligence assistant.\n"
-            "Rules:\n"
-            "1. Answer ONLY from the provided Meeting Excerpts and Verified Knowledge Memory.\n"
-            "2. Always cite meeting title, exact speaker name, and exact timestamp `[MM:SS]` for factual claims.\n"
-            "3. CRITICAL SPEAKER ATTRIBUTION: Each transcript line is tagged `[MM:SS|ExactSpeaker]`. Attribute every statement strictly to the ExactSpeaker tag on that line. NEVER merge two different speaker names into one person.\n"
-            "4. CRITICAL REFUSAL RULE: If the answer or requested detail (number, budget, date, decision, owner, topic) is NOT present in the provided excerpts, state explicitly: 'This was not discussed in the provided meeting excerpts.' NEVER guess or extrapolate.\n"
-            "5. If excerpts span multiple meetings, distinguish each meeting clearly.\n"
-            f"{depth_rule}"
+            f"Rules:{user_ref}\n"
+            "1. Answer ONLY from the provided Authoritative Structured Intelligence, Meeting Excerpts, and Verified Knowledge Memory.\n"
+            "2. Present natural, readable answers using exact speaker names and dates when relevant, without appending bracketed timestamp tags (`[MM:SS]`), reference numbers (`[1]`), or a 'Sources:' footer.\n"
+            "3. CRITICAL SPEAKER ATTRIBUTION: Each transcript line is tagged `[MM:SS|ExactSpeaker]`. Attribute every statement strictly to the ExactSpeaker tag on that line. NEVER merge two different speaker names into one person or present an unverified generic speaker as named without noting uncertainty.\n"
+            "4. CRITICAL REFUSAL RULE: If the answer or requested detail (number, budget, date, decision, owner, topic) is NOT present in the provided excerpts, state naturally and honestly that it was not discussed in the meeting without guessing or extrapolating.\n"
+            "5. If excerpts span multiple meetings, distinguish each meeting clearly by title and date.\n"
+            f"{format_rule}"
         )
         usr_msg = (
-            f"MEETING EXCERPTS:\n{excerpts_text}{k_block}{hist_block}\n\n"
+            f"MEETING EXCERPTS:\n{excerpts_text}{struct_block}{k_block}{hist_block}\n\n"
             f"QUESTION{scope_info}: {question}"
         )
         return [
@@ -539,10 +658,13 @@ class LocalLLMEngine:
         citations: List[Dict[str, Any]],
         context_meeting_title: Optional[str] = None,
         knowledge_items: Optional[List[Dict[str, Any]]] = None,
-        conversation_history: Optional[List[Tuple[str, str]]] = None,
+        conversation_history: Optional[List[Any]] = None,
         answer_depth: str = "detailed",
+        structured_context: str = "",
+        answer_intent: str = "general",
+        local_user_name: str = "",
     ) -> Optional[str]:
-        if not citations and not knowledge_items:
+        if not citations and not knowledge_items and not structured_context:
             return None
         self._server.ensure_started()
         ctx_now = int(getattr(self._server, "active_ctx_size", 16384) or 16384)
@@ -555,8 +677,11 @@ class LocalLLMEngine:
             max_citations=max_cit,
             conversation_history=conversation_history,
             answer_depth=answer_depth,
+            structured_context=structured_context,
+            answer_intent=answer_intent,
+            local_user_name=local_user_name,
         )
-        return self._server.chat(msgs, max_tokens=900, temperature=0.1)
+        return self._server.chat(msgs, max_tokens=1100, temperature=0.1)
 
     def answer_query_stream(
         self,
@@ -565,10 +690,13 @@ class LocalLLMEngine:
         context_meeting_title: Optional[str] = None,
         knowledge_items: Optional[List[Dict[str, Any]]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
-        conversation_history: Optional[List[Tuple[str, str]]] = None,
+        conversation_history: Optional[List[Any]] = None,
         answer_depth: str = "detailed",
+        structured_context: str = "",
+        answer_intent: str = "general",
+        local_user_name: str = "",
     ) -> Iterator[str]:
-        if not citations and not knowledge_items:
+        if not citations and not knowledge_items and not structured_context:
             return
         self._server.ensure_started()
         ctx_now = int(getattr(self._server, "active_ctx_size", 16384) or 16384)
@@ -581,9 +709,12 @@ class LocalLLMEngine:
             max_citations=max_cit,
             conversation_history=conversation_history,
             answer_depth=answer_depth,
+            structured_context=structured_context,
+            answer_intent=answer_intent,
+            local_user_name=local_user_name,
         )
         for chunk in self._server.chat_stream(
-            msgs, max_tokens=900, temperature=0.1, cancel_check=cancel_check
+            msgs, max_tokens=1100, temperature=0.1, cancel_check=cancel_check
         ):
             yield chunk
 
@@ -701,16 +832,32 @@ class LocalLLMEngine:
             data["decisions"] = cleaned_decisions
 
         if "key_discussion_points" in data and isinstance(data["key_discussion_points"], list):
-            data["key_discussion_points"] = [
-                k for k in data["key_discussion_points"]
-                if isinstance(k, dict) and (str(k.get("topic") or "").strip() or str(k.get("summary") or "").strip())
-            ]
+            from voxlocal.engine.intelligence_verifier import clean_user_facing_text, is_greeting_or_chatter
+            cleaned_kp = []
+            for k in data["key_discussion_points"]:
+                if isinstance(k, dict):
+                    top = clean_user_facing_text(str(k.get("topic") or ""))
+                    sm = clean_user_facing_text(str(k.get("summary") or ""))
+                    if (top or sm) and not is_greeting_or_chatter(sm or top):
+                        nk = dict(k)
+                        nk["topic"] = top
+                        nk["summary"] = sm
+                        cleaned_kp.append(nk)
+            data["key_discussion_points"] = cleaned_kp
 
         if "topics" in data and isinstance(data["topics"], list):
-            data["topics"] = [
-                t for t in data["topics"]
-                if isinstance(t, dict) and (str(t.get("title") or "").strip() or str(t.get("summary") or "").strip())
-            ]
+            from voxlocal.engine.intelligence_verifier import clean_user_facing_text, is_greeting_or_chatter
+            cleaned_topics = []
+            for t in data["topics"]:
+                if isinstance(t, dict):
+                    ttl = clean_user_facing_text(str(t.get("title") or ""))
+                    sm = clean_user_facing_text(str(t.get("summary") or ""))
+                    if (ttl or sm) and not (is_greeting_or_chatter(ttl) and is_greeting_or_chatter(sm)):
+                        nt = dict(t)
+                        nt["title"] = ttl or "Discussion Topic"
+                        nt["summary"] = sm
+                        cleaned_topics.append(nt)
+            data["topics"] = cleaned_topics
 
         if "follow_ups" in data and isinstance(data["follow_ups"], list):
             cleaned_fu = []
@@ -731,7 +878,7 @@ class LocalLLMEngine:
         if "risks" in data and isinstance(data["risks"], list):
             data["risks"] = [
                 r for r in data["risks"]
-                if isinstance(r, dict) and str(r.get("risk") or "").strip()
+                if isinstance(r, dict) and str(r.get("risk") or r.get("description") or "").strip()
             ]
 
         return data

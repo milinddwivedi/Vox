@@ -1,6 +1,6 @@
 """
 Read AI-Style Meeting Call Consent Dialog for VoxLocal.
-Appears when Zoom, Microsoft Teams, Google Meet, Slack, or Webex starts.
+Appears when Zoom, Microsoft Teams, Google Meet, or Webex starts.
 Ensures meeting recording is 100% user-controlled and explicit.
 Allows one-click recording of dual-track audio (both parties) + optional 1080p screen capture.
 """

@@ -29,6 +29,54 @@ from voxlocal.ui.icons import get_icon
 from voxlocal.ui.theme import get_html_font_family, get_theme_tokens
 
 _TS_TOKEN_RE = re.compile(r"\[(\d{1,2}:\d{2}(?::\d{2})?)\]")
+_ASK_THINK_BLOCK_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
+_ASK_TRAILING_SOURCES_RE = re.compile(
+    r"(?:\n\s*---+\s*)?\n\s*(?:#{1,4}\s*|\*\*)(?:Verified\s+Source\s+Citations|Direct\s+Source\s+Evidence|Source\s+Excerpts|Grounded\s+Source\s+Excerpts[^\n]*|Sources|References|Citations)\b:?[\s\S]*$",
+    re.IGNORECASE,
+)
+_ASK_INFO_TIP_RE = re.compile(r"\n?>\s*ℹ️\s*\*?Click any citation[^\n]*\*?", re.IGNORECASE)
+_ASK_BRACKET_TS_RE = re.compile(r"\(\s*\[\d{1,2}:\d{2}(?::\d{2})?(?:\s*[·|]\s*[^\]]+)?\]\s*\)|\[\d{1,2}:\d{2}(?::\d{2})?(?:\s*[·|]\s*[^\]]+)?\]")
+_ASK_BACKTICK_TS_RE = re.compile(r"`\s*\[?\d{1,2}:\d{2}(?::\d{2})?\]?\s*`")
+_ASK_REF_TAG_RE = re.compile(r"\[\d{1,2}\](?!\()")
+
+
+def sanitize_ask_vox_display_markdown(text: str) -> str:
+    """
+    Strip technical source blocks, citation footers, bracketed [MM:SS]/[1] tags,
+    and <think> reasoning fragments from Ask VOX responses while preserving clean
+    conversational Markdown structure (headings, lists, tables, code, bold emphasis).
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+    s = _ASK_THINK_BLOCK_RE.sub("", raw)
+    if "<think>" in s.lower():
+        idx = s.lower().find("<think>")
+        s = s[:idx]
+    s = _ASK_TRAILING_SOURCES_RE.sub("", s)
+    s = _ASK_INFO_TIP_RE.sub("", s)
+
+    cleaned_lines: List[str] = []
+    in_code_fence = False
+    for line in s.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_fence = not in_code_fence
+            cleaned_lines.append(line)
+            continue
+        if not in_code_fence:
+            line = _ASK_BRACKET_TS_RE.sub("", line)
+            line = _ASK_BACKTICK_TS_RE.sub("", line)
+            line = _ASK_REF_TAG_RE.sub("", line)
+            line = re.sub(r"[ \t]{2,}", " ", line)
+            line = re.sub(r"\s+([.,;:?!])", r"\1", line)
+            line = re.sub(r"\(\s*\)", "", line)
+            line = line.rstrip()
+        cleaned_lines.append(line)
+
+    out = "\n".join(cleaned_lines).strip()
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out
 
 
 def parse_timestamp_seconds(ts_str: str) -> float:
@@ -43,7 +91,7 @@ def parse_timestamp_seconds(ts_str: str) -> float:
     return 0.0
 
 
-def _apply_inline_markdown_html(escaped_line: str, t: dict) -> str:
+def _apply_inline_markdown_html(escaped_line: str, t: dict, include_timestamp_chips: bool = True) -> str:
     """Apply safe inline Markdown formatting to an already HTML-escaped line."""
     accent = t.get("accent_fathom", "#4F46E5")
     chip_bg = t.get("chip_bg", "#F1F5F9")
@@ -69,22 +117,23 @@ def _apply_inline_markdown_html(escaped_line: str, t: dict) -> str:
         s,
     )
 
-    # Clickable [MM:SS] timestamps
-    def _ts_badge(m: re.Match) -> str:
-        lbl = m.group(1)
-        sec = parse_timestamp_seconds(lbl)
-        return (
-            f'<a href="seek:{sec:.1f}" '
-            f'style="background:{chip_bg};color:{accent};border:1px solid {chip_bdr};'
-            f'border-radius:4px;padding:0px 5px;font-weight:700;text-decoration:none;font-size:11px;">'
-            f"{lbl}</a>"
-        )
+    if include_timestamp_chips:
+        # Clickable [MM:SS] timestamps (Summary / Overview workspace)
+        def _ts_badge(m: re.Match) -> str:
+            lbl = m.group(1)
+            sec = parse_timestamp_seconds(lbl)
+            return (
+                f'<a href="seek:{sec:.1f}" '
+                f'style="background:{chip_bg};color:{accent};border:1px solid {chip_bdr};'
+                f'border-radius:4px;padding:0px 5px;font-weight:700;text-decoration:none;font-size:11px;">'
+                f"{lbl}</a>"
+            )
 
-    s = _TS_TOKEN_RE.sub(_ts_badge, s)
+        s = _TS_TOKEN_RE.sub(_ts_badge, s)
     return s
 
 
-def render_safe_markdown_html(text: str, theme: str = "light") -> str:
+def render_safe_markdown_html(text: str, theme: str = "light", include_timestamp_chips: bool = True) -> str:
     """
     Convert structured or AI-generated Markdown/plain text into clean, safe HTML
     without exposing raw '#', '**', or '- [ ]' syntax in the Qt UI.
@@ -98,17 +147,19 @@ def render_safe_markdown_html(text: str, theme: str = "light") -> str:
     muted = t.get("text_secondary", "#475569")
     border = t.get("border", "#CBD5E1")
     tbl_hdr_bg = t.get("table_header_bg", "#F8FAFC")
-    accent = t.get("accent_fathom", "#4F46E5")
+    code_bg = t.get("surface_container", "#F1F5F9")
 
     lines = txt.splitlines()
     font_css = get_html_font_family()
     out: List[str] = [
-        f'<div style="font-family:{font_css};font-size:13.5px;line-height:1.62;color:{fg};">'
+        f'<div style="font-family:{font_css};font-size:13.5px;line-height:1.62;color:{fg};overflow-wrap:anywhere;">'
     ]
     in_ul = False
     in_ol = False
     in_table = False
     table_header_done = False
+    in_code_block = False
+    code_lines: List[str] = []
 
     def _close_lists() -> None:
         nonlocal in_ul, in_ol
@@ -126,8 +177,34 @@ def render_safe_markdown_html(text: str, theme: str = "light") -> str:
             in_table = False
             table_header_done = False
 
+    def _flush_code_block() -> None:
+        nonlocal in_code_block, code_lines
+        if in_code_block:
+            joined = html.escape("\n".join(code_lines))
+            out.append(
+                f'<pre style="background:{code_bg};border:1px solid {border};border-radius:8px;'
+                f'padding:8px 10px;margin:6px 0;font-family:Consolas,monospace;font-size:12px;'
+                f'white-space:pre-wrap;"><code>{joined}</code></pre>'
+            )
+            code_lines = []
+            in_code_block = False
+
     for raw_ln in lines:
         s = raw_ln.strip()
+        if s.startswith("```"):
+            _close_lists()
+            _close_table()
+            if in_code_block:
+                _flush_code_block()
+            else:
+                in_code_block = True
+                code_lines = []
+            continue
+
+        if in_code_block:
+            code_lines.append(raw_ln.rstrip("\n"))
+            continue
+
         if not s:
             _close_lists()
             _close_table()
@@ -159,7 +236,7 @@ def render_safe_markdown_html(text: str, theme: str = "light") -> str:
                     out.append(
                         f'<th style="text-align:left;padding:6px 8px;background:{tbl_hdr_bg};'
                         f'border-bottom:1px solid {border};color:{muted};font-weight:700;">'
-                        f"{_apply_inline_markdown_html(html.escape(c), t)}</th>"
+                        f"{_apply_inline_markdown_html(html.escape(c), t, include_timestamp_chips=include_timestamp_chips)}</th>"
                     )
                 out.append("</tr></thead><tbody>")
                 table_header_done = True
@@ -168,7 +245,7 @@ def render_safe_markdown_html(text: str, theme: str = "light") -> str:
                 for c in cells:
                     out.append(
                         f'<td style="padding:6px 8px;border-bottom:1px solid {border};vertical-align:top;">'
-                        f"{_apply_inline_markdown_html(html.escape(c), t)}</td>"
+                        f"{_apply_inline_markdown_html(html.escape(c), t, include_timestamp_chips=include_timestamp_chips)}</td>"
                     )
                 out.append("</tr>")
             continue
@@ -180,11 +257,11 @@ def render_safe_markdown_html(text: str, theme: str = "light") -> str:
         if m_h:
             _close_lists()
             lvl = len(m_h.group(1))
-            fsize = {1: "17px", 2: "15px", 3: "14px", 4: "13.5px"}.get(lvl, "13.5px")
-            top_m = "12px" if lvl <= 2 else "8px"
+            fsize = {1: "16.5px", 2: "15px", 3: "14px", 4: "13.5px"}.get(lvl, "13.5px")
+            top_m = "10px" if lvl <= 2 else "7px"
             out.append(
                 f'<div style="font-size:{fsize};font-weight:600;color:{fg};margin:{top_m} 0 4px 0;">'
-                f"{_apply_inline_markdown_html(html.escape(m_h.group(2)), t)}</div>"
+                f"{_apply_inline_markdown_html(html.escape(m_h.group(2)), t, include_timestamp_chips=include_timestamp_chips)}</div>"
             )
             continue
 
@@ -197,7 +274,7 @@ def render_safe_markdown_html(text: str, theme: str = "light") -> str:
             txt_style = f"color:{muted};text-decoration:line-through;" if checked else f"color:{fg};"
             out.append(
                 f'<div style="margin:3px 0 3px 4px;{txt_style}">{mark} '
-                f"{_apply_inline_markdown_html(html.escape(m_chk.group(2)), t)}</div>"
+                f"{_apply_inline_markdown_html(html.escape(m_chk.group(2)), t, include_timestamp_chips=include_timestamp_chips)}</div>"
             )
             continue
 
@@ -211,7 +288,7 @@ def render_safe_markdown_html(text: str, theme: str = "light") -> str:
                 out.append('<ul style="margin:4px 0 4px 18px;padding-left:0;">')
                 in_ul = True
             out.append(
-                f'<li style="margin-bottom:4px;">{_apply_inline_markdown_html(html.escape(m_ul.group(1)), t)}</li>'
+                f'<li style="margin-bottom:4px;">{_apply_inline_markdown_html(html.escape(m_ul.group(1)), t, include_timestamp_chips=include_timestamp_chips)}</li>'
             )
             continue
 
@@ -225,17 +302,17 @@ def render_safe_markdown_html(text: str, theme: str = "light") -> str:
                 out.append('<ol style="margin:4px 0 4px 18px;padding-left:0;">')
                 in_ol = True
             out.append(
-                f'<li style="margin-bottom:4px;">{_apply_inline_markdown_html(html.escape(m_ol.group(2)), t)}</li>'
+                f'<li style="margin-bottom:4px;">{_apply_inline_markdown_html(html.escape(m_ol.group(2)), t, include_timestamp_chips=include_timestamp_chips)}</li>'
             )
             continue
 
         # Plain paragraph
         _close_lists()
-        # Style "Heading-like" bold lead-ins nicely
         out.append(
-            f'<p style="margin:0 0 6px 0;">{_apply_inline_markdown_html(html.escape(s), t)}</p>'
+            f'<p style="margin:0 0 6px 0;">{_apply_inline_markdown_html(html.escape(s), t, include_timestamp_chips=include_timestamp_chips)}</p>'
         )
 
+    _flush_code_block()
     _close_lists()
     _close_table()
     out.append("</div>")
@@ -260,6 +337,26 @@ def strip_markdown_for_plain_copy(text: str) -> str:
         s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r"\1 (\2)", s)
         out_lines.append(s)
     return "\n".join(out_lines).strip()
+
+
+def split_markdown_sections(markdown_text: str) -> List[Tuple[str, str]]:
+    """Split markdown into (section_title, section_markdown) pairs on ##/###/#### headings."""
+    lines = str(markdown_text or "").splitlines()
+    sections: List[Tuple[str, List[str]]] = []
+    cur_title = "Full Response"
+    cur_lines: List[str] = []
+    for ln in lines:
+        m = re.match(r"^\s*#{2,4}\s+(.+?)\s*$", ln)
+        if m:
+            if cur_lines and any(x.strip() for x in cur_lines):
+                sections.append((cur_title, cur_lines))
+            cur_title = re.sub(r"[*_`]+", "", m.group(1)).strip()
+            cur_lines = [ln]
+        else:
+            cur_lines.append(ln)
+    if cur_lines and any(x.strip() for x in cur_lines):
+        sections.append((cur_title, cur_lines))
+    return [(title, "\n".join(body).strip()) for title, body in sections if any(x.strip() for x in body)]
 
 
 class WheelForwardingFilter(QObject):
@@ -348,7 +445,7 @@ class VoxSegmentedControl(QFrame):
 
 
 class VoxCollapsibleSectionCard(QFrame):
-    """Modern 2026 expandable section card with count pill and contextual Copy button (zero internal scrollbar)."""
+    """Editorial section block supporting standalone card or flat embedded section inside a unified document card."""
 
     copy_requested = pyqtSignal()
 
@@ -360,6 +457,7 @@ class VoxCollapsibleSectionCard(QFrame):
         show_copy: bool = True,
         copy_label: str = "Copy",
         collapsed: bool = False,
+        flat_embedded: bool = False,
         parent: Optional[QWidget] = None,
         theme: str = "light",
     ) -> None:
@@ -367,15 +465,17 @@ class VoxCollapsibleSectionCard(QFrame):
         self.theme = theme
         self.section_id = section_id
         self._collapsed = bool(collapsed)
-        self.setObjectName("voxSectionCard")
+        self._flat_embedded = bool(flat_embedded)
+        self._copy_feedback_state = "idle"
+        self.setObjectName("voxFlatSection" if self._flat_embedded else "voxSectionCard")
         self.setMinimumWidth(0)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 14)
-        root.setSpacing(10)
+        root.setContentsMargins(0, 6, 0, 12) if self._flat_embedded else root.setContentsMargins(16, 12, 16, 14)
+        root.setSpacing(6 if self._flat_embedded else 10)
 
         hdr = QHBoxLayout()
-        hdr.setSpacing(8)
+        hdr.setSpacing(6 if self._flat_embedded else 8)
 
         self.btn_toggle = QPushButton("")
         self.btn_toggle.setFixedSize(26, 26)
@@ -384,6 +484,8 @@ class VoxCollapsibleSectionCard(QFrame):
         self.btn_toggle.setToolTip("Expand or collapse section")
         self.btn_toggle.setAccessibleName(f"Toggle {title} section")
         self.btn_toggle.clicked.connect(self.toggle_collapsed)
+        if self._flat_embedded:
+            self.btn_toggle.setVisible(False)
         hdr.addWidget(self.btn_toggle)
 
         self.lbl_title = QLabel(title)
@@ -400,10 +502,14 @@ class VoxCollapsibleSectionCard(QFrame):
         hdr.addLayout(self._header_extra_layout)
 
         self.btn_copy: Optional[QPushButton] = None
+        self._copy_reset_timer = QTimer(self)
+        self._copy_reset_timer.setSingleShot(True)
+        self._copy_reset_timer.setInterval(1600)
+        self._copy_reset_timer.timeout.connect(self._reset_copy_icon)
         if show_copy:
             self.btn_copy = QPushButton("")
-            self.btn_copy.setFixedSize(28, 28)
-            self.btn_copy.setIconSize(QSize(14, 14))
+            self.btn_copy.setFixedSize(26, 26)
+            self.btn_copy.setIconSize(QSize(13, 13))
             self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
             self.btn_copy.setToolTip(copy_label or f"Copy {title}")
             self.btn_copy.setAccessibleName(copy_label or f"Copy {title}")
@@ -416,11 +522,24 @@ class VoxCollapsibleSectionCard(QFrame):
         self.body_widget.setMinimumWidth(0)
         self.body_layout = QVBoxLayout(self.body_widget)
         self.body_layout.setContentsMargins(0, 0, 0, 0)
-        self.body_layout.setSpacing(8)
+        self.body_layout.setSpacing(6 if self._flat_embedded else 8)
         self.body_widget.setVisible(not self._collapsed)
         root.addWidget(self.body_widget)
 
         self.set_theme(self.theme)
+
+    def show_copied_feedback(self) -> None:
+        self._copy_feedback_state = "copied"
+        if self.btn_copy is not None:
+            t = get_theme_tokens(self.theme)
+            self.btn_copy.setIcon(get_icon("check", t.get("status_success_text", "#059669"), 13))
+            self._copy_reset_timer.start()
+
+    def _reset_copy_icon(self) -> None:
+        self._copy_feedback_state = "idle"
+        if self.btn_copy is not None:
+            t = get_theme_tokens(self.theme)
+            self.btn_copy.setIcon(get_icon("copy", t.get("text_secondary", "#475569"), 13 if self._flat_embedded else 14))
 
     def add_header_widget(self, widget: QWidget) -> None:
         self._header_extra_layout.addWidget(widget)
@@ -428,7 +547,7 @@ class VoxCollapsibleSectionCard(QFrame):
     def set_count_badge(self, text: str) -> None:
         clean = str(text or "").strip()
         self.lbl_badge.setText(clean)
-        self.lbl_badge.setVisible(bool(clean))
+        self.lbl_badge.setVisible(bool(clean) and not self._flat_embedded)
 
     def set_collapsed(self, collapsed: bool) -> None:
         self._collapsed = bool(collapsed)
@@ -447,13 +566,21 @@ class VoxCollapsibleSectionCard(QFrame):
     def set_theme(self, theme_name: str) -> None:
         self.theme = (theme_name or "light").lower()
         t = get_theme_tokens(self.theme)
-        self.setStyleSheet(
-            f"QFrame#voxSectionCard {{ background-color: {t['surface']}; "
-            f"border: 1px solid {t['outline_variant']}; border-radius: 12px; }}"
-        )
-        self.lbl_title.setStyleSheet(
-            f"font-size: 14.5px; font-weight: 600; color: {t['text_primary']}; border: none; background: transparent;"
-        )
+        if self._flat_embedded:
+            self.setStyleSheet(
+                f"QFrame#voxFlatSection {{ background: transparent; border: none; border-bottom: 1px solid {t['outline_variant']}; }}"
+            )
+            self.lbl_title.setStyleSheet(
+                f"font-size: 13.5px; font-weight: 600; color: {t['text_primary']}; border: none; background: transparent;"
+            )
+        else:
+            self.setStyleSheet(
+                f"QFrame#voxSectionCard {{ background-color: {t['surface']}; "
+                f"border: 1px solid {t['outline_variant']}; border-radius: 12px; }}"
+            )
+            self.lbl_title.setStyleSheet(
+                f"font-size: 14.5px; font-weight: 600; color: {t['text_primary']}; border: none; background: transparent;"
+            )
         self.lbl_badge.setStyleSheet(
             f"background: {t['surface_container']}; color: {t['text_secondary']}; border: none; "
             f"border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600;"
@@ -466,7 +593,13 @@ class VoxCollapsibleSectionCard(QFrame):
             f"QPushButton:hover {{ background: {t['surface_hover']}; }}"
         )
         if self.btn_copy is not None:
-            self.btn_copy.setIcon(get_icon("copy", t.get("text_secondary", "#475569"), 14))
+            icon_name = "check" if self._copy_feedback_state == "copied" else "copy"
+            icon_col = (
+                t.get("status_success_text", "#059669")
+                if self._copy_feedback_state == "copied"
+                else t.get("text_secondary", "#475569")
+            )
+            self.btn_copy.setIcon(get_icon(icon_name, icon_col, 13 if self._flat_embedded else 14))
             self.btn_copy.setStyleSheet(
                 f"QPushButton {{ background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 0px; }} "
                 f"QPushButton:hover {{ background: {t['surface_hover']}; border-color: {t['outline_variant']}; }}"

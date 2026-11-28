@@ -254,7 +254,8 @@ def test_mandatory_meeting_context_isolation_backend_and_ui(qapp):
 
         # Ask VOX strictly inside Meeting A
         page._toggle_ask_rail(True)
-        assert "This Meeting Only: Client Alpha Contract" in page.lbl_ask_scope_badge.text()
+        assert page.combo_ask_scope.currentData() == "this_meeting"
+        assert "Client Alpha Contract" in page.lbl_ask_scope_badge.text()
         page.txt_ask_rail.setText("What budget was approved?")
         page._submit_ask_rail_input()
         for _ in range(40):

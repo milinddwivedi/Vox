@@ -12,6 +12,26 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+try:
+    from voxlocal.engine.intelligence_verifier import (
+        clean_user_facing_text,
+        is_greeting_or_chatter,
+        is_noisy_topic_fragment,
+        is_non_substantive_question,
+    )
+except Exception:  # pragma: no cover - defensive fallback
+    def clean_user_facing_text(text: str) -> str:
+        return str(text or "").strip()
+
+    def is_greeting_or_chatter(text: str) -> bool:
+        return False
+
+    def is_noisy_topic_fragment(title: str, summary: str = "", bullets: Any = None) -> bool:
+        return False
+
+    def is_non_substantive_question(text: str) -> bool:
+        return False
+
 
 def format_meeting_local_datetime(created_at: Any, tz_label: str = "") -> str:
     """Format a persisted meeting timestamp cleanly in local display form with timezone hint."""
@@ -1060,23 +1080,401 @@ class TranscriptExporter:
 </html>
 """
 
+    @staticmethod
+    def _pdf_safe_list(raw: Any) -> List[Any]:
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                pass
+        return []
+
+    @staticmethod
+    def _pdf_inline_format(text: str) -> str:
+        escaped = html.escape(text)
+        escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+        escaped = re.sub(r"`([^`]+)`", r"<span style='font-family:Consolas,monospace;background:#F1F5F9;padding:1px 3px;'>\1</span>", escaped)
+        return escaped
+
     @classmethod
-    def to_pdf(cls, meeting: Dict[str, Any], target_path: Optional[Union[Path, str]] = None) -> Path:
+    def _pdf_prose_to_html(cls, raw_text: str) -> str:
+        cleaned = clean_user_facing_text(str(raw_text or ""))
+        if not cleaned or is_greeting_or_chatter(cleaned):
+            return ""
+        blocks: List[str] = []
+        bullet_buf: List[str] = []
+
+        def _flush_bullets() -> None:
+            if bullet_buf:
+                items = "".join(f"<li style='margin:0 0 4pt 0;'>{cls._pdf_inline_format(it)}</li>" for it in bullet_buf)
+                blocks.append(f"<ul style='margin:4pt 0 6pt 16pt;padding:0;'>{items}</ul>")
+                bullet_buf.clear()
+
+        for raw_ln in cleaned.splitlines():
+            ln = raw_ln.strip()
+            if not ln:
+                _flush_bullets()
+                continue
+            if ln.startswith(("- ", "• ", "* ")):
+                bullet_txt = ln[2:].strip()
+                if bullet_txt and not is_greeting_or_chatter(bullet_txt):
+                    bullet_buf.append(bullet_txt)
+            elif re.match(r"^#{1,4}\s+", ln):
+                _flush_bullets()
+                hd = re.sub(r"^#{1,4}\s+", "", ln).strip()
+                if hd:
+                    blocks.append(f"<p style='margin:6pt 0 3pt 0;font-weight:bold;color:#0F172A;'>{cls._pdf_inline_format(hd)}</p>")
+            else:
+                _flush_bullets()
+                if not is_greeting_or_chatter(ln):
+                    blocks.append(f"<p style='margin:0 0 6pt 0;'>{cls._pdf_inline_format(ln)}</p>")
+        _flush_bullets()
+        return "".join(blocks)
+
+    @classmethod
+    def to_pdf_html(
+        cls,
+        meeting: Dict[str, Any],
+        detail_mode: str = "detailed",
+        include_transcript: bool = False,
+    ) -> str:
         """
-        Renders self-contained meeting HTML deliverable into a clean PDF document
-        using PyQt6 QPdfWriter and QTextDocument.
+        Generates a clean, executive QTextDocument-compatible HTML4/CSS2.1 report
+        for high-DPI PDF rendering with zero raw transcript/greeting clutter.
         """
-        from PyQt6.QtCore import QMarginsF
-        from PyQt6.QtGui import QPageLayout, QPageSize, QPdfWriter, QTextDocument
+        m = meeting if isinstance(meeting, dict) else {}
+        mode_l = "brief" if str(detail_mode or "").strip().lower() == "brief" else "detailed"
+        title = html.escape(str(m.get("title") or "Untitled Meeting").strip())
+        started = format_meeting_local_datetime(
+            m.get("started_at") or m.get("created_at") or "",
+            str(m.get("timezone") or ""),
+        )
+        dur_s = float(m.get("duration_sec") or 0.0)
+        dur_str = format_seconds_hms(dur_s) if dur_s > 0 else "—"
+        plat = str(m.get("source_platform") or "Meeting").strip()
+
+        parts_raw = cls._pdf_safe_list(m.get("participants_json"))
+        if not parts_raw:
+            rp = m.get("participants")
+            if isinstance(rp, list):
+                parts_raw = rp
+            elif isinstance(rp, str) and rp.strip():
+                parts_raw = [x.strip() for x in rp.split(",") if x.strip()]
+        participants = ", ".join(str(p).strip() for p in parts_raw if str(p).strip())
+
+        meta_items = [x for x in (started, f"Duration: {dur_str}", plat) if x]
+        meta_line = html.escape("  |  ".join(meta_items))
+
+        raw_brief = str(m.get("brief_summary") or m.get("summary") or "").strip()
+        raw_det = str(m.get("detailed_summary") or "").strip()
+        chosen_sum = raw_det if (mode_l == "detailed" and raw_det) else (raw_brief or raw_det)
+        sum_html = cls._pdf_prose_to_html(chosen_sum)
+
+        sections: List[str] = []
+
+        # Executive Summary Box
+        if sum_html:
+            sections.append(
+                "<h2 style='font-size:12pt;font-weight:bold;color:#0F172A;margin:14pt 0 6pt 0;"
+                "padding-bottom:3pt;border-bottom:1px solid #E2E8F0;'>Executive Summary</h2>"
+                "<table width='100%' cellspacing='0' cellpadding='0' style='border-collapse:collapse;margin-bottom:8pt;'>"
+                "<tr><td style='background-color:#F8FAFC;border:1px solid #E2E8F0;border-left:4px solid #1A73E8;"
+                f"padding:10pt 12pt;font-size:10pt;line-height:1.45;color:#1E293B;'>{sum_html}</td></tr>"
+                "</table>"
+            )
+
+        # Key Takeaways
+        kp_raw = cls._pdf_safe_list(m.get("key_points_json") or m.get("key_discussion_points"))
+        tk_items: List[str] = []
+        seen_tk = set()
+        for kp in kp_raw:
+            if isinstance(kp, dict):
+                top = clean_user_facing_text(str(kp.get("topic") or ""))
+                sm = clean_user_facing_text(str(kp.get("summary") or kp.get("point") or ""))
+            else:
+                top = ""
+                sm = clean_user_facing_text(str(kp or ""))
+            if not sm or is_greeting_or_chatter(sm):
+                continue
+            key = f"{top.lower()}::{sm.lower()}"
+            if key in seen_tk:
+                continue
+            seen_tk.add(key)
+            prefix = f"<b>{html.escape(top)}:</b> " if top and not is_greeting_or_chatter(top) else ""
+            tk_items.append(f"<li style='margin:0 0 5pt 0;'>{prefix}{html.escape(sm)}</li>")
+        if tk_items:
+            sections.append(
+                "<h2 style='font-size:12pt;font-weight:bold;color:#0F172A;margin:14pt 0 6pt 0;"
+                "padding-bottom:3pt;border-bottom:1px solid #E2E8F0;'>Key Takeaways</h2>"
+                f"<ul style='margin:4pt 0 8pt 16pt;padding:0;font-size:10pt;line-height:1.45;color:#1E293B;'>{''.join(tk_items)}</ul>"
+            )
+
+        # Detailed-only: Topics Discussed
+        if mode_l == "detailed":
+            topics_raw = cls._pdf_safe_list(m.get("topics_json") or m.get("topics_structured"))
+            top_blocks: List[str] = []
+            for top in topics_raw:
+                if not isinstance(top, dict):
+                    continue
+                raw_t_title = str(top.get("title") or top.get("topic") or "").strip()
+                raw_t_sum = str(top.get("summary") or "").strip()
+                raw_t_buls = top.get("key_points") or top.get("details") or []
+                if is_noisy_topic_fragment(raw_t_title, raw_t_sum, raw_t_buls):
+                    continue
+                t_title = clean_user_facing_text(raw_t_title)
+                t_sum = clean_user_facing_text(raw_t_sum)
+                t_buls = [clean_user_facing_text(str(b)) for b in raw_t_buls]
+                t_buls = [b for b in t_buls if b and not is_greeting_or_chatter(b)]
+                if t_title and is_greeting_or_chatter(t_title):
+                    continue
+                if t_sum and is_greeting_or_chatter(t_sum) and not t_buls:
+                    continue
+                if not t_title and not t_sum and not t_buls:
+                    continue
+                b_html = "".join(f"<li style='margin:0 0 3pt 0;'>{html.escape(b)}</li>" for b in t_buls)
+                top_blocks.append(
+                    "<div style='margin:0 0 8pt 0;padding:0 0 6pt 0;border-bottom:1px solid #F1F5F9;'>"
+                    f"<div style='font-size:10.5pt;font-weight:bold;color:#0F172A;margin-bottom:2pt;'>{html.escape(t_title or 'Discussion Topic')}</div>"
+                    + (f"<div style='font-size:10pt;color:#334155;margin-bottom:3pt;'>{html.escape(t_sum)}</div>" if t_sum and not is_greeting_or_chatter(t_sum) else "")
+                    + (f"<ul style='margin:2pt 0 2pt 16pt;padding:0;font-size:9.5pt;color:#334155;'>{b_html}</ul>" if b_html else "")
+                    + "</div>"
+                )
+            if top_blocks:
+                sections.append(
+                    "<h2 style='font-size:12pt;font-weight:bold;color:#0F172A;margin:14pt 0 6pt 0;"
+                    "padding-bottom:3pt;border-bottom:1px solid #E2E8F0;'>Topics Discussed</h2>"
+                    + "".join(top_blocks)
+                )
+
+        # Decisions
+        decs_raw = cls._pdf_safe_list(m.get("decisions"))
+        dec_items: List[str] = []
+        for d in decs_raw:
+            d_txt = clean_user_facing_text(str(d.get("decision") or "") if isinstance(d, dict) else str(d or ""))
+            if not d_txt or is_greeting_or_chatter(d_txt):
+                continue
+            stat = str(d.get("status") or "confirmed").strip().lower() if isinstance(d, dict) else "confirmed"
+            rat = clean_user_facing_text(str(d.get("rationale") or "")) if isinstance(d, dict) else ""
+            stat_tag = f" <span style='color:#64748B;font-size:9pt;'>({html.escape(stat.capitalize())})</span>" if stat != "confirmed" else ""
+            rat_html = f"<div style='font-size:9.5pt;color:#475569;margin-top:2pt;'>{html.escape(rat)}</div>" if rat else ""
+            dec_items.append(f"<li style='margin:0 0 5pt 0;'><b>{html.escape(d_txt)}</b>{stat_tag}{rat_html}</li>")
+        if dec_items:
+            sections.append(
+                "<h2 style='font-size:12pt;font-weight:bold;color:#0F172A;margin:14pt 0 6pt 0;"
+                "padding-bottom:3pt;border-bottom:1px solid #E2E8F0;'>Key Decisions</h2>"
+                f"<ul style='margin:4pt 0 8pt 16pt;padding:0;font-size:10pt;line-height:1.45;color:#1E293B;'>{''.join(dec_items)}</ul>"
+            )
+
+        # Action Items Table
+        acts_raw = cls._pdf_safe_list(m.get("action_items"))
+        act_rows: List[str] = []
+        for idx, a in enumerate(acts_raw):
+            if isinstance(a, dict):
+                desc = clean_user_facing_text(str(a.get("description") or ""))
+                own = str(a.get("owner") or "").strip()
+                if not own or own.lower() in {"unassigned", "unassigned — confirmation required", "owner unknown", "none", "null", "n/a"}:
+                    own = "-"
+                due = str(a.get("due_date") or "").strip()
+                if not due or due.lower() in {"not specified", "no due date", "tbd", "none", "null", "n/a"}:
+                    due = "-"
+                prio = str(a.get("priority") or "").strip().capitalize() or "-"
+                done = str(a.get("status") or "").strip().lower() == "completed"
+            else:
+                desc = clean_user_facing_text(str(a or ""))
+                own, due, prio, done = "-", "-", "-", False
+            if not desc or is_greeting_or_chatter(desc):
+                continue
+            bg = "#FFFFFF" if idx % 2 == 0 else "#F8FAFC"
+            prefix = "[Done] " if done else ""
+            act_rows.append(
+                f"<tr style='background-color:{bg};'>"
+                f"<td style='border:1px solid #E2E8F0;padding:6pt 8pt;font-size:9.8pt;color:#1E293B;'>{html.escape(prefix + desc)}</td>"
+                f"<td style='border:1px solid #E2E8F0;padding:6pt 8pt;font-size:9.5pt;color:#334155;'>{html.escape(own)}</td>"
+                f"<td style='border:1px solid #E2E8F0;padding:6pt 8pt;font-size:9.5pt;color:#334155;'>{html.escape(due)}</td>"
+                f"<td style='border:1px solid #E2E8F0;padding:6pt 8pt;font-size:9.5pt;color:#334155;'>{html.escape(prio)}</td>"
+                "</tr>"
+            )
+        if act_rows:
+            sections.append(
+                "<h2 style='font-size:12pt;font-weight:bold;color:#0F172A;margin:14pt 0 6pt 0;"
+                "padding-bottom:3pt;border-bottom:1px solid #E2E8F0;'>Action Items</h2>"
+                "<table width='100%' cellspacing='0' cellpadding='0' style='border-collapse:collapse;margin-bottom:8pt;'>"
+                "<tr style='background-color:#F1F5F9;'>"
+                "<th align='left' width='52%' style='border:1px solid #CBD5E1;padding:6pt 8pt;font-size:9pt;color:#334155;'>Task</th>"
+                "<th align='left' width='18%' style='border:1px solid #CBD5E1;padding:6pt 8pt;font-size:9pt;color:#334155;'>Owner</th>"
+                "<th align='left' width='16%' style='border:1px solid #CBD5E1;padding:6pt 8pt;font-size:9pt;color:#334155;'>Due</th>"
+                "<th align='left' width='14%' style='border:1px solid #CBD5E1;padding:6pt 8pt;font-size:9pt;color:#334155;'>Priority</th>"
+                "</tr>"
+                + "".join(act_rows)
+                + "</table>"
+            )
+
+        # Detailed-only: Follow-Ups, Risks & Blockers, Open Questions
+        if mode_l == "detailed":
+            fu_raw = cls._pdf_safe_list(m.get("follow_ups_json") or m.get("follow_ups"))
+            fu_items: List[str] = []
+            for fu in fu_raw:
+                if isinstance(fu, dict):
+                    desc = clean_user_facing_text(str(fu.get("item") or fu.get("description") or ""))
+                    own = str(fu.get("owner") or "").strip()
+                    if own.lower() in {"unassigned", "owner unknown", "none", "null", "n/a"}:
+                        own = ""
+                else:
+                    desc = clean_user_facing_text(str(fu or ""))
+                    own = ""
+                if not desc or is_greeting_or_chatter(desc):
+                    continue
+                own_tag = f" <span style='color:#475569;font-size:9pt;'>({html.escape(own)})</span>" if own else ""
+                fu_items.append(f"<li style='margin:0 0 4pt 0;'>{html.escape(desc)}{own_tag}</li>")
+            if fu_items:
+                sections.append(
+                    "<h2 style='font-size:12pt;font-weight:bold;color:#0F172A;margin:14pt 0 6pt 0;"
+                    "padding-bottom:3pt;border-bottom:1px solid #E2E8F0;'>Follow-Ups &amp; Next Steps</h2>"
+                    f"<ul style='margin:4pt 0 8pt 16pt;padding:0;font-size:10pt;line-height:1.45;color:#1E293B;'>{''.join(fu_items)}</ul>"
+                )
+
+            raw_risks = (
+                m.get("risks_and_blockers_list")
+                or m.get("risks_and_blockers")
+                or m.get("risks", [])
+            )
+            rk_iter = raw_risks if isinstance(raw_risks, list) else (raw_risks.splitlines() if isinstance(raw_risks, str) else [])
+            rk_items: List[str] = []
+            for r in rk_iter:
+                if isinstance(r, dict):
+                    itype = str(r.get("item_type") or r.get("type") or "risk").strip().lower()
+                    desc = clean_user_facing_text(str(r.get("description") or r.get("risk") or r.get("title") or ""))
+                    mit = clean_user_facing_text(str(r.get("mitigation_or_resolution") or r.get("mitigation") or ""))
+                    if mit.lower() in {"none", "n/a", "null", "under review"}:
+                        mit = ""
+                    sev = str(r.get("impact") or r.get("severity") or "Medium").strip().capitalize()
+                    lbl = "Blocker" if itype == "blocker" else f"{sev} Risk"
+                else:
+                    desc = clean_user_facing_text(str(r or "").lstrip("•-* "))
+                    mit = ""
+                    lbl = "Risk"
+                if not desc or is_greeting_or_chatter(desc):
+                    continue
+                mit_html = f"<div style='font-size:9.5pt;color:#475569;margin-top:2pt;'><b>Mitigation:</b> {html.escape(mit)}</div>" if mit else ""
+                rk_items.append(
+                    f"<li style='margin:0 0 6pt 0;'><b>[{html.escape(lbl)}]</b> {html.escape(desc)}{mit_html}</li>"
+                )
+            if rk_items:
+                sections.append(
+                    "<h2 style='font-size:12pt;font-weight:bold;color:#0F172A;margin:14pt 0 6pt 0;"
+                    "padding-bottom:3pt;border-bottom:1px solid #E2E8F0;'>Risks &amp; Blockers</h2>"
+                    f"<ul style='margin:4pt 0 8pt 16pt;padding:0;font-size:10pt;line-height:1.45;color:#1E293B;'>{''.join(rk_items)}</ul>"
+                )
+
+            oq_raw = cls._pdf_safe_list(m.get("open_questions_json") or m.get("open_questions"))
+            oq_items: List[str] = []
+            seen_oq = set()
+            for q in oq_raw:
+                qt = clean_user_facing_text(str(q.get("question") or q.get("description") or "") if isinstance(q, dict) else str(q or ""))
+                if not qt or is_greeting_or_chatter(qt) or is_non_substantive_question(qt):
+                    continue
+                if qt.lower() in seen_oq:
+                    continue
+                seen_oq.add(qt.lower())
+                oq_items.append(f"<li style='margin:0 0 4pt 0;'>{html.escape(qt)}</li>")
+            if oq_items:
+                sections.append(
+                    "<h2 style='font-size:12pt;font-weight:bold;color:#0F172A;margin:14pt 0 6pt 0;"
+                    "padding-bottom:3pt;border-bottom:1px solid #E2E8F0;'>Open Questions</h2>"
+                    f"<ul style='margin:4pt 0 8pt 16pt;padding:0;font-size:10pt;line-height:1.45;color:#1E293B;'>{''.join(oq_items)}</ul>"
+                )
+
+        if include_transcript:
+            segments = m.get("segments") or []
+            if segments:
+                seg_rows = []
+                for s in segments:
+                    ts = format_seconds_hms(float(s.get("start_time", 0.0)))
+                    spk = html.escape(str(s.get("speaker") or "Speaker"))
+                    txt = html.escape(str(s.get("text") or "").strip())
+                    if txt:
+                        seg_rows.append(
+                            f"<div style='margin:0 0 4pt 0;font-size:9.5pt;'>"
+                            f"<span style='color:#64748B;'>[{ts}]</span> <b>{spk}:</b> {txt}</div>"
+                        )
+                if seg_rows:
+                    sections.append(
+                        "<h2 style='font-size:12pt;font-weight:bold;color:#0F172A;margin:14pt 0 6pt 0;"
+                        "padding-bottom:3pt;border-bottom:1px solid #E2E8F0;'>Transcript</h2>"
+                        + "".join(seg_rows)
+                    )
+
+        if not sections:
+            sections.append("<p style='font-size:10pt;color:#64748B;'>No meeting summary details recorded.</p>")
+
+        part_html = (
+            f"<div style='font-size:9.5pt;color:#475569;margin-top:3pt;'><b>Participants:</b> {html.escape(participants)}</div>"
+            if participants else ""
+        )
+        mode_tag = "BRIEF SUMMARY" if mode_l == "brief" else "DETAILED SUMMARY"
+        gen_ts = datetime.now().strftime("%b %d, %Y · %I:%M %p").replace(" 0", " ")
+
+        return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:'Segoe UI',Arial,sans-serif;font-size:10pt;color:#1E293B;line-height:1.45;">
+  <table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin-bottom:10pt;border-bottom:2px solid #1A73E8;">
+    <tr>
+      <td style="padding:0 0 10pt 0;">
+        <div style="font-size:8.5pt;font-weight:bold;color:#1A73E8;letter-spacing:1px;margin-bottom:3pt;">VOX MEETING SUMMARY · {mode_tag}</div>
+        <div style="font-size:18pt;font-weight:bold;color:#0F172A;margin-bottom:4pt;">{title}</div>
+        <div style="font-size:9.5pt;color:#475569;">{meta_line}</div>
+        {part_html}
+      </td>
+    </tr>
+  </table>
+  {''.join(sections)}
+  <div style="margin-top:16pt;padding-top:6pt;border-top:1px solid #E2E8F0;font-size:8.5pt;color:#64748B;">
+    Generated by VOX Local Meeting Intelligence · {html.escape(gen_ts)}
+  </div>
+</body>
+</html>
+"""
+
+    @classmethod
+    def to_pdf(
+        cls,
+        meeting: Dict[str, Any],
+        target_path: Optional[Union[Path, str]] = None,
+        detail_mode: str = "detailed",
+        include_transcript: bool = False,
+    ) -> Path:
+        """
+        Renders an executive PDF document at crisp 150 DPI resolution using QPdfWriter
+        and QTextDocument HTML4/CSS2.1 layout.
+        """
+        from PyQt6.QtCore import QMarginsF, QSizeF
+        from PyQt6.QtGui import QFont, QFontDatabase, QPageLayout, QPageSize, QPdfWriter, QTextDocument
         from PyQt6.QtWidgets import QApplication
 
         app = QApplication.instance()
         if app is None:
             app = QApplication([])
 
-        html_content = cls.to_html(meeting)
-        doc = QTextDocument()
-        doc.setHtml(html_content)
+        families = set(QFontDatabase.families())
+        pdf_font_family = "Segoe UI"
+        if pdf_font_family not in families:
+            try:
+                from voxlocal.ui.theme import ensure_google_fonts_loaded
+                ensure_google_fonts_loaded()
+                families = set(QFontDatabase.families())
+            except Exception:
+                pass
+            if "Google Sans" in families:
+                pdf_font_family = "Google Sans"
+            elif "Arial" in families:
+                pdf_font_family = "Arial"
+            elif families:
+                pdf_font_family = sorted(families)[0]
 
         if target_path is None:
             import tempfile
@@ -1088,13 +1486,27 @@ class TranscriptExporter:
             target_path.parent.mkdir(parents=True, exist_ok=True)
 
         writer = QPdfWriter(str(target_path))
+        writer.setResolution(150)
         writer.setPageLayout(
             QPageLayout(
                 QPageSize(QPageSize.PageSizeId.A4),
                 QPageLayout.Orientation.Portrait,
-                QMarginsF(12.0, 14.0, 12.0, 14.0),
+                QMarginsF(14.0, 14.0, 14.0, 14.0),
+                QPageLayout.Unit.Millimeter,
             )
         )
+
+        html_content = cls.to_pdf_html(
+            meeting,
+            detail_mode=detail_mode,
+            include_transcript=include_transcript,
+        )
+        if pdf_font_family != "Segoe UI":
+            html_content = html_content.replace("'Segoe UI',", f"'{pdf_font_family}',")
+        doc = QTextDocument()
+        doc.setDefaultFont(QFont(pdf_font_family, 10))
+        doc.setHtml(html_content)
+        doc.setPageSize(QSizeF(writer.width(), writer.height()))
         doc.print(writer)
         return target_path
 
@@ -1106,6 +1518,7 @@ class TranscriptExporter:
         fmt: str,
         template_name: Optional[str] = None,
         templated_summary: Optional[str] = None,
+        detail_mode: str = "detailed",
     ) -> Path:
         fmt_lower = fmt.lower().strip(".")
         target_path = Path(target_path)
@@ -1130,7 +1543,7 @@ class TranscriptExporter:
             content = cls.to_html(meeting, template_name=template_name, templated_summary=templated_summary)
             target_path.write_text(content, encoding="utf-8")
         elif fmt_lower == "pdf":
-            cls.to_pdf(meeting, target_path=target_path)
+            cls.to_pdf(meeting, target_path=target_path, detail_mode=detail_mode, include_transcript=False)
         else:
             raise ValueError(f"Unsupported export format: {fmt}")
 
@@ -1172,6 +1585,7 @@ class LocalMeetingSummarizer:
         llm_engine: Optional[Any] = None,
         meeting_timestamp: Optional[str] = None,
         timezone: Optional[str] = None,
+        local_user_name: str = "",
     ) -> Dict[str, Any]:
         """
         Comprehensive 7-stage Minutes of Meeting (MoM) intelligence pipeline.
@@ -1189,6 +1603,7 @@ class LocalMeetingSummarizer:
             llm_engine=llm_engine,
             meeting_timestamp=meeting_timestamp,
             timezone=timezone,
+            local_user_name=local_user_name,
         )
 
         # 1. Speaker word counts & talk times

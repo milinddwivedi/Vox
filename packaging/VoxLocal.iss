@@ -4,7 +4,7 @@
 #define MyAppName "VOX Voice Assistant"
 #define MyAppShortName "VOX"
 #ifndef MyAppVersion
-  #define MyAppVersion "2.1.0"
+  #define MyAppVersion "2.3.0"
 #endif
 #define MyAppPublisher "VOX Local AI"
 #define MyAppURL "https://vox-voice-assistant.vercel.app/"

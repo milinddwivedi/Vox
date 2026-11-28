@@ -156,7 +156,7 @@ class MeetingQuickStartDialog(QDialog):
         header_row.addStretch()
 
         self.btn_retry_detect = QPushButton("Retry Detection")
-        self.btn_retry_detect.setToolTip("Rescan for active Microsoft Teams, Zoom, Google Meet, Webex, or Slack calls")
+        self.btn_retry_detect.setToolTip("Rescan for active Microsoft Teams, Zoom, Google Meet, or Webex calls")
         self.btn_retry_detect.clicked.connect(self.refresh_detection)
         header_row.addWidget(self.btn_retry_detect)
         layout.addLayout(header_row)

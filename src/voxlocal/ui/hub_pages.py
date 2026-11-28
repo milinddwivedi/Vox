@@ -1460,7 +1460,7 @@ class StylePage(QWidget):
 
     CATEGORIES = [
         ("style_personal", "Personal messages", "WhatsApp, Telegram, Messages, Instagram"),
-        ("style_work", "Work messages", "Slack, Microsoft Teams, Discord, Linear"),
+        ("style_work", "Work messages", "Microsoft Teams, Discord, Linear"),
         ("style_email", "Email", "Outlook, Gmail, Superhuman"),
         ("style_other", "Other apps", "Notion, Docs, Browsers, Editors"),
     ]
@@ -2081,7 +2081,7 @@ class InsightsPage(QWidget):
             parts = [f"{a.get('app')} ({a.get('words', 0)} words, {a.get('count', 0)}x)" for a in top_apps[:6]]
             self.lbl_top_apps.setText("  ·  ".join(parts))
         else:
-            self.lbl_top_apps.setText("Dictate into Teams, Slack, Outlook, or VS Code to see per-app distribution.")
+            self.lbl_top_apps.setText("Dictate into Teams, Outlook, or VS Code to see per-app distribution.")
 
     def apply_theme(self, theme_name: str) -> None:
         self._theme = "dark" if (theme_name or "").lower() == "dark" else "light"

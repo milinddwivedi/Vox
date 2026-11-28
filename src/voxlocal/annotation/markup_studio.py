@@ -3,7 +3,7 @@ VOX Image Markup Studio (Core Feature 2).
 Professional standalone screenshot and diagram markup workspace.
 Reuses the unified AnnotationEngine for non-destructive vector annotations,
 auto-incrementing tutorial steps, physical blur/redaction, and instant
-one-click copying to Teams/Slack/Outlook via native Windows CF_DIB.
+one-click copying to Teams/Outlook via native Windows CF_DIB.
 """
 
 from __future__ import annotations
@@ -720,7 +720,7 @@ class ImageMarkupStudio(QMainWindow):
         composite = self.get_composite_image()
         ok = copy_image_to_clipboard(composite)
         if ok:
-            self.status.showMessage("✓ Image with markups copied to clipboard! (Ready to paste in Teams/Slack/Outlook)")
+            self.status.showMessage("✓ Image with markups copied to clipboard! (Ready to paste in Teams/Outlook)")
             self.btn_copy.setText("✓ Copied!")
             from PyQt6.QtCore import QTimer
             QTimer.singleShot(2000, lambda: self.btn_copy.setText("📋 Copy Image"))

@@ -165,7 +165,6 @@ def test_call_detector() -> None:
     apps_to_test = [
         (r"c:\program files\zoom\bin\zoom.exe", "Zoom", False),
         (r"c:\program files\windowsapps\msteams_123\ms-teams.exe", "Microsoft Teams", False),
-        (r"c:\program files\slack\slack.exe", "Slack", False),
         (r"c:\program files\google\chrome\application\chrome.exe", "Browser call (Meet/Web)", True),
     ]
     for key, expected_name, expected_browser in apps_to_test:

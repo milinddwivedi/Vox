@@ -51,9 +51,9 @@ class LlamaServerManager:
         idle_timeout_sec: int = 300,
     ) -> None:
         if model_path is None:
-            self.model_path = get_user_models_root() / "meeting_llm" / self.DEFAULT_MODEL_NAME
+            self.model_path = (get_user_models_root() / "meeting_llm" / self.DEFAULT_MODEL_NAME).resolve()
         else:
-            p = Path(model_path)
+            p = Path(model_path).resolve()
             if p.is_dir():
                 p = p / self.DEFAULT_MODEL_NAME
             self.model_path = p
@@ -79,6 +79,7 @@ class LlamaServerManager:
         self._last_usage: Dict[str, Any] = {}
         self._shutting_down: bool = False
         self._active_requests: int = 0
+        self._active_stream_resp: Optional[Any] = None
 
         atexit.register(self.stop)
 
@@ -392,8 +393,20 @@ class LlamaServerManager:
                     pass
                 self._log_file_handle = None
 
+    def cancel_active_stream(self) -> None:
+        """Close any active streaming HTTP response so llama-server aborts immediately."""
+        with self._lock:
+            resp = self._active_stream_resp
+            self._active_stream_resp = None
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
     def shutdown(self) -> None:
         self._shutting_down = True
+        self.cancel_active_stream()
         self.stop()
 
     def get_last_usage(self) -> Dict[str, Any]:
@@ -449,6 +462,8 @@ class LlamaServerManager:
         max_tokens: int = 1200,
         temperature: float = 0.1,
         json_mode: bool = False,
+        json_schema: Optional[Dict[str, Any]] = None,
+        schema_name: str = "structured_output",
         timeout_sec: int = 240,
     ) -> Optional[str]:
         if not self.ensure_started():
@@ -462,7 +477,18 @@ class LlamaServerManager:
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": False},
         }
-        if json_mode:
+        schema_fallback_reason = ""
+        used_constrained_schema = bool(json_schema)
+        if json_schema:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": str(schema_name or "structured_output"),
+                    "strict": True,
+                    "schema": json_schema,
+                },
+            }
+        elif json_mode:
             payload["response_format"] = {"type": "json_object"}
 
         for attempt in (1, 2):
@@ -502,20 +528,29 @@ class LlamaServerManager:
                         "has_think_tags": bool(has_think_tags),
                         "thinking_disabled_verified": (not has_think_tags) and len(str(reasoning_content).strip()) == 0,
                         "finish_reason": choices[0].get("finish_reason"),
+                        "constrained_decoding_used": used_constrained_schema,
+                        "schema_fallback_reason": schema_fallback_reason,
                     }
                     return _strip_think_blocks(content)
                 return None
             except urllib.error.HTTPError as exc:
                 err_body = ""
                 try:
-                    err_body = exc.read().decode("utf-8", errors="ignore")[:300]
+                    err_body = exc.read().decode("utf-8", errors="ignore")[:400]
                 except Exception:
                     pass
                 self._last_error = f"{exc}: {err_body}".strip()
                 logger.warning("llama-server chat HTTP error (attempt %d): %s | %s", attempt, exc, err_body)
                 if attempt == 1:
+                    low_err = err_body.lower()
                     if "chat_template_kwargs" in err_body and "chat_template_kwargs" in payload:
                         payload.pop("chat_template_kwargs", None)
+                        continue
+                    if used_constrained_schema and any(k in low_err for k in ("schema", "grammar", "response_format")):
+                        used_constrained_schema = False
+                        schema_fallback_reason = f"Constrained json_schema fallback to json_object: {err_body[:160]}"
+                        payload["response_format"] = {"type": "json_object"}
+                        logger.warning("%s", schema_fallback_reason)
                         continue
                     self.stop()
                     if not self.ensure_started():
@@ -592,6 +627,8 @@ class LlamaServerManager:
                     raise
             if resp is None:
                 return
+            with self._lock:
+                self._active_stream_resp = resp
             with resp:
                 for raw_line in resp:
                     if cancel_check and cancel_check():
@@ -624,10 +661,14 @@ class LlamaServerManager:
                     except Exception:
                         continue
         except Exception as exc:
-            self._last_error = str(exc)
-            logger.warning("llama-server streaming error: %s", exc)
+            was_cancelled = self._shutting_down or bool(cancel_check and cancel_check())
+            if not was_cancelled:
+                self._last_error = str(exc)
+                logger.warning("llama-server streaming error: %s", exc)
         finally:
             with self._lock:
+                if self._active_stream_resp is resp:
+                    self._active_stream_resp = None
                 if self._active_requests > 0:
                     self._active_requests -= 1
                 self._last_used_mono = time.monotonic()

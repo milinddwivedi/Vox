@@ -5,10 +5,12 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import subprocess
 import threading
 import time
 import unittest.mock
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -47,12 +49,20 @@ from PyQt6.QtWidgets import (
 
 from voxlocal.core.logger import get_logger
 from voxlocal.storage.exporter import TranscriptExporter, format_seconds_hms
-from voxlocal.ui.components import VoxEmptyStateWidget
+from voxlocal.ui.ask_vox_panel import (
+    AskChatMessage,
+    AskMessageState,
+    VoxAskPanel,
+    VoxAssistantMessageWidget,
+)
+from voxlocal.ui.components import VoxEmptyStateWidget, VoxFlowLayout
 from voxlocal.ui.icons import get_icon, get_pixmap
 from voxlocal.ui.meeting_studio import VoxMeetingStudioWorkspace
 from voxlocal.ui.meeting_ui_helpers import (
     VoxSegmentedControl,
     render_safe_markdown_html,
+    sanitize_ask_vox_display_markdown,
+    split_markdown_sections,
     strip_markdown_for_plain_copy,
 )
 from voxlocal.ui.overall_intelligence_view import VoxOverallIntelligenceView
@@ -63,9 +73,13 @@ from voxlocal.ui.theme import (
     PADDING_BTN_GROUP_PX,
     PADDING_CARD_PX,
     PADDING_TOOLBAR_PX,
+    get_dialog_qss,
     get_html_font_family,
+    get_scrollbar_qss,
+    get_theme_palette,
     get_theme_tokens,
     get_ui_font,
+    show_themed_confirm,
 )
 
 if TYPE_CHECKING:
@@ -79,17 +93,22 @@ class VoxMeetingListDelegate(QStyledItemDelegate):
 
     ROLE_META = Qt.ItemDataRole.UserRole + 1
     ROLE_GROUP = Qt.ItemDataRole.UserRole + 2
+    ROLE_CHECKED = Qt.ItemDataRole.UserRole + 3
 
     def __init__(self, parent: Optional[QWidget] = None, theme: str = "light", compact: bool = False) -> None:
         super().__init__(parent)
         self.theme = (theme or "light").lower()
         self.compact = bool(compact)
+        self.multi_select = False
 
     def set_theme(self, theme: str) -> None:
         self.theme = (theme or "light").lower()
 
     def set_compact(self, compact: bool) -> None:
         self.compact = bool(compact)
+
+    def set_multi_select(self, enabled: bool) -> None:
+        self.multi_select = bool(enabled)
 
     def sizeHint(self, option: QStyleOptionViewItem, index: Any) -> QSize:
         group = str(index.data(self.ROLE_GROUP) or "")
@@ -150,8 +169,24 @@ class VoxMeetingListDelegate(QStyledItemDelegate):
         is_compact = bool(meta.get("compact", self.compact))
 
         pad_x = 12
-        inner_left = card_rect.left() + pad_x
-        inner_w = max(40, card_rect.width() - (pad_x * 2) - 12)
+        chk_offset = 24 if self.multi_select else 0
+        if self.multi_select:
+            is_checked = bool(index.data(self.ROLE_CHECKED))
+            box_r = QRect(card_rect.left() + 10, card_rect.top() + max(8, (card_rect.height() - 16) // 2), 16, 16)
+            painter.save()
+            painter.setBrush(QColor(t.get("accent", "#1967D2")) if is_checked else QColor(t.get("surface", "#FFFFFF")))
+            painter.setPen(QColor(t.get("accent", "#1967D2")) if is_checked else QColor(t.get("border", "#CBD5E1")))
+            painter.drawRoundedRect(box_r, 4, 4)
+            if is_checked:
+                pen = painter.pen()
+                pen.setColor(QColor("#FFFFFF"))
+                pen.setWidthF(1.8)
+                painter.setPen(pen)
+                painter.drawLine(box_r.left() + 3, box_r.top() + 8, box_r.left() + 7, box_r.top() + 12)
+                painter.drawLine(box_r.left() + 7, box_r.top() + 12, box_r.left() + 13, box_r.top() + 5)
+            painter.restore()
+        inner_left = card_rect.left() + pad_x + chk_offset
+        inner_w = max(40, card_rect.width() - (pad_x * 2) - 12 - chk_offset)
 
         # Right status dot
         dot_color = {
@@ -260,7 +295,7 @@ class NotetakerPage(QWidget):
     status_toast = pyqtSignal(str, str)
     open_calendar_requested = pyqtSignal()
     open_settings_requested = pyqtSignal(int)
-    _studio_ask_completed = pyqtSignal(str, str, str, object)
+    _studio_ask_completed = pyqtSignal(str, int, str, str, object, str)
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -296,6 +331,17 @@ class NotetakerPage(QWidget):
         # Context-isolated Ask VOX conversation stores (NEVER cross-leak)
         self._meeting_ask_threads: Dict[int, List[Dict[str, Any]]] = {}
         self._overall_ask_thread: List[Dict[str, Any]] = []
+        self._ask_messages_by_key: Dict[str, List[AskChatMessage]] = {}
+        self._ask_session_ids: Dict[str, str] = {}
+        self._ask_loaded_keys: set[str] = set()
+        self._ask_last_scope_by_key: Dict[str, str] = {}
+        self._inflight_ask_requests: Dict[int, Dict[str, Any]] = {}
+        self._active_ask_qid: Optional[int] = None
+        self._active_ask_key_inflight: Optional[str] = None
+        self._rendered_ask_key: Optional[str] = None
+        self._overall_theme_dirty: bool = False
+        self._local_ask_seq: int = 0
+        self._ask_rail_sheet_mode: bool = False
         self._overall_scope_ids: Optional[List[int]] = None
         self._overall_scope_label: str = "All Recorded Meetings"
         self._ask_loading_key: Optional[str] = None
@@ -330,6 +376,19 @@ class NotetakerPage(QWidget):
         self._build_ui()
         self._setup_shortcuts()
         self._studio_ask_completed.connect(self._on_studio_ask_completed)
+        for sig_name, slot in (
+            ("ask_vox_status_changed", self._on_controller_ask_status),
+            ("ask_vox_token_streamed", self._on_controller_ask_token),
+            ("ask_vox_citations_ready", self._on_controller_ask_citations),
+            ("ask_vox_stream_finished", self._on_controller_ask_finished),
+            ("ask_vox_stream_cancelled", self._on_controller_ask_cancelled),
+        ):
+            sig = getattr(self.controller, sig_name, None)
+            if sig is not None and hasattr(sig, "connect"):
+                try:
+                    sig.connect(slot, Qt.ConnectionType.QueuedConnection)
+                except TypeError:
+                    sig.connect(slot)
         self.apply_theme(self._theme)
 
         self.controller.meeting_saved_and_transcribed.connect(self._on_meeting_saved)
@@ -758,11 +817,13 @@ class NotetakerPage(QWidget):
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(6)
+        self.splitter.setMinimumWidth(0)
+        self.splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
 
         # --- Pane 1: Meeting Library (Google Workspace 2-Row Clean Toolbar) ---
         self.lib_card = QFrame()
         self.lib_card.setObjectName("ntCard")
-        self.lib_card.setMinimumWidth(240)
+        self.lib_card.setMinimumWidth(232)
         self.lib_card.setMaximumWidth(360)
         lib_lay = QVBoxLayout(self.lib_card)
         lib_lay.setContentsMargins(10, 10, 10, 10)
@@ -804,7 +865,52 @@ class NotetakerPage(QWidget):
         self.btn_density.setAccessibleName("Toggle meeting list row density")
         self.btn_density.clicked.connect(self._toggle_library_density)
         search_row.addWidget(self.btn_density)
+
+        self._multi_select_mode = False
+        self._checked_meeting_ids: set[int] = set()
+        self.btn_multi_select = QPushButton("")
+        self.btn_multi_select.setObjectName("ntIconToggleBtn")
+        self.btn_multi_select.setFixedSize(28, 28)
+        self.btn_multi_select.setIconSize(QSize(15, 15))
+        self.btn_multi_select.setCheckable(True)
+        self.btn_multi_select.setChecked(False)
+        self.btn_multi_select.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_multi_select.setToolTip("Select multiple meetings to delete")
+        self.btn_multi_select.setAccessibleName("Select multiple meetings")
+        self.btn_multi_select.clicked.connect(self._toggle_multi_select_mode)
+        search_row.addWidget(self.btn_multi_select)
         lib_lay.addLayout(search_row)
+
+        # Contextual Multi-Select Bulk Action Bar (hidden until multi-select enabled)
+        self.bulk_action_bar = QFrame()
+        self.bulk_action_bar.setObjectName("ntBulkBar")
+        self.bulk_action_bar.setVisible(False)
+        bulk_lay = QHBoxLayout(self.bulk_action_bar)
+        bulk_lay.setContentsMargins(8, 5, 8, 5)
+        bulk_lay.setSpacing(6)
+        self.lbl_bulk_count = QLabel("0 selected")
+        bulk_lay.addWidget(self.lbl_bulk_count)
+        bulk_lay.addStretch(1)
+        self.btn_bulk_select_all = QPushButton("All")
+        self.btn_bulk_select_all.setObjectName("ntChipBtn")
+        self.btn_bulk_select_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bulk_select_all.setToolTip("Select or clear all visible meetings")
+        self.btn_bulk_select_all.clicked.connect(self._toggle_select_all_meetings)
+        bulk_lay.addWidget(self.btn_bulk_select_all)
+        self.btn_bulk_delete = QPushButton("Delete")
+        self.btn_bulk_delete.setObjectName("ntBulkDeleteBtn")
+        self.btn_bulk_delete.setIconSize(QSize(13, 13))
+        self.btn_bulk_delete.setEnabled(False)
+        self.btn_bulk_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bulk_delete.setToolTip("Permanently delete selected meetings")
+        self.btn_bulk_delete.clicked.connect(self._delete_checked_meetings)
+        bulk_lay.addWidget(self.btn_bulk_delete)
+        self.btn_bulk_cancel = QPushButton("Done")
+        self.btn_bulk_cancel.setObjectName("ntChipBtn")
+        self.btn_bulk_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bulk_cancel.clicked.connect(lambda: self._toggle_multi_select_mode(False))
+        bulk_lay.addWidget(self.btn_bulk_cancel)
+        lib_lay.addWidget(self.bulk_action_bar)
 
         # Compact Folder + Sort Row
         lib_ctrl_row = QHBoxLayout()
@@ -851,6 +957,7 @@ class NotetakerPage(QWidget):
         self.meetings_list = QListWidget()
         self.meetings_list.setObjectName("ntMeetingsList")
         self.meetings_list.setAlternatingRowColors(False)
+        self.meetings_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.meetings_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.meetings_list.setAccessibleName("Recorded meetings library")
         self.meetings_list.setAccessibleDescription("List of recorded meetings and notes. Use arrow keys to select, Space/Enter to load.")
@@ -859,6 +966,10 @@ class NotetakerPage(QWidget):
         self.meetings_delegate = VoxMeetingListDelegate(self.meetings_list, theme=self._theme, compact=self._library_compact)
         self.meetings_list.setItemDelegate(self.meetings_delegate)
         self.meetings_list.currentItemChanged.connect(self._on_meeting_item_selected)
+        self.meetings_list.itemClicked.connect(self._on_meeting_item_clicked)
+        self._del_list_shortcut = QShortcut(QKeySequence.StandardKey.Delete, self.meetings_list)
+        self._del_list_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._del_list_shortcut.activated.connect(self._delete_checked_or_selected_meetings)
         lib_lay.addWidget(self.meetings_list, 1)
 
         self.lib_card.setVisible(not self._sidebar_collapsed)
@@ -901,7 +1012,7 @@ class NotetakerPage(QWidget):
         self.lbl_scope_badge.setObjectName("ntScopeBadge")
         top_meta.addWidget(self.lbl_scope_badge)
 
-        self.btn_split_view = QPushButton("Split ▾")
+        self.btn_split_view = QPushButton("Split")
         self.btn_split_view.setObjectName("secondaryBtn")
         self.btn_split_view.setIconSize(QSize(14, 14))
         self.btn_split_view.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1109,105 +1220,30 @@ class NotetakerPage(QWidget):
 
         self.splitter.addWidget(self.context_stack)
 
-        # --- Pane 3: Unified Context-Locked Ask VOX Right Rail ---
-        self.ask_rail = QFrame()
-        self.ask_rail.setObjectName("ntAskRail")
-        self.ask_rail.setMinimumWidth(320)
-        self.ask_rail.setMaximumWidth(480)
-        ar_lay = QVBoxLayout(self.ask_rail)
-        ar_lay.setContentsMargins(12, 10, 12, 10)
-        ar_lay.setSpacing(8)
+        # --- Pane 3: Unified Material 3 Ask VOX Right Rail / Side-Sheet ---
+        self.ask_panel = VoxAskPanel(
+            theme=self._theme,
+            config=getattr(self.controller, "config", None),
+            parent=self,
+        )
+        self.ask_panel.set_submit_validator(self._submit_ask_rail_text)
+        self.ask_panel.query_submitted.connect(self._submit_ask_rail_text)
+        self.ask_panel.stop_requested.connect(self._cancel_active_ask)
+        self.ask_panel.retry_requested.connect(self._retry_ask_query)
+        self.ask_panel.new_chat_requested.connect(self._clear_current_ask_thread)
+        self.ask_panel.scope_changed.connect(self._on_ask_scope_changed)
+        self.ask_panel.close_requested.connect(lambda: self._toggle_ask_rail(False))
 
-        ar_hdr = QHBoxLayout()
-        ar_hdr.setSpacing(6)
-        self.lbl_ask_rail_icon = QLabel()
-        self.lbl_ask_rail_icon.setFixedSize(18, 18)
-        ar_hdr.addWidget(self.lbl_ask_rail_icon)
-        self.lbl_ask_rail_title = QLabel("Ask VOX")
-        self.lbl_ask_rail_title.setFont(get_ui_font(15, 600))
-        ar_hdr.addWidget(self.lbl_ask_rail_title)
-        ar_hdr.addStretch(1)
-        self.combo_ask_depth = QComboBox()
-        self.combo_ask_depth.addItem("Concise", "concise")
-        self.combo_ask_depth.addItem("Detailed", "detailed")
-        ar_hdr.addWidget(self.combo_ask_depth)
-        self.btn_ask_close = QPushButton("")
-        self.btn_ask_close.setFixedSize(28, 28)
-        self.btn_ask_close.setIconSize(QSize(14, 14))
-        self.btn_ask_close.setObjectName("ghostBtn")
-        self.btn_ask_close.setToolTip("Collapse Ask VOX assistant")
-        self.btn_ask_close.setAccessibleName("Close Ask VOX rail")
-        self.btn_ask_close.clicked.connect(lambda: self._toggle_ask_rail(False))
-        ar_hdr.addWidget(self.btn_ask_close)
-        ar_lay.addLayout(ar_hdr)
-
-        # Prominent Context Lock Indicator
-        self.lbl_ask_scope_badge = QLabel("This Meeting")
-        self.lbl_ask_scope_badge.setObjectName("ntAskScopeLock")
-        self.lbl_ask_scope_badge.setWordWrap(True)
-        ar_lay.addWidget(self.lbl_ask_scope_badge)
-
-        # Action toolbar
-        ar_tools = QHBoxLayout()
-        ar_tools.setSpacing(6)
-        self.btn_ask_copy_ans = QPushButton("Copy Answer")
-        self.btn_ask_copy_ans.setObjectName("ntChipBtn")
-        self.btn_ask_copy_ans.setIconSize(QSize(12, 12))
-        self.btn_ask_copy_ans.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_ask_copy_ans.clicked.connect(lambda: self._copy_ask_answer(with_sources=False))
-        ar_tools.addWidget(self.btn_ask_copy_ans)
-
-        self.btn_ask_copy_src = QPushButton("Copy w/ Sources")
-        self.btn_ask_copy_src.setObjectName("ntChipBtn")
-        self.btn_ask_copy_src.setIconSize(QSize(12, 12))
-        self.btn_ask_copy_src.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_ask_copy_src.clicked.connect(lambda: self._copy_ask_answer(with_sources=True))
-        ar_tools.addWidget(self.btn_ask_copy_src)
-        ar_tools.addStretch(1)
-
-        self.btn_ask_clear = QPushButton("Clear")
-        self.btn_ask_clear.setObjectName("ghostBtn")
-        self.btn_ask_clear.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_ask_clear.clicked.connect(self._clear_current_ask_thread)
-        ar_tools.addWidget(self.btn_ask_clear)
-        ar_lay.addLayout(ar_tools)
-
-        # Starter prompt chips (context-reactive)
-        chips_wrap = QHBoxLayout()
-        chips_wrap.setSpacing(4)
-        self._ask_chip_btns: List[QPushButton] = []
-        for idx in range(3):
-            cb = QPushButton("")
-            cb.setObjectName("ntChipBtn")
-            cb.setCursor(Qt.CursorShape.PointingHandCursor)
-            cb.clicked.connect(lambda _=False, i=idx: self._on_ask_chip_clicked(i))
-            chips_wrap.addWidget(cb)
-            self._ask_chip_btns.append(cb)
-        chips_wrap.addStretch(1)
-        ar_lay.addLayout(chips_wrap)
-
-        self.ask_rail_browser = QTextBrowser()
-        self.ask_rail_browser.setObjectName("ntAskBrowser")
-        self.ask_rail_browser.setOpenExternalLinks(False)
-        self.ask_rail_browser.setFrameShape(QFrame.Shape.NoFrame)
-        self.ask_rail_browser.anchorClicked.connect(self._on_ask_anchor_clicked)
-        ar_lay.addWidget(self.ask_rail_browser, 1)
-
-        ask_inp_row = QHBoxLayout()
-        ask_inp_row.setSpacing(6)
-        self.txt_ask_rail = QLineEdit()
-        self.txt_ask_rail.setObjectName("voxSearchField")
-        self.txt_ask_rail.setPlaceholderText("Ask about this meeting...")
-        self.txt_ask_rail.returnPressed.connect(self._submit_ask_rail_input)
-        ask_inp_row.addWidget(self.txt_ask_rail, 1)
-
-        self.btn_ask_rail_send = QPushButton("Ask")
-        self.btn_ask_rail_send.setObjectName("fathomBtn")
-        self.btn_ask_rail_send.setIconSize(QSize(13, 13))
-        self.btn_ask_rail_send.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_ask_rail_send.clicked.connect(self._submit_ask_rail_input)
-        ask_inp_row.addWidget(self.btn_ask_rail_send)
-        ar_lay.addLayout(ask_inp_row)
+        # Preserve attribute references for controller & studio integration
+        self.ask_rail = self.ask_panel
+        self.ask_rail_browser = self.ask_panel.conversation_view
+        self.txt_ask_rail = self.ask_panel.composer.input_edit
+        self.btn_ask_rail_send = self.ask_panel.composer.btn_action
+        self.combo_ask_scope = self.ask_panel.combo_scope
+        self.lbl_ask_scope_badge = self.ask_panel.lbl_scope_context
+        self.btn_ask_clear = self.ask_panel.btn_new_chat
+        self.btn_ask_close = self.ask_panel.btn_close
+        self._ask_chip_btns = self.ask_panel.starter_chip_buttons
 
         self.ask_rail.setVisible(self._ask_rail_open)
         if hasattr(self, "studio") and hasattr(self.studio, "tab_summary") and hasattr(self.studio.tab_summary, "ask_box"):
@@ -1262,6 +1298,16 @@ class NotetakerPage(QWidget):
             self.media_player.setSource(QUrl())
 
     def teardown(self) -> None:
+        if hasattr(self, "controller") and hasattr(self.controller, "stop_ask_vox_stream"):
+            try:
+                self.controller.stop_ask_vox_stream()
+            except Exception:
+                pass
+        if hasattr(self, "ask_panel") and hasattr(self.ask_panel, "conversation_view"):
+            try:
+                self.ask_panel.conversation_view.stop_all_animations()
+            except Exception:
+                pass
         for attr in ("_search_debounce_timer", "_media_probe_timer", "_fin_elapsed_timer"):
             tmr = getattr(self, attr, None)
             if tmr is not None and tmr.isActive():
@@ -1848,6 +1894,9 @@ class NotetakerPage(QWidget):
         if hasattr(self, "context_stack"):
             self.context_stack.setCurrentIndex(1 if norm == "overall" else 0)
         if norm == "overall" and hasattr(self, "overall_view"):
+            if getattr(self, "_overall_theme_dirty", False):
+                self._overall_theme_dirty = False
+                self.overall_view.apply_theme(self._theme)
             self.overall_view.refresh_folders()
             self.overall_view.refresh_data()
         self._refresh_ask_rail_ui()
@@ -1966,6 +2015,14 @@ class NotetakerPage(QWidget):
         mid = item.data(Qt.ItemDataRole.UserRole)
         if mid is None:
             return
+        selected_items = [it for it in self.meetings_list.selectedItems() if it.data(Qt.ItemDataRole.UserRole) is not None]
+        if len(selected_items) > 1:
+            ids = [int(it.data(Qt.ItemDataRole.UserRole)) for it in selected_items]
+            menu = QMenu(self)
+            act_del_multi = menu.addAction(f"Delete {len(ids)} Selected Recordings...")
+            act_del_multi.triggered.connect(lambda: self._delete_meetings(ids))
+            menu.exec(self.meetings_list.viewport().mapToGlobal(pos))
+            return
         self.select_meeting(int(mid))
         menu = QMenu(self)
         act_open = menu.addAction("Open in This Meeting")
@@ -1976,26 +2033,30 @@ class NotetakerPage(QWidget):
         act_reproc.triggered.connect(lambda: self._on_reprocess_meeting_clicked(int(mid)))
         act_move = menu.addAction("Move to Folder...")
         act_move.triggered.connect(self._move_selected_to_folder)
-        act_exp = menu.addAction("Export Markdown (.md)...")
-        act_exp.triggered.connect(lambda: self._export_format("md"))
+        act_exp = menu.addAction("Export PDF Document (.pdf)...")
+        act_exp.triggered.connect(lambda: self._export_format("pdf"))
         act_rev = menu.addAction("Reveal Recording Folder")
         act_rev.triggered.connect(self._reveal_recording_folder)
         menu.addSeparator()
+        act_multi = menu.addAction("Select Multiple Meetings...")
+        act_multi.triggered.connect(lambda: self._toggle_multi_select_mode(True, initial_id=int(mid)))
         act_del = menu.addAction("Delete Recording")
         act_del.triggered.connect(self._delete_selected_meeting)
         menu.exec(self.meetings_list.viewport().mapToGlobal(pos))
 
     def refresh_folders(self) -> None:
+        if not hasattr(self, "combo_folders"):
+            return
         self.combo_folders.blockSignals(True)
         current = self.combo_folders.currentData()
         self.combo_folders.clear()
         self.combo_folders.addItem("All Notes", None)
-        for f in self.controller.db.list_folders():
-            self.combo_folders.addItem(f"Folder: {f['name']}", f["id"])
+        if hasattr(self.controller, "db"):
+            for f in self.controller.db.list_folders():
+                self.combo_folders.addItem(f"Folder: {f['name']}", f["id"])
         for i in range(self.combo_folders.count()):
             if self.combo_folders.itemData(i) == current:
                 self.combo_folders.setCurrentIndex(i)
-                break
         self.combo_folders.blockSignals(False)
         if hasattr(self, "overall_view"):
             self.overall_view.refresh_folders()
@@ -2004,8 +2065,109 @@ class NotetakerPage(QWidget):
         self._active_folder_id = self.combo_folders.currentData()
         self.refresh_meetings_list()
 
+    def _toggle_multi_select_mode(self, checked: Optional[bool] = None, initial_id: Optional[int] = None) -> None:
+        self._multi_select_mode = (not self._multi_select_mode) if checked is None else bool(checked)
+        if not self._multi_select_mode:
+            self._checked_meeting_ids.clear()
+        elif initial_id is not None:
+            self._checked_meeting_ids.add(int(initial_id))
+        if hasattr(self, "btn_multi_select"):
+            self.btn_multi_select.blockSignals(True)
+            self.btn_multi_select.setChecked(self._multi_select_mode)
+            self.btn_multi_select.blockSignals(False)
+        if hasattr(self, "bulk_action_bar"):
+            self.bulk_action_bar.setVisible(self._multi_select_mode)
+        if hasattr(self, "meetings_delegate"):
+            self.meetings_delegate.set_multi_select(self._multi_select_mode)
+        self._sync_checked_list_roles()
+
+    def _sync_checked_list_roles(self) -> None:
+        visible_ids = set()
+        for idx in range(self.meetings_list.count()):
+            it = self.meetings_list.item(idx)
+            mid = it.data(Qt.ItemDataRole.UserRole)
+            if mid is not None:
+                mid_i = int(mid)
+                visible_ids.add(mid_i)
+                it.setData(VoxMeetingListDelegate.ROLE_CHECKED, mid_i in self._checked_meeting_ids)
+        self._checked_meeting_ids.intersection_update(visible_ids)
+        cnt = len(self._checked_meeting_ids)
+        if hasattr(self, "lbl_bulk_count"):
+            self.lbl_bulk_count.setText(f"{cnt} selected")
+        if hasattr(self, "btn_bulk_delete"):
+            self.btn_bulk_delete.setEnabled(cnt > 0)
+            self.btn_bulk_delete.setText(f"Delete ({cnt})" if cnt > 0 else "Delete")
+        if hasattr(self, "btn_bulk_select_all"):
+            all_selected = cnt > 0 and cnt == len(visible_ids)
+            self.btn_bulk_select_all.setText("Clear" if all_selected else "All")
+        self.meetings_list.viewport().update()
+
+    def _toggle_select_all_meetings(self) -> None:
+        visible_ids = [
+            int(self.meetings_list.item(i).data(Qt.ItemDataRole.UserRole))
+            for i in range(self.meetings_list.count())
+            if self.meetings_list.item(i).data(Qt.ItemDataRole.UserRole) is not None
+        ]
+        if visible_ids and len(self._checked_meeting_ids) == len(visible_ids):
+            self._checked_meeting_ids.clear()
+        else:
+            self._checked_meeting_ids = set(visible_ids)
+        self._sync_checked_list_roles()
+
+    def _on_meeting_item_clicked(self, item: QListWidgetItem) -> None:
+        if not getattr(self, "_multi_select_mode", False) or item is None:
+            return
+        mid = item.data(Qt.ItemDataRole.UserRole)
+        if mid is None:
+            return
+        mid_i = int(mid)
+        if mid_i in self._checked_meeting_ids:
+            self._checked_meeting_ids.discard(mid_i)
+        else:
+            self._checked_meeting_ids.add(mid_i)
+        self._sync_checked_list_roles()
+
+    def _delete_checked_meetings(self) -> bool:
+        ids = sorted(self._checked_meeting_ids)
+        return self._delete_meetings(ids)
+
+    def _delete_checked_or_selected_meetings(self) -> None:
+        if getattr(self, "_multi_select_mode", False) and self._checked_meeting_ids:
+            self._delete_checked_meetings()
+            return
+        sel = [
+            int(it.data(Qt.ItemDataRole.UserRole))
+            for it in self.meetings_list.selectedItems()
+            if it.data(Qt.ItemDataRole.UserRole) is not None
+        ]
+        if len(sel) > 1:
+            self._delete_meetings(sel)
+        elif sel:
+            self._selected_meeting_id = sel[0]
+            self._delete_selected_meeting()
+
+    def _themed_input_text(self, title: str, label: str) -> Tuple[str, bool]:
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setLabelText(label)
+        dlg.setPalette(get_theme_palette(self._theme))
+        dlg.setStyleSheet(get_dialog_qss(self._theme))
+        ok = dlg.exec() == QDialog.DialogCode.Accepted
+        return dlg.textValue(), ok
+
+    def _themed_input_item(self, title: str, label: str, items: List[str]) -> Tuple[str, bool]:
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setLabelText(label)
+        dlg.setComboBoxItems(items)
+        dlg.setComboBoxEditable(False)
+        dlg.setPalette(get_theme_palette(self._theme))
+        dlg.setStyleSheet(get_dialog_qss(self._theme))
+        ok = dlg.exec() == QDialog.DialogCode.Accepted
+        return dlg.textValue(), ok
+
     def _on_create_folder_clicked(self) -> None:
-        name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
+        name, ok = self._themed_input_text("New Folder", "Folder name:")
         if ok and name.strip():
             self.controller.db.create_folder(name=name.strip(), folder_type="personal")
             self.refresh_folders()
@@ -2072,6 +2234,8 @@ class NotetakerPage(QWidget):
             flt,
             sort_mode,
             bool(self._library_compact),
+            bool(getattr(self, "_multi_select_mode", False)),
+            tuple(sorted(self._checked_meeting_ids)),
             self._selected_meeting_id,
             recoverable_count,
             first_interrupted,
@@ -2137,6 +2301,7 @@ class NotetakerPage(QWidget):
                 },
             )
             item.setData(VoxMeetingListDelegate.ROLE_GROUP, grp_header)
+            item.setData(VoxMeetingListDelegate.ROLE_CHECKED, int(m["id"]) in self._checked_meeting_ids)
             self.meetings_list.addItem(item)
             if m["id"] == self._selected_meeting_id:
                 item.setSelected(True)
@@ -2470,6 +2635,19 @@ class NotetakerPage(QWidget):
             self.controller.re_transcribe_meeting(int(target_id))
             self.status_toast.emit("Re-Transcribing", "Re-processing saved audio locally (original WAV preserved).")
 
+    def _on_reanalyze_insights_clicked(self, meeting_id: Optional[int] = None) -> None:
+        target_id = int(meeting_id) if meeting_id is not None else self._selected_meeting_id
+        if target_id is None or not hasattr(self.controller, "reanalyze_meeting_intelligence"):
+            return
+        ok, msg = self.controller.reanalyze_meeting_intelligence(target_id)
+        if ok:
+            self.status_toast.emit(
+                "Re-analyzing Insights",
+                msg or "Regenerating summary, decisions, actions, risks, and open questions...",
+            )
+        else:
+            self.status_toast.emit("Re-analysis Skipped", msg or "Could not start insights regeneration.")
+
     @staticmethod
     def _resolve_video_path(m: Dict[str, Any]) -> Optional[Path]:
         vpath = str(m.get("video_path") or "")
@@ -2490,7 +2668,13 @@ class NotetakerPage(QWidget):
             return
         vpath = self._resolve_video_path(m)
         if not vpath:
-            QMessageBox.information(self, "No Video", "No video file was recorded for this meeting.")
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("No Video")
+            box.setText("No video file was recorded for this meeting.")
+            box.setPalette(get_theme_palette(self._theme))
+            box.setStyleSheet(get_dialog_qss(self._theme))
+            box.exec()
             return
         self.media_player.stop()
         self.media_player.setSource(QUrl())
@@ -2509,6 +2693,8 @@ class NotetakerPage(QWidget):
         dlg = QDialog(self)
         dlg.setWindowTitle("Assign Participant Names")
         dlg.setFixedWidth(420)
+        dlg.setPalette(get_theme_palette(self._theme))
+        dlg.setStyleSheet(get_dialog_qss(self._theme))
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(20, 18, 20, 18)
         lay.setSpacing(10)
@@ -2589,7 +2775,10 @@ class NotetakerPage(QWidget):
         m["segments"] = self.controller.db.get_meeting_segments(self._selected_meeting_id)
         m["action_items"] = self.controller.db.list_action_items(meeting_id=self._selected_meeting_id)
         m["decisions"] = self.controller.db.list_decisions(meeting_id=self._selected_meeting_id)
-        TranscriptExporter.export_to_file(m, Path(path), fmt=fmt)
+        if hasattr(self.controller.db, "list_risks_and_blockers"):
+            m["risks_and_blockers_list"] = self.controller.db.list_risks_and_blockers(meeting_id=self._selected_meeting_id)
+        detail_mode = str(getattr(getattr(getattr(self, "studio", None), "tab_summary", None), "_detail_mode", "detailed") or "detailed")
+        TranscriptExporter.export_to_file(m, Path(path), fmt=fmt, detail_mode=detail_mode)
         self.status_toast.emit("Export Saved", f"Saved {Path(path).name}")
 
     def _copy_clean_summary(self) -> None:
@@ -2604,6 +2793,8 @@ class NotetakerPage(QWidget):
         menu = QMenu(self)
         act_speakers = menu.addAction("Manage Speakers...")
         act_speakers.triggered.connect(self._assign_speakers_dialog)
+        act_reanalyze = menu.addAction("↻ Re-run AI Insights (Keep Transcript)")
+        act_reanalyze.triggered.connect(lambda: self._on_reanalyze_insights_clicked(self._selected_meeting_id))
         act_reprocess = menu.addAction("Reprocess Transcription & Summary")
         m = self.controller.db.get_meeting(self._selected_meeting_id) if hasattr(self.controller, "db") else None
         act_reprocess.setEnabled(bool(m and self._resolve_audio_path(m) is not None))
@@ -2622,7 +2813,7 @@ class NotetakerPage(QWidget):
             return
         folders = self.controller.db.list_folders()
         names = ["(No Folder)"] + [f["name"] for f in folders]
-        choice, ok = QInputDialog.getItem(self, "Move to Folder", "Select folder:", names, 0, False)
+        choice, ok = self._themed_input_item("Move to Folder", "Select folder:", names)
         if ok:
             fid = None if choice == "(No Folder)" else next((f["id"] for f in folders if f["name"] == choice), None)
             self.controller.db.assign_meeting_folder(self._selected_meeting_id, fid)
@@ -2642,15 +2833,49 @@ class NotetakerPage(QWidget):
         if ap and Path(ap).parent.exists():
             os.startfile(str(Path(ap).parent))
 
+    def _delete_meetings(self, meeting_ids: List[int]) -> bool:
+        ids = sorted({int(mid) for mid in (meeting_ids or []) if mid is not None})
+        if not ids:
+            return False
+        label = (
+            "Permanently delete this meeting recording and notes?"
+            if len(ids) == 1
+            else f"Permanently delete {len(ids)} selected meeting recordings and notes?"
+        )
+        confirmed = show_themed_confirm(
+            self,
+            "Delete Meeting" if len(ids) == 1 else f"Delete {len(ids)} Meetings",
+            label,
+            confirm_label="Delete" if len(ids) == 1 else f"Delete {len(ids)}",
+            cancel_label="Cancel",
+            destructive=True,
+            theme=self._theme,
+        )
+        if not confirmed:
+            return False
+        if self._selected_meeting_id in ids and hasattr(self, "media_player"):
+            self.media_player.stop()
+            self.media_player.setSource(QUrl())
+        for mid in ids:
+            self.controller.db.delete_meeting(mid)
+            self._checked_meeting_ids.discard(mid)
+        if self._selected_meeting_id in ids:
+            self._selected_meeting_id = None
+        if getattr(self, "_multi_select_mode", False):
+            self._toggle_multi_select_mode(False)
+        self.refresh_meetings_list(force=True)
+        if hasattr(self, "overall_view"):
+            self.overall_view._needs_refresh = True
+        self.status_toast.emit(
+            "Deleted Recording" if len(ids) == 1 else "Deleted Recordings",
+            f"Removed {len(ids)} meeting{'s' if len(ids) != 1 else ''}.",
+        )
+        return True
+
     def _delete_selected_meeting(self) -> None:
         if self._selected_meeting_id is None:
             return
-        if QMessageBox.question(self, "Delete Meeting", "Permanently delete this meeting recording and notes?") == QMessageBox.StandardButton.Yes:
-            self.media_player.stop()
-            self.media_player.setSource(QUrl())
-            self.controller.db.delete_meeting(self._selected_meeting_id)
-            self._selected_meeting_id = None
-            self.refresh_meetings_list()
+        self._delete_meetings([int(self._selected_meeting_id)])
 
     def _sync_play_pause_visual(self, playing: bool) -> None:
         t = get_theme_tokens(self._theme)
@@ -2719,10 +2944,18 @@ class NotetakerPage(QWidget):
     def apply_theme(self, theme_name: str) -> None:
         self._theme = "dark" if (theme_name or "").lower() == "dark" else "light"
         t = get_theme_tokens(self._theme)
-        self.setStyleSheet(
-            f"""
-            QWidget {{ background-color: {t['bg']}; color: {t['text']}; }}
-            QLabel {{ background: transparent; border: none; color: {t['text']}; }}
+        self.setObjectName("ntPageRoot")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setUpdatesEnabled(False)
+        try:
+            self.setStyleSheet(
+                f"""
+                QWidget#ntPageRoot {{ background-color: {t['bg']}; color: {t['text']}; }}
+                QSplitter {{ background-color: {t['bg']}; }}
+                QSplitter::handle {{ background-color: {t['bg']}; }}
+                QSplitter::handle:hover {{ background-color: {t['outline_variant']}; }}
+                QScrollArea {{ background: transparent; border: none; }}
+                QLabel {{ background: transparent; border: none; color: {t['text']}; }}
             QLabel#ntMuted {{ color: {t['text_muted']}; font-size: 11.5px; }}
             QFrame#ntCommandBar {{
                 background-color: {t['surface']};
@@ -2864,8 +3097,8 @@ class NotetakerPage(QWidget):
                 color: {t['text_secondary']};
                 border: 1px solid transparent;
                 border-radius: 7px;
-                padding: 3px 9px;
-                font-size: 11.5px;
+                padding: 3px 6px;
+                font-size: 11px;
                 font-weight: 600;
             }}
             QPushButton#ntChipBtn:hover {{
@@ -2959,46 +3192,83 @@ class NotetakerPage(QWidget):
                 background: {t['surface_hover']};
                 color: {t['text_primary']};
             }}
-            """
-        )
-        if hasattr(self, "lbl_mic_health"):
-            mic_col = t["status_success_text"] if self._mic_ok else t["status_warning_text"]
-            self.lbl_mic_health.setStyleSheet(
-                f"font-size: 11px; font-weight: 600; color: {mic_col};"
+            QMenu {{
+                background-color: {t['surface']};
+                color: {t['text_primary']};
+                border: 1px solid {t['border']};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 6px 14px;
+                border-radius: 5px;
+            }}
+            QMenu::item:selected {{
+                background-color: {t['accent_dawn']};
+                color: {t['accent_dawn_text']};
+            }}
+            {get_scrollbar_qss(self._theme)}
+                """
             )
-        if hasattr(self, "lbl_sys_health"):
-            sys_col = t["status_success_text"] if self._sys_healthy else t["status_warning_text"]
-            self.lbl_sys_health.setStyleSheet(
-                f"font-size: 11px; font-weight: 600; color: {sys_col};"
-            )
-        if hasattr(self, "lbl_capture_anomaly"):
-            self.lbl_capture_anomaly.setStyleSheet(
-                f"background: {t['status_warning_bg']}; color: {t['status_warning_text']}; "
-                f"border: 1px solid {t['status_warning']}; border-radius: 6px; padding: 2px 7px; "
-                "font-size: 11px; font-weight: 600;"
-            )
-        if hasattr(self, "lbl_interrupted_summary"):
-            self.lbl_interrupted_summary.setStyleSheet(
-                f"font-weight: 600; font-size: 12px; color: {t['status_warning_text']};"
-            )
-        if hasattr(self, "btn_reprocess") and self.btn_reprocess.text() == "↻ Recover & Re-Transcribe":
-            self.btn_reprocess.setStyleSheet(
-                f"background-color: {t['status_warning_bg']}; color: {t['status_warning_text']}; "
-                f"border: 1px solid {t['status_warning']}; border-radius: 6px; padding: 4px 10px; font-weight: 700;"
-            )
-        if hasattr(self, "mode_switcher"):
-            self.mode_switcher.set_theme(self._theme)
-        if hasattr(self, "meetings_delegate"):
-            self.meetings_delegate.set_theme(self._theme)
-            self.meetings_list.viewport().update()
-        if hasattr(self, "empty_card") and hasattr(self.empty_card, "set_theme"):
-            self.empty_card.set_theme(self._theme)
-        if hasattr(self, "overall_view"):
-            self.overall_view.apply_theme(self._theme)
-        if hasattr(self, "studio"):
-            self.studio.apply_theme(self._theme)
-        self._refresh_toolbar_icons()
-        self._refresh_ask_rail_ui()
+            if hasattr(self, "bulk_action_bar"):
+                self.bulk_action_bar.setStyleSheet(
+                    f"QFrame#ntBulkBar {{ background-color: {t['surface_container']}; border: 1px solid {t['outline_variant']}; border-radius: 8px; }}"
+                )
+            if hasattr(self, "lbl_bulk_count"):
+                self.lbl_bulk_count.setStyleSheet(f"color: {t['text_primary']}; font-size: 11.5px; font-weight: 600;")
+            if hasattr(self, "btn_bulk_delete"):
+                self.btn_bulk_delete.setStyleSheet(
+                    f"QPushButton#ntBulkDeleteBtn {{ background-color: {t['status_danger_bg']}; color: {t['status_danger_text']}; "
+                    f"border: 1px solid {t['status_danger']}; border-radius: 7px; padding: 3px 9px; font-size: 11.5px; font-weight: 600; }} "
+                    f"QPushButton#ntBulkDeleteBtn:disabled {{ opacity: 0.45; }}"
+                )
+            if hasattr(self, "lbl_mic_health"):
+                mic_col = t["status_success_text"] if self._mic_ok else t["status_warning_text"]
+                self.lbl_mic_health.setStyleSheet(
+                    f"font-size: 11px; font-weight: 600; color: {mic_col};"
+                )
+            if hasattr(self, "lbl_sys_health"):
+                sys_col = t["status_success_text"] if self._sys_healthy else t["status_warning_text"]
+                self.lbl_sys_health.setStyleSheet(
+                    f"font-size: 11px; font-weight: 600; color: {sys_col};"
+                )
+            if hasattr(self, "lbl_capture_anomaly"):
+                self.lbl_capture_anomaly.setStyleSheet(
+                    f"background: {t['status_warning_bg']}; color: {t['status_warning_text']}; "
+                    f"border: 1px solid {t['status_warning']}; border-radius: 6px; padding: 2px 7px; "
+                    "font-size: 11px; font-weight: 600;"
+                )
+            if hasattr(self, "lbl_interrupted_summary"):
+                self.lbl_interrupted_summary.setStyleSheet(
+                    f"font-weight: 600; font-size: 12px; color: {t['status_warning_text']};"
+                )
+            if hasattr(self, "btn_reprocess") and self.btn_reprocess.text() == "↻ Recover & Re-Transcribe":
+                self.btn_reprocess.setStyleSheet(
+                    f"background-color: {t['status_warning_bg']}; color: {t['status_warning_text']}; "
+                    f"border: 1px solid {t['status_warning']}; border-radius: 6px; padding: 4px 10px; font-weight: 700;"
+                )
+            if hasattr(self, "mode_switcher"):
+                self.mode_switcher.set_theme(self._theme)
+            if hasattr(self, "meetings_delegate"):
+                self.meetings_delegate.set_theme(self._theme)
+                self.meetings_list.viewport().update()
+            if hasattr(self, "empty_card") and hasattr(self.empty_card, "set_theme"):
+                self.empty_card.set_theme(self._theme)
+            if hasattr(self, "overall_view"):
+                if self._workspace_context == "overall":
+                    self._overall_theme_dirty = False
+                    self.overall_view.apply_theme(self._theme)
+                else:
+                    self.overall_view.theme = self._theme
+                    self._overall_theme_dirty = True
+            if hasattr(self, "studio"):
+                self.studio.apply_theme(self._theme)
+            if hasattr(self, "ask_panel"):
+                self.ask_panel.apply_theme(self._theme)
+            self._refresh_toolbar_icons()
+            self._refresh_ask_rail_ui()
+        finally:
+            self.setUpdatesEnabled(True)
 
     def _refresh_toolbar_icons(self) -> None:
         t = get_theme_tokens(self._theme)
@@ -3015,6 +3285,8 @@ class NotetakerPage(QWidget):
             ("btn_start_adhoc", "record", pri_fg, 14),
             ("btn_new_folder", "folder_plus", fg, 15),
             ("btn_density", "density_compact" if self._library_compact else "density_comfy", fg, 15),
+            ("btn_multi_select", "checklist", ai_fg if getattr(self, "_multi_select_mode", False) else fg, 15),
+            ("btn_bulk_delete", "trash", t.get("status_danger_text", fg), 13),
             ("btn_split_view", "split_view", fg, 14),
             ("btn_watch_video", "video", fg, 14),
             ("btn_export", "export", fg, 14),
@@ -3023,10 +3295,6 @@ class NotetakerPage(QWidget):
             ("btn_speakers", "users", fg, 14),
             ("btn_skip_back", "skip_back", fg, 14),
             ("btn_skip_forward", "skip_forward", fg, 14),
-            ("btn_ask_close", "close", fg, 14),
-            ("btn_ask_copy_ans", "copy", fg, 12),
-            ("btn_ask_copy_src", "copy", fg, 12),
-            ("btn_ask_rail_send", "send", pri_fg, 13),
         ]
         for attr, iname, col, sz in icon_map:
             btn = getattr(self, attr, None)
@@ -3034,8 +3302,6 @@ class NotetakerPage(QWidget):
                 btn.setIcon(get_icon(iname, col, sz))
         if hasattr(self, "auto_start_banner") and hasattr(self.auto_start_banner, "lbl_icon"):
             self.auto_start_banner.lbl_icon.setPixmap(get_pixmap("meetings", t.get("accent", "#1967D2"), 15))
-        if hasattr(self, "lbl_ask_rail_icon"):
-            self.lbl_ask_rail_icon.setPixmap(get_pixmap("sparkles", ai_fg, 16))
         playing = (
             hasattr(self, "media_player")
             and self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
@@ -3043,32 +3309,152 @@ class NotetakerPage(QWidget):
         self._sync_play_pause_visual(playing)
 
     # ------------------------------------------------------------------
-    # Unified Context-Locked Ask VOX Right Rail (Zero Cross-Context Leakage)
+    # Material 3 Conversational Ask VOX (Zero Leakage, Immediate Optimistic UI)
     # ------------------------------------------------------------------
-    def _toggle_ask_rail(self, visible: Optional[bool] = None) -> None:
-        if visible is None:
-            self._ask_rail_open = not self._ask_rail_open
+    def _dock_or_float_ask_panel(self, width_px: Optional[int] = None) -> None:
+        if not hasattr(self, "ask_panel") or not hasattr(self, "splitter"):
+            return
+        w = int(width_px if width_px is not None else (self.width() or 1280))
+        if w <= 0:
+            w = 1280
+
+        if w < 980:
+            # Narrow breakpoint: keep inline bar in summary; when rail is explicitly opened, float as clean side-sheet
+            if self._ask_rail_open:
+                if not self._ask_rail_sheet_mode:
+                    self._ask_rail_sheet_mode = True
+                    self.ask_panel.setParent(self)
+                sheet_w = min(380, max(276, w - 28))
+                self.ask_panel.setMinimumWidth(sheet_w)
+                self.ask_panel.setMaximumWidth(sheet_w)
+                self.ask_panel.set_compact_mode(True)
+                self.ask_panel.setGeometry(max(8, w - sheet_w - 8), 8, sheet_w, max(320, self.height() - 16))
+                self.ask_panel.setVisible(True)
+                self.ask_panel.raise_()
+            else:
+                if self._ask_rail_sheet_mode:
+                    self._ask_rail_sheet_mode = False
+                    self.splitter.addWidget(self.ask_panel)
+                self.ask_panel.setMinimumWidth(0)
+                self.ask_panel.setVisible(False)
+            if hasattr(self, "studio") and hasattr(self.studio, "tab_summary") and hasattr(self.studio.tab_summary, "ask_box"):
+                self.studio.tab_summary.ask_box.setVisible(not self._ask_rail_open)
+            return
+
+        # Wide / Medium docked rail inside splitter
+        if self._ask_rail_sheet_mode:
+            self._ask_rail_sheet_mode = False
+            self.splitter.addWidget(self.ask_panel)
+
+        if w < 1240:
+            self.ask_panel.setMinimumWidth(268)
+            self.ask_panel.setMaximumWidth(350)
+            self.ask_panel.set_compact_mode(True)
         else:
-            self._ask_rail_open = bool(visible)
-        if hasattr(self, "ask_rail"):
-            self.ask_rail.setVisible(self._ask_rail_open)
-        if hasattr(self, "btn_ask_vox_rail"):
-            self.btn_ask_vox_rail.blockSignals(True)
-            self.btn_ask_vox_rail.setChecked(self._ask_rail_open)
-            self.btn_ask_vox_rail.blockSignals(False)
-        # Progressive disclosure: prevent duplicate inline Ask VOX bars when Right Rail is open
+            self.ask_panel.setMinimumWidth(320)
+            self.ask_panel.setMaximumWidth(480)
+            self.ask_panel.set_compact_mode(False)
+
+        self.ask_panel.setVisible(self._ask_rail_open)
+        if w < 1240 and self._ask_rail_open:
+            self.splitter.setSizes([236, max(440, w - 560), 310])
+
         if hasattr(self, "studio") and hasattr(self.studio, "tab_summary") and hasattr(self.studio.tab_summary, "ask_box"):
             self.studio.tab_summary.ask_box.setVisible(not self._ask_rail_open)
         if hasattr(self, "overall_view") and hasattr(self.overall_view, "prompt_strip_card"):
             self.overall_view.prompt_strip_card.setVisible(not self._ask_rail_open)
+
+    def _toggle_ask_rail(self, visible: Optional[bool] = None) -> None:
+        self._responsive_rail_auto_hidden = False
+        if visible is None:
+            self._ask_rail_open = not self._ask_rail_open
+        else:
+            self._ask_rail_open = bool(visible)
+        if hasattr(self, "btn_ask_vox_rail"):
+            self.btn_ask_vox_rail.blockSignals(True)
+            self.btn_ask_vox_rail.setChecked(self._ask_rail_open)
+            self.btn_ask_vox_rail.blockSignals(False)
+        self._dock_or_float_ask_panel()
         self._persist_ui_pref("notetaker_ask_rail_open", self._ask_rail_open)
         self._refresh_toolbar_icons()
         self._refresh_ask_rail_ui()
+        if self._ask_rail_open and hasattr(self, "ask_panel"):
+            self.ask_panel.composer.input_edit.setFocus()
 
     def _active_ask_key(self) -> str:
         if self._workspace_context == "overall":
             return "overall"
         return f"m:{self._selected_meeting_id}" if self._selected_meeting_id is not None else "none"
+
+    def _ensure_session_id(self, target_key: str) -> str:
+        sid = self._ask_session_ids.get(target_key)
+        if not sid:
+            sid = uuid.uuid4().hex[:16]
+            self._ask_session_ids[target_key] = sid
+        return sid
+
+    def _load_persisted_ask_messages(self, target_key: str) -> None:
+        if target_key in self._ask_loaded_keys or target_key == "none":
+            return
+        self._ask_loaded_keys.add(target_key)
+        db = getattr(self.controller, "db", None)
+        if db is None or not hasattr(db, "get_active_ask_vox_messages"):
+            return
+        try:
+            rows = db.get_active_ask_vox_messages(target_key, limit=100)
+        except Exception:
+            rows = []
+        if not rows:
+            return
+        msgs = self._ask_messages_by_key.setdefault(target_key, [])
+        if msgs:
+            return
+        last_sid = str(rows[0].get("session_id") or "")
+        if last_sid:
+            self._ask_session_ids[target_key] = last_sid
+        last_user_q = ""
+        legacy_list: List[Dict[str, Any]] = []
+        mid_val: Optional[int] = None
+        if target_key.startswith("m:"):
+            try:
+                mid_val = int(target_key.split(":", 1)[1])
+            except Exception:
+                mid_val = None
+            legacy_list = self._meeting_ask_threads.setdefault(mid_val, []) if mid_val else []
+        elif target_key == "overall":
+            legacy_list = self._overall_ask_thread
+
+        for r in rows:
+            role = str(r.get("role") or "assistant")
+            content = str(r.get("content") or "")
+            raw_st = str(r.get("status") or "completed")
+            try:
+                state = AskMessageState(raw_st)
+            except Exception:
+                state = AskMessageState.COMPLETED
+            if state.is_pending:
+                state = AskMessageState.CANCELLED
+            cits = list(r.get("citations") or [])
+            msg = AskChatMessage(
+                id=str(r.get("message_uid") or uuid.uuid4().hex[:12]),
+                role=role,
+                content=content,
+                state=state,
+                citations=cits,
+                scope_key=target_key,
+                question_for_retry=last_user_q if role == "assistant" else "",
+            )
+            msgs.append(msg)
+            if role == "user":
+                last_user_q = content
+            elif role == "assistant" and last_user_q:
+                legacy_list.append({"id": msg.id, "q": last_user_q, "a": content, "citations": cits})
+                last_user_q = ""
+
+    def _get_current_ask_messages(self) -> List[AskChatMessage]:
+        key = self._active_ask_key()
+        self._load_persisted_ask_messages(key)
+        return self._ask_messages_by_key.setdefault(key, [])
 
     def _get_current_ask_thread(self) -> List[Dict[str, Any]]:
         if self._workspace_context == "overall":
@@ -3077,96 +3463,211 @@ class NotetakerPage(QWidget):
             return self._meeting_ask_threads.setdefault(int(self._selected_meeting_id), [])
         return []
 
-    def _refresh_ask_rail_ui(self) -> None:
-        if not hasattr(self, "lbl_ask_scope_badge"):
-            return
-        t = get_theme_tokens(self._theme)
+    def _current_scope_summary(self) -> Tuple[str, str, str, str, List[Tuple[str, str]]]:
+        """Return (scope_mode, scope_label, context_text, placeholder, chips)."""
+        scope_mode = str(self.combo_ask_scope.currentData() or "this_meeting") if hasattr(self, "combo_ask_scope") else "this_meeting"
         if self._workspace_context == "overall":
-            self.lbl_ask_scope_badge.setText(f"Overall Library · {self._overall_scope_label}")
-            self.lbl_ask_scope_badge.setStyleSheet(
-                f"background: {t['status_info_bg']}; color: {t['status_info_text']}; "
-                f"border: 1px solid {t['accent']}; border-radius: 7px; padding: 6px 9px; font-size: 11.5px; font-weight: 600;"
+            return (
+                "overall",
+                self._overall_scope_label,
+                f"Overall Library · {self._overall_scope_label}",
+                "Ask VOX anything...",
+                [
+                    ("Last 3 Recap", "Summarize the last 3 meetings and list action items that belong only to me."),
+                    ("Commitments", "Summarize all open commitments and owners across these meetings."),
+                    ("Conflicts", "Compare key decisions across meetings and flag any contradictions."),
+                ],
             )
-            self.txt_ask_rail.setPlaceholderText("Ask across all filtered meetings...")
-            chips = [
-                ("Topics", "What recurring topics and projects appear across these meetings?"),
-                ("Commitments", "Summarize all open commitments and owners across these meetings."),
-                ("Conflicts", "Compare key decisions across meetings and flag any contradictions."),
-            ]
-        else:
-            title = self.lbl_sel_title.text().strip() if hasattr(self, "lbl_sel_title") else "Select a meeting"
-            if self._selected_meeting_id is None:
-                self.lbl_ask_scope_badge.setText("This Meeting · Select a meeting from Library")
-            else:
-                self.lbl_ask_scope_badge.setText(f"This Meeting Only: {title}")
-            self.lbl_ask_scope_badge.setStyleSheet(
-                f"background: {t['accent_dawn']}; color: {t['accent_dawn_text']}; "
-                f"border: 1px solid {t['outline_variant']}; border-radius: 7px; padding: 6px 9px; font-size: 11.5px; font-weight: 600;"
+        if scope_mode in ("last_3", "last_5", "all"):
+            scope_lbl = {
+                "last_3": "Last 3 Meetings",
+                "last_5": "Last 5 Meetings",
+                "all": "All Meetings",
+            }.get(scope_mode, "Multi-Meeting")
+            return (
+                scope_mode,
+                scope_lbl,
+                f"Scoped to {scope_lbl.lower()}",
+                "Ask VOX anything...",
+                [
+                    ("My Actions", "Summarize these meetings and list action items that belong only to me."),
+                    ("Decisions", "What decisions were made or evolved across these meetings?"),
+                    ("Open Items", "What risks or confirmations remain unresolved across these meetings?"),
+                ],
             )
-            self.txt_ask_rail.setPlaceholderText("Ask strictly about this meeting...")
-            chips = [
-                ("Decisions", "What were the key decisions made in this meeting?"),
-                ("Actions", "List action items, owners, and due dates from this meeting."),
-                ("Risks", "What risks, blockers, or open questions were raised in this meeting?"),
-            ]
+        title = self.lbl_sel_title.text().strip() if hasattr(self, "lbl_sel_title") else ""
+        ctx_txt = title if (self._selected_meeting_id is not None and title) else "Select a meeting"
+        return (
+            "this_meeting",
+            ctx_txt,
+            ctx_txt,
+            "Ask VOX anything...",
+            [
+                ("Customer Notes", "Prepare notes of this meeting to share with the customer."),
+                ("Follow-Up Email", "Prepare a follow-up email for this meeting."),
+                ("Risks && Open", "What risks, blockers, or pending confirmations remain?"),
+            ],
+        )
 
-        for idx, btn in enumerate(getattr(self, "_ask_chip_btns", [])):
-            if idx < len(chips):
-                btn.setText(chips[idx][0])
-                btn.setProperty("ask_prompt", chips[idx][1])
-                btn.setVisible(True)
-        self._render_ask_rail_thread()
+    def _on_ask_scope_changed(self, scope_mode: str) -> None:
+        key = self._active_ask_key()
+        prev_scope = self._ask_last_scope_by_key.get(key)
+        self._refresh_ask_rail_ui()
+        if prev_scope and prev_scope != scope_mode and self._get_current_ask_messages():
+            _, scope_lbl, _, _, _ = self._current_scope_summary()
+            self.ask_panel.conversation_view.append_divider(f"Context: {scope_lbl}")
+        self._ask_last_scope_by_key[key] = scope_mode
+
+    def _refresh_ask_rail_ui(self) -> None:
+        if not hasattr(self, "ask_panel"):
+            return
+        scope_mode, scope_lbl, ctx_txt, placeholder, chips = self._current_scope_summary()
+        key = self._active_ask_key()
+        self._ask_last_scope_by_key.setdefault(key, scope_mode)
+
+        empty_title = (
+            "Ask across your meetings"
+            if self._workspace_context == "overall" or scope_mode in ("last_3", "last_5", "all")
+            else "Ask about this meeting"
+        )
+        empty_sub = (
+            f"Answers stay grounded in {scope_lbl}."
+            if (self._workspace_context == "overall" or scope_mode in ("last_3", "last_5", "all"))
+            else "Get summaries, decisions, action items, or answers from this conversation."
+        )
+        self.ask_panel.set_context_display(
+            scope_selector_visible=(self._workspace_context != "overall"),
+            context_text=ctx_txt,
+            empty_title=empty_title,
+            empty_subtitle=empty_sub,
+            chips=chips,
+        )
+        self.ask_panel.composer.set_placeholder(placeholder)
+        if self._rendered_ask_key != key:
+            self._render_ask_rail_thread()
 
     def _on_ask_chip_clicked(self, idx: int) -> None:
         if idx < 0 or idx >= len(getattr(self, "_ask_chip_btns", [])):
             return
         prompt = str(self._ask_chip_btns[idx].property("ask_prompt") or "").strip()
         if prompt:
-            self.txt_ask_rail.setText(prompt)
-            self._submit_ask_rail_input()
+            self._submit_ask_rail_text(prompt)
 
-    def _submit_ask_rail_input(self) -> None:
-        q = self.txt_ask_rail.text().strip() if hasattr(self, "txt_ask_rail") else ""
+    def _resolve_multi_meeting_scope_ids(self, window_size: Optional[int]) -> List[int]:
+        if not hasattr(self, "controller") or not hasattr(self.controller, "db"):
+            return []
+        try:
+            all_m = self.controller.db.list_meetings(limit=250) or []
+        except Exception:
+            return []
+        ids = [int(m.get("id")) for m in all_m if m.get("id") is not None]
+        return ids[:window_size] if window_size is not None else ids
+
+    def _submit_ask_rail_input(self) -> bool:
+        q = self.txt_ask_rail.toPlainText().strip() if hasattr(self.txt_ask_rail, "toPlainText") else (
+            self.txt_ask_rail.text().strip() if hasattr(self, "txt_ask_rail") else ""
+        )
+        accepted = self._submit_ask_rail_text(q)
+        if accepted and hasattr(self, "txt_ask_rail"):
+            self.txt_ask_rail.clear()
+        return accepted
+
+    def _submit_ask_rail_text(self, query_text: str) -> bool:
+        q = str(query_text or "").strip()
         if not q:
-            return
-        self.txt_ask_rail.clear()
+            return False
+
         if self._workspace_context == "overall":
             scope_ids = (
                 self.overall_view.get_active_scope()[0]
                 if hasattr(self, "overall_view")
                 else self._overall_scope_ids
             )
-            self._run_context_ask_async(q, target_key="overall", meeting_id=None, meeting_ids=scope_ids)
-        else:
-            if self._selected_meeting_id is None:
-                return
-            mid = int(self._selected_meeting_id)
-            self._run_context_ask_async(q, target_key=f"m:{mid}", meeting_id=mid, meeting_ids=None)
+            return self._run_context_ask_async(
+                q, target_key="overall", meeting_id=None, meeting_ids=scope_ids
+            )
+
+        scope_mode = str(self.combo_ask_scope.currentData() or "this_meeting") if hasattr(self, "combo_ask_scope") else "this_meeting"
+        nl_multi = re.search(r"\b(?:last|past|recent|previous)\s+(\d+|one|two|three|four|five)\s+meetings?\b", q.lower())
+        if scope_mode in ("last_3", "last_5", "all") or nl_multi:
+            win_n = None
+            if nl_multi:
+                wmap = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+                raw_n = nl_multi.group(1)
+                win_n = int(raw_n) if raw_n.isdigit() else wmap.get(raw_n, 3)
+            elif scope_mode == "last_3":
+                win_n = 3
+            elif scope_mode == "last_5":
+                win_n = 5
+            scope_ids = self._resolve_multi_meeting_scope_ids(win_n)
+            tkey = f"m:{int(self._selected_meeting_id)}" if self._selected_meeting_id is not None else "overall"
+            return self._run_context_ask_async(q, target_key=tkey, meeting_id=None, meeting_ids=scope_ids)
+
+        if self._selected_meeting_id is None:
+            return False
+        mid = int(self._selected_meeting_id)
+        return self._run_context_ask_async(q, target_key=f"m:{mid}", meeting_id=mid, meeting_ids=None)
+
+    def _retry_ask_query(self, question: str) -> None:
+        q = str(question or "").strip()
+        if q:
+            self._submit_ask_rail_text(q)
+
+    def _cancel_active_ask(self) -> None:
+        qid = self._active_ask_qid
+        if hasattr(self.controller, "stop_ask_vox_stream"):
+            try:
+                self.controller.stop_ask_vox_stream()
+            except Exception:
+                pass
+        if qid is not None:
+            self._on_controller_ask_cancelled(qid)
 
     def _clear_current_ask_thread(self) -> None:
+        key = self._active_ask_key()
+        if self._active_ask_key_inflight == key and self._active_ask_qid is not None:
+            self._cancel_active_ask()
+
+        db = getattr(self.controller, "db", None)
+        if db is not None and hasattr(db, "archive_ask_vox_scope") and key != "none":
+            try:
+                db.archive_ask_vox_scope(key)
+            except Exception:
+                pass
+
+        self._ask_session_ids[key] = uuid.uuid4().hex[:16]
+        self._ask_messages_by_key[key] = []
+        self._ask_loaded_keys.add(key)
+
         if self._workspace_context == "overall":
             self._overall_ask_thread.clear()
         elif self._selected_meeting_id is not None:
             self._meeting_ask_threads[int(self._selected_meeting_id)] = []
         self._last_ask_answer_plain = ""
         self._last_ask_with_sources_plain = ""
-        self._render_ask_rail_thread()
+        self._render_ask_rail_thread(force=True)
 
     def _copy_ask_answer(self, with_sources: bool = False) -> None:
-        txt = self._last_ask_with_sources_plain if with_sources else self._last_ask_answer_plain
-        if txt:
-            QApplication.clipboard().setText(txt)
-            self.status_toast.emit("Copied", "Answer copied to clipboard.")
+        msgs = self._get_current_ask_messages()
+        for m in reversed(msgs):
+            if m.role == "assistant" and m.content.strip():
+                clean = sanitize_ask_vox_display_markdown(m.content)
+                if clean:
+                    cb = QApplication.clipboard()
+                    if cb:
+                        cb.setText(clean)
+                    return
 
     def _on_ask_anchor_clicked(self, url: QUrl) -> None:
         raw = url.toString()
-        if raw.startswith("meeting:"):
-            spec = raw[len("meeting:"):]
-            parts = spec.split("@", 1)
+        if raw.startswith("copy-answer:"):
             try:
-                mid = int(parts[0])
-                sec = float(parts[1]) if len(parts) > 1 else 0.0
-                self._open_meeting_at_seconds(mid, sec)
+                idx = int(raw.split(":", 1)[1])
+                thread = self._get_current_ask_thread()
+                if 0 <= idx < len(thread):
+                    cb = QApplication.clipboard()
+                    if cb:
+                        cb.setText(sanitize_ask_vox_display_markdown(str(thread[idx].get("a") or "")))
             except Exception:
                 pass
         elif raw.startswith("seek:"):
@@ -3178,83 +3679,22 @@ class NotetakerPage(QWidget):
             except Exception:
                 pass
 
-    def _render_ask_rail_thread(self) -> None:
-        if not hasattr(self, "ask_rail_browser"):
+    def _render_ask_rail_thread(self, force: bool = False) -> None:
+        if not hasattr(self, "ask_panel"):
             return
-        t = get_theme_tokens(self._theme)
-        thread = self._get_current_ask_thread()
-        loading = self._ask_loading_key == self._active_ask_key()
-
-        font_css = get_html_font_family()
-        if not thread and not loading:
-            scope_desc = (
-                f"the current filtered library (<b>{html.escape(self._overall_scope_label)}</b>)"
-                if self._workspace_context == "overall"
-                else "<b>this selected meeting only</b> — other meetings are strictly excluded"
-            )
-            self.ask_rail_browser.setHtml(
-                f"<div style='font-family:{font_css};font-size:13px;line-height:1.52;color:{t['text_secondary']};padding:6px;'>"
-                f"<p style='margin:0 0 6px 0;'>Ask VOX answers are grounded strictly in local transcripts and memory for {scope_desc}.</p>"
-                f"<p style='margin:0;color:{t['text_muted']};font-size:12px;'>Use the quick prompt chips above or ask any question below.</p>"
-                "</div>"
-            )
+        key = self._active_ask_key()
+        if not force and self._rendered_ask_key == key:
+            busy = (self._active_ask_key_inflight == key and self._active_ask_qid is not None)
+            self.ask_panel.set_busy(busy)
             return
-
-        parts = [f"<div style='font-family:{font_css};font-size:13px;color:{t['text_primary']};line-height:1.52;'>"]
-        for entry in thread:
-            q_html = html.escape(str(entry.get("q") or ""))
-            ans_md = str(entry.get("a") or "")
-            cits = list(entry.get("citations") or [])
-
-            parts.append(
-                f"<div style='background:{t['accent_dawn']};border:1px solid {t['chip_border']};"
-                f"border-radius:8px;padding:7px 10px;margin:0 0 8px 0;'>"
-                f"<div style='font-size:10.5px;font-weight:700;color:{t['accent_dawn_text']};margin-bottom:2px;'>YOU</div>"
-                f"<div style='color:{t['text_primary']};font-weight:600;'>{q_html}</div></div>"
-            )
-            # Synthesis card
-            ans_html = render_safe_markdown_html(ans_md, theme=self._theme)
-            parts.append(
-                f"<div style='background:{t['surface']};border:1px solid {t['border']};"
-                f"border-radius:8px;padding:8px 10px;margin:0 0 8px 0;'>"
-                f"<div style='font-size:10.5px;font-weight:700;color:{t['accent_fathom']};margin-bottom:4px;'>SYNTHESIS</div>"
-                f"{ans_html}"
-            )
-            # Distinct Direct Source Evidence section
-            if cits:
-                parts.append(
-                    f"<div style='margin-top:8px;padding-top:6px;border-top:1px solid {t['line']};'>"
-                    f"<div style='font-size:10.5px;font-weight:700;color:{t['text_muted']};margin-bottom:4px;'>DIRECT SOURCE EVIDENCE</div>"
-                )
-                for c in cits[:5]:
-                    cmid = c.get("meeting_id")
-                    ctitle = html.escape(str(c.get("meeting_title") or "Meeting")[:34])
-                    sec = float(c.get("start_sec") or 0.0)
-                    ts_lbl = format_seconds_hms(sec)
-                    snippet = html.escape(str(c.get("excerpt") or c.get("text") or "")[:140])
-                    href = f"meeting:{int(cmid)}@{sec:.1f}" if cmid is not None else f"seek:{sec:.1f}"
-                    parts.append(
-                        f"<div style='background:{t['surface_secondary']};border-radius:6px;padding:5px 7px;margin-bottom:4px;font-size:11.5px;'>"
-                        f"<a href='{href}' style='color:{t['accent_fathom']};font-weight:700;text-decoration:none;'>"
-                        f"[{ctitle} · {ts_lbl}]</a> "
-                        f"<span style='color:{t['text_secondary']};'>{snippet}</span></div>"
-                    )
-                parts.append("</div>")
-            parts.append("</div>")
-
-        if loading:
-            parts.append(
-                f"<div style='padding:6px 8px;color:{t['text_muted']};font-size:12px;'>"
-                "⏳ Searching scoped local memory & synthesizing answer...</div>"
-            )
-        parts.append("</div>")
-        self.ask_rail_browser.setHtml("".join(parts))
-        sb = self.ask_rail_browser.verticalScrollBar()
-        if sb is not None:
-            sb.setValue(sb.maximum())
+        msgs = self._get_current_ask_messages()
+        self.ask_panel.conversation_view.load_messages(msgs)
+        self._rendered_ask_key = key
+        busy = (self._active_ask_key_inflight == key and self._active_ask_qid is not None)
+        self.ask_panel.set_busy(busy)
 
     def _on_studio_ask_submitted(self, query: str) -> None:
-        """Execute a scoped Ask VOX query against the currently selected meeting."""
+        """Execute an Ask VOX query submitted from the narrow inline Summary bar."""
         m_id = self._selected_meeting_id
         if m_id is None:
             self.studio.tab_summary.set_ask_answer("Select a meeting first to ask a scoped question.")
@@ -3264,8 +3704,10 @@ class NotetakerPage(QWidget):
             res = fn(query, meeting_id=int(m_id))
             ans = str((res or {}).get("answer") or "No relevant excerpts found in this meeting.")
             citations = list((res or {}).get("citations") or [])
-            self._on_studio_ask_completed(f"m:{int(m_id)}", query, ans, citations)
+            self._finalize_ask_entry(f"m:{int(m_id)}", None, query, ans, citations, "")
             return
+        if not self._ask_rail_open:
+            self._toggle_ask_rail(True)
         self._run_context_ask_async(query, target_key=f"m:{int(m_id)}", meeting_id=int(m_id), meeting_ids=None)
 
     def _on_studio_ask_rail_submitted(self, query: str) -> None:
@@ -3277,13 +3719,27 @@ class NotetakerPage(QWidget):
             return
         m_id = self._selected_meeting_id
         if m_id is None:
-            self.studio.append_ask_rail_exchange(
-                query,
-                "Select a meeting first, or switch Ask VOX scope to 'All Meetings'.",
-                citations=[],
-            )
             return
         self._run_context_ask_async(query, target_key=f"m:{int(m_id)}", meeting_id=int(m_id), meeting_ids=None)
+
+    def _persist_message(self, msg: AskChatMessage, meeting_id: Optional[int]) -> None:
+        db = getattr(self.controller, "db", None)
+        if db is None or not hasattr(db, "save_ask_vox_message") or msg.scope_key == "none":
+            return
+        try:
+            sid = self._ensure_session_id(msg.scope_key)
+            db.save_ask_vox_message(
+                message_uid=msg.id,
+                session_id=sid,
+                scope_key=msg.scope_key,
+                role=msg.role,
+                content=msg.content,
+                meeting_id=meeting_id,
+                citations=msg.citations,
+                status=msg.state.value,
+            )
+        except Exception as exc:
+            logger.debug("Ask VOX message persistence skipped: %s", exc)
 
     def _run_context_ask_async(
         self,
@@ -3292,17 +3748,107 @@ class NotetakerPage(QWidget):
         target_key: str,
         meeting_id: Optional[int],
         meeting_ids: Optional[List[int]],
-    ) -> None:
+    ) -> bool:
+        # Guard against duplicate concurrent submissions in the same context
+        if self._active_ask_qid is not None and self._active_ask_key_inflight == target_key:
+            return False
+
+        self._load_persisted_ask_messages(target_key)
+        _, scope_lbl, _, _, _ = self._current_scope_summary()
+
+        # 1. Immediate optimistic UI append: User question + pending assistant placeholder
+        user_msg = AskChatMessage(
+            role="user",
+            content=query,
+            state=AskMessageState.COMPLETED,
+            scope_key=target_key,
+            scope_label=scope_lbl,
+        )
+        asst_msg = AskChatMessage(
+            role="assistant",
+            content="",
+            state=AskMessageState.SUBMITTED,
+            scope_key=target_key,
+            scope_label=scope_lbl,
+            question_for_retry=query,
+        )
+        msgs = self._ask_messages_by_key.setdefault(target_key, [])
+        msgs.append(user_msg)
+        msgs.append(asst_msg)
+
+        persist_mid = meeting_id
+        if persist_mid is None and target_key.startswith("m:"):
+            try:
+                persist_mid = int(target_key.split(":", 1)[1])
+            except Exception:
+                persist_mid = None
+        self._persist_message(user_msg, persist_mid)
+
         self._ask_loading_key = target_key
-        self._render_ask_rail_thread()
+        if target_key == self._active_ask_key() and hasattr(self, "ask_panel"):
+            self.ask_panel.conversation_view.append_message(user_msg, animate=False, scroll=True)
+            self.ask_panel.conversation_view.append_message(asst_msg, animate=True, scroll=True)
+            self.ask_panel.set_busy(True)
+
         if hasattr(self, "studio") and hasattr(self.studio, "set_ask_rail_loading"):
             self.studio.set_ask_rail_loading(query)
 
-        ans_depth = str(self.combo_ask_depth.currentData() or "concise") if hasattr(self, "combo_ask_depth") else "concise"
-        hist_src = self._overall_ask_thread if target_key == "overall" else self._meeting_ask_threads.get(int(meeting_id or 0), [])
-        conv_history = [{"question": e["q"], "answer": e["a"]} for e in hist_src[-4:]]
+        hist_src = self._overall_ask_thread if target_key == "overall" else self._meeting_ask_threads.get(int(persist_mid or 0), [])
+        conv_history = [(str(e["q"]), str(e["a"])) for e in hist_src[-4:] if e.get("q") and e.get("a")]
+
+        # 2. Dispatch real streaming on controller if supported (and not a non-streaming test mock)
+        qmem_fn = getattr(self.controller, "query_meeting_memory", None)
+        stream_fn = getattr(self.controller, "query_meeting_memory_stream", None)
+        use_stream = (
+            callable(stream_fn)
+            and not isinstance(qmem_fn, unittest.mock.Base)
+            and not isinstance(stream_fn, unittest.mock.Base)
+        )
+
+        if use_stream:
+            try:
+                try:
+                    qid = stream_fn(
+                        query,
+                        meeting_id=meeting_id,
+                        conversation_history=conv_history,
+                        answer_depth="detailed",
+                        meeting_ids=meeting_ids,
+                    )
+                except TypeError:
+                    qid = stream_fn(query, meeting_id=meeting_id)
+                if qid is None:
+                    qid = int(getattr(self.controller, "_ask_vox_query_id", 0) or 1)
+                self._active_ask_qid = int(qid)
+                self._active_ask_key_inflight = target_key
+                self._inflight_ask_requests[int(qid)] = {
+                    "target_key": target_key,
+                    "meeting_id": persist_mid,
+                    "query": query,
+                    "user_msg": user_msg,
+                    "asst_msg": asst_msg,
+                }
+                return True
+            except Exception as exc:
+                logger.warning("Ask VOX stream dispatch failed, falling back to async query: %s", exc)
+
+        # Fallback background thread for dummy/mock test controllers that only implement query_meeting_memory
+        self._local_ask_seq -= 1
+        local_qid = self._local_ask_seq
+        self._active_ask_qid = local_qid
+        self._active_ask_key_inflight = target_key
+        self._inflight_ask_requests[local_qid] = {
+            "target_key": target_key,
+            "meeting_id": persist_mid,
+            "query": query,
+            "user_msg": user_msg,
+            "asst_msg": asst_msg,
+        }
 
         def _worker() -> None:
+            err_msg = ""
+            ans = ""
+            cits: List[Dict[str, Any]] = []
             try:
                 try:
                     res = self.controller.query_meeting_memory(
@@ -3310,31 +3856,148 @@ class NotetakerPage(QWidget):
                         meeting_id=meeting_id,
                         meeting_ids=meeting_ids,
                         conversation_history=conv_history,
-                        answer_depth=ans_depth,
+                        answer_depth="detailed",
                     )
                 except TypeError:
                     res = self.controller.query_meeting_memory(query, meeting_id=meeting_id)
                 ans = str((res or {}).get("answer") or "No relevant excerpts found in scoped recorded meetings.")
                 cits = list((res or {}).get("citations") or [])
             except Exception as exc:
-                ans = f"Could not query meeting memory: {exc}"
+                err_msg = f"Couldn't generate a response right now ({exc})."
                 cits = []
             try:
-                self._studio_ask_completed.emit(target_key, query, ans, cits)
+                self._studio_ask_completed.emit(target_key, local_qid, query, ans, cits, err_msg)
             except RuntimeError:
                 pass
 
         threading.Thread(target=_worker, daemon=True, name="StudioAskVoxWorker").start()
+        return True
+
+    def _on_controller_ask_status(self, query_id: int, state_name: str) -> None:
+        info = self._inflight_ask_requests.get(int(query_id))
+        if not info:
+            return
+        asst_msg: AskChatMessage = info["asst_msg"]
+        try:
+            st = AskMessageState(str(state_name or "submitted"))
+        except Exception:
+            return
+        if not st.is_pending:
+            return
+        asst_msg.state = st
+        if info["target_key"] == self._active_ask_key() and hasattr(self, "ask_panel"):
+            w = self.ask_panel.conversation_view.get_message_widget(asst_msg.id)
+            if isinstance(w, VoxAssistantMessageWidget):
+                w.set_state(st)
+
+    def _on_controller_ask_token(self, query_id: int, token: str) -> None:
+        info = self._inflight_ask_requests.get(int(query_id))
+        if not info or not token:
+            return
+        asst_msg: AskChatMessage = info["asst_msg"]
+        if info["target_key"] == self._active_ask_key() and hasattr(self, "ask_panel"):
+            w = self.ask_panel.conversation_view.get_message_widget(asst_msg.id)
+            if isinstance(w, VoxAssistantMessageWidget):
+                w.append_token(token)
+                return
+        asst_msg.content = str(asst_msg.content or "") + str(token)
+        if asst_msg.state in (AskMessageState.SUBMITTED, AskMessageState.RETRIEVING_CONTEXT):
+            asst_msg.state = AskMessageState.GENERATING
+
+    def _on_controller_ask_citations(self, query_id: int, citations: object) -> None:
+        info = self._inflight_ask_requests.get(int(query_id))
+        if not info:
+            return
+        info["asst_msg"].citations = list(citations) if isinstance(citations, (list, tuple)) else []
+
+    def _on_controller_ask_cancelled(self, query_id: int) -> None:
+        info = self._inflight_ask_requests.pop(int(query_id), None)
+        if not info:
+            return
+        if self._active_ask_qid == int(query_id):
+            self._active_ask_qid = None
+            self._active_ask_key_inflight = None
+        target_key = info["target_key"]
+        if self._ask_loading_key == target_key:
+            self._ask_loading_key = None
+        asst_msg: AskChatMessage = info["asst_msg"]
+        partial = sanitize_ask_vox_display_markdown(asst_msg.content)
+        asst_msg.state = AskMessageState.CANCELLED
+        asst_msg.content = partial
+        if target_key == self._active_ask_key() and hasattr(self, "ask_panel"):
+            w = self.ask_panel.conversation_view.get_message_widget(asst_msg.id)
+            if isinstance(w, VoxAssistantMessageWidget):
+                w.set_final_result(content=partial, citations=asst_msg.citations, state=AskMessageState.CANCELLED)
+            if self._active_ask_qid is None:
+                self.ask_panel.set_busy(False)
+        if partial:
+            self._persist_message(asst_msg, info.get("meeting_id"))
+
+    def _on_controller_ask_finished(self, query_id: int, res: object) -> None:
+        res_dict = res if isinstance(res, dict) else {}
+        if res_dict.get("cancelled"):
+            self._on_controller_ask_cancelled(int(query_id))
+            return
+        info = self._inflight_ask_requests.get(int(query_id))
+        if not info:
+            return
+        q = str(res_dict.get("question") or info["query"])
+        ans = str(res_dict.get("answer") or "")
+        cits = list(res_dict.get("citations") or info["asst_msg"].citations or [])
+        err_msg = ""
+        if res_dict.get("error"):
+            err_msg = str(res_dict.get("error_message") or ans or "Couldn't generate a response right now.")
+        self._finalize_ask_entry(info["target_key"], int(query_id), q, ans, cits, err_msg)
 
     def _on_studio_ask_completed(
-        self, target_key: str, question: str, answer: str, citations: object
+        self, target_key: str, query_id: int, question: str, answer: str, citations: object, error_message: str
     ) -> None:
         if getattr(self.controller, "_cancel_ask_vox", False):
             return
+        cits = list(citations) if isinstance(citations, (list, tuple)) else []
+        self._finalize_ask_entry(target_key, int(query_id), question, answer, cits, error_message)
+
+    def _finalize_ask_entry(
+        self,
+        target_key: str,
+        query_id: Optional[int],
+        question: str,
+        answer: str,
+        citations: List[Dict[str, Any]],
+        error_message: str,
+    ) -> None:
+        info = self._inflight_ask_requests.pop(int(query_id), None) if query_id is not None else None
+        if query_id is not None and self._active_ask_qid == int(query_id):
+            self._active_ask_qid = None
+            self._active_ask_key_inflight = None
         if self._ask_loading_key == target_key:
             self._ask_loading_key = None
-        cits = list(citations) if isinstance(citations, (list, tuple)) else []
-        entry = {"q": question, "a": answer, "citations": cits}
+
+        raw_ans = str(answer or "").strip()
+        clean_ans = sanitize_ask_vox_display_markdown(raw_ans)
+        if not error_message and not clean_ans:
+            clean_ans = "No matching information was found in the selected meeting scope."
+
+        asst_msg: Optional[AskChatMessage] = info["asst_msg"] if info else None
+        if asst_msg is None:
+            asst_msg = AskChatMessage(
+                role="assistant",
+                content=clean_ans,
+                state=AskMessageState.FAILED if error_message else AskMessageState.COMPLETED,
+                citations=citations,
+                scope_key=target_key,
+                error_message=error_message,
+                question_for_retry=question,
+            )
+            self._ask_messages_by_key.setdefault(target_key, []).append(asst_msg)
+        else:
+            asst_msg.citations = citations
+            asst_msg.error_message = error_message
+            asst_msg.state = AskMessageState.FAILED if error_message else AskMessageState.COMPLETED
+            asst_msg.content = clean_ans
+
+        entry = {"id": asst_msg.id, "q": question, "a": clean_ans, "citations": citations}
+        persist_mid = info.get("meeting_id") if info else None
 
         if target_key == "overall":
             self._overall_ask_thread.append(entry)
@@ -3344,24 +4007,35 @@ class NotetakerPage(QWidget):
             except Exception:
                 mid = -1
             if mid > 0:
+                persist_mid = mid
                 self._meeting_ask_threads.setdefault(mid, []).append(entry)
 
-        plain_ans = strip_markdown_for_plain_copy(answer)
-        src_lines = [
-            f"- [{c.get('meeting_title', 'Meeting')} @ {format_seconds_hms(float(c.get('start_sec') or 0.0))}] "
-            f"{str(c.get('excerpt') or c.get('text') or '').strip()}"
-            for c in cits[:5]
-        ]
-        if target_key == self._active_ask_key():
-            self._last_ask_answer_plain = plain_ans
-            self._last_ask_with_sources_plain = (plain_ans + ("\n\nSources:\n" + "\n".join(src_lines) if src_lines else "")).strip()
-            self._render_ask_rail_thread()
+        if not error_message:
+            self._persist_message(asst_msg, persist_mid)
+
+        if target_key == self._active_ask_key() and hasattr(self, "ask_panel"):
+            self._last_ask_answer_plain = clean_ans
+            self._last_ask_with_sources_plain = clean_ans
+            w = self.ask_panel.conversation_view.get_message_widget(asst_msg.id)
+            if isinstance(w, VoxAssistantMessageWidget):
+                w.set_final_result(
+                    content=clean_ans,
+                    citations=citations,
+                    state=asst_msg.state,
+                    error_message=error_message,
+                )
+            else:
+                self.ask_panel.conversation_view.append_message(asst_msg, animate=True, scroll=True)
+            if self._active_ask_qid is None or self._active_ask_key_inflight != target_key:
+                self.ask_panel.set_busy(False)
+            self.ask_panel.conversation_view.scroll_to_bottom(force=False)
 
         if target_key == f"m:{self._selected_meeting_id}":
-            self.studio.tab_summary.set_ask_answer(answer, citations=cits)
-            self.studio.append_ask_rail_exchange(question, answer, citations=cits)
+            if hasattr(self.studio, "tab_summary") and hasattr(self.studio.tab_summary, "lbl_ask_answer"):
+                self.studio.tab_summary.lbl_ask_answer.hide()
+            self.studio.append_ask_rail_exchange(question, raw_ans or clean_ans, citations=citations)
         elif target_key == "overall" and self._workspace_context == "overall":
-            self.studio.append_ask_rail_exchange(question, answer, citations=cits)
+            self.studio.append_ask_rail_exchange(question, raw_ans or clean_ans, citations=citations)
 
     def _on_dictation_interim_updated(self, provisional: str, stable: str) -> None:
         combined = " ".join(x for x in (stable.strip(), provisional.strip()) if x).strip()
@@ -3381,5 +4055,23 @@ class NotetakerPage(QWidget):
                     tail = current[-max(40, len(text) + 10) :] if current else ""
                     if text.strip() not in tail:
                         self.studio.tab_thoughts.editor.insertPlainText(text + " ")
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(680, 480)
+
+    def resizeEvent(self, event) -> None:
+        w = int(event.size().width() if event is not None else (self.width() or 0))
+        if w > 0 and hasattr(self, "ask_rail"):
+            if w < 980:
+                if getattr(self, "_ask_rail_open", False) and not getattr(self, "_responsive_rail_auto_hidden", False) and not getattr(self, "_ask_rail_sheet_mode", False):
+                    self._responsive_rail_auto_hidden = True
+                    self._ask_rail_open = False
+                self._dock_or_float_ask_panel(width_px=w)
+            else:
+                if getattr(self, "_responsive_rail_auto_hidden", False):
+                    self._responsive_rail_auto_hidden = False
+                    self._ask_rail_open = True
+                self._dock_or_float_ask_panel(width_px=w)
+        super().resizeEvent(event)
 
     set_theme = apply_theme

@@ -55,7 +55,7 @@ _TRY_IT_PROMPTS = [
         "Let's push the Sprint review to Tuesday, actually make that Thursday at 3 PM.",
     ),
     (
-        "Quick Slack note",
+        "Quick Teams note",
         "Hey team, comma, the Q4 budget deck is ready for final review, period.",
     ),
     (
@@ -252,7 +252,7 @@ class VoxOnboardingWizard(QDialog):
             (
                 "Ctrl + Win",
                 "Universal Dictation",
-                "Press once or hold to dictate into Slack, Outlook, Notion, Word, or your code editor with automatic self-correction.",
+                "Press once or hold to dictate into Teams, Outlook, Notion, Word, or your code editor with automatic self-correction.",
             ),
             (
                 "Zero Bots",
@@ -972,7 +972,7 @@ class VoxOnboardingWizard(QDialog):
     def _run_sample_preview(self) -> None:
         sample_raw = (
             "um hey team comma so we should ship the onboarding flow on tuesday "
-            "actually wait make that wednesday at 3 pm period new paragraph let's follow up on slack"
+            "actually wait make that wednesday at 3 pm period new paragraph let's follow up on teams"
         )
         cleaned = DictationProcessor.process(sample_raw, mode="clean")
         self.tiy_editor.setPlainText(cleaned)

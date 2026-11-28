@@ -66,7 +66,6 @@ def _platform_display_info(platform: str, tokens: Dict[str, Any]) -> Tuple[str, 
         "meet": ("Google Meet", str(tokens.get("platform_meet", "#0F9D58"))),
         "zoom": ("Zoom", str(tokens.get("platform_zoom", "#2D8CFF"))),
         "webex": ("Cisco Webex", str(tokens.get("platform_webex", "#00A0D1"))),
-        "slack": ("Slack Huddle", str(tokens.get("platform_slack", "#E01E5A"))),
         "in_person": ("In Person", str(tokens.get("text_muted", "#736E62"))),
     }
     return mapping.get(p, ("Calendar Event", str(tokens.get("accent_fathom", "#034F46"))))

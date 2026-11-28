@@ -147,8 +147,6 @@ def _get_platform_badge(platform_name: str) -> str:
         return "zoom"
     elif "meet" in p:
         return "meet"
-    elif "slack" in p:
-        return "slack"
     return "generic_meeting"
 
 

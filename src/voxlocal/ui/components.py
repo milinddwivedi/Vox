@@ -70,8 +70,21 @@ from PyQt6.QtWidgets import (
 
 from voxlocal.core.logger import get_logger
 from voxlocal.ui.animations import is_reduced_motion_enabled
-from voxlocal.ui.theme import get_theme_tokens, get_ui_font
+from voxlocal.ui.theme import (
+    get_dialog_qss,
+    get_scrollbar_qss,
+    get_theme_palette,
+    get_theme_tokens,
+    get_ui_font,
+    show_themed_confirm,
+)
 from voxlocal.storage.exporter import format_seconds_hms
+
+try:
+    from voxlocal.engine.intelligence_verifier import clean_user_facing_text
+except Exception:  # pragma: no cover - defensive fallback
+    def clean_user_facing_text(text: str) -> str:
+        return str(text or "").strip()
 
 logger = get_logger("ui.components")
 
@@ -1391,9 +1404,15 @@ class VoxActionItemMatrixWidget(QFrame):
 
     PAGE_SIZE = 20
 
-    def __init__(self, parent: Optional[QWidget] = None, theme: str = "dark") -> None:
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        theme: str = "dark",
+        clean_summary_mode: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.theme = theme
+        self._clean_summary_mode = bool(clean_summary_mode)
         self.setObjectName("actionMatrixContainer")
         self._items: List[dict] = []
         self._filter_mode: str = "all"
@@ -1411,10 +1430,12 @@ class VoxActionItemMatrixWidget(QFrame):
         self.setMinimumWidth(0)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(6 if self._clean_summary_mode else 8)
 
         # Row 1: Title, Count Pill, Copy / Export actions (wrapping flow, zero QScrollArea)
-        hdr = VoxFlowLayout(margin=0, h_spacing=6, v_spacing=6)
+        self._hdr_host = QWidget()
+        self._hdr_host.setMinimumWidth(0)
+        hdr = VoxFlowLayout(self._hdr_host, margin=0, h_spacing=6, v_spacing=6)
         self.lbl_title = QLabel("Action Items & Commitments")
         self.lbl_title.setMinimumWidth(0)
         hdr.addWidget(self.lbl_title)
@@ -1428,17 +1449,8 @@ class VoxActionItemMatrixWidget(QFrame):
         copy_menu = QMenu(self)
         copy_menu.addAction("Copy Filtered List", self._copy_filtered_plain)
         copy_menu.addAction("Copy All Actions", self._copy_all_plain)
-        copy_menu.addAction("Copy for Slack / Teams", self._copy_for_slack)
         self.btn_copy_menu.setMenu(copy_menu)
         hdr.addWidget(self.btn_copy_menu)
-
-        # Keep direct attribute for backward compatibility
-        self.btn_copy_slack = QPushButton("Copy Slack / Teams")
-        self.btn_copy_slack.setFixedHeight(28)
-        self.btn_copy_slack.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_copy_slack.setToolTip("Copy action items formatted for Slack or Microsoft Teams")
-        self.btn_copy_slack.clicked.connect(self._copy_for_slack)
-        hdr.addWidget(self.btn_copy_slack)
 
         self.btn_export_actions = QPushButton("Export ▾")
         self.btn_export_actions.setFixedHeight(28)
@@ -1449,10 +1461,14 @@ class VoxActionItemMatrixWidget(QFrame):
         exp_menu.addAction("Export as JSON (.json)", lambda: self._export_actions("json"))
         self.btn_export_actions.setMenu(exp_menu)
         hdr.addWidget(self.btn_export_actions)
-        layout.addLayout(hdr)
+        layout.addWidget(self._hdr_host)
+        if self._clean_summary_mode:
+            self._hdr_host.setVisible(False)
 
         # Row 2: Filter Pills + Participant + Priority + Search (wrapping flow, zero QScrollArea)
-        filters_row = VoxFlowLayout(margin=0, h_spacing=6, v_spacing=6)
+        self._filters_host = QWidget()
+        self._filters_host.setMinimumWidth(0)
+        filters_row = VoxFlowLayout(self._filters_host, margin=0, h_spacing=6, v_spacing=6)
 
         self.btn_filter_all = QPushButton("All")
         self.btn_filter_pending = QPushButton("Pending")
@@ -1497,7 +1513,9 @@ class VoxActionItemMatrixWidget(QFrame):
         self.txt_action_search.textChanged.connect(self._on_search_changed)
         filters_row.addWidget(self.txt_action_search)
 
-        layout.addLayout(filters_row)
+        layout.addWidget(self._filters_host)
+        if self._clean_summary_mode:
+            self._filters_host.setVisible(False)
 
         # Responsive non-nested items container
         self.items_host = QWidget()
@@ -1578,6 +1596,9 @@ class VoxActionItemMatrixWidget(QFrame):
     def set_theme(self, theme_name: str) -> None:
         self.theme = (theme_name or "light").lower()
         t = get_theme_tokens(self.theme)
+        self.setStyleSheet("QFrame#actionMatrixContainer { background: transparent; border: none; }")
+        if hasattr(self, "items_host"):
+            self.items_host.setStyleSheet("background: transparent; border: none;")
         self.lbl_title.setStyleSheet(f"font-size: 13.5px; font-weight: 700; color: {t['text_primary']};")
         self.lbl_count.setStyleSheet(
             f"font-size: 11px; font-weight: 600; color: {t['text_secondary']}; "
@@ -1588,8 +1609,20 @@ class VoxActionItemMatrixWidget(QFrame):
             f"border: 1px solid {t['border']}; border-radius: 7px; padding: 3px 10px; font-size: 11.5px; font-weight: 600; }} "
             f"QPushButton:hover {{ background: {t['surface_hover']}; }}"
         )
-        for b in (self.btn_copy_menu, self.btn_copy_slack, self.btn_export_actions, self.btn_show_more, self.btn_show_all):
+        for b in (self.btn_copy_menu, self.btn_export_actions, self.btn_show_more, self.btn_show_all):
             b.setStyleSheet(btn_css)
+        combo_css = (
+            f"QComboBox {{ background: {t['input_bg']}; color: {t['text_primary']}; "
+            f"border: 1px solid {t['border']}; border-radius: 7px; padding: 2px 8px; font-size: 11.5px; }} "
+            f"QComboBox QAbstractItemView {{ background: {t['surface']}; color: {t['text_primary']}; "
+            f"selection-background-color: {t['accent_fathom_tint']}; selection-color: {t['text_primary']}; }}"
+        )
+        self.combo_participant.setStyleSheet(combo_css)
+        self.combo_priority.setStyleSheet(combo_css)
+        self.txt_action_search.setStyleSheet(
+            f"QLineEdit {{ background: {t['input_bg']}; color: {t['text_primary']}; "
+            f"border: 1px solid {t['border']}; border-radius: 7px; padding: 2px 8px; font-size: 11.5px; }}"
+        )
         self.lbl_showing.setStyleSheet(f"font-size: 11.5px; color: {t['text_muted']};")
         self._style_filter_buttons()
         self._render_items()
@@ -1630,6 +1663,8 @@ class VoxActionItemMatrixWidget(QFrame):
         self.combo_participant.setCurrentIndex(idx if idx >= 0 else 0)
         self._participant_filter = str(self.combo_participant.currentData() or "")
         self.combo_participant.blockSignals(False)
+        if self._clean_summary_mode and hasattr(self, "_filters_host"):
+            self._filters_host.setVisible(len(self._items) > 8)
 
         self._render_items()
 
@@ -1667,6 +1702,8 @@ class VoxActionItemMatrixWidget(QFrame):
             item = self.items_layout.takeAt(0)
             w = item.widget()
             if w:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
         t = get_theme_tokens(self.theme)
@@ -1706,26 +1743,38 @@ class VoxActionItemMatrixWidget(QFrame):
             card = QFrame()
             card.setObjectName("actionCardRow")
             card.setMinimumWidth(0)
-            bdr_col = t["border"] if not is_done else t["line"]
-            bg_col = t["surface_alt"] if not is_done else t["surface_secondary"]
-            card.setStyleSheet(
-                f"QFrame#actionCardRow {{ background-color: {bg_col}; border: 1px solid {bdr_col}; border-radius: 10px; }}"
-            )
+            if self._clean_summary_mode:
+                card.setStyleSheet(
+                    f"QFrame#actionCardRow {{ background-color: transparent; border: none; border-bottom: 1px solid {t['line']}; border-radius: 0px; }}"
+                )
+            else:
+                bdr_col = t["border"] if not is_done else t["line"]
+                bg_col = t["surface_alt"] if not is_done else t["surface_secondary"]
+                card.setStyleSheet(
+                    f"QFrame#actionCardRow {{ background-color: {bg_col}; border: 1px solid {bdr_col}; border-radius: 10px; }}"
+                )
             c_lay = QVBoxLayout(card)
-            c_lay.setContentsMargins(12, 10, 12, 10)
-            c_lay.setSpacing(6)
+            c_lay.setContentsMargins(2 if self._clean_summary_mode else 12, 8 if self._clean_summary_mode else 10, 2 if self._clean_summary_mode else 12, 8 if self._clean_summary_mode else 10)
+            c_lay.setSpacing(4 if self._clean_summary_mode else 6)
 
             top_row = QHBoxLayout()
             top_row.setSpacing(8)
 
             chk = QCheckBox()
             chk.setChecked(is_done)
+            chk.setStyleSheet(
+                f"QCheckBox {{ spacing: 0px; background: transparent; }} "
+                f"QCheckBox::indicator {{ width: 15px; height: 15px; border: 1.5px solid {t['border']}; border-radius: 4px; background: {t['surface']}; }} "
+                f"QCheckBox::indicator:hover {{ border-color: {t['accent_fathom']}; }} "
+                f"QCheckBox::indicator:checked {{ background: {t['accent_fathom']}; border-color: {t['accent_fathom']}; }}"
+            )
             chk.setToolTip("Reopen task" if is_done else "Mark completed")
             chk.toggled.connect(lambda checked, iid=item_id, ref=item: self._on_item_toggled(iid, checked, ref))
             top_row.addWidget(chk, 0, Qt.AlignmentFlag.AlignTop)
 
-            desc = str(item.get("description") or "")
-            lbl_desc = QLabel(desc)
+            raw_desc = str(item.get("description") or "")
+            desc = clean_user_facing_text(raw_desc) if self._clean_summary_mode else raw_desc
+            lbl_desc = QLabel(desc or raw_desc)
             lbl_desc.setWordWrap(True)
             lbl_desc.setMinimumWidth(0)
             lbl_desc.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -1736,7 +1785,7 @@ class VoxActionItemMatrixWidget(QFrame):
                 )
             else:
                 lbl_desc.setStyleSheet(
-                    f"font-size: 13px; font-weight: 600; color: {t['text_primary']}; border: none; background: transparent;"
+                    f"font-size: 13px; font-weight: {'500' if self._clean_summary_mode else '600'}; color: {t['text_primary']}; border: none; background: transparent;"
                 )
             top_row.addWidget(lbl_desc, 1)
 
@@ -1751,12 +1800,13 @@ class VoxActionItemMatrixWidget(QFrame):
             btn_edit.clicked.connect(lambda _=False, it_ref=item: self._open_edit_dialog(it_ref))
             top_row.addWidget(btn_edit, 0, Qt.AlignmentFlag.AlignTop)
 
-            btn_cp = QPushButton("Copy")
-            btn_cp.setFixedHeight(24)
-            btn_cp.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_cp.setStyleSheet(btn_edit.styleSheet())
-            btn_cp.clicked.connect(lambda _=False, it_ref=item: self._copy_single_action(it_ref))
-            top_row.addWidget(btn_cp, 0, Qt.AlignmentFlag.AlignTop)
+            if not self._clean_summary_mode:
+                btn_cp = QPushButton("Copy")
+                btn_cp.setFixedHeight(24)
+                btn_cp.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_cp.setStyleSheet(btn_edit.styleSheet())
+                btn_cp.clicked.connect(lambda _=False, it_ref=item: self._copy_single_action(it_ref))
+                top_row.addWidget(btn_cp, 0, Qt.AlignmentFlag.AlignTop)
 
             c_lay.addLayout(top_row)
 
@@ -1772,13 +1822,14 @@ class VoxActionItemMatrixWidget(QFrame):
                     f"font-size: 11px; font-weight: 700; color: {t['status_info_text']}; "
                     f"background: {t['status_info_bg']}; border-radius: 6px; padding: 2px 8px;"
                 )
-            else:
-                lbl_owner = QLabel("Owner unknown")
+                meta_row.addWidget(lbl_owner)
+            elif not self._clean_summary_mode:
+                lbl_owner = QLabel("Owner needed")
                 lbl_owner.setStyleSheet(
                     f"font-size: 11px; font-weight: 600; color: {t['status_neutral_text']}; "
                     f"background: {t['status_neutral_bg']}; border-radius: 6px; padding: 2px 8px;"
                 )
-            meta_row.addWidget(lbl_owner)
+                meta_row.addWidget(lbl_owner)
 
             if due:
                 lbl_due = QLabel(f"Due: {due}")
@@ -1788,33 +1839,28 @@ class VoxActionItemMatrixWidget(QFrame):
                 )
                 meta_row.addWidget(lbl_due)
 
-            if prio:
-                p_bg, p_fg = {
-                    "High": (t["status_danger_bg"], t["status_danger_text"]),
-                    "Medium": (t["status_warning_bg"], t["status_warning_text"]),
-                    "Low": (t["status_neutral_bg"], t["status_neutral_text"]),
-                }[prio]
+            if prio == "High":
+                p_bg, p_fg = t["status_danger_bg"], t["status_danger_text"]
                 lbl_prio = QLabel(f"{prio} priority")
                 lbl_prio.setStyleSheet(
                     f"font-size: 10.5px; font-weight: 700; color: {p_fg}; background: {p_bg}; border-radius: 6px; padding: 2px 7px;"
                 )
                 meta_row.addWidget(lbl_prio)
 
-            # Confirmation badge (prevents questionable items looking over-confident)
-            c_map = {
-                "confirmed_commitment": ("Confirmed", t["status_success_bg"], t["status_success_text"]),
-                "confirmed": ("Confirmed", t["status_success_bg"], t["status_success_text"]),
-                "suggested_action": ("Suggested", t["status_purple_bg"], t["status_purple_text"]),
-                "needs_confirmation": ("Needs confirmation", t["status_warning_bg"], t["status_warning_text"]),
-            }
-            c_lbl, c_bg, c_fg = c_map.get(cstate, ("Needs confirmation", t["status_warning_bg"], t["status_warning_text"]))
-            lbl_conf = QLabel(c_lbl)
-            lbl_conf.setStyleSheet(
-                f"font-size: 10.5px; font-weight: 600; color: {c_fg}; background: {c_bg}; border-radius: 6px; padding: 2px 7px;"
-            )
-            meta_row.addWidget(lbl_conf)
+            # Confirmation badge only in detailed/standalone matrix mode (never clutter editorial summary)
+            if not self._clean_summary_mode and cstate in ("suggested_action", "needs_confirmation"):
+                c_map = {
+                    "suggested_action": ("Suggested", t["status_purple_bg"], t["status_purple_text"]),
+                    "needs_confirmation": ("Needs confirmation", t["status_warning_bg"], t["status_warning_text"]),
+                }
+                c_lbl, c_bg, c_fg = c_map[cstate]
+                lbl_conf = QLabel(c_lbl)
+                lbl_conf.setStyleSheet(
+                    f"font-size: 10.5px; font-weight: 600; color: {c_fg}; background: {c_bg}; border-radius: 6px; padding: 2px 7px;"
+                )
+                meta_row.addWidget(lbl_conf)
 
-            if topic:
+            if not self._clean_summary_mode and topic and len(topic) <= 28:
                 lbl_top = QLabel(topic)
                 lbl_top.setStyleSheet(
                     f"font-size: 10.5px; font-weight: 600; color: {t['text_secondary']}; "
@@ -1822,7 +1868,7 @@ class VoxActionItemMatrixWidget(QFrame):
                 )
                 meta_row.addWidget(lbl_top)
 
-            if ts_sec > 0:
+            if not self._clean_summary_mode and ts_sec > 0:
                 btn_ts = QPushButton(format_seconds_hms(ts_sec))
                 btn_ts.setFixedHeight(22)
                 btn_ts.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1835,7 +1881,7 @@ class VoxActionItemMatrixWidget(QFrame):
                 btn_ts.clicked.connect(lambda _=False, sec=ts_sec: self.timestamp_clicked.emit(sec))
                 meta_row.addWidget(btn_ts)
 
-            has_details = bool(evidence or context or notes)
+            has_details = (not self._clean_summary_mode) and bool(evidence or context or notes)
             if has_details:
                 is_exp = item_id in self._expanded_ids
                 btn_ev = QPushButton("Hide source" if is_exp else "View source")
@@ -1848,7 +1894,12 @@ class VoxActionItemMatrixWidget(QFrame):
                 btn_ev.clicked.connect(lambda _=False, iid=item_id: self._toggle_expand(iid))
                 meta_row.addWidget(btn_ev)
 
-            c_lay.addWidget(meta_host)
+            if meta_row.count() > 0:
+                if self._clean_summary_mode:
+                    meta_host.setContentsMargins(24, 0, 0, 0)
+                c_lay.addWidget(meta_host)
+            else:
+                meta_host.deleteLater()
 
             if has_details and item_id in self._expanded_ids:
                 det_frame = QFrame()
@@ -1915,6 +1966,8 @@ class VoxActionItemMatrixWidget(QFrame):
         dlg = QDialog(self)
         dlg.setWindowTitle("Edit Action Item")
         dlg.setMinimumWidth(460)
+        dlg.setPalette(get_theme_palette(self.theme))
+        dlg.setStyleSheet(get_dialog_qss(self.theme) + "\n" + get_scrollbar_qss(self.theme))
         lyt = QVBoxLayout(dlg)
         lyt.setSpacing(10)
 
@@ -2004,12 +2057,16 @@ class VoxActionItemMatrixWidget(QFrame):
         lines: List[str] = []
         for it in items:
             done = "☑" if str(it.get("status") or "").lower() == "completed" else "☐"
-            owner = self._clean_display_owner(it.get("owner")) or "Owner Unknown"
+            owner = self._clean_display_owner(it.get("owner"))
             due = self._clean_display_due(it.get("due_date"))
-            due_s = f" (Due: {due})" if due else ""
-            prio = str(it.get("priority") or "").strip()
-            prio_s = f" [{prio}]" if prio else ""
-            lines.append(f"{done} [{owner}]{prio_s} {it.get('description', '')}{due_s}")
+            desc = clean_user_facing_text(str(it.get("description") or ""))
+            meta_parts: List[str] = []
+            if owner:
+                meta_parts.append(f"Owner: {owner}")
+            if due:
+                meta_parts.append(f"Due: {due}")
+            meta_s = f" ({', '.join(meta_parts)})" if meta_parts else ""
+            lines.append(f"{done} {desc}{meta_s}")
         return "\n".join(lines)
 
     def _copy_text_safe(self, text: str, label: str) -> None:
@@ -2028,16 +2085,6 @@ class VoxActionItemMatrixWidget(QFrame):
 
     def _copy_all_plain(self) -> None:
         self._copy_text_safe(self._format_actions_plain(self._items), "all action items")
-
-    def _copy_for_slack(self) -> None:
-        lines = ["*Action Items & Next Steps*"]
-        for it in self._items:
-            done = "✅" if str(it.get("status") or "").lower() == "completed" else "▫️"
-            owner = self._clean_display_owner(it.get("owner")) or "Owner Unknown"
-            due = self._clean_display_due(it.get("due_date"))
-            due_s = f" _(Due: {due})_" if due else ""
-            lines.append(f"{done} *@{owner}* — {it.get('description', '')}{due_s}")
-        self._copy_text_safe("\n".join(lines), "Slack/Teams action checklist")
 
     def _export_actions(self, fmt: str) -> None:
         import json as _json
@@ -2077,9 +2124,15 @@ class VoxStructuredDecisionsWidget(QFrame):
     decision_updated = pyqtSignal(int, dict)
     toast_requested = pyqtSignal(str, str)
 
-    def __init__(self, parent: Optional[QWidget] = None, theme: str = "dark") -> None:
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        theme: str = "dark",
+        clean_summary_mode: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.theme = theme
+        self._clean_summary_mode = bool(clean_summary_mode)
         self.setObjectName("decisionsMatrixContainer")
         self._decisions: List[dict] = []
         self._build_ui()
@@ -2089,9 +2142,11 @@ class VoxStructuredDecisionsWidget(QFrame):
         self.setMinimumWidth(0)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(6 if self._clean_summary_mode else 10)
 
-        hdr = VoxFlowLayout(margin=0, h_spacing=6, v_spacing=6)
+        self._hdr_host = QWidget()
+        self._hdr_host.setMinimumWidth(0)
+        hdr = VoxFlowLayout(self._hdr_host, margin=0, h_spacing=6, v_spacing=6)
         self.lbl_title = QLabel("Key Decisions & Outcomes")
         self.lbl_title.setMinimumWidth(0)
         hdr.addWidget(self.lbl_title)
@@ -2106,7 +2161,9 @@ class VoxStructuredDecisionsWidget(QFrame):
         self.btn_copy.clicked.connect(self._copy_decisions)
         hdr.addWidget(self.btn_copy)
 
-        layout.addLayout(hdr)
+        layout.addWidget(self._hdr_host)
+        if self._clean_summary_mode:
+            self._hdr_host.setVisible(False)
 
         self.cards_host = QWidget()
         self.cards_layout = QVBoxLayout(self.cards_host)
@@ -2117,6 +2174,9 @@ class VoxStructuredDecisionsWidget(QFrame):
     def set_theme(self, theme_name: str) -> None:
         self.theme = (theme_name or "light").lower()
         t = get_theme_tokens(self.theme)
+        self.setStyleSheet("QFrame#decisionsMatrixContainer { background: transparent; border: none; }")
+        if hasattr(self, "cards_host"):
+            self.cards_host.setStyleSheet("background: transparent; border: none;")
         self.lbl_title.setStyleSheet(f"font-size: 13.5px; font-weight: 700; color: {t['text_primary']};")
         self.lbl_count.setStyleSheet(
             f"font-size: 11px; font-weight: 600; color: {t['status_success_text']}; "
@@ -2145,6 +2205,8 @@ class VoxStructuredDecisionsWidget(QFrame):
             item = self.cards_layout.takeAt(0)
             w = item.widget()
             if w:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
         t = get_theme_tokens(self.theme)
@@ -2164,6 +2226,7 @@ class VoxStructuredDecisionsWidget(QFrame):
         for idx, dec in enumerate(self._decisions):
             dec_id = int(dec.get("id") or (idx + 1))
             stat = str(dec.get("status") or "confirmed").strip().lower()
+            raw_state = str(dec.get("decision_state") or stat or "confirmed").strip().lower()
             cat = str(dec.get("category") or "General").strip()
             speaker = str(dec.get("speaker") or "").strip()
             ctx = str(dec.get("context") or "").strip()
@@ -2171,35 +2234,54 @@ class VoxStructuredDecisionsWidget(QFrame):
             evidence = str(dec.get("evidence_quote") or "").strip()
             ts_sec = float(dec.get("timestamp_sec") or 0.0)
 
-            accent_bar = {
-                "confirmed": t["status_success"],
-                "proposed": t["status_info"],
-                "rejected": t["status_danger"],
-                "unresolved": t["status_warning"],
-            }.get(stat, t["status_success"])
+            state_meta = {
+                "confirmed": ("Confirmed", t["status_success"], t["status_success_bg"], t["status_success_text"]),
+                "proposed": ("Proposed", t["status_info"], t["status_info_bg"], t["status_info_text"]),
+                "pending_confirmation": ("Pending Confirmation", t["status_warning"], t["status_warning_bg"], t["status_warning_text"]),
+                "under_discussion": ("Under Discussion", t["status_warning"], t["status_warning_bg"], t["status_warning_text"]),
+                "unresolved": ("Unresolved", t["status_warning"], t["status_warning_bg"], t["status_warning_text"]),
+                "rejected": ("Rejected", t["status_danger"], t["status_danger_bg"], t["status_danger_text"]),
+            }.get(
+                raw_state,
+                (raw_state.replace("_", " ").title(), t["status_neutral"], t["status_neutral_bg"], t["status_neutral_text"]),
+            )
+            state_label, accent_bar, st_bg, st_fg = state_meta
 
             card = QFrame()
             card.setObjectName("decisionCardRow")
             card.setMinimumWidth(0)
-            card.setStyleSheet(
-                f"QFrame#decisionCardRow {{ background-color: {t['surface_alt']}; border: 1px solid {t['border']}; "
-                f"border-left: 3px solid {accent_bar}; border-radius: 10px; }}"
-            )
+            if self._clean_summary_mode:
+                card.setStyleSheet(
+                    f"QFrame#decisionCardRow {{ background-color: transparent; border: none; "
+                    f"border-bottom: 1px solid {t['line']}; border-radius: 0px; }}"
+                )
+            else:
+                card.setStyleSheet(
+                    f"QFrame#decisionCardRow {{ background-color: {t['surface_alt']}; border: 1px solid {t['border']}; "
+                    f"border-left: 3px solid {accent_bar}; border-radius: 10px; }}"
+                )
             c_layout = QVBoxLayout(card)
-            c_layout.setContentsMargins(12, 10, 12, 10)
-            c_layout.setSpacing(6)
+            c_layout.setContentsMargins(2 if self._clean_summary_mode else 12, 8 if self._clean_summary_mode else 10, 2 if self._clean_summary_mode else 12, 8 if self._clean_summary_mode else 10)
+            c_layout.setSpacing(4 if self._clean_summary_mode else 6)
 
             top = QHBoxLayout()
             top.setSpacing(6)
-            lbl_dec = QLabel(str(dec.get("decision") or ""))
-            lbl_dec.setStyleSheet(f"font-size: 13px; font-weight: 700; color: {t['text_primary']}; border: none;")
+            dec_text = str(dec.get("decision") or "")
+            if self._clean_summary_mode:
+                dec_text = clean_user_facing_text(dec_text) or dec_text
+                ctx = clean_user_facing_text(ctx) if ctx else ""
+                rationale = clean_user_facing_text(rationale) if rationale else ""
+            lbl_dec = QLabel(f"•  {dec_text}" if self._clean_summary_mode else dec_text)
+            lbl_dec.setStyleSheet(
+                f"font-size: 13px; font-weight: {'600' if self._clean_summary_mode else '700'}; color: {t['text_primary']}; border: none; background: transparent;"
+            )
             lbl_dec.setWordWrap(True)
             lbl_dec.setMinimumWidth(0)
             lbl_dec.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             lbl_dec.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             top.addWidget(lbl_dec, 1)
 
-            if ts_sec > 0:
+            if not self._clean_summary_mode and ts_sec > 0:
                 btn_ts = QPushButton(format_seconds_hms(ts_sec))
                 btn_ts.setFixedHeight(22)
                 btn_ts.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2222,66 +2304,65 @@ class VoxStructuredDecisionsWidget(QFrame):
                 btn_confirm.clicked.connect(lambda _=False, did=dec_id, dref=dec: self._mark_confirmed(did, dref))
                 top.addWidget(btn_confirm, 0, Qt.AlignmentFlag.AlignTop)
 
-            btn_cp = QPushButton("Copy")
-            btn_cp.setFixedHeight(22)
-            btn_cp.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_cp.setStyleSheet(
-                f"QPushButton {{ font-size: 10.5px; font-weight: 600; color: {t['text_secondary']}; "
-                f"background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 6px; padding: 1px 8px; }}"
-            )
-            btn_cp.clicked.connect(lambda _=False, dref=dec: self._copy_single_decision(dref))
-            top.addWidget(btn_cp, 0, Qt.AlignmentFlag.AlignTop)
+            if not self._clean_summary_mode:
+                btn_cp = QPushButton("Copy")
+                btn_cp.setFixedHeight(22)
+                btn_cp.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_cp.setStyleSheet(
+                    f"QPushButton {{ font-size: 10.5px; font-weight: 600; color: {t['text_secondary']}; "
+                    f"background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 6px; padding: 1px 8px; }}"
+                )
+                btn_cp.clicked.connect(lambda _=False, dref=dec: self._copy_single_decision(dref))
+                top.addWidget(btn_cp, 0, Qt.AlignmentFlag.AlignTop)
 
             c_layout.addLayout(top)
 
             # Badges row using wrapping VoxFlowLayout (zero QScrollArea)
-            badges = VoxFlowLayout(margin=0, h_spacing=6, v_spacing=5)
-            badges_host = QWidget()
-            badges_host.setMinimumWidth(0)
-            badges_host.setLayout(badges)
-            st_colors = {
-                "confirmed": (t["status_success_bg"], t["status_success_text"]),
-                "proposed": (t["status_info_bg"], t["status_info_text"]),
-                "rejected": (t["status_danger_bg"], t["status_danger_text"]),
-                "unresolved": (t["status_warning_bg"], t["status_warning_text"]),
-            }.get(stat, (t["status_neutral_bg"], t["status_neutral_text"]))
-            lbl_st = QLabel(stat.capitalize())
-            lbl_st.setStyleSheet(
-                f"font-size: 10.5px; font-weight: 700; color: {st_colors[1]}; background: {st_colors[0]}; border-radius: 6px; padding: 2px 7px;"
-            )
-            badges.addWidget(lbl_st)
+            show_badges = (not self._clean_summary_mode) or (raw_state != "confirmed") or (cat and cat.lower() != "general")
+            if show_badges:
+                badges = VoxFlowLayout(margin=0, h_spacing=6, v_spacing=5)
+                badges_host = QWidget()
+                badges_host.setMinimumWidth(0)
+                badges_host.setLayout(badges)
+                if (not self._clean_summary_mode) or (raw_state != "confirmed"):
+                    lbl_st = QLabel(state_label)
+                    lbl_st.setStyleSheet(
+                        f"font-size: 10.5px; font-weight: 700; color: {st_fg}; background: {st_bg}; border-radius: 6px; padding: 2px 7px;"
+                    )
+                    badges.addWidget(lbl_st)
 
-            lbl_cat = QLabel(cat)
-            lbl_cat.setStyleSheet(
-                f"font-size: 10.5px; font-weight: 600; color: {t['text_secondary']}; "
-                f"background: {t['chip_bg']}; border: 1px solid {t['chip_border']}; border-radius: 6px; padding: 1px 7px;"
-            )
-            badges.addWidget(lbl_cat)
+                if cat and cat.lower() != "general":
+                    lbl_cat = QLabel(cat)
+                    lbl_cat.setStyleSheet(
+                        f"font-size: 10.5px; font-weight: 600; color: {t['text_secondary']}; "
+                        f"background: {t['chip_bg']}; border: 1px solid {t['chip_border']}; border-radius: 6px; padding: 1px 7px;"
+                    )
+                    badges.addWidget(lbl_cat)
 
-            if speaker:
-                lbl_spk = QLabel(f"Raised by: {speaker}")
-                lbl_spk.setStyleSheet(
-                    f"font-size: 10.5px; font-weight: 600; color: {t['status_info_text']}; "
-                    f"background: {t['status_info_bg']}; border-radius: 6px; padding: 2px 7px;"
-                )
-                badges.addWidget(lbl_spk)
-            c_layout.addWidget(badges_host)
+                if (not self._clean_summary_mode) and speaker:
+                    lbl_spk = QLabel(f"Raised by: {speaker}")
+                    lbl_spk.setStyleSheet(
+                        f"font-size: 10.5px; font-weight: 600; color: {t['status_info_text']}; "
+                        f"background: {t['status_info_bg']}; border-radius: 6px; padding: 2px 7px;"
+                    )
+                    badges.addWidget(lbl_spk)
+                c_layout.addWidget(badges_host)
 
             if ctx and ctx != rationale:
                 lbl_ctx = QLabel(f"Context: {ctx}")
                 lbl_ctx.setWordWrap(True)
                 lbl_ctx.setMinimumWidth(0)
                 lbl_ctx.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-                lbl_ctx.setStyleSheet(f"font-size: 12px; color: {t['text_secondary']}; border: none;")
+                lbl_ctx.setStyleSheet(f"font-size: 12px; color: {t['text_secondary']}; border: none; background: transparent;")
                 c_layout.addWidget(lbl_ctx)
             if rationale:
                 lbl_rat = QLabel(f"Rationale: {rationale}")
                 lbl_rat.setWordWrap(True)
                 lbl_rat.setMinimumWidth(0)
                 lbl_rat.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-                lbl_rat.setStyleSheet(f"font-size: 12px; color: {t['text_secondary']}; border: none;")
+                lbl_rat.setStyleSheet(f"font-size: 12px; color: {t['text_secondary']}; border: none; background: transparent;")
                 c_layout.addWidget(lbl_rat)
-            if evidence:
+            if (not self._clean_summary_mode) and evidence:
                 lbl_ev = QLabel(f"Evidence: “{evidence}”")
                 lbl_ev.setWordWrap(True)
                 lbl_ev.setMinimumWidth(0)
@@ -2301,13 +2382,20 @@ class VoxStructuredDecisionsWidget(QFrame):
     def _format_decision_lines(self, decs: List[dict]) -> str:
         lines: List[str] = []
         for dec in decs:
-            ts = f"[{format_seconds_hms(float(dec.get('timestamp_sec', 0.0)))}] " if dec.get("timestamp_sec") else ""
+            dec_txt = clean_user_facing_text(str(dec.get("decision") or "")) or str(dec.get("decision") or "")
             stat = str(dec.get("status") or "confirmed").capitalize()
-            lines.append(f"• {ts}{dec.get('decision', '')} ({stat})")
-            if dec.get("rationale"):
-                lines.append(f"  Rationale: {dec.get('rationale')}")
-            if dec.get("evidence_quote"):
-                lines.append(f"  Evidence: \"{dec.get('evidence_quote')}\"")
+            if self._clean_summary_mode:
+                suffix = f" ({stat})" if stat.lower() != "confirmed" else ""
+                lines.append(f"• {dec_txt}{suffix}")
+                if dec.get("rationale"):
+                    lines.append(f"  Rationale: {clean_user_facing_text(str(dec.get('rationale')))}")
+            else:
+                ts = f"[{format_seconds_hms(float(dec.get('timestamp_sec', 0.0)))}] " if dec.get("timestamp_sec") else ""
+                lines.append(f"• {ts}{dec_txt} ({stat})")
+                if dec.get("rationale"):
+                    lines.append(f"  Rationale: {dec.get('rationale')}")
+                if dec.get("evidence_quote"):
+                    lines.append(f"  Evidence: \"{dec.get('evidence_quote')}\"")
         return "\n".join(lines)
 
     def _copy_single_decision(self, dec: dict) -> None:
@@ -2534,6 +2622,7 @@ class VoxMeetingComparisonDialog(QDialog):
         border_color = t["border"]
         accent_color = t["accent_fathom"]
 
+        self.setPalette(get_theme_palette(self.theme))
         self.setStyleSheet(f"""
             QDialog {{
                 background-color: {bg_color};
@@ -2549,6 +2638,12 @@ class VoxMeetingComparisonDialog(QDialog):
                 border-radius: 6px;
                 padding: 6px 10px;
                 font-size: 12px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {card_bg};
+                color: {text_color};
+                selection-background-color: {t['accent_fathom_tint']};
+                selection-color: {text_color};
             }}
             QTextBrowser {{
                 background-color: {card_bg};
@@ -2573,7 +2668,7 @@ class VoxMeetingComparisonDialog(QDialog):
                 border-color: {accent_color};
                 color: {accent_color};
             }}
-        """)
+        """ + "\n" + get_scrollbar_qss(self.theme))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
@@ -2634,13 +2729,13 @@ class VoxMeetingComparisonDialog(QDialog):
         btn_bar = QHBoxLayout()
         btn_bar.setSpacing(8)
 
-        self.btn_copy_md = QPushButton("📋 Copy Markdown")
+        self.btn_copy_md = QPushButton("Copy Markdown")
         self.btn_copy_md.clicked.connect(self._copy_markdown)
         btn_bar.addWidget(self.btn_copy_md)
 
-        self.btn_export_slack = QPushButton("💬 Copy for Slack/Teams")
-        self.btn_export_slack.clicked.connect(self._copy_slack)
-        btn_bar.addWidget(self.btn_export_slack)
+        self.btn_copy_plain = QPushButton("Copy Summary Text")
+        self.btn_copy_plain.clicked.connect(self._copy_plain_summary)
+        btn_bar.addWidget(self.btn_copy_plain)
 
         btn_bar.addStretch()
 
@@ -2715,14 +2810,15 @@ class VoxMeetingComparisonDialog(QDialog):
                 sensitive.extend(TranscriptExporter.check_sensitive_content(m_b))
             if sensitive:
                 kw_str = ", ".join(f"'{k}'" for k in sorted(set(sensitive)))
-                ret = QMessageBox.warning(
+                if not show_themed_confirm(
                     self,
                     "Sensitive Content Warning",
                     f"This comparison contains potentially sensitive keywords ({kw_str}).\n\nDo you want to proceed with copying to clipboard?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                if ret != QMessageBox.StandardButton.Yes:
+                    confirm_label="Copy Anyway",
+                    cancel_label="Cancel",
+                    destructive=False,
+                    theme=self.theme,
+                ):
                     return
         except Exception as exc:
             logger.debug("Sensitive content check skipped: %s", exc)
@@ -2735,7 +2831,7 @@ class VoxMeetingComparisonDialog(QDialog):
             if clipboard:
                 clipboard.setText(md)
 
-    def _copy_slack(self) -> None:
+    def _copy_plain_summary(self) -> None:
         if not self._current_result:
             return
         res = self._current_result
@@ -2750,14 +2846,15 @@ class VoxMeetingComparisonDialog(QDialog):
                 sensitive.extend(TranscriptExporter.check_sensitive_content(m_b))
             if sensitive:
                 kw_str = ", ".join(f"'{k}'" for k in sorted(set(sensitive)))
-                ret = QMessageBox.warning(
+                if not show_themed_confirm(
                     self,
                     "Sensitive Content Warning",
                     f"This comparison contains potentially sensitive keywords ({kw_str}).\n\nDo you want to proceed with copying to clipboard?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                if ret != QMessageBox.StandardButton.Yes:
+                    confirm_label="Copy Anyway",
+                    cancel_label="Cancel",
+                    destructive=False,
+                    theme=self.theme,
+                ):
                     return
         except Exception as exc:
             logger.debug("Sensitive content check skipped: %s", exc)
@@ -2776,32 +2873,33 @@ class VoxMeetingComparisonDialog(QDialog):
             m_early, m_later = m_a, m_b
             dec_later = dec_b
 
-        slack_lines = [
-            f"*⚖️ VOX Meeting Comparison: {m_early.get('title')} vs {m_later.get('title')}*",
-            f"• *Earlier Session:* {m_early.get('title')} ({m_early.get('created_at', '')})",
-            f"• *Later Session:* {m_later.get('title')} ({m_later.get('created_at', '')})",
+        summary_lines = [
+            f"VOX Meeting Comparison: {m_early.get('title')} vs {m_later.get('title')}",
+            f"• Earlier Session: {m_early.get('title')} ({m_early.get('created_at', '')})",
+            f"• Later Session: {m_later.get('title')} ({m_later.get('created_at', '')})",
             "",
-            "*🎯 Strategic Decisions Summary:*",
+            "Key Decisions Summary:",
         ]
         active_decisions = [d for d in dec_later if d.get("status") not in ("rejected",)]
         if active_decisions:
             for d in active_decisions[:4]:
-                slack_lines.append(f"• *[New/Active]* {d.get('decision', '')}")
+                summary_lines.append(f"• [New/Active] {d.get('decision', '')}")
         elif dec_later:
             for d in dec_later[:4]:
-                slack_lines.append(f"• *[New/Active]* {d.get('decision', '')}")
+                summary_lines.append(f"• [New/Active] {d.get('decision', '')}")
         else:
-            slack_lines.append("• _No new decisions tracked in latest meeting_")
+            summary_lines.append("• No new decisions tracked in latest meeting")
 
         if carry_over:
-            slack_lines.append("")
-            slack_lines.append("*⚠️ Carry-Over Action Items:*")
+            summary_lines.append("")
+            summary_lines.append("Carry-Over Action Items:")
             for act in carry_over[:5]:
-                owner = act.get("owner") or "Unassigned"
+                owner = act.get("owner") or ""
+                own_part = f"[{owner}] " if owner else ""
                 due = f" (Due: {act.get('due_date')})" if act.get("due_date") else ""
-                slack_lines.append(f"• [ ] *[{owner}]* {act.get('description', '')}{due}")
+                summary_lines.append(f"• {own_part}{act.get('description', '')}{due}")
 
-        text = "\n".join(slack_lines)
+        text = "\n".join(summary_lines)
         self._last_copied_text = text
         app = QApplication.instance()
         if app:
@@ -2845,6 +2943,7 @@ class VoxPreMeetingBriefingDialog(QDialog):
         border_color = t["border"]
         accent_color = t["accent_fathom"]
 
+        self.setPalette(get_theme_palette(self.theme))
         self.setStyleSheet(f"""
             QDialog {{
                 background-color: {bg_color};
@@ -2884,7 +2983,7 @@ class VoxPreMeetingBriefingDialog(QDialog):
                 border-color: {accent_color};
                 color: {accent_color};
             }}
-        """)
+        """ + "\n" + get_scrollbar_qss(self.theme))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
@@ -2959,13 +3058,13 @@ class VoxPreMeetingBriefingDialog(QDialog):
         btn_bar = QHBoxLayout()
         btn_bar.setSpacing(8)
 
-        self.btn_copy_md = QPushButton("📋 Copy Briefing")
+        self.btn_copy_md = QPushButton("Copy Briefing")
         self.btn_copy_md.clicked.connect(self._copy_markdown)
         btn_bar.addWidget(self.btn_copy_md)
 
-        self.btn_export_slack = QPushButton("💬 Copy for Slack/Teams")
-        self.btn_export_slack.clicked.connect(self._copy_slack)
-        btn_bar.addWidget(self.btn_export_slack)
+        self.btn_copy_plain = QPushButton("Copy Summary Text")
+        self.btn_copy_plain.clicked.connect(self._copy_plain_summary)
+        btn_bar.addWidget(self.btn_copy_plain)
 
         btn_bar.addStretch()
 
@@ -3005,7 +3104,7 @@ class VoxPreMeetingBriefingDialog(QDialog):
                 if clipboard:
                     clipboard.setText(md)
 
-    def _copy_slack(self) -> None:
+    def _copy_plain_summary(self) -> None:
         if not self._current_result:
             return
         res = self._current_result
@@ -3013,26 +3112,27 @@ class VoxPreMeetingBriefingDialog(QDialog):
         open_actions = res.get("open_action_items", [])
         decisions = res.get("key_decisions", [])
 
-        slack_lines = [
-            f"*🎯 VOX Pre-Meeting Briefing: {topic}*",
+        summary_lines = [
+            f"VOX Pre-Meeting Briefing: {topic}",
             "",
-            "*🎯 Strategic Context & Decisions:*",
+            "Strategic Context & Decisions:",
         ]
         if decisions:
             for d in decisions[:4]:
-                slack_lines.append(f"• *{d.get('decision', '')}*")
+                summary_lines.append(f"• {d.get('decision', '')}")
         else:
-            slack_lines.append("• _No prior formal decisions tracked_")
+            summary_lines.append("• No prior formal decisions tracked")
 
         if open_actions:
-            slack_lines.append("")
-            slack_lines.append("*⚠️ Outstanding Commitments:*")
+            summary_lines.append("")
+            summary_lines.append("Outstanding Commitments:")
             for act in open_actions[:5]:
-                owner = act.get("owner") or "Unassigned"
+                owner = act.get("owner") or ""
+                own_part = f"[{owner}] " if owner else ""
                 due = f" (Due: {act.get('due_date')})" if act.get("due_date") else ""
-                slack_lines.append(f"• [ ] *[{owner}]* {act.get('description', '')}{due}")
+                summary_lines.append(f"• {own_part}{act.get('description', '')}{due}")
 
-        text = "\n".join(slack_lines)
+        text = "\n".join(summary_lines)
         self._last_copied_text = text
         app = QApplication.instance()
         if app:

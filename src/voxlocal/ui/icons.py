@@ -368,7 +368,7 @@ def get_pixmap(name: str, color: str = "#0F172A", size: int = 16, filled: bool =
         path.closeSubpath()
         p.drawPath(path)
 
-    elif n == "refresh":
+    elif n in ("refresh", "retry"):
         p.setBrush(Qt.BrushStyle.NoBrush)
         arc = QPainterPath()
         arc.moveTo(_pt(19.2, 10.2))
@@ -492,6 +492,28 @@ def get_pixmap(name: str, color: str = "#0F172A", size: int = 16, filled: bool =
         path.lineTo(_pt(6.8, 12))
         path.closeSubpath()
         p.drawPath(path)
+
+    elif n == "new_chat":
+        # Minimal rounded square + top-right compose pen (Lucide square-pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        box = QPainterPath()
+        box.moveTo(_pt(12.2, 4.2))
+        box.lineTo(_pt(6.4, 4.2))
+        box.quadTo(_pt(4.2, 4.2), _pt(4.2, 6.4))
+        box.lineTo(_pt(4.2, 17.6))
+        box.quadTo(_pt(4.2, 19.8), _pt(6.4, 19.8))
+        box.lineTo(_pt(17.6, 19.8))
+        box.quadTo(_pt(19.8, 19.8), _pt(19.8, 17.6))
+        box.lineTo(_pt(19.8, 11.8))
+        p.drawPath(box)
+        pen_path = QPainterPath()
+        pen_path.moveTo(_pt(17.4, 3.6))
+        pen_path.lineTo(_pt(20.4, 6.6))
+        pen_path.lineTo(_pt(12.6, 14.4))
+        pen_path.lineTo(_pt(9.4, 14.6))
+        pen_path.lineTo(_pt(9.6, 11.4))
+        pen_path.closeSubpath()
+        p.drawPath(pen_path)
 
     else:
         p.drawEllipse(_rect(5, 5, 14, 14))

@@ -147,8 +147,10 @@ LIGHT_TOKENS: ThemeTokenDict = ThemeTokenDict({
     "table_header_bg": "#F8FAFC",
     "table_header_text": "#64748B",
     "table_row_alt": "#F8FAFC",
-    "scrollbar_handle": "rgba(100, 116, 139, 0.25)",
-    "scrollbar_hover": "rgba(100, 116, 139, 0.45)",
+    "scrollbar_track": "#E9EEF5",
+    "scrollbar_handle": "#94A3B8",
+    "scrollbar_hover": "#64748B",
+    "scrollbar_pressed": "#475569",
 
     # FlowBar Pill & Floating Surfaces (Obsidian with Electric Indigo/Cyan Rim)
     "pill_bg": "#0B0F19",
@@ -185,7 +187,6 @@ LIGHT_TOKENS: ThemeTokenDict = ThemeTokenDict({
     "platform_teams": "#6264A7",
     "platform_zoom": "#2D8CFF",
     "platform_meet": "#0F9D58",
-    "platform_slack": "#E01E5A",
     "platform_webex": "#00A0D1",
     "obsidian": "#0F172A",
     "canvas_obsidian": "#0F172A",
@@ -308,8 +309,10 @@ DARK_TOKENS: ThemeTokenDict = ThemeTokenDict({
     "table_header_bg": "#111827",
     "table_header_text": "#94A3B8",
     "table_row_alt": "#0D1322",
-    "scrollbar_handle": "rgba(248, 250, 252, 0.16)",
-    "scrollbar_hover": "rgba(248, 250, 252, 0.34)",
+    "scrollbar_track": "#111A2B",
+    "scrollbar_handle": "#475569",
+    "scrollbar_hover": "#64748B",
+    "scrollbar_pressed": "#94A3B8",
 
     # FlowBar Pill
     "pill_bg": "#0B0F19",
@@ -346,7 +349,6 @@ DARK_TOKENS: ThemeTokenDict = ThemeTokenDict({
     "platform_teams": "#6264A7",
     "platform_zoom": "#2D8CFF",
     "platform_meet": "#0F9D58",
-    "platform_slack": "#E01E5A",
     "platform_webex": "#00A0D1",
     "ivory": "#F8FAFC",
     "canvas_ivory": "#F1F5F9",
@@ -490,48 +492,164 @@ def get_type_font(role: str = "body_medium", mono: bool = False) -> QFont:
     return get_ui_font(size_px=size_px, weight=weight, mono=mono)
 
 
+def get_scrollbar_qss(theme: str = "light") -> str:
+    """High-visibility, theme-adaptive scrollbar rules for all scroll areas and lists."""
+    t = get_theme_tokens(theme)
+    return f"""
+    QScrollBar:vertical {{
+        background: {t['scrollbar_track']};
+        width: 10px;
+        margin: 2px 1px;
+        border-radius: 5px;
+    }}
+    QScrollBar::handle:vertical {{
+        background: {t['scrollbar_handle']};
+        border-radius: 5px;
+        min-height: 36px;
+        margin: 1px;
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background: {t['scrollbar_hover']};
+    }}
+    QScrollBar::handle:vertical:pressed {{
+        background: {t['scrollbar_pressed']};
+    }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+        height: 0px;
+        width: 0px;
+    }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+        background: none;
+    }}
+    QScrollBar:horizontal {{
+        background: {t['scrollbar_track']};
+        height: 10px;
+        margin: 1px 2px;
+        border-radius: 5px;
+    }}
+    QScrollBar::handle:horizontal {{
+        background: {t['scrollbar_handle']};
+        border-radius: 5px;
+        min-width: 36px;
+        margin: 1px;
+    }}
+    QScrollBar::handle:horizontal:hover {{
+        background: {t['scrollbar_hover']};
+    }}
+    QScrollBar::handle:horizontal:pressed {{
+        background: {t['scrollbar_pressed']};
+    }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+        height: 0px;
+        width: 0px;
+    }}
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+        background: none;
+    }}
+    """
+
+
+def get_dialog_qss(theme: str = "light") -> str:
+    """Theme-adaptive QSS for QDialog, QMessageBox, QInputDialog, and dropdown popups."""
+    t = get_theme_tokens(theme)
+    font_css = get_html_font_family()
+    return f"""
+    QDialog, QMessageBox, QInputDialog {{
+        background-color: {t['surface']};
+        color: {t['text']};
+        font-family: {font_css};
+    }}
+    QDialog QLabel, QMessageBox QLabel, QInputDialog QLabel {{
+        color: {t['text']};
+        background: transparent;
+        font-size: 13px;
+    }}
+    QDialog QPushButton, QMessageBox QPushButton, QInputDialog QPushButton {{
+        background-color: {t['secondary_btn_bg']};
+        color: {t['secondary_btn_text']};
+        border: 1px solid {t['border']};
+        border-radius: 8px;
+        padding: 6px 14px;
+        font-size: 12.5px;
+        font-weight: 600;
+        min-width: 72px;
+    }}
+    QDialog QPushButton:hover, QMessageBox QPushButton:hover, QInputDialog QPushButton:hover {{
+        background-color: {t['surface_hover']};
+    }}
+    QDialog QPushButton#primaryBtn {{
+        background-color: {t['primary_btn_bg']};
+        color: {t['primary_btn_text']};
+        border: none;
+    }}
+    QDialog QPushButton#primaryBtn:hover {{
+        background-color: {t['primary_btn_hover']};
+    }}
+    QDialog QPushButton#dangerConfirmBtn, QMessageBox QPushButton#dangerConfirmBtn {{
+        background-color: {t['status_danger']};
+        color: #FFFFFF;
+        border: 1px solid {t['status_danger']};
+    }}
+    QComboBox QAbstractItemView {{
+        background-color: {t['surface']};
+        color: {t['text']};
+        border: 1px solid {t['border']};
+        selection-background-color: {t['accent_dawn']};
+        selection-color: {t['accent_dawn_text']};
+    }}
+    """
+
+
+def show_themed_confirm(
+    parent,
+    title: str,
+    message: str,
+    *,
+    confirm_label: str = "Delete",
+    cancel_label: str = "Cancel",
+    destructive: bool = True,
+    theme: str = "light",
+) -> bool:
+    """Display a theme-adaptive confirmation dialog matching VOX Light/Dark mode."""
+    from PyQt6.QtWidgets import QMessageBox
+
+    t = get_theme_tokens(theme)
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(message)
+    box.setIcon(QMessageBox.Icon.Warning if destructive else QMessageBox.Icon.Question)
+    box.setPalette(get_theme_palette(theme))
+    box.setStyleSheet(get_dialog_qss(theme))
+
+    btn_yes = box.addButton(confirm_label, QMessageBox.ButtonRole.AcceptRole)
+    btn_no = box.addButton(cancel_label, QMessageBox.ButtonRole.RejectRole)
+    if destructive:
+        btn_yes.setObjectName("dangerConfirmBtn")
+        btn_yes.setStyleSheet(
+            f"QPushButton#dangerConfirmBtn {{ background-color: {t['status_danger']}; color: #FFFFFF; "
+            f"border: 1px solid {t['status_danger']}; border-radius: 8px; padding: 6px 14px; font-weight: 600; }}"
+        )
+    else:
+        btn_yes.setObjectName("primaryBtn")
+    box.setDefaultButton(btn_no)
+    box.exec()
+    return box.clickedButton() == btn_yes
+
+
 def get_chrome_stylesheet(theme: str = "light") -> str:
     """Targeted Material 3 / Fluent desktop chrome rules with zero universal QWidget wildcard."""
     t = get_theme_tokens(theme)
     font_css = get_html_font_family()
+    scrollbar_qss = get_scrollbar_qss(theme)
+    dialog_qss = get_dialog_qss(theme)
     return f"""
     QMainWindow {{
         background-color: {t['bg']};
         color: {t['text']};
         font-family: {font_css};
     }}
-    QScrollBar:vertical {{
-        background: transparent;
-        width: 7px;
-        margin: 2px 1px;
-    }}
-    QScrollBar::handle:vertical {{
-        background: {t['scrollbar_handle']};
-        border-radius: 3px;
-        min-height: 28px;
-    }}
-    QScrollBar::handle:vertical:hover {{
-        background: {t['scrollbar_hover']};
-    }}
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-        height: 0px;
-    }}
-    QScrollBar:horizontal {{
-        background: transparent;
-        height: 7px;
-        margin: 1px 2px;
-    }}
-    QScrollBar::handle:horizontal {{
-        background: {t['scrollbar_handle']};
-        border-radius: 3px;
-        min-width: 28px;
-    }}
-    QScrollBar::handle:horizontal:hover {{
-        background: {t['scrollbar_hover']};
-    }}
-    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-        width: 0px;
-    }}
+    {scrollbar_qss}
+    {dialog_qss}
     QToolTip {{
         background-color: {t['tooltip_bg']};
         color: {t['tooltip_text']};
@@ -630,6 +748,8 @@ def get_theme_stylesheet(theme: str = "light") -> str:
     """Build the VOX Hub stylesheet matching Wispr Flow's editorial desktop aesthetic."""
     t = get_theme_tokens(theme)
     is_dark = (theme or "light").lower().strip() == "dark"
+    scrollbar_qss = get_scrollbar_qss(theme)
+    dialog_qss = get_dialog_qss(theme)
 
     return f"""
 /* ============================================================
@@ -867,35 +987,8 @@ QCheckBox {{
     color: {t['text']};
 }}
 
-QScrollBar:vertical {{
-    background: transparent;
-    width: 8px;
-    margin: 2px;
-}}
-QScrollBar::handle:vertical {{
-    background: {t['scrollbar_handle']};
-    border-radius: 4px;
-    min-height: 24px;
-}}
-QScrollBar::handle:vertical:hover {{
-    background: {t['scrollbar_hover']};
-}}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-    height: 0px;
-}}
-QScrollBar:horizontal {{
-    background: transparent;
-    height: 8px;
-    margin: 2px;
-}}
-QScrollBar::handle:horizontal {{
-    background: {t['scrollbar_handle']};
-    border-radius: 4px;
-    min-width: 24px;
-}}
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-    width: 0px;
-}}
+{scrollbar_qss}
+{dialog_qss}
 
 QToolTip {{
     background-color: {t['tooltip_bg']};

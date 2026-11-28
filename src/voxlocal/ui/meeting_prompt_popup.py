@@ -260,8 +260,6 @@ class MeetingPromptPopup(QWidget):
             return "●", "Zoom", "#2D8CFF"
         elif "meet" in plat:
             return "●", "Google Meet", "#0F9D58"
-        elif "slack" in plat:
-            return "●", "Slack Huddle", "#E01E5A"
         elif "webex" in plat:
             return "●", "Webex", "#00A0D1"
         return "●", self.session_info.platform or "Meeting", "#0EA5E9"

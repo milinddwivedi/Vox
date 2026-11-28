@@ -45,6 +45,7 @@ from voxlocal.ui.theme import (
     create_app_pixmap,
     ensure_google_fonts_loaded,
     get_chrome_stylesheet,
+    get_theme_palette,
     get_theme_tokens,
     get_ui_font,
 )
@@ -851,12 +852,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, "theme_toggle"):
             self.theme_toggle.set_theme(self._theme)
 
-        pal = self.palette()
-        pal.setColor(pal.ColorRole.Window, QColor(t["bg"]))
-        pal.setColor(pal.ColorRole.WindowText, QColor(t["text"]))
-        pal.setColor(pal.ColorRole.Text, QColor(t["text"]))
-        pal.setColor(pal.ColorRole.ButtonText, QColor(t["text"]))
+        pal = get_theme_palette(self._theme)
         self.setPalette(pal)
+        app = QApplication.instance()
+        if app is not None:
+            app.setPalette(pal)
 
         self.setStyleSheet(get_chrome_stylesheet(self._theme))
         self.sidebar.setStyleSheet(

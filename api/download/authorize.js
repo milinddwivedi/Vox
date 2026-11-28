@@ -1,9 +1,15 @@
 const { supabase, authenticateUser } = require('../_lib/supabase');
 const { signDownloadTicket } = require('../_lib/token');
 
-const LATEST_ARTIFACT = 'releases/2.1.0/VoxLocal-Setup.exe';
+const LATEST_ARTIFACT = 'releases/2.3.0/VoxLocal-Setup.exe';
 
 const RELEASE_CATALOG = {
+  'releases/2.3.0/VoxLocal-Setup.exe': {
+    version: '2.3.0',
+    filename: 'VoxLocal-Setup.exe',
+    sha256: '4944fb00abe36499619c5fa44d15a040695bd57afa07a7082eb944a7d163e5aa',
+    size_bytes: 227427919,
+  },
   'releases/2.1.0/VoxLocal-Setup.exe': {
     version: '2.1.0',
     filename: 'VoxLocal-Setup.exe',
@@ -23,10 +29,10 @@ const RELEASE_CATALOG = {
     size_bytes: 56393405,
   },
   'VoxLocal-Setup.exe': {
-    version: '2.1.0',
+    version: '2.3.0',
     filename: 'VoxLocal-Setup.exe',
-    sha256: '7ae6361d16fd851b8ef1abace8dba00fbf514f664b04d99abbd7373b840450ad',
-    size_bytes: 227486842,
+    sha256: '4944fb00abe36499619c5fa44d15a040695bd57afa07a7082eb944a7d163e5aa',
+    size_bytes: 227427919,
   },
 };
 
@@ -95,7 +101,9 @@ module.exports = async function handler(req, res) {
     // 3. Issue short-lived signed download ticket (bypass Supabase Storage for v2.1.0+ / direct release origin)
     const expiresInSec = 120;
     const skipSupabaseStorage =
-      Boolean(process.env.VOX_RELEASE_DOWNLOAD_URL) || metadata.version === '2.1.0';
+      Boolean((process.env.VOX_RELEASE_DOWNLOAD_URL || '').trim()) ||
+      metadata.version === '2.3.0' ||
+      metadata.version === '2.1.0';
     let downloadUrl = null;
     if (!skipSupabaseStorage) {
       try {

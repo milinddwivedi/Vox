@@ -1647,13 +1647,20 @@ class GoogleMeetTabCaptureProvider(MeetingCaptureProvider):
         t_low = (title or "").strip().lower()
         if not t_low:
             return False
-        if "google meet" in t_low:
-            return True
+        try:
+            from voxlocal.audio.call_detector import _is_non_meeting_document_window
+            if _is_non_meeting_document_window(t_low, ""):
+                return False
+        except Exception:
+            if any(ext in t_low for ext in (".pdf", ".html", ".htm", ".md", ".docx", ".xlsx")):
+                return False
         if "meet.google.com" in t_low:
+            return True
+        if extract_google_meet_slug(t_low) and "meet" in t_low:
             return True
         if t_low.startswith("meet - ") or " - meet - " in t_low or "| meet" in t_low:
             return True
-        if extract_google_meet_slug(t_low) and "meet" in t_low:
+        if t_low in ("google meet", "google meet - google chrome", "google meet - microsoft edge") or t_low.endswith("- google meet"):
             return True
         return False
 
@@ -1772,13 +1779,12 @@ class GoogleMeetTabCaptureProvider(MeetingCaptureProvider):
 
 
 class GenericCallWindowCaptureProvider(MeetingCaptureProvider):
-    """Extensible Call-Only Provider for Webex, Slack Huddles, and Browser Teams/Zoom."""
+    """Extensible Call-Only Provider for Webex and Browser Teams/Zoom."""
 
     provider_id = "generic_call"
     platform_name = "Meeting Call"
 
     WEBEX_EXES = {"atmgr.exe", "ciscocollabhost.exe", "webexmta.exe"}
-    SLACK_EXES = {"slack.exe"}
 
     def inspect_window(
         self,
@@ -1795,11 +1801,18 @@ class GenericCallWindowCaptureProvider(MeetingCaptureProvider):
         if w < 300 or h < 200 or not t_low:
             return None
 
-        # Never match VOX's own windows
+        # Never match VOX's own windows or PDF/document/article viewers
         if "vox" in t_low or proc_low in ("voxlocal.exe", "python.exe", "pythonw.exe"):
             return None
+        try:
+            from voxlocal.audio.call_detector import _is_non_meeting_document_window
+            if _is_non_meeting_document_window(t_low, proc_low):
+                return None
+        except Exception:
+            if any(ext in t_low for ext in (".pdf", ".html", ".htm", ".md", ".docx", ".xlsx")):
+                return None
 
-        if proc_low in self.WEBEX_EXES or "webex" in t_low:
+        if proc_low in self.WEBEX_EXES or ("webex" in t_low and proc_low not in {"chrome.exe", "msedge.exe", "brave.exe", "firefox.exe", "opera.exe"}):
             return MeetingSourceDescriptor(
                 provider_id="webex_desktop",
                 platform_name="Cisco Webex",
@@ -1814,26 +1827,9 @@ class GenericCallWindowCaptureProvider(MeetingCaptureProvider):
                 is_call_stage=True,
             )
 
-        if (proc_low in self.SLACK_EXES or "slack" in t_low) and (
-            "huddle" in t_low or "slack call" in t_low
-        ):
-            return MeetingSourceDescriptor(
-                provider_id="slack_huddle",
-                platform_name="Slack Huddle",
-                hwnd=hwnd,
-                pid=pid,
-                process_name=proc_low or "slack.exe",
-                class_name=class_name,
-                window_title=title,
-                meeting_id_slug=t_low,
-                bounds=bounds,
-                score=180,
-                is_call_stage=True,
-            )
-
-        BROWSER_EXES = {"chrome.exe", "msedge.exe", "brave.exe", "firefox.exe", "opera.exe", "vivaldi.exe", "arc.exe"}
+        BROWSER_EXES = {"chrome.exe", "msedge.exe", "brave.exe", "firefox.exe", "opera.exe", "comet.exe", "vivaldi.exe", "arc.exe"}
         if proc_low in BROWSER_EXES:
-            if ("teams" in t_low and any(k in t_low for k in ("meeting", "call", "|"))) or "microsoft teams" in t_low:
+            if any(tok in t_low for tok in ("teams.microsoft.com", "teams.live.com", "| microsoft teams")):
                 return MeetingSourceDescriptor(
                     provider_id="generic_call",
                     platform_name="Microsoft Teams (Browser)",
@@ -1847,7 +1843,7 @@ class GenericCallWindowCaptureProvider(MeetingCaptureProvider):
                     score=195,
                     is_call_stage=True,
                 )
-            if "zoom" in t_low and any(k in t_low for k in ("meeting", "webinar", "call")):
+            if "zoom.us" in t_low or "zoom workplace" in t_low:
                 return MeetingSourceDescriptor(
                     provider_id="generic_call",
                     platform_name="Zoom (Browser)",
@@ -1900,7 +1896,6 @@ PROVIDER_MAP: Dict[str, MeetingCaptureProvider] = {
     p.provider_id: p for p in PROVIDERS
 }
 PROVIDER_MAP["webex_desktop"] = PROVIDERS[3]
-PROVIDER_MAP["slack_huddle"] = PROVIDERS[3]
 PROVIDER_MAP["generic_call"] = PROVIDERS[3]
 
 

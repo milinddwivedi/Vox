@@ -41,7 +41,6 @@ class MeetingPlatform(str, Enum):
     MEET = "meet"
     ZOOM = "zoom"
     WEBEX = "webex"
-    SLACK = "slack"
     IN_PERSON = "in_person"
     GENERIC = "generic"
 
@@ -126,8 +125,6 @@ class CalendarMeeting:
             return MeetingPlatform.MEET.value
         if "webex.com" in u:
             return MeetingPlatform.WEBEX.value
-        if "slack.com" in u:
-            return MeetingPlatform.SLACK.value
         return MeetingPlatform.GENERIC.value
 
     @property
@@ -209,7 +206,6 @@ class CalendarMeeting:
             MeetingPlatform.MEET.value: "Google Meet",
             MeetingPlatform.ZOOM.value: "Zoom",
             MeetingPlatform.WEBEX.value: "Webex",
-            MeetingPlatform.SLACK.value: "Slack Huddle",
             MeetingPlatform.IN_PERSON.value: "In Person",
             MeetingPlatform.GENERIC.value: "Online Link" if self.join_url else "Calendar Event",
         }

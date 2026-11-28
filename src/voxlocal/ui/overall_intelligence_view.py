@@ -28,7 +28,7 @@ from voxlocal.storage.exporter import format_meeting_local_datetime, format_seco
 from voxlocal.ui.components import VoxSearchField
 from voxlocal.ui.meeting_studio import VoxKnowledgeBaseTab
 from voxlocal.ui.meeting_ui_helpers import VoxSegmentedControl, render_safe_markdown_html
-from voxlocal.ui.theme import get_html_font_family, get_theme_tokens, get_ui_font
+from voxlocal.ui.theme import get_html_font_family, get_scrollbar_qss, get_theme_palette, get_theme_tokens, get_ui_font
 
 logger = get_logger("ui.overall_intelligence")
 
@@ -986,8 +986,16 @@ class VoxOverallIntelligenceView(QWidget):
             br.setStyleSheet(
                 f"QTextBrowser#overallRichBrowser {{ background: {t['bg']}; color: {t['text_primary']}; border: none; }}"
             )
+        scroll_qss = get_scrollbar_qss(self.theme)
         for sa in (self.overview_scroll, self.actions_scroll):
-            sa.setStyleSheet(f"QScrollArea {{ background: {t['bg']}; border: none; }}")
+            sa.setPalette(get_theme_palette(self.theme))
+            sa.setStyleSheet(
+                f"QScrollArea {{ background: {t['bg']}; border: none; }} "
+                f"QScrollArea > QWidget > QWidget {{ background: {t['bg']}; }} "
+                f"{scroll_qss}"
+            )
+            if sa.viewport() is not None:
+                sa.viewport().setStyleSheet(f"background: {t['bg']}; border: none;")
         if hasattr(self, "global_knowledge_tab"):
             self.global_knowledge_tab.apply_theme(self.theme)
         if self.isVisible():

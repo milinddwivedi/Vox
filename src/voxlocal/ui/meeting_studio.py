@@ -97,6 +97,25 @@ from PyQt6.QtWidgets import (
 
 from voxlocal.core.logger import get_app_root, get_logger, get_user_data_root
 from voxlocal.engine.meeting_intelligence import MeetingIntelligenceEngine
+try:
+    from voxlocal.engine.intelligence_verifier import (
+        clean_user_facing_text,
+        is_greeting_or_chatter,
+        is_noisy_topic_fragment,
+        is_non_substantive_question,
+    )
+except Exception:  # pragma: no cover - defensive fallback
+    def clean_user_facing_text(text: str) -> str:
+        return str(text or "").strip()
+
+    def is_greeting_or_chatter(text: str) -> bool:
+        return False
+
+    def is_noisy_topic_fragment(title: str, summary: str = "", bullets: Any = None) -> bool:
+        return False
+
+    def is_non_substantive_question(text: str) -> bool:
+        return False
 from voxlocal.storage.exporter import (
     TranscriptExporter,
     format_meeting_local_datetime,
@@ -124,8 +143,11 @@ from voxlocal.ui.meeting_ui_helpers import (
 )
 from voxlocal.ui.icons import get_icon
 from voxlocal.ui.theme import (
+    get_dialog_qss,
     get_html_font_family,
     get_mono_font_family,
+    get_scrollbar_qss,
+    get_theme_palette,
     get_theme_tokens,
     get_ui_font,
 )
@@ -327,8 +349,11 @@ class VoxMyThoughtsTab(QWidget):
         fmt_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         fmt_scroll.setFixedHeight(34)
         fmt_scroll.setMinimumWidth(0)
+        fmt_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        fmt_scroll.viewport().setStyleSheet("background: transparent;")
         fmt_host = QWidget()
         fmt_host.setMinimumWidth(0)
+        fmt_host.setStyleSheet("background: transparent;")
         fmt_row = QHBoxLayout(fmt_host)
         fmt_row.setContentsMargins(0, 0, 0, 0)
         fmt_row.setSpacing(5)
@@ -680,7 +705,8 @@ class VoxMyThoughtsTab(QWidget):
             self.editor.setFont(get_ui_font(14, 400))
             self.editor.setStyleSheet(
                 f"QTextEdit#thoughtsEditor {{ background-color: {t['surface']}; color: {t['text_primary']}; "
-                f"border: 1px solid {t['outline_variant']}; border-radius: 12px; padding: 16px; font-size: 14px; line-height: 1.6; }}"
+                f"border: 1px solid {t['outline_variant']}; border-radius: 12px; padding: 16px; font-size: 14px; line-height: 1.6; }}\n"
+                + get_scrollbar_qss(self.theme)
             )
         if hasattr(self, "toggle_include_summary") and hasattr(self.toggle_include_summary, "set_theme"):
             self.toggle_include_summary.set_theme(self.theme)
@@ -1334,8 +1360,11 @@ class VoxInteractiveTranscriptTab(QWidget):
         b_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         b_scroll.setFixedHeight(34)
         b_scroll.setMinimumWidth(0)
+        b_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        b_scroll.viewport().setStyleSheet("background: transparent;")
         b_host = QWidget()
         b_host.setMinimumWidth(0)
+        b_host.setStyleSheet("background: transparent;")
         b_layout = QHBoxLayout(b_host)
         b_layout.setContentsMargins(0, 0, 0, 0)
         b_layout.setSpacing(6)
@@ -1572,6 +1601,11 @@ class VoxInteractiveTranscriptTab(QWidget):
             self.btn_copy_transcript.setIcon(get_icon("copy", muted, size=13))
         if hasattr(self, "btn_reset"):
             self.btn_reset.setIcon(get_icon("refresh", muted, size=13))
+        if hasattr(self, "list_view"):
+            self.list_view.setStyleSheet(
+                f"QListView {{ background-color: {t.get('bg', '#FFFFFF')}; color: {t.get('text_primary', '#1E293B')}; border: none; }}\n"
+                + get_scrollbar_qss(self.theme)
+            )
         if hasattr(self, "_delegate"):
             self._delegate.theme = self.theme
             self._delegate.clear_cache()
@@ -1836,6 +1870,14 @@ class VoxFollowUpEmailDialog(QDialog):
 
         self.setWindowTitle("✉️ Executive Follow-Up Email")
         self.resize(680, 560)
+        dlg_theme = str(
+            kwargs.get("theme")
+            or getattr(q_parent, "theme", None)
+            or getattr(q_parent, "_theme", None)
+            or "light"
+        ).lower()
+        self.setPalette(get_theme_palette(dlg_theme))
+        self.setStyleSheet(get_dialog_qss(dlg_theme) + "\n" + get_scrollbar_qss(dlg_theme))
         self._build_ui()
         self._email_text = self.txt_markdown
 
@@ -1856,7 +1898,7 @@ class VoxFollowUpEmailDialog(QDialog):
 
         self.txt_markdown = QTextEdit()
         self.txt_markdown.setPlainText(self.email_data.get("markdown", ""))
-        self.preview_tabs.addTab(self.txt_markdown, "Markdown (Slack / Notion)")
+        self.preview_tabs.addTab(self.txt_markdown, "Markdown")
 
         self.txt_html = QTextEdit()
         self.txt_html.setHtml(self.email_data.get("html", ""))
@@ -2044,6 +2086,8 @@ class VoxSummaryDeliverablesTab(QWidget):
         self._risks_edit_mode: bool = False
         self._detail_mode: str = "brief"
         self._summary_search_query: str = ""
+        self._clean_counts: Dict[str, int] = {}
+        self._copy_overall_token: int = 0
         self._section_cards: Dict[str, VoxCollapsibleSectionCard] = {}
         self._jump_buttons: Dict[str, QPushButton] = {}
         self._participant_cards: List[Tuple[str, str, VoxCollapsibleSectionCard]] = []
@@ -2103,21 +2147,21 @@ class VoxSummaryDeliverablesTab(QWidget):
         ribbon.setMinimumWidth(0)
         self.summary_ribbon = ribbon
         r_outer = QVBoxLayout(ribbon)
-        r_outer.setContentsMargins(10, 8, 10, 8)
-        r_outer.setSpacing(6)
+        r_outer.setContentsMargins(8, 6, 8, 6)
+        r_outer.setSpacing(4)
 
         r_row1_scroll = QScrollArea()
         r_row1_scroll.setWidgetResizable(True)
         r_row1_scroll.setFrameShape(QFrame.Shape.NoFrame)
         r_row1_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         r_row1_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        r_row1_scroll.setFixedHeight(38)
+        r_row1_scroll.setFixedHeight(36)
         r_row1_scroll.setMinimumWidth(0)
         r_row1_host = QWidget()
         r_row1_host.setMinimumWidth(0)
         r_row1 = QHBoxLayout(r_row1_host)
         r_row1.setContentsMargins(0, 0, 0, 0)
-        r_row1.setSpacing(6)
+        r_row1.setSpacing(4)
 
         self.detail_mode_control = VoxSegmentedControl(
             [("brief", "Brief"), ("detailed", "Detailed")],
@@ -2127,9 +2171,9 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.detail_mode_control.selection_changed.connect(self._on_detail_mode_changed)
         r_row1.addWidget(self.detail_mode_control)
 
-        self.search_summary_input = VoxSearchField("Filter summary...")
-        self.search_summary_input.setMinimumWidth(110)
-        self.search_summary_input.setMaximumWidth(200)
+        self.search_summary_input = VoxSearchField("Filter...")
+        self.search_summary_input.setMinimumWidth(80)
+        self.search_summary_input.setMaximumWidth(140)
         self.search_summary_input.textChanged.connect(self._on_summary_search_changed)
         r_row1.addWidget(self.search_summary_input)
 
@@ -2139,6 +2183,7 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.btn_expand_all.setToolTip("Expand all sections")
         self.btn_expand_all.setAccessibleName("Expand all sections")
         self.btn_expand_all.clicked.connect(lambda: self._set_all_sections_collapsed(False))
+        self.btn_expand_all.setVisible(False)
         r_row1.addWidget(self.btn_expand_all)
 
         self.btn_collapse_all = AnimatedPushButton("")
@@ -2147,12 +2192,22 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.btn_collapse_all.setToolTip("Collapse all sections")
         self.btn_collapse_all.setAccessibleName("Collapse all sections")
         self.btn_collapse_all.clicked.connect(lambda: self._set_all_sections_collapsed(True))
+        self.btn_collapse_all.setVisible(False)
         r_row1.addWidget(self.btn_collapse_all)
 
         r_row1.addStretch(1)
 
         self.feedback_pill = VoxInlineFeedbackPill(parent=ribbon, theme=self.theme)
         r_row1.addWidget(self.feedback_pill)
+
+        self.btn_copy_overall = AnimatedPushButton("")
+        self.btn_copy_overall.setFixedSize(28, 28)
+        self.btn_copy_overall.setIconSize(QSize(14, 14))
+        self.btn_copy_overall.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy_overall.setToolTip("Copy Brief Summary")
+        self.btn_copy_overall.setAccessibleName("Copy overall summary")
+        self.btn_copy_overall.clicked.connect(self._copy_overall_summary)
+        r_row1.addWidget(self.btn_copy_overall)
 
         self.btn_copy_menu = AnimatedPushButton("Copy")
         self.btn_copy_menu.setIconSize(QSize(13, 13))
@@ -2164,21 +2219,32 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.btn_export_menu.clicked.connect(self._show_export_menu)
         r_row1.addWidget(self.btn_export_menu)
 
-        self.btn_generate_email = AnimatedPushButton("Follow-Up Email")
+        self.btn_generate_email = AnimatedPushButton("Email")
         self.btn_generate_email.setIconSize(QSize(13, 13))
+        self.btn_generate_email.setToolTip("Generate Executive Follow-Up Email")
+        self.btn_generate_email.setAccessibleName("Follow-Up Email")
         self.btn_generate_email.clicked.connect(self._on_generate_email_clicked)
         r_row1.addWidget(self.btn_generate_email)
 
-        self.btn_copy_slack_checklists = AnimatedPushButton("Copy Slack Checklists")
-        self.btn_copy_slack_checklists.setVisible(False)
-        self.btn_copy_slack_checklists.clicked.connect(self._on_copy_slack_checklists_clicked)
-        r_row1.addWidget(self.btn_copy_slack_checklists)
+        self.lbl_summary_save_status = QLabel("✓ Saved")
+        self.lbl_summary_save_status.setObjectName("summarySaveStatus")
+        r_row1.addWidget(self.lbl_summary_save_status)
+
+        self.lbl_decision_count = QLabel("0 Decisions")
+        self.lbl_decision_count.setVisible(False)
+        r_row1.addWidget(self.lbl_decision_count)
+
+        self.lbl_action_count = QLabel("0 Action Items")
+        self.lbl_action_count.setVisible(False)
+        r_row1.addWidget(self.lbl_action_count)
 
         r_row1_scroll.setWidget(r_row1_host)
         r_outer.addWidget(r_row1_scroll)
 
-        # Sticky quick-jump navigation strip + summary counts on right (keeps Row 1 unclipped)
-        r_row2_wrap = QHBoxLayout()
+        # Keep quick-jump navigation buttons wired for shortcuts without visual ribbon clutter
+        self._jump_row_host = QWidget()
+        self._jump_row_host.setVisible(False)
+        r_row2_wrap = QHBoxLayout(self._jump_row_host)
         r_row2_wrap.setContentsMargins(0, 0, 0, 0)
         r_row2_wrap.setSpacing(8)
         jump_scroll = QScrollArea()
@@ -2215,17 +2281,7 @@ class VoxSummaryDeliverablesTab(QWidget):
         jump_row.addStretch(1)
         jump_scroll.setWidget(jump_host)
         r_row2_wrap.addWidget(jump_scroll, 1)
-
-        self.lbl_summary_save_status = QLabel("✓ Saved")
-        self.lbl_summary_save_status.setObjectName("summarySaveStatus")
-        r_row2_wrap.addWidget(self.lbl_summary_save_status)
-
-        self.lbl_decision_count = QLabel("0 Decisions")
-        r_row2_wrap.addWidget(self.lbl_decision_count)
-
-        self.lbl_action_count = QLabel("0 Action Items")
-        r_row2_wrap.addWidget(self.lbl_action_count)
-        r_outer.addLayout(r_row2_wrap)
+        r_outer.addWidget(self._jump_row_host)
 
         layout.addWidget(ribbon)
 
@@ -2240,8 +2296,8 @@ class VoxSummaryDeliverablesTab(QWidget):
         container.setMinimumWidth(0)
         self.summary_container = container
         c_layout = QVBoxLayout(container)
-        c_layout.setContentsMargins(2, 4, 6, 8)
-        c_layout.setSpacing(12)
+        c_layout.setContentsMargins(6, 6, 8, 12)
+        c_layout.setSpacing(10)
 
         self.lbl_llm_fallback_banner = QLabel("")
         self.lbl_llm_fallback_banner.setObjectName("llmFallbackBanner")
@@ -2249,29 +2305,65 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.lbl_llm_fallback_banner.setVisible(False)
         c_layout.addWidget(self.lbl_llm_fallback_banner)
 
-        # 0. Meeting Overview Card
-        self.card_overview = VoxCollapsibleSectionCard("Meeting Overview", section_id="overview", copy_label="Copy Overview", theme=self.theme)
+        # Single Unified Editorial Summary Document Box (Brief | Detailed sections + per-section Copy)
+        self.unified_doc_card = QFrame()
+        self.unified_doc_card.setObjectName("unifiedSummaryDocCard")
+        self.unified_doc_card.setMinimumWidth(0)
+        doc_layout = QVBoxLayout(self.unified_doc_card)
+        doc_layout.setContentsMargins(20, 18, 20, 18)
+        doc_layout.setSpacing(4)
+
+        doc_hdr = QHBoxLayout()
+        doc_hdr.setSpacing(10)
+        doc_title_col = QVBoxLayout()
+        doc_title_col.setSpacing(2)
+        self.lbl_doc_title = QLabel("Meeting Summary")
+        self.lbl_doc_title.setWordWrap(True)
+        self.lbl_doc_title.setMinimumWidth(0)
+        doc_title_col.addWidget(self.lbl_doc_title)
+        self.lbl_doc_meta = QLabel("")
+        self.lbl_doc_meta.setWordWrap(True)
+        self.lbl_doc_meta.setMinimumWidth(0)
+        doc_title_col.addWidget(self.lbl_doc_meta)
+        doc_hdr.addLayout(doc_title_col, 1)
+
+        self.btn_doc_copy_all = AnimatedPushButton("Copy Brief Summary")
+        self.btn_doc_copy_all.setIconSize(QSize(13, 13))
+        self.btn_doc_copy_all.setFixedHeight(28)
+        self.btn_doc_copy_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_doc_copy_all.setToolTip("Copy complete Brief Summary to clipboard")
+        self.btn_doc_copy_all.clicked.connect(self._copy_overall_summary)
+        doc_hdr.addWidget(self.btn_doc_copy_all, 0, Qt.AlignmentFlag.AlignTop)
+        doc_layout.addLayout(doc_hdr)
+
+        self.doc_header_divider = QFrame()
+        self.doc_header_divider.setObjectName("summaryDocDivider")
+        self.doc_header_divider.setFixedHeight(1)
+        doc_layout.addWidget(self.doc_header_divider)
+
+        # 0. Meeting Overview (kept hidden in clean unified view; visible when explicitly searched)
+        self.card_overview = VoxCollapsibleSectionCard("Meeting Overview", section_id="overview", copy_label="Copy Overview", theme=self.theme, flat_embedded=True)
         self.card_overview.copy_requested.connect(lambda: self._copy_section("overview"))
         self.overview_browser = self._make_html_browser("Meeting date, purpose, outcome, and participants appear here.", min_h=56)
         self.card_overview.body_layout.addWidget(self.overview_browser)
         self._section_cards["overview"] = self.card_overview
-        c_layout.addWidget(self.card_overview)
+        doc_layout.addWidget(self.card_overview)
 
-        # 1. Executive Summary Card (Brief | Detailed + Inline Edit)
-        self.card_summary = VoxCollapsibleSectionCard("Executive Summary", section_id="summary", copy_label="Copy Summary", theme=self.theme)
+        # 1. Executive Summary Section (Brief | Detailed + Inline Edit)
+        self.card_summary = VoxCollapsibleSectionCard("Executive Summary", section_id="summary", copy_label="Copy Executive Summary", theme=self.theme, flat_embedded=True)
         self.card_summary.copy_requested.connect(lambda: self._copy_section("summary"))
         self.btn_edit_summary = QPushButton("Edit")
         self.btn_edit_summary.setCheckable(True)
-        self.btn_edit_summary.setFixedHeight(26)
+        self.btn_edit_summary.setFixedHeight(24)
         self.btn_edit_summary.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_edit_summary.toggled.connect(self._toggle_summary_edit)
         self.card_summary.add_header_widget(self.btn_edit_summary)
 
-        self.summary_browser = self._make_html_browser("Generated summary will appear here after finalization.", min_h=80)
+        self.summary_browser = self._make_html_browser("Generated summary will appear here after finalization.", min_h=60)
         self.card_summary.body_layout.addWidget(self.summary_browser)
 
         self.txt_summary = QTextEdit()
-        self.txt_summary.setMinimumHeight(130)
+        self.txt_summary.setMinimumHeight(120)
         self.txt_summary.setPlaceholderText("Edit executive summary...")
         self.txt_summary.setVisible(False)
         self.txt_summary.textChanged.connect(self._on_summary_text_changed)
@@ -2282,65 +2374,65 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.txt_detailed_summary.setReadOnly(True)
         self.txt_detailed_summary.setVisible(False)
         self._section_cards["summary"] = self.card_summary
-        c_layout.addWidget(self.card_summary)
+        doc_layout.addWidget(self.card_summary)
 
-        # 2. Key Takeaways Card
-        self.card_takeaways = VoxCollapsibleSectionCard("Key Takeaways", section_id="takeaways", copy_label="Copy Takeaways", theme=self.theme)
+        # 2. Key Takeaways Section
+        self.card_takeaways = VoxCollapsibleSectionCard("Key Takeaways", section_id="takeaways", copy_label="Copy Key Takeaways", theme=self.theme, flat_embedded=True)
         self.card_takeaways.copy_requested.connect(lambda: self._copy_section("takeaways"))
-        self.takeaways_browser = self._make_html_browser("No key takeaways recorded yet.", min_h=48)
+        self.takeaways_browser = self._make_html_browser("No key takeaways recorded yet.", min_h=44)
         self.card_takeaways.body_layout.addWidget(self.takeaways_browser)
         self.txt_key_points = QTextEdit()
         self.txt_key_points.setReadOnly(True)
         self.txt_key_points.setVisible(False)
         self._section_cards["takeaways"] = self.card_takeaways
-        c_layout.addWidget(self.card_takeaways)
+        doc_layout.addWidget(self.card_takeaways)
 
-        # 3. Topics Discussed Card
-        self.card_topics = VoxCollapsibleSectionCard("Topics Discussed", section_id="topics", copy_label="Copy Topics", theme=self.theme)
+        # 3. Topics Discussed Section
+        self.card_topics = VoxCollapsibleSectionCard("Topics Discussed", section_id="topics", copy_label="Copy Topics Discussed", theme=self.theme, flat_embedded=True)
         self.card_topics.copy_requested.connect(lambda: self._copy_section("topics"))
-        self.topics_browser = self._make_html_browser("Topic breakdown will appear after analysis.", min_h=48)
+        self.topics_browser = self._make_html_browser("Topic breakdown will appear after analysis.", min_h=44)
         self.card_topics.body_layout.addWidget(self.topics_browser)
         self._section_cards["topics"] = self.card_topics
-        c_layout.addWidget(self.card_topics)
+        doc_layout.addWidget(self.card_topics)
 
-        # 4. Decisions Card
-        self.card_decisions = VoxCollapsibleSectionCard("Decisions", section_id="decisions", copy_label="Copy Decisions", theme=self.theme)
+        # 4. Decisions Section
+        self.card_decisions = VoxCollapsibleSectionCard("Decisions", section_id="decisions", copy_label="Copy Decisions", theme=self.theme, flat_embedded=True)
         self.card_decisions.copy_requested.connect(lambda: self._copy_section("decisions"))
-        self.decisions_widget = VoxStructuredDecisionsWidget(parent=self, theme=self.theme)
+        self.decisions_widget = VoxStructuredDecisionsWidget(parent=self, theme=self.theme, clean_summary_mode=True)
         self.card_decisions.body_layout.addWidget(self.decisions_widget)
         self._section_cards["decisions"] = self.card_decisions
-        c_layout.addWidget(self.card_decisions)
+        doc_layout.addWidget(self.card_decisions)
 
-        # 5. Action Items Card (scales to 60+ with filters/pagination)
-        self.card_actions = VoxCollapsibleSectionCard("Action Items", section_id="actions", copy_label="Copy Actions", theme=self.theme)
+        # 5. Action Items Section
+        self.card_actions = VoxCollapsibleSectionCard("Action Items", section_id="actions", copy_label="Copy Action Items", theme=self.theme, flat_embedded=True)
         self.card_actions.copy_requested.connect(lambda: self._copy_section("actions"))
-        self.actions_widget = VoxActionItemMatrixWidget(parent=self, theme=self.theme)
+        self.actions_widget = VoxActionItemMatrixWidget(parent=self, theme=self.theme, clean_summary_mode=True)
         self.card_actions.body_layout.addWidget(self.actions_widget)
         self._section_cards["actions"] = self.card_actions
-        c_layout.addWidget(self.card_actions)
+        doc_layout.addWidget(self.card_actions)
 
-        # 6. Follow-Ups Card
-        self.card_followups = VoxCollapsibleSectionCard("Follow-Ups & Next Steps", section_id="followups", copy_label="Copy Follow-Ups", theme=self.theme)
+        # 6. Follow-Ups Section
+        self.card_followups = VoxCollapsibleSectionCard("Follow-Ups & Next Steps", section_id="followups", copy_label="Copy Follow-Ups", theme=self.theme, flat_embedded=True)
         self.card_followups.copy_requested.connect(lambda: self._copy_section("followups"))
-        self.followups_browser = self._make_html_browser("No pending follow-ups recorded.", min_h=44)
+        self.followups_browser = self._make_html_browser("No pending follow-ups recorded.", min_h=40)
         self.card_followups.body_layout.addWidget(self.followups_browser)
         self.txt_follow_ups = QTextEdit()
         self.txt_follow_ups.setReadOnly(True)
         self.txt_follow_ups.setVisible(False)
         self._section_cards["followups"] = self.card_followups
-        c_layout.addWidget(self.card_followups)
+        doc_layout.addWidget(self.card_followups)
 
-        # 7. Risks & Blockers Card (Separated Badges + Inline Edit)
-        self.card_risks = VoxCollapsibleSectionCard("Risks & Blockers", section_id="risks", copy_label="Copy Risks", theme=self.theme)
+        # 7. Risks & Blockers Section
+        self.card_risks = VoxCollapsibleSectionCard("Risks & Blockers", section_id="risks", copy_label="Copy Risks & Blockers", theme=self.theme, flat_embedded=True)
         self.card_risks.copy_requested.connect(lambda: self._copy_section("risks"))
         self.btn_edit_risks = QPushButton("Edit")
         self.btn_edit_risks.setCheckable(True)
-        self.btn_edit_risks.setFixedHeight(26)
+        self.btn_edit_risks.setFixedHeight(24)
         self.btn_edit_risks.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_edit_risks.toggled.connect(self._toggle_risks_edit)
         self.card_risks.add_header_widget(self.btn_edit_risks)
 
-        self.risks_browser = self._make_html_browser("No risks or blockers flagged.", min_h=44)
+        self.risks_browser = self._make_html_browser("No risks or blockers flagged.", min_h=40)
         self.card_risks.body_layout.addWidget(self.risks_browser)
 
         self.txt_risks = QTextEdit()
@@ -2350,64 +2442,62 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.txt_risks.textChanged.connect(self._on_risks_text_changed)
         self.card_risks.body_layout.addWidget(self.txt_risks)
         self._section_cards["risks"] = self.card_risks
-        c_layout.addWidget(self.card_risks)
+        doc_layout.addWidget(self.card_risks)
 
-        # 8. Open Questions Card
-        self.card_questions = VoxCollapsibleSectionCard("Open Questions", section_id="questions", copy_label="Copy Questions", theme=self.theme)
+        # 8. Open Questions Section
+        self.card_questions = VoxCollapsibleSectionCard("Open Questions", section_id="questions", copy_label="Copy Open Questions", theme=self.theme, flat_embedded=True)
         self.card_questions.copy_requested.connect(lambda: self._copy_section("questions"))
-        self.questions_browser = self._make_html_browser("No unresolved questions recorded.", min_h=44)
+        self.questions_browser = self._make_html_browser("No unresolved questions recorded.", min_h=40)
         self.card_questions.body_layout.addWidget(self.questions_browser)
         self._section_cards["questions"] = self.card_questions
-        c_layout.addWidget(self.card_questions)
+        doc_layout.addWidget(self.card_questions)
 
-        # 9. Per-Participant Contributions & Checklists Card (Expandable Sub-Cards)
+        # 9. Per-Participant Contributions (hidden unless explicitly searched)
         self.card_checklists = VoxCollapsibleSectionCard(
-            "Per-Participant Checklists & Contributions",
+            "Per-Participant Action Checklists",
             section_id="checklists",
             copy_label="Copy All Checklists",
             theme=self.theme,
+            flat_embedded=True,
         )
         self.card_checklists.copy_requested.connect(lambda: self._copy_section("checklists"))
-        chk_actions_row = QHBoxLayout()
-        chk_actions_row.setContentsMargins(0, 0, 0, 4)
-        self.btn_copy_slack_inline = QPushButton("Copy Slack Format")
-        self.btn_copy_slack_inline.setFixedHeight(26)
-        self.btn_copy_slack_inline.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_copy_slack_inline.clicked.connect(self._on_copy_slack_checklists_clicked)
-        chk_actions_row.addWidget(self.btn_copy_slack_inline)
-        chk_actions_row.addStretch(1)
-        self.card_checklists.body_layout.addLayout(chk_actions_row)
-
         self.checklists_cards_host = QWidget()
         self.checklists_cards_layout = QVBoxLayout(self.checklists_cards_host)
         self.checklists_cards_layout.setContentsMargins(0, 0, 0, 0)
-        self.checklists_cards_layout.setSpacing(8)
+        self.checklists_cards_layout.setSpacing(6)
         self.card_checklists.body_layout.addWidget(self.checklists_cards_host)
 
         self.txt_participant_checklists = QTextEdit()
         self.txt_participant_checklists.setReadOnly(True)
         self.txt_participant_checklists.setVisible(False)
         self._section_cards["checklists"] = self.card_checklists
-        c_layout.addWidget(self.card_checklists)
+        doc_layout.addWidget(self.card_checklists)
 
+        c_layout.addWidget(self.unified_doc_card)
         c_layout.addStretch(1)
         self.summary_scroll.setWidget(container)
         layout.addWidget(self.summary_scroll, 1)
 
-        # Bottom Scoped Quick Ask Bar
+        # Bottom Scoped Quick Ask Bar (shown when side rail is collapsed / narrow mode)
         ask_box = QFrame()
         ask_box.setObjectName("askVoxBar")
         self.ask_box = ask_box
         ab_layout = QHBoxLayout(ask_box)
-        ab_layout.setContentsMargins(8, 6, 8, 6)
+        ab_layout.setContentsMargins(10, 6, 8, 6)
         ab_layout.setSpacing(8)
 
         self.txt_ask_input = QLineEdit()
-        self.txt_ask_input.setPlaceholderText("Ask anything about this meeting (100% scoped with timestamp citations)...")
+        self.txt_ask_input.setPlaceholderText("Ask VOX anything...")
         self.txt_ask_input.returnPressed.connect(self._on_ask_submitted)
         ab_layout.addWidget(self.txt_ask_input, 1)
 
-        self.btn_inline_ask = AnimatedPushButton("Ask VOX")
+        self.btn_inline_ask = QPushButton("")
+        self.btn_inline_ask.setObjectName("inlineAskSendBtn")
+        self.btn_inline_ask.setFixedSize(30, 30)
+        self.btn_inline_ask.setIconSize(QSize(14, 14))
+        self.btn_inline_ask.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_inline_ask.setToolTip("Ask VOX")
+        self.btn_inline_ask.setAccessibleName("Ask VOX")
         self.btn_inline_ask.clicked.connect(self._on_ask_submitted)
         ab_layout.addWidget(self.btn_inline_ask)
         layout.addWidget(ask_box)
@@ -2435,10 +2525,70 @@ class VoxSummaryDeliverablesTab(QWidget):
     def _on_detail_mode_changed(self, mode: str) -> None:
         self._detail_mode = "detailed" if str(mode).lower() == "detailed" else "brief"
         self._refresh_summary_browser()
+        self._update_copy_overall_labels()
+        self._apply_detail_mode_visibility()
 
     def _on_summary_search_changed(self, text: str) -> None:
         self._summary_search_query = str(text or "").strip().lower()
         self._render_all_sections()
+        self._apply_detail_mode_visibility()
+
+    def _update_copy_overall_labels(self) -> None:
+        mode_lbl = "Detailed" if self._detail_mode == "detailed" else "Brief"
+        if hasattr(self, "btn_copy_overall"):
+            self.btn_copy_overall.setToolTip(f"Copy {mode_lbl} Summary")
+        if hasattr(self, "btn_doc_copy_all"):
+            self.btn_doc_copy_all.setText(f"Copy {mode_lbl} Summary")
+            self.btn_doc_copy_all.setToolTip(f"Copy complete {mode_lbl} Summary to clipboard")
+
+    def _apply_detail_mode_visibility(self) -> None:
+        searching = bool(self._summary_search_query)
+        is_detailed = self._detail_mode == "detailed"
+        counts = self._clean_counts
+
+        if hasattr(self, "card_overview"):
+            self.card_overview.setVisible(False)
+        if hasattr(self, "card_summary"):
+            self.card_summary.setVisible(True)
+            self.card_summary.set_collapsed(False)
+        if hasattr(self, "card_takeaways"):
+            has_tk = counts.get("takeaways", 0) > 0
+            self.card_takeaways.setVisible(has_tk or (not searching and not self.txt_summary.toPlainText().strip()))
+            if has_tk:
+                self.card_takeaways.set_collapsed(False)
+        if hasattr(self, "card_topics"):
+            has_top = counts.get("topics", 0) > 0
+            self.card_topics.setVisible((is_detailed or searching) and has_top)
+            if has_top and (is_detailed or searching):
+                self.card_topics.set_collapsed(False)
+        if hasattr(self, "card_decisions"):
+            has_dec = counts.get("decisions", 0) > 0
+            self.card_decisions.setVisible(has_dec)
+            if has_dec:
+                self.card_decisions.set_collapsed(False)
+        if hasattr(self, "card_actions"):
+            has_act = counts.get("actions", 0) > 0
+            self.card_actions.setVisible(has_act)
+            if has_act:
+                self.card_actions.set_collapsed(False)
+        if hasattr(self, "card_followups"):
+            has_fu = counts.get("followups", 0) > 0
+            self.card_followups.setVisible((is_detailed or searching) and has_fu)
+            if has_fu and (is_detailed or searching):
+                self.card_followups.set_collapsed(False)
+        if hasattr(self, "card_risks"):
+            has_rk = counts.get("risks", 0) > 0 or bool(getattr(self, "_risks_edit_mode", False))
+            self.card_risks.setVisible((is_detailed or searching) and has_rk)
+            if has_rk and (is_detailed or searching):
+                self.card_risks.set_collapsed(False)
+        if hasattr(self, "card_questions"):
+            has_oq = counts.get("questions", 0) > 0
+            self.card_questions.setVisible((is_detailed or searching) and has_oq)
+            if has_oq and (is_detailed or searching):
+                self.card_questions.set_collapsed(False)
+        if hasattr(self, "card_checklists"):
+            show_chk = searching and "checklist" in self._summary_search_query and counts.get("actions", 0) > 0
+            self.card_checklists.setVisible(show_chk)
 
     def _set_all_sections_collapsed(self, collapsed: bool) -> None:
         for card in self._section_cards.values():
@@ -2499,10 +2649,39 @@ class VoxSummaryDeliverablesTab(QWidget):
         self.btn_generate_email.setIcon(get_icon("email", t["fathom_btn_text"], size=13))
         self.btn_expand_all.setIcon(get_icon("expand", muted_icon, size=13))
         self.btn_collapse_all.setIcon(get_icon("collapse", muted_icon, size=13))
+        if hasattr(self, "btn_copy_overall"):
+            self.btn_copy_overall.setIcon(get_icon("copy", muted_icon, size=14))
+        if hasattr(self, "btn_doc_copy_all"):
+            self.btn_doc_copy_all.setIcon(get_icon("copy", muted_icon, size=13))
+            self.btn_doc_copy_all.setStyleSheet(sec_btn_css)
         self.btn_copy_menu.setIcon(get_icon("copy", muted_icon, size=13))
         self.btn_export_menu.setIcon(get_icon("export", muted_icon, size=13))
-        for sb in (self.btn_expand_all, self.btn_collapse_all, self.btn_copy_menu, self.btn_export_menu, self.btn_edit_summary, self.btn_edit_risks, self.btn_copy_slack_inline):
+        for sb in (self.btn_expand_all, self.btn_collapse_all, self.btn_copy_overall, self.btn_copy_menu, self.btn_export_menu, self.btn_edit_summary, self.btn_edit_risks):
             sb.setStyleSheet(sec_btn_css)
+        if hasattr(self, "unified_doc_card"):
+            self.unified_doc_card.setStyleSheet(
+                f"QFrame#unifiedSummaryDocCard {{ background-color: {t['surface']}; "
+                f"border: 1px solid {t['outline_variant']}; border-radius: 14px; }}"
+            )
+        if hasattr(self, "doc_header_divider"):
+            self.doc_header_divider.setStyleSheet(
+                f"QFrame#summaryDocDivider {{ background-color: {t['line']}; border: none; }}"
+            )
+        if hasattr(self, "lbl_doc_title"):
+            self.lbl_doc_title.setStyleSheet(
+                f"font-size: 16px; font-weight: 700; color: {t['text_primary']}; background: transparent; border: none;"
+            )
+        if hasattr(self, "lbl_doc_meta"):
+            self.lbl_doc_meta.setStyleSheet(
+                f"font-size: 12px; color: {t['text_muted']}; background: transparent; border: none;"
+            )
+        edit_css = (
+            f"QTextEdit {{ background-color: {t['input_bg']}; color: {t['text_primary']}; "
+            f"border: 1px solid {t['input_border']}; border-radius: 8px; padding: 8px; font-size: 13px; }}\n"
+            + get_scrollbar_qss(self.theme)
+        )
+        self.txt_summary.setStyleSheet(edit_css)
+        self.txt_risks.setStyleSheet(edit_css)
         jump_css = (
             f"QPushButton#summaryJumpChip {{ background: transparent; color: {t['text_secondary']}; "
             f"border: 1px solid transparent; border-radius: 7px; padding: 2px 8px; font-size: 11.5px; font-weight: 500; }} "
@@ -2537,16 +2716,22 @@ class VoxSummaryDeliverablesTab(QWidget):
         if hasattr(self, "summary_scroll"):
             self.summary_scroll.setStyleSheet(
                 f"QScrollArea {{ background: {t['bg']}; border: none; }} "
-                f"QScrollArea > QWidget > QWidget {{ background: {t['bg']}; }}"
+                f"QScrollArea > QWidget > QWidget {{ background: {t['bg']}; }}\n"
+                + get_scrollbar_qss(self.theme)
             )
+            self._update_copy_overall_labels()
         self.ask_box.setStyleSheet(
-            f"QFrame#askVoxBar {{ background-color: {t['surface_alt']}; "
-            f"border: 1px solid {t['border']}; border-radius: 10px; }} "
-            f"QFrame#askVoxBar QLineEdit {{ background-color: {t['input_bg']}; color: {t['text_primary']}; "
-            f"border: 1px solid {t['input_border']}; border-radius: 7px; padding: 5px 10px; font-size: 12.5px; }}"
+            f"QFrame#askVoxBar {{ background-color: {t['surface']}; "
+            f"border: 1px solid {t['outline_variant']}; border-radius: 14px; }} "
+            f"QFrame#askVoxBar QLineEdit {{ background: transparent; color: {t['text_primary']}; "
+            f"border: none; padding: 4px 6px; font-size: 13px; }}"
         )
         if hasattr(self, "btn_inline_ask"):
-            self.btn_inline_ask.setStyleSheet(pill_css)
+            self.btn_inline_ask.setIcon(get_icon("send", t["primary_btn_text"], size=14))
+            self.btn_inline_ask.setStyleSheet(
+                f"QPushButton#inlineAskSendBtn {{ background-color: {t['primary_btn_bg']}; border: none; border-radius: 15px; padding: 0px; }} "
+                f"QPushButton#inlineAskSendBtn:hover {{ background-color: {t['primary_btn_hover']}; }}"
+            )
         if hasattr(self.decisions_widget, "set_theme"):
             self.decisions_widget.set_theme(self.theme)
         if hasattr(self.actions_widget, "set_theme"):
@@ -2797,17 +2982,29 @@ class VoxSummaryDeliverablesTab(QWidget):
             self.lbl_summary_save_status.setStyleSheet(
                 f"color: {t['status_success_text']}; font-size: 11px; font-weight: 700;"
             )
+            if hasattr(self, "lbl_doc_title"):
+                self.lbl_doc_title.setText(str(self.meeting_data.get("title") or "Meeting Summary"))
+            if hasattr(self, "lbl_doc_meta"):
+                date_local = format_meeting_local_datetime(
+                    self.meeting_data.get("created_at") or self.meeting_data.get("started_at"),
+                    str(self.meeting_data.get("timezone") or ""),
+                )
+                dur_s = float(self.meeting_data.get("duration_sec") or 0.0)
+                dur_lbl = format_seconds_hms(dur_s) if dur_s > 0 else ""
+                plat = str(self.meeting_data.get("source_platform") or "").strip()
+                meta_parts = [p for p in (date_local, dur_lbl, plat) if p]
+                self.lbl_doc_meta.setText("  ·  ".join(meta_parts))
+            self._clean_counts["decisions"] = len(decisions)
+            self._clean_counts["actions"] = len(actions)
             self._render_all_sections()
-            followups_list = self._parse_json_list(
-                self.meeting_data.get("follow_ups_json") or self.meeting_data.get("follow_ups")
-            )
-            oq_list = self._parse_json_list(
-                self.meeting_data.get("open_questions_json") or self.meeting_data.get("open_questions")
-            )
+            followups_list = self._clean_followups_list()
+            oq_list = self._clean_open_questions_list()
             self.card_followups.set_collapsed(len(followups_list) == 0)
-            self.card_risks.set_collapsed(len(risk_lines) == 0 and not risks_text.strip())
+            self.card_risks.set_collapsed(self._clean_counts.get("risks", 0) == 0)
             self.card_questions.set_collapsed(len(oq_list) == 0)
             self.card_checklists.set_collapsed(len(actions) == 0)
+            self._update_copy_overall_labels()
+            self._apply_detail_mode_visibility()
         finally:
             self._is_loading = False
 
@@ -2872,213 +3069,294 @@ class VoxSummaryDeliverablesTab(QWidget):
         _fit_browser_height(self.overview_browser, min_h=56)
 
     def _refresh_summary_browser(self) -> None:
-        brief = str(self.meeting_data.get("brief_summary") or self.meeting_data.get("summary") or "").strip()
-        detailed = str(self.meeting_data.get("detailed_summary") or brief).strip()
-        chosen = detailed if self._detail_mode == "detailed" else (brief or detailed)
+        raw_brief = str(self.meeting_data.get("brief_summary") or self.meeting_data.get("summary") or "").strip()
+        raw_detailed = str(self.meeting_data.get("detailed_summary") or raw_brief).strip()
+        chosen_raw = raw_detailed if self._detail_mode == "detailed" else (raw_brief or raw_detailed)
+        chosen = clean_user_facing_text(chosen_raw)
+        if chosen and is_greeting_or_chatter(chosen):
+            chosen = ""
         t = get_theme_tokens(self.theme)
         if not chosen:
             self.summary_browser.setHtml(
-                f'<div style="color:{t["text_muted"]};font-style:italic;font-size:12.5px;">No summary generated yet for this meeting.</div>'
+                f'<div style="color:{t["text_muted"]};font-style:italic;font-size:13px;">No summary generated yet for this meeting.</div>'
             )
-            _fit_browser_height(self.summary_browser, min_h=48)
+            _fit_browser_height(self.summary_browser, min_h=44)
+            return
+        if self._summary_search_query and not self._matches_search(chosen):
+            self.summary_browser.setHtml(
+                f'<div style="color:{t["text_muted"]};font-style:italic;font-size:12.5px;">No summary lines match your filter.</div>'
+            )
+            _fit_browser_height(self.summary_browser, min_h=40)
             return
         self.summary_browser.setHtml(render_safe_markdown_html(chosen, theme=self.theme))
-        _fit_browser_height(self.summary_browser, min_h=72)
+        _fit_browser_height(self.summary_browser, min_h=60)
 
-    def _render_takeaways_html(self) -> None:
-        t = get_theme_tokens(self.theme)
+    def _clean_takeaways_list(self) -> List[Tuple[str, str]]:
         kp_raw = self._parse_json_list(
             self.meeting_data.get("key_points_json") or self.meeting_data.get("key_discussion_points")
         )
-        items: List[str] = []
+        cleaned: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
         for kp in kp_raw:
             if isinstance(kp, dict):
-                ts = str(kp.get("timestamp_str") or "").strip()
-                top = str(kp.get("topic") or "").strip()
-                sm = str(kp.get("summary") or kp.get("point") or "").strip()
-                line = f"{'[' + ts + '] ' if ts else ''}{top + ': ' if top else ''}{sm}".strip()
-                if line and self._matches_search(line):
-                    ts_html = ""
-                    if ts:
-                        sec = parse_timestamp_seconds(ts)
-                        ts_html = (
-                            f'<a href="seek:{sec:.1f}" style="background-color:{t["chip_bg"]};color:{t["accent_fathom"]};'
-                            f'border-radius:4px;padding:1px 5px;font-weight:700;'
-                            f'text-decoration:none;font-size:11px;">{html.escape(ts)}</a>&nbsp; '
-                        )
-                    top_html = f"<strong>{html.escape(top)}:</strong> " if top else ""
-                    items.append(
-                        f'<div style="padding:6px 10px;margin-bottom:6px;background:{t["surface_alt"]};'
-                        f'border:1px solid {t["border"]};border-radius:8px;">'
-                        f'{ts_html}{top_html}{render_safe_markdown_html(sm, theme=self.theme)}</div>'
-                    )
+                top = clean_user_facing_text(str(kp.get("topic") or ""))
+                sm = clean_user_facing_text(str(kp.get("summary") or kp.get("point") or ""))
             else:
-                s = str(kp or "").strip()
-                if s and self._matches_search(s):
-                    items.append(f'<div style="margin-bottom:4px;">{render_safe_markdown_html(s, theme=self.theme)}</div>')
-        self.card_takeaways.set_count_badge(f"{len(items)}")
-        html_font = get_html_font_family()
-        if items:
-            self.takeaways_browser.setHtml(
-                f'<div style="font-family:{html_font};font-size:13px;line-height:1.55;color:{t["text_primary"]};">'
-                + "".join(items)
-                + "</div>"
-            )
-        else:
-            self.takeaways_browser.setHtml(
-                f'<div style="color:{t["text_muted"]};font-style:italic;font-size:12.5px;">No matching takeaways.</div>'
-            )
-        _fit_browser_height(self.takeaways_browser, min_h=44)
+                top = ""
+                sm = clean_user_facing_text(str(kp or ""))
+            if not sm or is_greeting_or_chatter(sm):
+                continue
+            if top and is_greeting_or_chatter(top):
+                top = ""
+            dedup_key = f"{top.lower()}::{sm.lower()}"
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            cleaned.append((top, sm))
+        return cleaned
 
-    def _render_topics_html(self) -> None:
-        t = get_theme_tokens(self.theme)
+    def _clean_topics_list(self) -> List[Dict[str, Any]]:
         topics = self._parse_json_list(self.meeting_data.get("topics_json") or self.meeting_data.get("topics_structured"))
-        blocks: List[str] = []
+        cleaned: List[Dict[str, Any]] = []
         for top in topics:
-            if isinstance(top, dict):
-                title = str(top.get("title") or top.get("topic") or "Discussion Topic").strip()
-                summary = str(top.get("summary") or "").strip()
-                ts_range = str(top.get("timestamp_range") or top.get("timestamp_str") or "").strip()
-                bullets = top.get("key_points") or top.get("details") or []
-                blob = f"{title} {summary} {' '.join(str(b) for b in bullets)}"
-                if not self._matches_search(blob):
-                    continue
-                b_html = "".join(f"<li>{html.escape(str(b))}</li>" for b in bullets if str(b).strip())
-                ts_badge = ""
-                if ts_range:
-                    first_ts = ts_range.split("-")[0].strip().strip("[]")
-                    sec = parse_timestamp_seconds(first_ts)
-                    ts_badge = (
-                        f'<a href="seek:{sec:.1f}" style="background:{t["chip_bg"]};color:{t["accent_fathom"]};'
-                        f'border:1px solid {t["chip_border"]};border-radius:4px;padding:1px 6px;font-size:11px;'
-                        f'font-weight:700;text-decoration:none;margin-left:8px;">{html.escape(ts_range)}</a>'
-                    )
-                blocks.append(
-                    f'<div style="padding:8px 12px;margin-bottom:8px;background:{t["surface_alt"]};'
-                    f'border:1px solid {t["border"]};border-radius:8px;">'
-                    f'<div style="font-weight:700;font-size:13px;margin-bottom:4px;">{html.escape(title)}{ts_badge}</div>'
-                    + (f'<div style="color:{t["text_secondary"]};margin-bottom:4px;">{html.escape(summary)}</div>' if summary else "")
-                    + (f'<ul style="margin:4px 0 0 18px;padding:0;">{b_html}</ul>' if b_html else "")
-                    + "</div>"
-                )
-        self.card_topics.set_count_badge(f"{len(blocks)}")
-        html_font = get_html_font_family()
-        if blocks:
-            self.topics_browser.setHtml(
-                f'<div style="font-family:{html_font};font-size:13px;line-height:1.55;color:{t["text_primary"]};">'
-                + "".join(blocks)
-                + "</div>"
-            )
-        else:
-            self.topics_browser.setHtml(
-                f'<div style="color:{t["text_muted"]};font-style:italic;font-size:12.5px;">No structured topic chapters available for this session.</div>'
-            )
-        _fit_browser_height(self.topics_browser, min_h=44)
+            if not isinstance(top, dict):
+                continue
+            raw_title = str(top.get("title") or top.get("topic") or "").strip()
+            raw_summary = str(top.get("summary") or "").strip()
+            raw_bullets = top.get("key_points") or top.get("details") or []
+            if is_noisy_topic_fragment(raw_title, raw_summary, raw_bullets):
+                continue
+            title = clean_user_facing_text(raw_title)
+            summary = clean_user_facing_text(raw_summary)
+            bullets: List[str] = []
+            for b in raw_bullets:
+                bc = clean_user_facing_text(str(b or ""))
+                if bc and not is_greeting_or_chatter(bc):
+                    bullets.append(bc)
+            if title and is_greeting_or_chatter(title):
+                continue
+            if summary and is_greeting_or_chatter(summary) and not bullets:
+                continue
+            if not title and not summary and not bullets:
+                continue
+            cleaned.append({
+                "title": title or "Discussion Topic",
+                "summary": "" if is_greeting_or_chatter(summary) else summary,
+                "bullets": bullets,
+            })
+        return cleaned
 
-    def _render_followups_html(self) -> None:
-        t = get_theme_tokens(self.theme)
+    def _clean_followups_list(self) -> List[Dict[str, str]]:
         fu_raw = self._parse_json_list(self.meeting_data.get("follow_ups_json") or self.meeting_data.get("follow_ups"))
-        blocks: List[str] = []
+        cleaned: List[Dict[str, str]] = []
+        seen: Set[str] = set()
         for fu in fu_raw:
             if isinstance(fu, dict):
-                desc = str(fu.get("item") or fu.get("description") or "").strip()
-                if not desc:
-                    continue
-                cat = str(fu.get("category") or "follow_up").replace("_", " ").title()
+                desc = clean_user_facing_text(str(fu.get("item") or fu.get("description") or ""))
                 own = str(fu.get("owner") or "").strip()
-                ts = str(fu.get("timestamp_str") or "").strip()
-                if not self._matches_search(f"{cat} {desc} {own}"):
-                    continue
-                own_html = (
-                    f'<span style="background:{t["status_info_bg"]};color:{t["status_info_text"]};'
-                    f'border-radius:6px;padding:1px 6px;font-size:10.5px;font-weight:700;margin-right:6px;">{html.escape(own)}</span>'
-                    if own else ""
-                )
-                ts_html = ""
-                if ts:
-                    sec = parse_timestamp_seconds(ts)
-                    ts_html = (
-                        f'<a href="seek:{sec:.1f}" style="color:{t["accent_fathom"]};font-weight:700;'
-                        f'text-decoration:none;margin-left:6px;font-size:11px;">[{html.escape(ts)}]</a>'
-                    )
-                blocks.append(
-                    f'<div style="padding:7px 10px;margin-bottom:6px;background:{t["surface_alt"]};'
-                    f'border:1px solid {t["border"]};border-radius:8px;">'
-                    f'<span style="background:{t["accent_fathom_tint"]};color:{t["accent_fathom"]};'
-                    f'border-radius:6px;padding:1px 6px;font-size:10.5px;font-weight:700;margin-right:6px;">{html.escape(cat)}</span>'
-                    f'{own_html}{html.escape(desc)}{ts_html}</div>'
-                )
+                if own.lower() in {"unassigned", "owner unknown", "none", "null", "n/a"}:
+                    own = ""
             else:
-                s = str(fu or "").strip()
-                if s and self._matches_search(s):
-                    blocks.append(f'<div style="margin-bottom:4px;">• {html.escape(s)}</div>')
-        self.card_followups.set_count_badge(f"{len(blocks)}")
-        html_font = get_html_font_family()
-        if blocks:
-            self.followups_browser.setHtml(
-                f'<div style="font-family:{html_font};font-size:13px;line-height:1.55;color:{t["text_primary"]};">'
-                + "".join(blocks)
-                + "</div>"
-            )
-        else:
-            self.followups_browser.setHtml(
-                f'<div style="color:{t["text_muted"]};font-style:italic;font-size:12.5px;">No open follow-ups identified.</div>'
-            )
-        _fit_browser_height(self.followups_browser, min_h=44)
+                desc = clean_user_facing_text(str(fu or ""))
+                own = ""
+            if not desc or is_greeting_or_chatter(desc):
+                continue
+            key = desc.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append({"description": desc, "owner": own})
+        return cleaned
 
-    def _render_risks_html(self) -> None:
-        t = get_theme_tokens(self.theme)
+    def _clean_risks_list(self) -> List[Dict[str, str]]:
         raw_risks = (
             self.meeting_data.get("risks_and_blockers_list")
             or self.meeting_data.get("risks_and_blockers")
             or self.meeting_data.get("risks", [])
         )
+        cleaned: List[Dict[str, str]] = []
+        seen: Set[str] = set()
+        items_iter = raw_risks if isinstance(raw_risks, list) else (raw_risks.splitlines() if isinstance(raw_risks, str) else [])
+        for r in items_iter:
+            if isinstance(r, dict):
+                itype = str(r.get("item_type") or r.get("type") or "risk").strip().lower()
+                desc = clean_user_facing_text(str(r.get("description") or r.get("risk") or r.get("title") or ""))
+                mit = clean_user_facing_text(str(r.get("mitigation_or_resolution") or r.get("mitigation") or ""))
+                if mit.lower() in {"none", "n/a", "null", "under review"}:
+                    mit = ""
+                sev = str(r.get("impact") or r.get("severity") or "Medium").strip().capitalize()
+                if sev not in {"High", "Medium", "Low"}:
+                    sev = "Medium"
+                own = str(r.get("owner") or r.get("raised_by") or "").strip()
+                if own.lower() in {"unassigned", "owner unknown", "none", "null", "n/a"}:
+                    own = ""
+            else:
+                itype = "risk"
+                desc = clean_user_facing_text(str(r or "").lstrip("•-* "))
+                mit = ""
+                sev = "Medium"
+                own = ""
+            if not desc or is_greeting_or_chatter(desc):
+                continue
+            key = desc.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append({
+                "item_type": itype,
+                "description": desc,
+                "mitigation": mit,
+                "severity": sev,
+                "owner": own,
+            })
+        return cleaned
+
+    def _clean_open_questions_list(self) -> List[str]:
+        oq_raw = self._parse_json_list(self.meeting_data.get("open_questions_json") or self.meeting_data.get("open_questions"))
+        cleaned: List[str] = []
+        seen: Set[str] = set()
+        for q in oq_raw:
+            raw_q = str(q.get("question") or q.get("description") or "") if isinstance(q, dict) else str(q or "")
+            qt = clean_user_facing_text(raw_q)
+            if not qt or is_greeting_or_chatter(qt) or is_non_substantive_question(qt):
+                continue
+            key = qt.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(qt)
+        return cleaned
+
+    def _render_takeaways_html(self) -> None:
+        t = get_theme_tokens(self.theme)
+        takeaways = self._clean_takeaways_list()
+        items: List[str] = []
+        for top, sm in takeaways:
+            blob = f"{top}: {sm}" if top else sm
+            if not self._matches_search(blob):
+                continue
+            top_html = f'<strong style="color:{t["text_primary"]};">{html.escape(top)}:</strong> ' if top else ""
+            items.append(
+                f'<li style="margin-bottom:6px;color:{t["text_primary"]};">{top_html}{html.escape(sm)}</li>'
+            )
+        self._clean_counts["takeaways"] = len(items)
+        self.card_takeaways.set_count_badge(f"{len(items)}" if items else "")
+        self.card_takeaways.set_collapsed(len(items) == 0)
+        html_font = get_html_font_family()
+        if items:
+            self.takeaways_browser.setHtml(
+                f'<div style="font-family:{html_font};font-size:13px;line-height:1.58;color:{t["text_primary"]};">'
+                f'<ul style="margin:2px 0 2px 18px;padding:0;">'
+                + "".join(items)
+                + "</ul></div>"
+            )
+        else:
+            self.takeaways_browser.setHtml(
+                f'<div style="color:{t["text_muted"]};font-style:italic;font-size:12.5px;">No matching takeaways.</div>'
+            )
+        _fit_browser_height(self.takeaways_browser, min_h=38)
+
+    def _render_topics_html(self) -> None:
+        t = get_theme_tokens(self.theme)
+        topics = self._clean_topics_list()
         blocks: List[str] = []
-        if isinstance(raw_risks, list):
-            for r in raw_risks:
-                if isinstance(r, dict):
-                    itype = str(r.get("item_type") or "risk").lower()
-                    desc = str(r.get("description") or r.get("title") or "").strip()
-                    mit = str(r.get("mitigation") or "").strip()
-                    sev = str(r.get("impact") or r.get("severity") or "medium").upper()
-                    own = str(r.get("owner") or "").strip()
-                    ts = str(r.get("timestamp_str") or "").strip()
-                    if not desc or not self._matches_search(f"{itype} {desc} {mit} {own}"):
-                        continue
-                    is_blk = (itype == "blocker")
-                    badge_bg = t["status_danger_bg"] if is_blk else t["status_warning_bg"]
-                    badge_fg = t["status_danger_text"] if is_blk else t["status_warning_text"]
-                    badge_lbl = "BLOCKER" if is_blk else "RISK"
-                    ts_html = ""
-                    if ts:
-                        sec = parse_timestamp_seconds(ts)
-                        ts_html = (
-                            f'<a href="seek:{sec:.1f}" style="color:{t["accent_fathom"]};font-weight:700;'
-                            f'text-decoration:none;margin-left:6px;font-size:11px;">[{html.escape(ts)}]</a>'
-                        )
-                    blocks.append(
-                        f'<div style="padding:8px 10px;margin-bottom:6px;background:{t["surface_alt"]};'
-                        f'border:1px solid {t["border"]};border-radius:8px;">'
-                        f'<span style="background:{badge_bg};color:{badge_fg};border-radius:6px;padding:1px 7px;'
-                        f'font-size:10.5px;font-weight:700;margin-right:6px;">{badge_lbl}</span>'
-                        f'<span style="background:{t["chip_bg"]};color:{t["text_secondary"]};border-radius:6px;'
-                        f'padding:1px 6px;font-size:10.5px;font-weight:600;margin-right:6px;">Impact: {html.escape(sev)}</span>'
-                        + (f'<span style="color:{t["text_secondary"]};font-size:11px;font-weight:600;margin-right:6px;">Owner: {html.escape(own)}</span>' if own else "")
-                        + f'<div style="margin-top:4px;font-weight:500;">{html.escape(desc)}{ts_html}</div>'
-                        + (f'<div style="margin-top:3px;color:{t["text_secondary"]};font-size:12px;"><strong>Mitigation:</strong> {html.escape(mit)}</div>' if mit else "")
-                        + "</div>"
-                    )
-                elif str(r).strip() and self._matches_search(str(r)):
-                    blocks.append(f'<div style="margin-bottom:4px;">• {html.escape(str(r).strip())}</div>')
-        elif isinstance(raw_risks, str) and raw_risks.strip():
-            for ln in raw_risks.splitlines():
-                if ln.strip() and self._matches_search(ln):
-                    blocks.append(f'<div style="margin-bottom:4px;">{html.escape(ln.strip())}</div>')
-        self.card_risks.set_count_badge(f"{len(blocks)}")
+        for top in topics:
+            title = top["title"]
+            summary = top["summary"]
+            bullets = top["bullets"]
+            blob = f"{title} {summary} {' '.join(bullets)}"
+            if not self._matches_search(blob):
+                continue
+            b_html = "".join(f"<li style='margin-bottom:3px;'>{html.escape(b)}</li>" for b in bullets)
+            blocks.append(
+                f'<div style="padding:4px 0 10px 0;margin-bottom:8px;border-bottom:1px solid {t["line"]};">'
+                f'<div style="font-weight:700;font-size:13.5px;color:{t["text_primary"]};margin-bottom:4px;">{html.escape(title)}</div>'
+                + (f'<div style="color:{t["text_secondary"]};font-size:13px;margin-bottom:4px;">{html.escape(summary)}</div>' if summary else "")
+                + (f'<ul style="margin:4px 0 0 18px;padding:0;color:{t["text_primary"]};font-size:12.5px;">{b_html}</ul>' if b_html else "")
+                + "</div>"
+            )
+        self._clean_counts["topics"] = len(blocks)
+        self.card_topics.set_count_badge(f"{len(blocks)}" if blocks else "")
+        self.card_topics.set_collapsed(len(blocks) == 0)
+        html_font = get_html_font_family()
+        if blocks:
+            self.topics_browser.setHtml(
+                f'<div style="font-family:{html_font};font-size:13px;line-height:1.58;color:{t["text_primary"]};">'
+                + "".join(blocks)
+                + "</div>"
+            )
+        else:
+            self.topics_browser.setHtml(
+                f'<div style="color:{t["text_muted"]};font-style:italic;font-size:12.5px;">No structured topics available for this session.</div>'
+            )
+        _fit_browser_height(self.topics_browser, min_h=38)
+
+    def _render_followups_html(self) -> None:
+        t = get_theme_tokens(self.theme)
+        fu_clean = self._clean_followups_list()
+        blocks: List[str] = []
+        for fu in fu_clean:
+            desc = fu["description"]
+            own = fu["owner"]
+            if not self._matches_search(f"{desc} {own}"):
+                continue
+            own_html = (
+                f' <span style="background:{t["status_info_bg"]};color:{t["status_info_text"]};'
+                f'border-radius:5px;padding:1px 6px;font-size:10.5px;font-weight:600;margin-left:6px;">{html.escape(own)}</span>'
+                if own else ""
+            )
+            blocks.append(f'<li style="margin-bottom:6px;color:{t["text_primary"]};">{html.escape(desc)}{own_html}</li>')
+        self._clean_counts["followups"] = len(blocks)
+        self.card_followups.set_count_badge(f"{len(blocks)}" if blocks else "")
+        html_font = get_html_font_family()
+        if blocks:
+            self.followups_browser.setHtml(
+                f'<div style="font-family:{html_font};font-size:13px;line-height:1.58;color:{t["text_primary"]};">'
+                f'<ul style="margin:2px 0 2px 18px;padding:0;">'
+                + "".join(blocks)
+                + "</ul></div>"
+            )
+        else:
+            self.followups_browser.setHtml(
+                f'<div style="color:{t["text_muted"]};font-style:italic;font-size:12.5px;">No open follow-ups identified.</div>'
+            )
+        _fit_browser_height(self.followups_browser, min_h=38)
+
+    def _render_risks_html(self) -> None:
+        t = get_theme_tokens(self.theme)
+        risks_clean = self._clean_risks_list()
+        blocks: List[str] = []
+        for r in risks_clean:
+            itype = r["item_type"]
+            desc = r["description"]
+            mit = r["mitigation"]
+            sev = r["severity"]
+            own = r["owner"]
+            if not self._matches_search(f"{itype} {desc} {mit} {own}"):
+                continue
+            is_blk = (itype == "blocker")
+            badge_bg = t["status_danger_bg"] if is_blk else t["status_warning_bg"]
+            badge_fg = t["status_danger_text"] if is_blk else t["status_warning_text"]
+            badge_lbl = "Blocker" if is_blk else (f"{sev} Risk")
+            own_part = f' <span style="color:{t["text_muted"]};font-size:11.5px;">({html.escape(own)})</span>' if own else ""
+            mit_html = (
+                f'<div style="margin-top:3px;color:{t["text_secondary"]};font-size:12px;">'
+                f'<strong>Mitigation:</strong> {html.escape(mit)}</div>'
+                if mit else ""
+            )
+            blocks.append(
+                f'<div style="padding:6px 0 8px 0;margin-bottom:6px;border-bottom:1px solid {t["line"]};">'
+                f'<span style="background:{badge_bg};color:{badge_fg};border-radius:5px;padding:1px 7px;'
+                f'font-size:10.5px;font-weight:700;">{html.escape(badge_lbl)}</span>&nbsp;&nbsp;'
+                f'<span style="color:{t["text_primary"]};font-weight:500;">{html.escape(desc)}</span>{own_part}'
+                f'{mit_html}</div>'
+            )
+        self._clean_counts["risks"] = len(blocks)
+        self.card_risks.set_count_badge(f"{len(blocks)}" if blocks else "")
         html_font = get_html_font_family()
         if blocks:
             self.risks_browser.setHtml(
-                f'<div style="font-family:{html_font};font-size:13px;line-height:1.55;color:{t["text_primary"]};">'
+                f'<div style="font-family:{html_font};font-size:13px;line-height:1.58;color:{t["text_primary"]};">'
                 + "".join(blocks)
                 + "</div>"
             )
@@ -3086,47 +3364,32 @@ class VoxSummaryDeliverablesTab(QWidget):
             self.risks_browser.setHtml(
                 f'<div style="color:{t["text_muted"]};font-style:italic;font-size:12.5px;">No risks or blockers flagged.</div>'
             )
-        _fit_browser_height(self.risks_browser, min_h=44)
+        _fit_browser_height(self.risks_browser, min_h=38)
 
     def _render_open_questions_html(self) -> None:
         t = get_theme_tokens(self.theme)
-        oq_raw = self._parse_json_list(self.meeting_data.get("open_questions_json") or self.meeting_data.get("open_questions"))
+        oq_clean = self._clean_open_questions_list()
         blocks: List[str] = []
-        for q in oq_raw:
-            if isinstance(q, dict):
-                qt = str(q.get("question") or q.get("description") or "").strip()
-                if not qt or not self._matches_search(qt):
-                    continue
-                rb = str(q.get("raised_by") or q.get("asked_by") or q.get("speaker") or "").strip()
-                ts = str(q.get("timestamp_str") or "").strip()
-                ts_html = ""
-                if ts:
-                    sec = parse_timestamp_seconds(ts)
-                    ts_html = (
-                        f'<a href="seek:{sec:.1f}" style="color:{t["accent_fathom"]};font-weight:700;'
-                        f'text-decoration:none;margin-left:6px;font-size:11px;">[{html.escape(ts)}]</a>'
-                    )
-                rb_html = f'<span style="color:{t["text_secondary"]};font-size:11px;">(Raised by {html.escape(rb)})</span> ' if rb else ""
-                blocks.append(
-                    f'<div style="padding:6px 10px;margin-bottom:6px;background:{t["surface_alt"]};'
-                    f'border:1px solid {t["border"]};border-radius:8px;">'
-                    f'{rb_html}{html.escape(qt)}{ts_html}</div>'
-                )
-            elif str(q).strip() and self._matches_search(str(q)):
-                blocks.append(f'<div style="margin-bottom:4px;">• {html.escape(str(q).strip())}</div>')
-        self.card_questions.set_count_badge(f"{len(blocks)}")
+        for qt in oq_clean:
+            if not self._matches_search(qt):
+                continue
+            blocks.append(f'<li style="margin-bottom:6px;color:{t["text_primary"]};">{html.escape(qt)}</li>')
+        self._clean_counts["questions"] = len(blocks)
+        self.card_questions.set_count_badge(f"{len(blocks)}" if blocks else "")
+        self.card_questions.set_collapsed(len(blocks) == 0)
         html_font = get_html_font_family()
         if blocks:
             self.questions_browser.setHtml(
-                f'<div style="font-family:{html_font};font-size:13px;line-height:1.55;color:{t["text_primary"]};">'
+                f'<div style="font-family:{html_font};font-size:13px;line-height:1.58;color:{t["text_primary"]};">'
+                f'<ul style="margin:2px 0 2px 18px;padding:0;">'
                 + "".join(blocks)
-                + "</div>"
+                + "</ul></div>"
             )
         else:
             self.questions_browser.setHtml(
                 f'<div style="color:{t["text_muted"]};font-style:italic;font-size:12.5px;">No open questions recorded.</div>'
             )
-        _fit_browser_height(self.questions_browser, min_h=44)
+        _fit_browser_height(self.questions_browser, min_h=38)
 
     def _clear_participant_cards(self) -> None:
         self._participant_cards.clear()
@@ -3257,52 +3520,117 @@ class VoxSummaryDeliverablesTab(QWidget):
 
     def _section_plain_text(self, section: str) -> str:
         m = self.meeting_data
+        title = str(m.get("title") or "Meeting Summary").strip()
         if section == "overview":
             date_local = format_meeting_local_datetime(m.get("created_at") or m.get("started_at"), str(m.get("timezone") or ""))
             return (
-                f"{m.get('title', 'Meeting')}\n"
+                f"{title}\n"
                 f"When: {date_local}\n"
                 f"Purpose: {m.get('meeting_purpose', '')}\n"
                 f"Outcome: {m.get('overall_outcome', '')}"
             ).strip()
         if section == "summary":
             raw = self.txt_detailed_summary.toPlainText() if self._detail_mode == "detailed" else self.txt_summary.toPlainText()
-            return strip_markdown_for_plain_copy(raw)
-        if section == "brief_summary":
-            return strip_markdown_for_plain_copy(self.txt_summary.toPlainText())
-        if section == "detailed_summary":
-            return strip_markdown_for_plain_copy(self.txt_detailed_summary.toPlainText())
+            return clean_user_facing_text(strip_markdown_for_plain_copy(raw))
+        if section in ("brief_summary", "overall_brief"):
+            parts: List[str] = [title, "=" * min(len(title), 60), ""]
+            brief_txt = clean_user_facing_text(strip_markdown_for_plain_copy(self.txt_summary.toPlainText()))
+            if brief_txt and not is_greeting_or_chatter(brief_txt):
+                parts.extend(["Executive Summary", brief_txt, ""])
+            tk = self._section_plain_text("takeaways")
+            if tk:
+                parts.extend(["Key Takeaways", tk, ""])
+            dc = self._section_plain_text("decisions")
+            if dc:
+                parts.extend(["Decisions", dc, ""])
+            ac = self._section_plain_text("actions")
+            if ac:
+                parts.extend(["Action Items", ac, ""])
+            return "\n".join(parts).strip()
+        if section in ("detailed_summary", "overall_detailed", "all"):
+            parts = [title, "=" * min(len(title), 60), ""]
+            det_txt = clean_user_facing_text(strip_markdown_for_plain_copy(self.txt_detailed_summary.toPlainText() or self.txt_summary.toPlainText()))
+            if det_txt and not is_greeting_or_chatter(det_txt):
+                parts.extend(["Executive Summary", det_txt, ""])
+            for heading, key in (
+                ("Key Takeaways", "takeaways"),
+                ("Topics Discussed", "topics"),
+                ("Decisions", "decisions"),
+                ("Action Items", "actions"),
+                ("Follow-Ups & Next Steps", "followups"),
+                ("Risks & Blockers", "risks"),
+                ("Open Questions", "questions"),
+            ):
+                sec_txt = self._section_plain_text(key)
+                if sec_txt:
+                    parts.extend([heading, sec_txt, ""])
+            return "\n".join(parts).strip()
         if section == "takeaways":
-            return strip_markdown_for_plain_copy(self.txt_key_points.toPlainText())
+            lines = []
+            for top, sm in self._clean_takeaways_list():
+                lines.append(f"• {top + ': ' if top else ''}{sm}")
+            return "\n".join(lines).strip()
         if section == "topics":
             lines = []
-            for tp in self._parse_json_list(m.get("topics_json") or m.get("topics_structured")):
-                if isinstance(tp, dict):
-                    lines.append(f"{tp.get('title', '')} ({tp.get('timestamp_range', '')}): {tp.get('summary', '')}")
+            for tp in self._clean_topics_list():
+                lines.append(tp["title"])
+                if tp["summary"]:
+                    lines.append(f"  {tp['summary']}")
+                for b in tp["bullets"]:
+                    lines.append(f"  • {b}")
+                lines.append("")
             return "\n".join(lines).strip()
         if section == "decisions":
             decs = self._parse_json_list(m.get("decisions"))
-            return "\n".join(f"[{d.get('status', 'confirmed')}] {d.get('decision', '')}" for d in decs if isinstance(d, dict))
+            lines = []
+            for d in decs:
+                if isinstance(d, dict):
+                    txt = clean_user_facing_text(str(d.get("decision") or ""))
+                    if txt:
+                        stat = str(d.get("status") or "confirmed").strip().lower()
+                        suffix = f" ({stat.capitalize()})" if stat != "confirmed" else ""
+                        lines.append(f"• {txt}{suffix}")
+            return "\n".join(lines).strip()
         if section == "actions":
             acts = self._parse_json_list(m.get("action_items"))
             lines = []
             for a in acts:
                 if isinstance(a, dict):
-                    own = str(a.get("owner") or "").strip() or "Unassigned"
+                    desc = clean_user_facing_text(str(a.get("description") or ""))
+                    if not desc:
+                        continue
+                    done = "☑" if str(a.get("status") or "").lower() == "completed" else "☐"
+                    own = str(a.get("owner") or "").strip()
+                    if own.lower() in {"unassigned", "unassigned — confirmation required", "owner unknown", "none", "null", "n/a"}:
+                        own = ""
                     due = str(a.get("due_date") or "").strip()
-                    lines.append(f"☐ [{own}] {a.get('description', '')}" + (f" (Due: {due})" if due else ""))
+                    if due.lower() in {"not specified", "no due date", "tbd", "none", "null", "n/a"}:
+                        due = ""
+                    meta = []
+                    if own:
+                        meta.append(f"Owner: {own}")
+                    if due:
+                        meta.append(f"Due: {due}")
+                    meta_s = f" ({', '.join(meta)})" if meta else ""
+                    lines.append(f"{done} {desc}{meta_s}")
             return "\n".join(lines).strip()
         if section == "followups":
-            return strip_markdown_for_plain_copy(self.txt_follow_ups.toPlainText())
+            lines = []
+            for fu in self._clean_followups_list():
+                own_s = f" ({fu['owner']})" if fu["owner"] else ""
+                lines.append(f"• {fu['description']}{own_s}")
+            return "\n".join(lines).strip()
         if section == "risks":
-            return strip_markdown_for_plain_copy(self.txt_risks.toPlainText())
+            lines = []
+            for r in self._clean_risks_list():
+                mit_s = f" — Mitigation: {r['mitigation']}" if r["mitigation"] else ""
+                lines.append(f"• [{r['severity']}] {r['description']}{mit_s}")
+            return "\n".join(lines).strip()
         if section == "questions":
-            oqs = self._parse_json_list(m.get("open_questions_json") or m.get("open_questions"))
-            return "\n".join(f"• {q.get('question', q) if isinstance(q, dict) else q}" for q in oqs).strip()
+            return "\n".join(f"• {q}" for q in self._clean_open_questions_list()).strip()
         if section == "checklists":
             return strip_markdown_for_plain_copy(self.txt_participant_checklists.toPlainText())
-        # Entire report
-        return strip_markdown_for_plain_copy(TranscriptExporter.to_markdown(m))
+        return self._section_plain_text("overall_detailed")
 
     def _copy_section(self, section: str) -> None:
         txt = self._section_plain_text(section)
@@ -3310,28 +3638,63 @@ class VoxSummaryDeliverablesTab(QWidget):
             self.feedback_pill.show_message("Nothing to copy in this section", kind="warning")
             return
         self._copy_text_with_feedback(txt, f"Copied {section.replace('_', ' ')}")
+        card = self._section_cards.get(section)
+        if card is not None and hasattr(card, "show_copied_feedback"):
+            card.show_copied_feedback()
+
+    def _copy_overall_summary(self) -> None:
+        key = "overall_detailed" if self._detail_mode == "detailed" else "overall_brief"
+        mode_lbl = "Detailed" if self._detail_mode == "detailed" else "Brief"
+        txt = self._section_plain_text(key)
+        if not txt:
+            self.feedback_pill.show_message("Nothing to copy yet", kind="warning")
+            return
+        self._copy_text_with_feedback(txt, f"Copied {mode_lbl} summary")
+        t = get_theme_tokens(self.theme)
+        check_clr = t.get("accent_emerald", t.get("accent_fathom", "#188038"))
+        self._copy_overall_token += 1
+        token = self._copy_overall_token
+        if hasattr(self, "btn_copy_overall"):
+            self.btn_copy_overall.setIcon(get_icon("check", check_clr, size=14))
+        if hasattr(self, "btn_doc_copy_all"):
+            self.btn_doc_copy_all.setIcon(get_icon("check", check_clr, size=13))
+            self.btn_doc_copy_all.setText("Copied")
+
+        def _reset() -> None:
+            if token != self._copy_overall_token:
+                return
+            cur_t = get_theme_tokens(self.theme)
+            muted_clr = cur_t.get("text_secondary", "#5F6368")
+            if hasattr(self, "btn_copy_overall"):
+                self.btn_copy_overall.setIcon(get_icon("copy", muted_clr, size=14))
+            if hasattr(self, "btn_doc_copy_all"):
+                self.btn_doc_copy_all.setIcon(get_icon("copy", muted_clr, size=13))
+                self._update_copy_overall_labels()
+
+        QTimer.singleShot(1600, _reset)
 
     def _show_copy_menu(self) -> None:
         menu = QMenu(self)
         choices = [
-            ("Brief Summary", "brief_summary"),
-            ("Detailed Summary", "detailed_summary"),
-            ("Entire Meeting Report", "all"),
+            ("Copy Brief Summary", "overall_brief"),
+            ("Copy Detailed Summary", "overall_detailed"),
+            None,
+            ("Executive Summary Only", "summary"),
             ("Key Takeaways", "takeaways"),
             ("Topics Discussed", "topics"),
             ("Decisions", "decisions"),
             ("Action Items", "actions"),
-            ("Follow-Ups", "followups"),
+            ("Follow-Ups & Next Steps", "followups"),
             ("Risks & Blockers", "risks"),
             ("Open Questions", "questions"),
-            ("Per-Participant Checklists", "checklists"),
         ]
-        for label, key in choices:
+        for entry in choices:
+            if entry is None:
+                menu.addSeparator()
+                continue
+            label, key = entry
             act = menu.addAction(label)
             act.triggered.connect(lambda _=False, k=key: self._copy_section(k))
-        menu.addSeparator()
-        act_slack = menu.addAction("Slack / Teams Checklist Format")
-        act_slack.triggered.connect(self._on_copy_slack_checklists_clicked)
         menu.exec(self.btn_copy_menu.mapToGlobal(QPoint(0, self.btn_copy_menu.height())))
 
     def _show_export_menu(self) -> None:
@@ -3368,14 +3731,12 @@ class VoxSummaryDeliverablesTab(QWidget):
             )
             out_path.write_text(html_doc, encoding="utf-8")
         elif fmt_l == "pdf":
-            from PyQt6.QtGui import QTextDocument
-            from PyQt6.QtPrintSupport import QPrinter
-            doc = QTextDocument()
-            doc.setHtml(render_safe_markdown_html(TranscriptExporter.to_markdown(m), theme="light"))
-            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-            printer.setOutputFileName(str(out_path))
-            doc.print(printer)
+            return TranscriptExporter.to_pdf(
+                m,
+                target_path=out_path,
+                detail_mode=self._detail_mode,
+                include_transcript=False,
+            )
         return out_path
 
     def _export_format(self, ext: str) -> None:
@@ -3403,16 +3764,8 @@ class VoxSummaryDeliverablesTab(QWidget):
             email_data = self.engine.generate_follow_up_email(
                 meeting_id=self.meeting_id, meeting_data=self.meeting_data
             )
-        dlg = VoxFollowUpEmailDialog(email_data, parent=self)
+        dlg = VoxFollowUpEmailDialog(email_data, parent=self, theme=self.theme)
         dlg.exec()
-
-    def _on_copy_slack_checklists_clicked(self) -> None:
-        if self.engine:
-            chk_res = self.engine.generate_participant_checklists(meeting_data=self.meeting_data)
-            slack_text = chk_res.get("slack_format", "")
-        else:
-            slack_text = strip_markdown_for_plain_copy(self.txt_participant_checklists.toPlainText())
-        self._copy_text_with_feedback(slack_text, "Copied Slack checklists")
 
     def _on_ask_submitted(self) -> None:
         query = self.txt_ask_input.text().strip()
@@ -3589,8 +3942,11 @@ class VoxKnowledgeBaseTab(QWidget):
         cat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         cat_scroll.setFixedHeight(34)
         cat_scroll.setMinimumWidth(0)
+        cat_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        cat_scroll.viewport().setStyleSheet("background: transparent;")
         cat_host = QWidget()
         cat_host.setMinimumWidth(0)
+        cat_host.setStyleSheet("background: transparent;")
         cat_row = QHBoxLayout(cat_host)
         cat_row.setContentsMargins(0, 0, 0, 0)
         cat_row.setSpacing(5)
@@ -4328,7 +4684,8 @@ class VoxKnowledgeBaseTab(QWidget):
             f"border: 1px solid {t['border']}; border-radius: 10px; padding: 6px; outline: none; }} "
             f"QListWidget#kbMasterList::item {{ background: {t['surface_alt']}; border: 1px solid {t['border']}; "
             f"border-radius: 8px; padding: 8px 10px; margin-bottom: 4px; }} "
-            f"QListWidget#kbMasterList::item:selected {{ background: {t['accent_fathom_tint']}; border: 1px solid {t['accent_fathom']}; color: {t['text_primary']}; }}"
+            f"QListWidget#kbMasterList::item:selected {{ background: {t['accent_fathom_tint']}; border: 1px solid {t['accent_fathom']}; color: {t['text_primary']}; }}\n"
+            + get_scrollbar_qss(self.theme)
         )
         self.inspector_card.setStyleSheet(
             f"QFrame#kbInspectorCard {{ background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 10px; }}"
@@ -4347,7 +4704,10 @@ class VoxKnowledgeBaseTab(QWidget):
             f"QFrame#kbConflictBox {{ background: {t['status_warning_bg']}; border: 1px solid {t['status_warning']}; border-radius: 8px; }}"
         )
         self.lbl_conflict_text.setStyleSheet(f"color: {t['text_primary']}; font-size: 12px;")
-        self.inspector_browser.setStyleSheet(f"QTextBrowser {{ background: transparent; color: {t['text_primary']}; border: none; }}")
+        self.inspector_browser.setStyleSheet(
+            f"QTextBrowser {{ background: transparent; color: {t['text_primary']}; border: none; }}\n"
+            + get_scrollbar_qss(self.theme)
+        )
         self.table.setStyleSheet(
             f"QTableWidget {{ background-color: {t['surface']}; color: {t['text_primary']}; "
             f"border: 1px solid {t['border']}; border-radius: 8px; }}"
@@ -4863,6 +5223,9 @@ class VoxMeetingStudioWorkspace(QWidget):
 
     def toggle_ask_rail(self, visible: Optional[bool] = None) -> None:
         target = (not self.ask_rail.isVisible()) if visible is None else bool(visible)
+        if target and getattr(self, "_studio_ask_rail_theme_dirty", False):
+            self._studio_ask_rail_theme_dirty = False
+            self._apply_ask_rail_theme(get_theme_tokens(self.theme))
         self.ask_rail.setVisible(target)
         if hasattr(self, "btn_toggle_ask_rail"):
             self.btn_toggle_ask_rail.setChecked(target)
@@ -5070,6 +5433,56 @@ class VoxMeetingStudioWorkspace(QWidget):
                 clr = t["accent_fathom"] if i == cur else t["text_secondary"]
                 self.unified_tabs.setTabIcon(i, get_icon(name, clr, size=15, filled=(i == cur)))
 
+    def _apply_ask_rail_theme(self, t: dict) -> None:
+        if not hasattr(self, "ask_rail"):
+            return
+        self.ask_rail.setStyleSheet(
+            f"""
+            QFrame#studioAskRail {{
+                background-color: {t['surface']};
+                border: 1px solid {t['border']};
+                border-radius: 10px;
+            }}
+            QTextBrowser#studioAskRailBrowser {{
+                background-color: {t['bg']};
+                color: {t['text_primary']};
+                border: 1px solid {t['border']};
+                border-radius: 8px;
+                padding: 8px;
+            }}
+            QLineEdit#studioRailInput {{
+                background-color: {t['input_bg']};
+                color: {t['text_primary']};
+                border: 1px solid {t['input_border']};
+                border-radius: 7px;
+                padding: 6px 10px;
+                font-size: 12.5px;
+            }}
+            QPushButton#studioRailAskBtn {{
+                background-color: {t['fathom_btn_bg']};
+                color: {t['fathom_btn_text']};
+                border: 1px solid {t['fathom_btn_border']};
+                border-radius: 7px;
+                padding: 6px 12px;
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QPushButton#studioRailMiniBtn {{
+                background-color: {t['chip_bg']};
+                color: {t['text_secondary']};
+                border: 1px solid {t['chip_border']};
+                border-radius: 6px;
+                padding: 2px 7px;
+                font-size: 10.5px;
+                font-weight: 600;
+            }}
+            {get_scrollbar_qss(self.theme)}
+            """
+        )
+        self._rebuild_rail_starter_chips()
+        if self._rail_exchanges:
+            self._render_ask_rail_html()
+
     def apply_theme(self, theme_name: str) -> None:
         """Apply light or dark theme across all Meeting Studio workspace headers, rail, and sub-tabs."""
         self.theme = (theme_name or "dark").lower()
@@ -5113,6 +5526,22 @@ class VoxMeetingStudioWorkspace(QWidget):
                 border-bottom: 2px solid {t['accent_fathom']};
                 font-weight: 600;
             }}
+            QMenu {{
+                background-color: {t['surface']};
+                color: {t['text_primary']};
+                border: 1px solid {t['border']};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 6px 14px;
+                border-radius: 5px;
+            }}
+            QMenu::item:selected {{
+                background-color: {t['accent_fathom_tint']};
+                color: {t['accent_fathom']};
+            }}
+            {get_scrollbar_qss(self.theme)}
             """
         )
         self._refresh_studio_tab_icons()
@@ -5156,51 +5585,11 @@ class VoxMeetingStudioWorkspace(QWidget):
                 f"selection-background-color: {t['accent_fathom_tint']}; selection-color: {t['text_primary']}; }}"
             )
         if hasattr(self, "ask_rail"):
-            self.ask_rail.setStyleSheet(
-                f"""
-                QFrame#studioAskRail {{
-                    background-color: {t['surface']};
-                    border: 1px solid {t['border']};
-                    border-radius: 10px;
-                }}
-                QTextBrowser#studioAskRailBrowser {{
-                    background-color: {t['bg']};
-                    color: {t['text_primary']};
-                    border: 1px solid {t['border']};
-                    border-radius: 8px;
-                    padding: 8px;
-                }}
-                QLineEdit#studioRailInput {{
-                    background-color: {t['input_bg']};
-                    color: {t['text_primary']};
-                    border: 1px solid {t['input_border']};
-                    border-radius: 7px;
-                    padding: 6px 10px;
-                    font-size: 12.5px;
-                }}
-                QPushButton#studioRailAskBtn {{
-                    background-color: {t['fathom_btn_bg']};
-                    color: {t['fathom_btn_text']};
-                    border: 1px solid {t['fathom_btn_border']};
-                    border-radius: 7px;
-                    padding: 6px 12px;
-                    font-size: 12px;
-                    font-weight: 700;
-                }}
-                QPushButton#studioRailMiniBtn {{
-                    background-color: {t['chip_bg']};
-                    color: {t['text_secondary']};
-                    border: 1px solid {t['chip_border']};
-                    border-radius: 6px;
-                    padding: 2px 7px;
-                    font-size: 10.5px;
-                    font-weight: 600;
-                }}
-                """
-            )
-            self._rebuild_rail_starter_chips()
-            if self._rail_exchanges:
-                self._render_ask_rail_html()
+            if self.ask_rail.isVisible():
+                self._studio_ask_rail_theme_dirty = False
+                self._apply_ask_rail_theme(t)
+            else:
+                self._studio_ask_rail_theme_dirty = True
         for child_name in (
             "tab_thoughts",
             "tab_transcript",

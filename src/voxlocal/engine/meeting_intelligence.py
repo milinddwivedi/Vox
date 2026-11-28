@@ -32,6 +32,11 @@ class QueryIntent(Enum):
     SPEAKER_QA = "speaker_qa"
     TIMELINE = "timeline"
     GENERAL = "general"
+    CUSTOMER_NOTES = "customer_notes"
+    FOLLOW_UP_EMAIL = "follow_up_email"
+    RISKS_AND_OPEN_ITEMS = "risks_open_items"
+    COMPARE_MEETINGS = "compare_meetings"
+    MULTI_MEETING_RECAP = "multi_meeting_recap"
 
 
 STOPWORDS: Set[str] = {
@@ -106,6 +111,21 @@ DECISION_CUES = [
 SUMMARY_CUES = [
     "summarize", "summary", "recap", "overview", "what happened", "what was discussed",
     "key points", "highlights", "brief", "briefing", "minutes", "arguments"
+]
+
+CUSTOMER_NOTE_CUES = [
+    "share with the customer", "share with customer", "customer notes", "client notes",
+    "notes of this meeting", "shareable notes", "external notes", "meeting notes to share",
+]
+
+FOLLOWUP_EMAIL_CUES = [
+    "follow-up email", "follow up email", "followup email", "draft an email",
+    "prepare an email", "prepare a follow-up email", "write an email", "email recap",
+]
+
+RISK_OPEN_CUES = [
+    "risk", "risks", "blocker", "blockers", "unresolved", "still pending",
+    "pending confirmation", "open question", "open questions", "remaining issue",
 ]
 
 
@@ -229,7 +249,48 @@ def resolve_relative_due_date(
             target = anchor_dt + timedelta(weeks=n_wks)
             resolved_date_str = target.strftime("%Y-%m-%d")
 
-    # Weekdays
+    # Explicit calendar date e.g. "4th of December", "December 4", "4 Dec 2026"
+    _mon_map = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6,
+        "jul": 7, "july": 7, "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+    }
+    low_clean = clean_expr.lower()
+    m_dmy = re.search(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|october|oct|november|nov|december|dec)(?:[,\s]+(\d{4}))?\b",
+        low_clean,
+    )
+    m_mdy = re.search(
+        r"\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|october|oct|november|nov|december|dec)\s+(\d{1,2})(?:st|nd|rd|th)?(?:[,\s]+(\d{4}))?\b",
+        low_clean,
+    )
+    if (m_dmy or m_mdy) and (anchor_dt is not None or (m_dmy and m_dmy.group(3)) or (m_mdy and m_mdy.group(3))):
+        if m_dmy:
+            day_i, mon_i, yr_str = int(m_dmy.group(1)), _mon_map[m_dmy.group(2)], m_dmy.group(3)
+        else:
+            mon_i, day_i, yr_str = _mon_map[m_mdy.group(1)], int(m_mdy.group(2)), m_mdy.group(3)
+        year_i = int(yr_str) if yr_str else anchor_dt.year
+        try:
+            cand_dt = datetime(year_i, mon_i, day_i)
+            if not yr_str and anchor_dt and (anchor_dt.date() - cand_dt.date()).days > 180:
+                cand_dt = datetime(year_i + 1, mon_i, day_i)
+            return {
+                "original_expression": clean_expr,
+                "original_text": clean_expr,
+                "resolved_date": cand_dt.strftime("%Y-%m-%d"),
+                "meeting_timestamp": meeting_timestamp,
+                "reference_timestamp": meeting_timestamp,
+                "timezone_used": timezone,
+                "timezone": timezone,
+                "resolution_status": "deterministic",
+                "confidence": 1.0,
+                "uncertainty_reason": None,
+            }
+        except Exception:
+            pass
+
+    # Weekdays ("next week Thursday" vs "Friday")
     else:
         weekdays = {
             "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -244,11 +305,12 @@ def resolve_relative_due_date(
         if matched_day:
             day_name, target_day_num = matched_day
             cur_weekday = anchor_dt.weekday()
-            
-            days_ahead = (target_day_num - cur_weekday) % 7
-            if days_ahead == 0:
-                # If meeting is on Friday and phrase is "by Friday", it refers to next week Friday (7 days)
-                days_ahead = 7
+            if re.search(r"\bnext\s+week\b", lowered):
+                days_ahead = (7 - cur_weekday) + target_day_num
+            else:
+                days_ahead = (target_day_num - cur_weekday) % 7
+                if days_ahead == 0:
+                    days_ahead = 7
 
             target = anchor_dt + timedelta(days=days_ahead)
             resolved_date_str = target.strftime("%Y-%m-%d")
@@ -308,9 +370,10 @@ class MeetingIntelligenceEngine:
         self,
         question: str,
         meeting_id: Optional[int] = None,
-        conversation_history: Optional[List[Tuple[str, str]]] = None,
+        conversation_history: Optional[List[Any]] = None,
         answer_depth: str = "detailed",
         meeting_ids: Optional[List[int]] = None,
+        local_user_name: str = "",
     ) -> Dict[str, Any]:
         """
         Process a natural language user query against meeting memory.
@@ -320,7 +383,8 @@ class MeetingIntelligenceEngine:
                 "answer": str (rich formatted markdown),
                 "citations": List[Dict[str, Any]],
                 "intent": str,
-                "suggestions": List[str]
+                "suggestions": List[str],
+                "effective_scope_label": str
             }
         """
         cleaned_q = question.strip()
@@ -334,23 +398,39 @@ class MeetingIntelligenceEngine:
             }
 
         try:
-            # 1. Intent & Scope Classification
+            # 1. Intent, Multi-Meeting Count, Owner Filter & Scope Classification
             intent, tokens, scoped_title = self._classify_query(cleaned_q)
+            multi_n, self_only = self._extract_scope_modifiers(cleaned_q)
 
             # 2. Retrieve Candidate Documents & Source Excerpts
             all_meetings = self.db.list_meetings(limit=250)
             target_meeting_id = meeting_id
             scoped_meeting = None
             allowed_ids: Optional[set[int]] = None
-            if target_meeting_id is None and meeting_ids is not None:
+            effective_scope_label = "This Meeting" if target_meeting_id is not None else "All Recorded Meetings"
+
+            # Explicit natural language multi-meeting override ("last 3 meetings", "last three meetings")
+            if multi_n is not None and meeting_ids is None:
+                completed_recent = [
+                    m for m in all_meetings
+                    if str(m.get("status") or "").strip().lower() in ("completed", "incomplete", "")
+                ] or all_meetings
+                picked = completed_recent[:multi_n]
+                allowed_ids = {int(m.get("id")) for m in picked if m.get("id") is not None}
+                target_meeting_id = None
+                all_meetings = picked
+                effective_scope_label = f"Last {len(picked)} Meetings"
+            elif target_meeting_id is None and meeting_ids is not None:
                 allowed_ids = {int(x) for x in meeting_ids}
                 all_meetings = [m for m in all_meetings if int(m.get("id") or 0) in allowed_ids]
+                effective_scope_label = f"{len(all_meetings)} Scoped Meetings"
 
             # If a specific meeting ID was explicitly provided, retrieve directly from DB (bypasses 250 catalog cap)
             if target_meeting_id is not None:
                 scoped_meeting = self.db.get_meeting(target_meeting_id)
                 if scoped_meeting:
                     all_meetings = [scoped_meeting] + [m for m in all_meetings if m.get("id") != target_meeting_id]
+                    effective_scope_label = f"This Meeting: {scoped_meeting.get('title') or f'#{target_meeting_id}'}"
 
             if not all_meetings and target_meeting_id is None:
                 return {
@@ -413,6 +493,9 @@ class MeetingIntelligenceEngine:
                 scoped_meeting=scoped_meeting,
                 conversation_history=conversation_history,
                 answer_depth=answer_depth,
+                allowed_ids=allowed_ids,
+                local_user_name=local_user_name,
+                self_only=self_only,
             )
 
             return {
@@ -421,6 +504,7 @@ class MeetingIntelligenceEngine:
                 "citations": citations,
                 "intent": intent.value,
                 "suggestions": suggestions,
+                "effective_scope_label": effective_scope_label,
             }
 
         except Exception as exc:
@@ -437,21 +521,48 @@ class MeetingIntelligenceEngine:
                 "suggestions": ["Summarize recent meetings", "List all action items"]
             }
 
+    def _verify_ask_answer_grounding(
+        self,
+        answer_text: str,
+        citations: List[Dict[str, Any]],
+        intent: QueryIntent,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Validate Ask VOX answer formatting & internal traceability without leaking raw metadata."""
+        cleaned = re.sub(r"<think>[\s\S]*?</think>", "", str(answer_text or ""), flags=re.IGNORECASE).strip()
+        if "<think>" in cleaned:
+            cleaned = cleaned.split("<think>", 1)[0].strip()
+        report = {
+            "citation_count": len(citations or []),
+            "intent": intent.value if isinstance(intent, QueryIntent) else str(intent),
+            "grounded": bool(cleaned),
+        }
+        return cleaned, report
+
     def query_stream(
         self,
         question: str,
         meeting_id: Optional[int] = None,
         on_token: Optional[Callable[[str], None]] = None,
         on_citations: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
-        conversation_history: Optional[List[Tuple[str, str]]] = None,
+        conversation_history: Optional[List[Any]] = None,
         answer_depth: str = "detailed",
         meeting_ids: Optional[List[int]] = None,
+        local_user_name: str = "",
     ) -> Dict[str, Any]:
         """
         Stream a natural language user query answer against meeting memory in real time.
-        Yields tokens incrementally via on_token and delivers citations via on_citations.
+        Emits genuine internal processing states via on_status, tokens via on_token,
+        and preserves internal traceability citations on the returned dictionary.
         """
+        def _emit_status(state_name: str) -> None:
+            if on_status:
+                try:
+                    on_status(state_name)
+                except Exception:
+                    pass
+
         cleaned_q = question.strip()
         if not cleaned_q:
             msg = "Please ask a question about your recorded meetings, discussions, action items, or decisions."
@@ -462,35 +573,50 @@ class MeetingIntelligenceEngine:
                 "answer": msg,
                 "citations": [],
                 "intent": "empty",
-                "suggestions": ["What were the key decisions in recent meetings?", "List all pending action items."]
+                "suggestions": ["What were the key decisions in recent meetings?", "List all pending action items."],
             }
 
         try:
+            _emit_status("retrieving_context")
             # 1. Intent & Scope Classification
             intent, tokens, scoped_title = self._classify_query(cleaned_q)
+            multi_n, self_only = self._extract_scope_modifiers(cleaned_q)
 
             # 2. Retrieve Candidate Documents & Source Excerpts
             all_meetings = self.db.list_meetings(limit=250)
             target_meeting_id = meeting_id
             scoped_meeting = None
             allowed_ids: Optional[set[int]] = None
-            if target_meeting_id is None and meeting_ids is not None:
+            effective_scope_label = "This Meeting" if target_meeting_id is not None else "All Recorded Meetings"
+            if multi_n is not None and meeting_ids is None:
+                completed_recent = [
+                    m for m in all_meetings
+                    if str(m.get("status") or "").strip().lower() in ("completed", "incomplete", "")
+                ] or all_meetings
+                picked = completed_recent[:multi_n]
+                allowed_ids = {int(m.get("id")) for m in picked if m.get("id") is not None}
+                target_meeting_id = None
+                all_meetings = picked
+                effective_scope_label = f"Last {len(picked)} Meetings"
+            elif target_meeting_id is None and meeting_ids is not None:
                 allowed_ids = {int(x) for x in meeting_ids}
                 all_meetings = [m for m in all_meetings if int(m.get("id") or 0) in allowed_ids]
+                effective_scope_label = f"{len(all_meetings)} Scoped Meetings"
 
             # If a specific meeting ID was explicitly provided, retrieve directly from DB (bypasses 250 catalog cap)
             if target_meeting_id is not None:
                 scoped_meeting = self.db.get_meeting(target_meeting_id)
                 if scoped_meeting:
                     all_meetings = [scoped_meeting] + [m for m in all_meetings if m.get("id") != target_meeting_id]
+                    effective_scope_label = f"This Meeting: {scoped_meeting.get('title') or f'#{target_meeting_id}'}"
 
             if not all_meetings and target_meeting_id is None:
                 empty_msg = (
-                    "### 🎙️ No Recorded Meetings Found\n\n"
-                    "No meeting recordings or transcripts are currently stored in your local VoxLocal database.\n\n"
+                    "### No Recorded Meetings Found\n\n"
+                    "No meeting recordings or transcripts are currently stored in your local VOX library.\n\n"
                     "**Next steps:**\n"
-                    "• Use the **Meeting Studio** tab or the floating pill (`⏺`) to record a live call or conversation.\n"
-                    "• Once recorded, VoxLocal's local AI will automatically transcribe and index your audio."
+                    "• Start a recording from Notetaker or the floating bar.\n"
+                    "• Once recorded, VOX will automatically transcribe and analyze your meeting."
                 )
                 if on_token:
                     on_token(empty_msg)
@@ -499,7 +625,7 @@ class MeetingIntelligenceEngine:
                     "answer": empty_msg,
                     "citations": [],
                     "intent": intent.value,
-                    "suggestions": []
+                    "suggestions": [],
                 }
 
             # If not explicitly provided, check if the user named a specific meeting
@@ -537,7 +663,7 @@ class MeetingIntelligenceEngine:
                 meeting_ids=list(allowed_ids) if allowed_ids is not None else None,
             )
 
-            # Deliver citations to UI immediately!
+            # Deliver citations internally right away (retained for traceability, hidden in UI)
             if on_citations:
                 try:
                     on_citations(citations)
@@ -551,13 +677,23 @@ class MeetingIntelligenceEngine:
                     "citations": citations,
                     "intent": intent.value,
                     "suggestions": [],
+                    "cancelled": True,
                 }
 
-            # 4. Stream via Local LLM Engine (if available and has citations)
+            # 4. Stream via Local LLM Engine (if available and has citations or structured context)
             accumulated_answer: List[str] = []
             has_llm_streamed = False
+            structured_ctx = self._build_structured_context_for_scope(
+                target_meeting_id=target_meeting_id,
+                scoped_meeting=scoped_meeting,
+                all_meetings=all_meetings,
+                allowed_ids=allowed_ids,
+                local_user_name=local_user_name,
+                self_only=self_only,
+            )
 
-            if self.llm_engine and getattr(self.llm_engine, "is_available", lambda: False)() and (citations or self._last_retrieved_knowledge):
+            _emit_status("generating")
+            if self.llm_engine and getattr(self.llm_engine, "is_available", lambda: False)() and (citations or self._last_retrieved_knowledge or structured_ctx):
                 try:
                     meeting_title = scoped_meeting.get("title") if scoped_meeting else None
                     if hasattr(self.llm_engine, "answer_query_stream"):
@@ -570,13 +706,27 @@ class MeetingIntelligenceEngine:
                                 cancel_check=cancel_check,
                                 conversation_history=conversation_history,
                                 answer_depth=answer_depth,
+                                structured_context=structured_ctx,
+                                answer_intent=intent.value,
+                                local_user_name=local_user_name,
                             )
                         except TypeError:
-                            stream_it = self.llm_engine.answer_query_stream(
-                                question=cleaned_q,
-                                citations=citations,
-                                context_meeting_title=meeting_title,
-                            )
+                            try:
+                                stream_it = self.llm_engine.answer_query_stream(
+                                    question=cleaned_q,
+                                    citations=citations,
+                                    context_meeting_title=meeting_title,
+                                    knowledge_items=self._last_retrieved_knowledge,
+                                    cancel_check=cancel_check,
+                                    conversation_history=conversation_history,
+                                    answer_depth=answer_depth,
+                                )
+                            except TypeError:
+                                stream_it = self.llm_engine.answer_query_stream(
+                                    question=cleaned_q,
+                                    citations=citations,
+                                    context_meeting_title=meeting_title,
+                                )
                         for token_chunk in stream_it:
                             if cancel_check and cancel_check():
                                 break
@@ -586,9 +736,28 @@ class MeetingIntelligenceEngine:
                         if accumulated_answer:
                             has_llm_streamed = True
                 except Exception as exc:
+                    if cancel_check and cancel_check():
+                        return {
+                            "question": question,
+                            "answer": "".join(accumulated_answer),
+                            "citations": citations,
+                            "intent": intent.value,
+                            "suggestions": [],
+                            "cancelled": True,
+                        }
                     logger.warning("Local LLM stream failed (%s), falling back to template synthesis", exc)
 
-            # 5. Fallback Algorithmic Synthesis (if LLM was unavailable, empty, or failed)
+            if cancel_check and cancel_check():
+                return {
+                    "question": question,
+                    "answer": "".join(accumulated_answer),
+                    "citations": citations,
+                    "intent": intent.value,
+                    "suggestions": [],
+                    "cancelled": True,
+                }
+
+            # 5. Fallback Algorithmic Synthesis (deliver completed response immediately — never simulate streaming)
             suggestions: List[str] = []
             if not has_llm_streamed and not (cancel_check and cancel_check()):
                 answer_md, suggestions = self._synthesize_answer(
@@ -599,16 +768,16 @@ class MeetingIntelligenceEngine:
                     citations=citations,
                     all_meetings=all_meetings,
                     scoped_meeting=scoped_meeting,
+                    conversation_history=conversation_history,
+                    answer_depth=answer_depth,
+                    allowed_ids=allowed_ids,
+                    local_user_name=local_user_name,
+                    self_only=self_only,
                 )
-                # Stream the markdown words smoothly with a 12ms pace
-                words = re.split(r"(\s+)", answer_md)
-                for w in words:
-                    if cancel_check and cancel_check():
-                        break
-                    accumulated_answer.append(w)
-                    if on_token:
-                        on_token(w)
-                    time.sleep(0.012)
+                if answer_md:
+                    accumulated_answer.append(answer_md)
+                    if on_token and not (cancel_check and cancel_check()):
+                        on_token(answer_md)
             elif has_llm_streamed:
                 meeting_label = (scoped_meeting.get("title") if scoped_meeting else None) or (citations[0].get("meeting_title", "recorded meetings") if citations else "recorded meetings")
                 suggestions = [
@@ -617,13 +786,21 @@ class MeetingIntelligenceEngine:
                     "Were there any risks or blockers mentioned?",
                 ]
 
-            full_answer = "".join(accumulated_answer)
+            _emit_status("validating")
+            full_answer, validation_report = self._verify_ask_answer_grounding(
+                "".join(accumulated_answer),
+                citations,
+                intent,
+            )
             return {
                 "question": question,
                 "answer": full_answer,
                 "citations": citations,
                 "intent": intent.value,
                 "suggestions": suggestions,
+                "effective_scope_label": effective_scope_label,
+                "validation": validation_report,
+                "cancelled": bool(cancel_check and cancel_check()),
             }
 
         except Exception as exc:
@@ -1519,6 +1696,147 @@ class MeetingIntelligenceEngine:
             "pending_tasks": total_tasks - completed_tasks,
         }
 
+    def _extract_scope_modifiers(self, query: str) -> Tuple[Optional[int], bool]:
+        """Detect explicit multi-meeting window ('last 3 meetings') and self-only filters ('only me')."""
+        q_lower = query.lower()
+        multi_n: Optional[int] = None
+        m_last = re.search(
+            r"\b(?:last|past|recent|previous)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+meetings?\b",
+            q_lower,
+        )
+        if m_last:
+            word_map = {
+                "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+            }
+            raw_n = m_last.group(1)
+            multi_n = int(raw_n) if raw_n.isdigit() else word_map.get(raw_n)
+            if multi_n is not None:
+                multi_n = max(1, min(multi_n, 25))
+        elif any(p in q_lower for p in ("across meetings", "all meetings", "recent meetings", "last few meetings")):
+            multi_n = 5
+
+        self_only = any(
+            p in q_lower
+            for p in (
+                "only to me", "belong only to me", "belong to me", "assigned to me",
+                "my action", "my tasks", "my commitments", "for me only", "what did i ",
+                "just for me", "only me",
+            )
+        )
+        return multi_n, self_only
+
+    def _build_structured_context_for_scope(
+        self,
+        *,
+        target_meeting_id: Optional[int],
+        scoped_meeting: Optional[Dict[str, Any]],
+        all_meetings: List[Dict[str, Any]],
+        allowed_ids: Optional[Set[int]] = None,
+        local_user_name: str = "",
+        self_only: bool = False,
+    ) -> str:
+        """Assemble grounded structured DB records (summary, decisions, actions, risks, open questions) for LLM Ask VOX."""
+        meetings_to_pack: List[Dict[str, Any]] = []
+        if scoped_meeting is not None:
+            meetings_to_pack = [scoped_meeting]
+        elif target_meeting_id is not None:
+            m = self.db.get_meeting(target_meeting_id)
+            if m:
+                meetings_to_pack = [m]
+        elif allowed_ids is not None:
+            meetings_to_pack = [m for m in all_meetings if int(m.get("id") or 0) in allowed_ids][:8]
+        else:
+            meetings_to_pack = list(all_meetings[:5])
+
+        if not meetings_to_pack:
+            return ""
+
+        user_tokens = [tok.lower() for tok in re.split(r"[\s._-]+", local_user_name or "") if len(tok) >= 3]
+        blocks: List[str] = []
+        for m in meetings_to_pack:
+            mid = m.get("id")
+            if mid is None:
+                continue
+            m_title = str(m.get("title") or f"Meeting #{mid}").strip()
+            m_date = str(m.get("created_at") or "").strip()
+            m_dur = format_seconds_hms(float(m.get("duration_sec") or 0.0))
+            parts: List[str] = [f"### Meeting #{mid}: {m_title} (Date: {m_date or 'Unknown'}, Duration: {m_dur})"]
+
+            mom = self._load_mom_dict(m)
+            brief = str(mom.get("brief_summary") or m.get("summary") or "").strip()
+            if brief:
+                parts.append(f"Brief Summary: {brief[:700]}")
+            detailed = str(mom.get("detailed_summary") or "").strip()
+            if detailed and detailed != brief:
+                parts.append(f"Detailed Summary: {detailed[:1200]}")
+
+            decisions = self.db.list_decisions(mid, limit=40) if hasattr(self.db, "list_decisions") else []
+            if decisions:
+                dec_lines = []
+                for d in decisions[:12]:
+                    dstate = str(d.get("decision_state") or d.get("status") or "confirmed").strip()
+                    ts = format_seconds_hms(float(d.get("timestamp_sec") or 0.0))
+                    dec_lines.append(f"  - [{dstate}] ({ts}) {str(d.get('decision') or '').strip()}")
+                parts.append("Decisions:\n" + "\n".join(dec_lines))
+
+            actions = self.db.list_action_items(mid, limit=60) if hasattr(self.db, "list_action_items") else []
+            if self_only and actions:
+                filtered_actions = []
+                for a in actions:
+                    own_l = str(a.get("owner") or "").strip().lower()
+                    spk_l = str(a.get("speaker") or "").strip().lower()
+                    if (
+                        "you" in own_l
+                        or "mic" in own_l
+                        or (user_tokens and any(tok in own_l for tok in user_tokens))
+                        or ("you" in spk_l and not own_l)
+                    ):
+                        filtered_actions.append(a)
+                actions = filtered_actions
+            if actions:
+                act_lines = []
+                for a in actions[:15]:
+                    own = str(a.get("owner") or "").strip() or "Owner needed"
+                    due = str(a.get("due_date") or "").strip()
+                    stat = str(a.get("status") or "pending").strip()
+                    due_txt = f" | Due: {due}" if due else ""
+                    act_lines.append(f"  - Owner: {own}{due_txt} | Status: {stat} | Task: {str(a.get('description') or '').strip()}")
+                parts.append(("User-Scoped Action Items" if self_only else "Action Items") + ":\n" + "\n".join(act_lines))
+
+            risks = mom.get("risks_and_blockers") or mom.get("risks") or []
+            if isinstance(risks, list) and risks:
+                r_lines = []
+                for r in risks[:10]:
+                    if isinstance(r, dict):
+                        itype = str(r.get("item_type") or r.get("type") or "risk").upper()
+                        sev = str(r.get("impact") or r.get("severity") or "Medium").strip()
+                        desc = str(r.get("description") or r.get("risk") or "").strip()
+                        mit = str(r.get("mitigation_or_resolution") or r.get("mitigation") or "").strip()
+                        r_lines.append(f"  - [{itype} | Impact: {sev}] ({format_seconds_hms(float(r.get('timestamp_sec') if r.get('timestamp_sec') is not None else (r.get('source_timestamp_sec') or 0.0)))}) {desc}" + (f" (Mitigation: {mit})" if mit and mit.lower() != "none" else ""))
+                if r_lines:
+                    parts.append("Risks & Blockers:\n" + "\n".join(r_lines))
+
+            oqs = mom.get("open_questions") or []
+            if isinstance(oqs, list) and oqs:
+                oq_lines = []
+                for q in oqs[:10]:
+                    if isinstance(q, dict):
+                        cat = str(q.get("category") or "Open Question").strip()
+                        qtxt = str(q.get("question") or "").strip()
+                        by = str(q.get("asked_by") or "Speaker").strip()
+                        if qtxt:
+                            oq_lines.append(f"  - [{cat}] ({by}) {qtxt}")
+                if oq_lines:
+                    parts.append("Open Questions & Pending Confirmations:\n" + "\n".join(oq_lines))
+
+            blocks.append("\n".join(parts))
+
+        if self_only:
+            who = local_user_name or "You (Mic)"
+            blocks.insert(0, f"[Scope Constraint: Filter action items and commitments belonging strictly to {who}; keep unassigned items separate.]")
+        return "\n\n".join(blocks)
+
     def _classify_query(self, query: str) -> Tuple[QueryIntent, List[str], Optional[str]]:
         """Classify query intent, extract content tokens, and check for meeting title scoping."""
         q_lower = query.lower()
@@ -1532,17 +1850,27 @@ class MeetingIntelligenceEngine:
             match_in = re.search(r"in (?:the )?([A-Za-z0-9_\- ]+?)(?: meeting|\?|$)", query, re.IGNORECASE)
             if match_in:
                 candidate = match_in.group(1).strip()
-                if candidate.lower() not in ("all", "any", "this", "recent", "past", "last", "latest"):
+                if candidate.lower() not in ("all", "any", "this", "recent", "past", "last", "latest", "last 3", "last 5", "past 3", "past 5"):
                     scoped_title = candidate
 
-        # Intent detection
-        if any(cue in q_lower for cue in ACTION_CUES):
+        multi_n, _ = self._extract_scope_modifiers(query)
+
+        # Intent detection (specific deliverable intents first)
+        if any(cue in q_lower for cue in FOLLOWUP_EMAIL_CUES):
+            intent = QueryIntent.FOLLOW_UP_EMAIL
+        elif any(cue in q_lower for cue in CUSTOMER_NOTE_CUES):
+            intent = QueryIntent.CUSTOMER_NOTES
+        elif any(cue in q_lower for cue in RISK_OPEN_CUES):
+            intent = QueryIntent.RISKS_AND_OPEN_ITEMS
+        elif multi_n is not None:
+            intent = QueryIntent.MULTI_MEETING_RECAP
+        elif any(cue in q_lower for cue in ACTION_CUES):
             intent = QueryIntent.ACTION_ITEMS
         elif any(cue in q_lower for cue in DECISION_CUES):
             intent = QueryIntent.DECISIONS
         elif any(cue in q_lower for cue in SUMMARY_CUES):
             intent = QueryIntent.SUMMARY
-        elif any(w in q_lower for w in ("who said", "who spoke", "speaker", "speakers", "what did i say")):
+        elif any(w in q_lower for w in ("who said", "who spoke", "speaker", "speakers", "what did i say", "did amar say", "said about")):
             intent = QueryIntent.SPEAKER_QA
         elif any(w in q_lower for w in ("when", "timeline", "timestamp", "time", "date")):
             intent = QueryIntent.TIMELINE
@@ -1799,8 +2127,11 @@ class MeetingIntelligenceEngine:
         citations: List[Dict[str, Any]],
         all_meetings: List[Dict[str, Any]],
         scoped_meeting: Optional[Dict[str, Any]] = None,
-        conversation_history: Optional[List[Tuple[str, str]]] = None,
+        conversation_history: Optional[List[Any]] = None,
         answer_depth: str = "detailed",
+        allowed_ids: Optional[Set[int]] = None,
+        local_user_name: str = "",
+        self_only: bool = False,
     ) -> Tuple[str, List[str]]:
         """Synthesize rich, structured markdown answer based on intent and retrieved evidence."""
         # Find scoped meeting details if explicitly targeted
@@ -1812,44 +2143,77 @@ class MeetingIntelligenceEngine:
             if scoped_meeting is None:
                 scoped_meeting = self.db.get_meeting(target_meeting_id)
 
-        suggestions: List[str] = []
+        structured_ctx = self._build_structured_context_for_scope(
+            target_meeting_id=target_meeting_id,
+            scoped_meeting=scoped_meeting,
+            all_meetings=all_meetings,
+            allowed_ids=allowed_ids,
+            local_user_name=local_user_name,
+            self_only=self_only,
+        )
 
-        # If zero citations found
-        if not citations:
+        # Strict Negative-Trap guard for specific factual/topic queries with zero lexical/semantic overlap
+        structured_intents = {
+            QueryIntent.SUMMARY,
+            QueryIntent.ACTION_ITEMS,
+            QueryIntent.DECISIONS,
+            QueryIntent.CUSTOMER_NOTES,
+            QueryIntent.FOLLOW_UP_EMAIL,
+            QueryIntent.RISKS_AND_OPEN_ITEMS,
+            QueryIntent.MULTI_MEETING_RECAP,
+        }
+        if not citations and not structured_ctx:
             if scoped_meeting or target_meeting_id is not None:
                 target_title = scoped_meeting.get("title") if scoped_meeting else f"Meeting #{target_meeting_id}"
                 ans = (
-                    f"### 🔍 No Direct Matches / No Relevant Information Found\n\n"
+                    f"### No Direct Matches Found\n\n"
                     f"No relevant information found in '{target_title}' matching **'{question}'**.\n\n"
                     f"**Tips:**\n"
-                    f"• Try rephrasing your question or using broader keywords.\n"
-                    f"• Check the verbatim transcript in the **Reports & Intelligence** tab."
+                    f"- Try rephrasing your question or using broader keywords.\n"
+                    f"- Check the verbatim transcript in the **Transcript** tab."
                 )
-                suggestions = [
+                return ans, [
                     f"Summarize key decisions made in {target_title}",
                     f"What are the assigned action items in {target_title}?",
                 ]
-                return ans, suggestions
 
             ans = (
-                f"### 🔍 No Direct Matches / No Relevant Meeting Context Found\n\n"
+                f"### No Direct Matches Found\n\n"
                 f"I searched across your recorded meetings but could not find explicit mentions matching **'{question}'**.\n\n"
                 f"**Tips to find what you need:**\n"
-                f"• Ask for an executive recap of a specific session.\n"
-                f"• Search by broader keywords (e.g. *'audio'*, *'budget'*, *'architecture'*).\n"
-                f"• Check the **Reports & Intelligence** tab for full verbatim transcripts."
+                f"- Ask for an executive recap of a specific session.\n"
+                f"- Search by broader keywords (e.g. *'PLM'*, *'budget'*, *'upload'*).\n"
+                f"- Check the **Transcript** tab for verbatim speaker turns."
             )
-            suggestions = [
+            return ans, [
                 "What were the key decisions in recent meetings?",
                 "List all open action items",
             ]
-            return ans, suggestions
 
-        # Only return Negative-Trap fallback if no lexical keyword hit AND weak semantic similarity
-        if self.llm_engine and getattr(self.llm_engine, "is_available", lambda: False)():
-            top_lex = max((int(c.get("lexical_hits", 0)) for c in citations), default=0) if "lexical_hits" in (citations[0] if citations else {}) else 1
-            top_sim = max((float(c.get("semantic_sim", 0.0)) for c in citations), default=0.0)
-            if citations and top_lex == 0 and top_sim < 0.25 and not self._last_retrieved_knowledge and intent not in (QueryIntent.SUMMARY, QueryIntent.ACTION_ITEMS, QueryIntent.DECISIONS):
+        generic_intent_tokens = {
+            "decision", "decisions", "decide", "decided", "action", "actions", "item", "items",
+            "summary", "summarize", "recap", "overview", "risk", "risks", "blocker", "blockers",
+            "question", "questions", "meeting", "meetings", "last", "recent", "only", "mine",
+            "notes", "note", "email", "follow", "customer", "share", "list", "show", "give",
+            "discussed", "pending", "unresolved", "open",
+        }
+        entity_tokens = [t for t in tokens if t not in generic_intent_tokens]
+        broad_only_intents = {
+            QueryIntent.SUMMARY,
+            QueryIntent.CUSTOMER_NOTES,
+            QueryIntent.FOLLOW_UP_EMAIL,
+            QueryIntent.MULTI_MEETING_RECAP,
+        }
+        if entity_tokens and intent not in broad_only_intents:
+            cit_blob = " ".join((c.get("text") or "").lower() for c in citations)
+            ctx_l = structured_ctx.lower()
+            know_blob = " ".join(
+                f"{k.get('title', '')} {k.get('content', '')}".lower()
+                for k in (self._last_retrieved_knowledge or [])
+            )
+            combined_blob = f"{cit_blob} {ctx_l} {know_blob}"
+            entity_hits = sum(1 for t in entity_tokens if t in combined_blob)
+            if entity_hits == 0:
                 return (
                     "### Not Discussed in Recorded Meetings\n\n"
                     f"No relevant discussion matching **\"{question}\"** was found in the recorded transcript(s)."
@@ -1857,7 +2221,24 @@ class MeetingIntelligenceEngine:
                     "What were the key decisions made?",
                     "List the action items from this meeting.",
                 ]
-        if self.llm_engine and getattr(self.llm_engine, "is_available", lambda: False)() and (citations or self._last_retrieved_knowledge):
+
+        if tokens and intent not in structured_intents:
+            top_lex = max((int(c.get("lexical_hits", 0)) for c in citations), default=0) if (citations and "lexical_hits" in citations[0]) else (
+                sum(1 for t in tokens if any(t in (c.get("text") or "").lower() for c in citations))
+            )
+            top_sim = max((float(c.get("semantic_sim", 0.0)) for c in citations), default=0.0)
+            ctx_l = structured_ctx.lower()
+            struct_hits = sum(1 for t in tokens if t in ctx_l)
+            if top_lex == 0 and struct_hits == 0 and top_sim < 0.25 and not self._last_retrieved_knowledge:
+                return (
+                    "### Not Discussed in Recorded Meetings\n\n"
+                    f"No relevant discussion matching **\"{question}\"** was found in the recorded transcript(s)."
+                ), [
+                    "What were the key decisions made?",
+                    "List the action items from this meeting.",
+                ]
+
+        if self.llm_engine and getattr(self.llm_engine, "is_available", lambda: False)() and (citations or self._last_retrieved_knowledge or structured_ctx):
             try:
                 scoped_title = scoped_meeting.get("title") if scoped_meeting else None
                 try:
@@ -1868,13 +2249,26 @@ class MeetingIntelligenceEngine:
                         knowledge_items=self._last_retrieved_knowledge,
                         conversation_history=conversation_history,
                         answer_depth=answer_depth,
+                        structured_context=structured_ctx,
+                        answer_intent=intent.value,
+                        local_user_name=local_user_name,
                     )
                 except TypeError:
-                    llm_ans = self.llm_engine.answer_query(
-                        question=question,
-                        citations=citations,
-                        context_meeting_title=scoped_title,
-                    )
+                    try:
+                        llm_ans = self.llm_engine.answer_query(
+                            question=question,
+                            citations=citations,
+                            context_meeting_title=scoped_title,
+                            knowledge_items=self._last_retrieved_knowledge,
+                            conversation_history=conversation_history,
+                            answer_depth=answer_depth,
+                        )
+                    except TypeError:
+                        llm_ans = self.llm_engine.answer_query(
+                            question=question,
+                            citations=citations,
+                            context_meeting_title=scoped_title,
+                        )
                 if llm_ans:
                     meeting_label = scoped_title or (citations[0].get("meeting_title", "recorded meetings") if citations else "recorded meetings")
                     llm_suggestions = [
@@ -1886,11 +2280,34 @@ class MeetingIntelligenceEngine:
             except Exception as exc:
                 logger.warning("Local LLM answer generation failed (%s), falling back to template synthesis", exc)
 
+        if intent == QueryIntent.CUSTOMER_NOTES:
+            return self._synthesize_customer_notes(scoped_meeting, all_meetings, target_meeting_id=target_meeting_id)
+
+        if intent == QueryIntent.FOLLOW_UP_EMAIL:
+            return self._synthesize_follow_up_email(scoped_meeting, all_meetings, target_meeting_id=target_meeting_id)
+
+        if intent == QueryIntent.RISKS_AND_OPEN_ITEMS:
+            return self._synthesize_risks_and_open_items(scoped_meeting, all_meetings, citations, target_meeting_id=target_meeting_id)
+
+        if intent == QueryIntent.MULTI_MEETING_RECAP:
+            return self._synthesize_multi_meeting_recap(
+                all_meetings=all_meetings,
+                self_only=self_only,
+                local_user_name=local_user_name,
+            )
+
         # -------------------------------------------------------------
         # INTENT: ACTION ITEMS
         # -------------------------------------------------------------
         if intent == QueryIntent.ACTION_ITEMS:
-            return self._synthesize_action_items(citations, scoped_meeting, all_meetings, target_meeting_id=target_meeting_id)
+            return self._synthesize_action_items(
+                citations,
+                scoped_meeting,
+                all_meetings,
+                target_meeting_id=target_meeting_id,
+                self_only=self_only,
+                local_user_name=local_user_name,
+            )
 
         # -------------------------------------------------------------
         # INTENT: DECISIONS
@@ -1909,17 +2326,254 @@ class MeetingIntelligenceEngine:
         # -------------------------------------------------------------
         return self._synthesize_topic_qa(question, tokens, citations, scoped_meeting, all_meetings, target_meeting_id=target_meeting_id)
 
+    def _load_mom_dict(self, meeting: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not meeting:
+            return {}
+        def _parse_json_field(val: Any) -> List[Any]:
+            if isinstance(val, list):
+                return val
+            if isinstance(val, str) and val.strip():
+                try:
+                    parsed = json.loads(val)
+                    return parsed if isinstance(parsed, list) else []
+                except Exception:
+                    return []
+            return []
+
+        mid = meeting.get("id")
+        risks: List[Any] = []
+        if mid is not None and self.db is not None and hasattr(self.db, "list_risks_and_blockers"):
+            try:
+                risks = self.db.list_risks_and_blockers(int(mid)) or []
+            except Exception:
+                risks = []
+        if not risks:
+            risks = list(meeting.get("risks_and_blockers_list") or meeting.get("risks_and_blockers") or meeting.get("risks") or [])
+
+        return {
+            "brief_summary": str(meeting.get("brief_summary") or meeting.get("summary") or "").strip(),
+            "detailed_summary": str(meeting.get("detailed_summary") or "").strip(),
+            "open_questions": _parse_json_field(meeting.get("open_questions_json") if meeting.get("open_questions_json") is not None else meeting.get("open_questions")),
+            "topics": _parse_json_field(meeting.get("topics_json") if meeting.get("topics_json") is not None else meeting.get("topics")),
+            "key_points": _parse_json_field(meeting.get("key_points_json") if meeting.get("key_points_json") is not None else meeting.get("key_points")),
+            "follow_ups": _parse_json_field(meeting.get("follow_ups_json") if meeting.get("follow_ups_json") is not None else meeting.get("follow_ups")),
+            "risks_and_blockers": risks,
+        }
+
+    def _synthesize_customer_notes(
+        self,
+        scoped_meeting: Optional[Dict[str, Any]],
+        all_meetings: List[Dict[str, Any]],
+        target_meeting_id: Optional[int] = None,
+    ) -> Tuple[str, List[str]]:
+        m = scoped_meeting or (self.db.get_meeting(target_meeting_id) if target_meeting_id is not None else (all_meetings[0] if all_meetings else None))
+        if not m:
+            return "### Customer-Shareable Notes\n\nNo meeting selected.", []
+        mid = m.get("id")
+        title = str(m.get("title") or "Meeting Notes").strip()
+        date_str = str(m.get("created_at") or "").split()[0] or "Recent"
+        mom = self._load_mom_dict(m)
+        summary = str(mom.get("brief_summary") or m.get("summary") or "").strip()
+        decisions = self.db.list_decisions(mid, limit=30) if mid is not None else []
+        actions = self.db.list_action_items(mid, limit=40) if mid is not None else []
+        oqs = [q for q in (mom.get("open_questions") or []) if isinstance(q, dict) and str(q.get("question") or "").strip()]
+        risks = [r for r in (mom.get("risks_and_blockers") or mom.get("risks") or []) if isinstance(r, dict)]
+
+        lines = [f"### Customer-Shareable Meeting Notes — {title} ({date_str})\n"]
+        if summary:
+            lines.append("#### Overview\n")
+            lines.append(f"{summary}\n")
+        if decisions:
+            lines.append("#### Agreed Decisions & Next Approach\n")
+            for d in decisions:
+                st = str(d.get("decision_state") or d.get("status") or "confirmed").replace("_", " ").title()
+                lines.append(f"- **[{st}]** {str(d.get('decision') or '').strip()}")
+            lines.append("")
+        if actions:
+            lines.append("#### Action Plan\n")
+            lines.append("| Action Item | Owner | Target Date |")
+            lines.append("|---|---|---|")
+            for a in actions:
+                own = str(a.get("owner") or "").strip() or "Owner needed"
+                due = str(a.get("due_date") or "").strip() or "TBD"
+                desc = str(a.get("description") or "").replace("|", "/").strip()
+                lines.append(f"| {desc} | {own} | {due} |")
+            lines.append("")
+        if oqs or risks:
+            lines.append("#### Items Pending Confirmation\n")
+            for r in risks:
+                desc = str(r.get("description") or r.get("risk") or "").strip()
+                if desc:
+                    lines.append(f"- **Risk / Blocker:** {desc}")
+            for q in oqs:
+                qtxt = str(q.get("question") or "").strip()
+                if qtxt:
+                    lines.append(f"- **Open Question:** {qtxt}")
+            lines.append("")
+
+        return "\n".join(lines).strip(), [
+            "Prepare a follow-up email for this meeting",
+            "What risks or unresolved confirmations remain?",
+        ]
+
+    def _synthesize_follow_up_email(
+        self,
+        scoped_meeting: Optional[Dict[str, Any]],
+        all_meetings: List[Dict[str, Any]],
+        target_meeting_id: Optional[int] = None,
+    ) -> Tuple[str, List[str]]:
+        m = scoped_meeting or (self.db.get_meeting(target_meeting_id) if target_meeting_id is not None else (all_meetings[0] if all_meetings else None))
+        if not m:
+            return "### Follow-Up Email Draft\n\nNo meeting selected.", []
+        mid = m.get("id")
+        title = str(m.get("title") or "Recent Discussion").strip()
+        mom = self._load_mom_dict(m)
+        summary = str(mom.get("brief_summary") or m.get("summary") or "").strip()
+        decisions = self.db.list_decisions(mid, limit=25) if mid is not None else []
+        actions = self.db.list_action_items(mid, limit=30) if mid is not None else []
+        oqs = [q for q in (mom.get("open_questions") or []) if isinstance(q, dict) and str(q.get("question") or "").strip()]
+
+        lines = [
+            f"### Follow-Up Email Draft\n",
+            f"**Subject:** Follow-Up & Action Plan — {title}\n",
+            "Hi team,\n",
+            f"Thank you for joining **{title}**. Below is a concise summary of what we covered, our agreed direction, and next steps.\n",
+        ]
+        if summary:
+            lines.append(f"**Summary**\n{summary}\n")
+        if decisions:
+            lines.append("**Key Decisions**")
+            for d in decisions[:8]:
+                st = str(d.get("decision_state") or d.get("status") or "confirmed").replace("_", " ").title()
+                lines.append(f"- **[{st}]** {str(d.get('decision') or '').strip()}")
+            lines.append("")
+        if actions:
+            lines.append("**Action Items & Owners**")
+            for a in actions[:10]:
+                own = str(a.get("owner") or "").strip() or "Owner needed"
+                due = str(a.get("due_date") or "").strip()
+                due_s = f" *(Due: {due})*" if due else ""
+                lines.append(f"- [ ] **{own}**: {str(a.get('description') or '').strip()}{due_s}")
+            lines.append("")
+        if oqs:
+            lines.append("**Open Items Requiring Confirmation**")
+            for q in oqs[:6]:
+                lines.append(f"- {str(q.get('question') or '').strip()}")
+            lines.append("")
+        lines.append("Please let me know if any adjustments or additional confirmations are needed.\n\nBest regards,")
+        return "\n".join(lines).strip(), [
+            "Prepare notes of this meeting to share with the customer",
+            "Which action items still need an owner?",
+        ]
+
+    def _synthesize_risks_and_open_items(
+        self,
+        scoped_meeting: Optional[Dict[str, Any]],
+        all_meetings: List[Dict[str, Any]],
+        citations: List[Dict[str, Any]],
+        target_meeting_id: Optional[int] = None,
+    ) -> Tuple[str, List[str]]:
+        m = scoped_meeting or (self.db.get_meeting(target_meeting_id) if target_meeting_id is not None else (all_meetings[0] if all_meetings else None))
+        mom = self._load_mom_dict(m)
+        risks = [r for r in (mom.get("risks_and_blockers") or mom.get("risks") or []) if isinstance(r, dict)]
+        oqs = [q for q in (mom.get("open_questions") or []) if isinstance(q, dict) and str(q.get("question") or "").strip()]
+        lines = [f"### Risks, Blockers & Unresolved Items ({m.get('title', 'Meeting') if m else 'Meetings'})\n"]
+        if risks:
+            lines.append("#### Risks & Blockers\n")
+            for r in risks:
+                itype = str(r.get("item_type") or r.get("type") or "Risk").replace("_", " ").title()
+                sev = str(r.get("impact") or r.get("severity") or "Medium").strip()
+                desc = str(r.get("description") or r.get("risk") or "").strip()
+                mit = str(r.get("mitigation_or_resolution") or r.get("mitigation") or "").strip()
+                ts_raw = r.get("timestamp_sec") if r.get("timestamp_sec") is not None else r.get("source_timestamp_sec")
+                ts = format_seconds_hms(float(ts_raw or 0.0))
+                lines.append(f"- **[{itype} | Impact: {sev}]** (`{ts}`) {desc}")
+                if mit and mit.lower() != "none":
+                    lines.append(f"  - *Mitigation:* {mit}")
+            lines.append("")
+        if oqs:
+            lines.append("#### Open Questions & Pending Confirmations\n")
+            for q in oqs:
+                cat = str(q.get("category") or "Pending Confirmation").strip()
+                ts = format_seconds_hms(float(q.get("timestamp_sec") or 0.0))
+                lines.append(f"- **[{cat}]** (`{ts}`) {str(q.get('question') or '').strip()}")
+            lines.append("")
+        if not risks and not oqs:
+            if citations:
+                lines.append("No structured risks were flagged separately; relevant transcript moments:")
+                for c in citations[:4]:
+                    lines.append(f"- `{format_seconds_hms(float(c.get('start_time') or 0.0))}` **{c.get('speaker', 'Speaker')}**: \"{c.get('text', '')}\"")
+            else:
+                lines.append("No unresolved risks or open questions were logged for this session.")
+        return "\n".join(lines).strip(), [
+            "What decisions were made?",
+            "List action items and owners",
+        ]
+
+    def _synthesize_multi_meeting_recap(
+        self,
+        all_meetings: List[Dict[str, Any]],
+        self_only: bool = False,
+        local_user_name: str = "",
+    ) -> Tuple[str, List[str]]:
+        if not all_meetings:
+            return "### Multi-Meeting Recap\n\nNo meetings found in the requested window.", []
+        user_tokens = [tok.lower() for tok in re.split(r"[\s._-]+", local_user_name or "") if len(tok) >= 3]
+        lines = [f"### Cross-Meeting Summary & Commitments ({len(all_meetings)} Meetings)\n"]
+        lines.append("#### Session Highlights\n")
+        collected_actions: List[Tuple[str, Dict[str, Any]]] = []
+        for m in all_meetings:
+            mid = m.get("id")
+            title = str(m.get("title") or f"Meeting #{mid}").strip()
+            date_s = str(m.get("created_at") or "").split()[0] or "Recent"
+            dur = format_seconds_hms(float(m.get("duration_sec") or 0.0))
+            brief = str(m.get("summary") or "").strip().splitlines()[0] if m.get("summary") else ""
+            lines.append(f"- **{title}** ({date_s}, `{dur}`){(': ' + brief[:220]) if brief else ''}")
+            if mid is not None:
+                for a in self.db.list_action_items(mid, limit=50):
+                    if self_only:
+                        own_l = str(a.get("owner") or "").strip().lower()
+                        spk_l = str(a.get("speaker") or "").strip().lower()
+                        if not (
+                            "you" in own_l
+                            or "mic" in own_l
+                            or (user_tokens and any(tok in own_l for tok in user_tokens))
+                            or ("you" in spk_l and not own_l)
+                        ):
+                            continue
+                    collected_actions.append((title, a))
+        lines.append("")
+        hdr = "#### Action Items Assigned Only to You\n" if self_only else "#### Action Items Across These Meetings\n"
+        lines.append(hdr)
+        if collected_actions:
+            lines.append("| Meeting | Owner | Action Item | Due Date | Status |")
+            lines.append("|---|---|---|---|---|")
+            for mtitle, a in collected_actions[:25]:
+                own = str(a.get("owner") or "").strip() or "Owner needed"
+                due = str(a.get("due_date") or "").strip() or "TBD"
+                stat = str(a.get("status") or "pending").title()
+                desc = str(a.get("description") or "").replace("|", "/").strip()
+                lines.append(f"| {mtitle.replace('|', '/')} | {own} | {desc} | {due} | {stat} |")
+        else:
+            lines.append("No action items matched the requested scope across these meetings.")
+        return "\n".join(lines).strip(), [
+            "What decisions evolved across recent meetings?",
+            "Which action items are still pending?",
+        ]
+
     def _synthesize_action_items(
         self,
         citations: List[Dict[str, Any]],
         scoped_meeting: Optional[Dict[str, Any]],
         all_meetings: List[Dict[str, Any]],
         target_meeting_id: Optional[int] = None,
+        self_only: bool = False,
+        local_user_name: str = "",
     ) -> Tuple[str, List[str]]:
         """Synthesize action items from structured table and transcript obligation cues."""
         lines = []
         meeting_name = scoped_meeting.get("title", f"Meeting #{target_meeting_id}") if (scoped_meeting or target_meeting_id) else "Across Meetings"
-        lines.append(f"### 📋 Action Items & Next Steps ({meeting_name})\n")
+        lines.append(f"### Action Items & Next Steps ({meeting_name})\n")
 
         # 1. Look for explicit action items from DB
         explicit_actions = []
@@ -1928,13 +2582,24 @@ class MeetingIntelligenceEngine:
         elif target_meeting_id is not None:
             explicit_actions = self.db.list_action_items(target_meeting_id)
         else:
-            for m in all_meetings[:3]:
+            for m in all_meetings[:5]:
                 explicit_actions.extend(self.db.list_action_items(m.get("id")))
+
+        if self_only and explicit_actions:
+            user_tokens = [tok.lower() for tok in re.split(r"[\s._-]+", local_user_name or "") if len(tok) >= 3]
+            explicit_actions = [
+                a for a in explicit_actions
+                if (
+                    "you" in str(a.get("owner") or "").lower()
+                    or "mic" in str(a.get("owner") or "").lower()
+                    or (user_tokens and any(tok in str(a.get("owner") or "").lower() for tok in user_tokens))
+                )
+            ]
 
         if explicit_actions:
             lines.append("**Explicit Action Items:**\n")
             for act in explicit_actions:
-                owner = act.get("owner", "Unassigned")
+                owner = str(act.get("owner") or "").strip() or "Owner needed"
                 desc = act.get("description", "")
                 due = act.get("due_date", "")
                 due_str = f" *(Due: {due})*" if due else ""
@@ -1953,18 +2618,12 @@ class MeetingIntelligenceEngine:
                     spoken_tasks.append((spk, txt, t_str, m_title))
 
             if spoken_tasks:
-                lines.append("**Extracted Spoken Commitments & Next Steps:**\n")
-                for spk, txt, t_str, m_title in spoken_tasks[:5]:
-                    lines.append(f"- [ ] **{spk}** (`{t_str}` in *{m_title}*): \"{txt}\"")
+                lines.append("**Extracted Commitments & Next Steps:**\n")
+                for spk, txt, _t_str, m_title in spoken_tasks[:5]:
+                    lines.append(f"- [ ] **{spk}** (*{m_title}*): \"{txt}\"")
                 lines.append("")
             else:
                 lines.append("No explicit pending action items or tasks were detected in these recorded sessions.\n")
-
-        lines.append("---")
-        lines.append("**Verified Source Citations:**")
-        for c in citations[:3]:
-            t_str = format_seconds_hms(float(c.get("start_time", 0.0)))
-            lines.append(f"• `{t_str}` **{c.get('meeting_title')}** — **{c.get('speaker')}**: *\"{c.get('text')}\"*")
 
         suggestions = [
             f"What decisions were made in {meeting_name}?",
@@ -2020,17 +2679,11 @@ class MeetingIntelligenceEngine:
 
             if conclusion_quotes:
                 lines.append("**Identified Agreements & Conclusions:**\n")
-                for spk, txt, t_str, m_title in conclusion_quotes[:4]:
-                    lines.append(f"• **Outcome** (`{t_str}` in *{m_title}*): **{spk}** confirmed: *\"{txt}\"*")
+                for spk, txt, _t_str, m_title in conclusion_quotes[:4]:
+                    lines.append(f"• **Outcome** (*{m_title}*): **{spk}** confirmed: *\"{txt}\"*")
                 lines.append("")
             else:
                 lines.append("No formal consensus or contractual decisions were logged for this session.\n")
-
-        lines.append("---")
-        lines.append("**Source Excerpts:**")
-        for c in citations[:3]:
-            t_str = format_seconds_hms(float(c.get("start_time", 0.0)))
-            lines.append(f"• `[{t_str}]` **{c.get('speaker')}**: \"{c.get('text')}\"")
 
         suggestions = [
             f"What are the action items for {meeting_name}?",
@@ -2123,23 +2776,17 @@ class MeetingIntelligenceEngine:
 
         if direct_insight_parts:
             lines.append(f"Based on recorded discussions, {'; '.join(direct_insight_parts)}.\n")
+        else:
+            lines.append("Relevant discussion points found in the selected meeting context:\n")
 
-        lines.append("#### 📌 Grounded Source Excerpts & Timestamps:\n")
         for c in top_citations:
-            t_sec = float(c.get("start_time", 0.0))
-            ts_str = format_seconds_hms(t_sec)
             spk = c.get("speaker", "Speaker")
             txt = c.get("text", "")
             title = c.get("meeting_title", "Meeting")
             raw_date = c.get("meeting_date", "")
             date_str = raw_date.split()[0] if raw_date and " " in raw_date else raw_date or "Recent"
-
-            lines.append(f"• `[{ts_str}]` In **{title}** ({date_str}), **{spk}** spoke: \"{txt}\"")
-
-        lines.append("")
-        lines.append(
-            "> ℹ️ *Click any citation below to jump directly to this exact timestamp in the Meeting Studio & Reports tab.*"
-        )
+            prefix = f"In **{title}** ({date_str}), " if not scoped_meeting else ""
+            lines.append(f"• {prefix}**{spk}**: {txt}")
 
         suggestions = [
             f"What decisions were made regarding {topic_phrase}?",
@@ -2283,41 +2930,62 @@ class MeetingMinutesPipeline:
         # Stage 2: Participant Registry
         participants = cls._stage2_participant_registry(evidence_items, calc_duration)
 
+        local_user_name = str(kwargs.get("local_user_name") or "").strip()
+
         # Check for Local LLM Engine (when provided)
         llm_analysis = None
         if llm_engine and getattr(llm_engine, "is_available", lambda: False)():
             try:
-                llm_analysis = llm_engine.generate_meeting_analysis(
-                    segments=segments,
-                    title=title,
-                    platform=platform,
-                    duration_sec=calc_duration
-                )
+                try:
+                    llm_analysis = llm_engine.generate_meeting_analysis(
+                        segments=segments,
+                        title=title,
+                        platform=platform,
+                        duration_sec=calc_duration,
+                        meeting_timestamp=meeting_timestamp,
+                        local_user_name=local_user_name,
+                    )
+                except TypeError:
+                    llm_analysis = llm_engine.generate_meeting_analysis(
+                        segments=segments,
+                        title=title,
+                        platform=platform,
+                        duration_sec=calc_duration,
+                    )
             except Exception as exc:
                 logger.warning("Local LLM meeting analysis failed (%s), falling back to rule-based extraction.", exc)
 
         if llm_analysis and isinstance(llm_analysis, dict):
-            # 1. Agenda Topics from LLM
+            from voxlocal.engine.intelligence_verifier import clean_user_facing_text, is_greeting_or_chatter
+
+            # 1. Agenda Topics from LLM (never replace LLM topics with raw utterance chunks when Call 1A succeeded)
             raw_topics = llm_analysis.get("topics", [])
+            agenda_items = []
             if raw_topics:
-                agenda_items = []
                 n_top = len(raw_topics)
                 for idx, top in enumerate(raw_topics):
                     st_sec = round(calc_duration * (idx / max(1, n_top)), 1)
                     end_sec = round(calc_duration * ((idx + 1) / max(1, n_top)), 1)
-                    title_txt = top.get("title", f"Topic {idx+1}")
-                    sum_txt = top.get("summary", "")
+                    title_txt = clean_user_facing_text(str(top.get("title") or f"Topic {idx+1}"))
+                    sum_txt = clean_user_facing_text(str(top.get("summary") or ""))
+                    if is_greeting_or_chatter(title_txt) and is_greeting_or_chatter(sum_txt):
+                        continue
+                    details_clean = [
+                        clean_user_facing_text(str(d))
+                        for d in (top.get("details") or [])
+                        if str(d).strip() and not is_greeting_or_chatter(str(d))
+                    ]
                     agenda_items.append({
-                        "agenda_id": f"AG-{idx+1:02d}",
-                        "title": title_txt,
+                        "agenda_id": f"AG-{len(agenda_items)+1:02d}",
+                        "title": title_txt or f"Topic {len(agenda_items)+1}",
                         "item_type": "AI Structured",
                         "start_sec": st_sec,
                         "end_sec": end_sec,
                         "summary": sum_txt,
-                        "discussion_points": [sum_txt] if sum_txt else [],
+                        "discussion_points": details_clean or ([sum_txt] if sum_txt else []),
                         "outcomes": [],
                     })
-            else:
+            elif not llm_analysis.get("call1a_ok"):
                 agenda_items = cls._stage3_reconstruct_agenda(evidence_items, calc_duration)
 
             # 2. Decisions from LLM (Decoupled schema: status, category, evolution_relationship)
@@ -2330,9 +2998,19 @@ class MeetingMinutesPipeline:
                 cat = str(d.get("category", "General")).strip().capitalize()
                 if cat not in ("Strategic", "Technical", "Product", "Budget", "Process", "General"):
                     cat = "General"
-                stat = str(d.get("status", "confirmed")).strip().lower()
-                if stat not in ("proposed", "confirmed", "rejected", "unresolved", "unclassified"):
-                    stat = "confirmed"
+                raw_state = str(d.get("decision_state") or d.get("status") or "confirmed").strip().lower()
+                if raw_state not in ("confirmed", "proposed", "under_discussion", "rejected", "pending_confirmation", "unresolved", "unclassified"):
+                    raw_state = "confirmed"
+                stat_map = {
+                    "confirmed": "confirmed",
+                    "proposed": "proposed",
+                    "under_discussion": "unresolved",
+                    "pending_confirmation": "unresolved",
+                    "rejected": "rejected",
+                    "unresolved": "unresolved",
+                    "unclassified": "unclassified",
+                }
+                stat = stat_map.get(raw_state, "confirmed")
                 evo = str(d.get("evolution_relationship", "new")).strip().lower()
                 if evo not in ("new", "repeated", "superseded", "reversed"):
                     evo = "new"
@@ -2346,6 +3024,7 @@ class MeetingMinutesPipeline:
                     "decision": d_text,
                     "category": cat,
                     "status": stat,
+                    "decision_state": raw_state,
                     "evolution_relationship": evo,
                     "supersedes_id": d.get("supersedes_id"),
                     "context": str(d.get("context") or "").strip(),
@@ -2421,52 +3100,73 @@ class MeetingMinutesPipeline:
                 action_items = cls._stage5_extract_action_plan(evidence_items, meeting_timestamp=meeting_timestamp, timezone=timezone)
 
             # 4. Open Questions & Risks
+            from voxlocal.engine.intelligence_verifier import (
+                classify_open_question,
+                is_non_substantive_question,
+            )
+
             raw_q = llm_analysis.get("open_questions", [])
             raw_r = llm_analysis.get("risks", [])
             open_questions = []
             for idx, q in enumerate(raw_q, 1):
                 q_txt = str(q.get("question", "")).strip()
-                if q_txt:
-                    t_sec, spk = cls._match_timestamp(evidence_items, q_txt, q.get("timestamp_str", ""))
-                    open_questions.append({
-                        "question_id": f"Q-{idx:02d}",
-                        "question": q_txt,
-                        "asked_by": q.get("asked_by") or q.get("ask_by") or spk,
-                        "context": f"Raised at {format_seconds_hms(t_sec)}",
-                        "status": "Pending Clarification",
-                        "timestamp_sec": t_sec,
-                    })
+                if not q_txt or is_non_substantive_question(q_txt):
+                    continue
+                t_sec, spk = cls._match_timestamp(evidence_items, q_txt, q.get("timestamp_str", ""))
+                q_cat = str(q.get("category") or classify_open_question(q_txt)).strip()
+                open_questions.append({
+                    "question_id": f"Q-{len(open_questions)+1:02d}",
+                    "question": q_txt,
+                    "category": q_cat,
+                    "asked_by": q.get("asked_by") or q.get("ask_by") or spk,
+                    "context": str(q.get("context") or f"Raised at {format_seconds_hms(t_sec)}").strip(),
+                    "status": str(q.get("status") or "Unresolved").strip(),
+                    "timestamp_sec": t_sec,
+                })
 
             risks = []
             for idx, r in enumerate(raw_r, 1):
-                r_txt = str(r.get("risk", "")).strip()
-                if r_txt:
-                    t_sec, spk = cls._match_timestamp(evidence_items, r_txt, r.get("timestamp_str", ""))
-                    matched_quote = next((it["text"] for it in evidence_items if abs(it["start"] - t_sec) < 1.0), evidence_items[0]["text"])
-                    risks.append({
-                        "risk_id": f"RSK-{idx:02d}",
-                        "description": f"{r_txt} (Impact: {r.get('impact', 'Moderate')}; Mitigation: {r.get('mitigation', 'Under review')})",
-                        "severity": "Medium",
-                        "raised_by": spk,
-                        "evidence_quote": matched_quote,
-                        "timestamp_sec": t_sec,
-                        "verified": True,
-                    })
+                r_txt = str(r.get("risk") or r.get("description") or "").strip()
+                if not r_txt:
+                    continue
+                quote = str(r.get("evidence_quote") or "").strip()
+                t_sec, spk = cls._match_timestamp(evidence_items, quote or r_txt, r.get("timestamp_str", ""))
+                matched_quote = quote or next((it["text"] for it in evidence_items if abs(it["start"] - t_sec) < 1.0), evidence_items[0]["text"])
+                itype = str(r.get("item_type") or r.get("type") or "risk").strip().lower()
+                if itype not in ("risk", "blocker", "open_dependency", "compliance_gap"):
+                    itype = "risk"
+                imp = str(r.get("impact") or r.get("severity") or "Medium").strip().capitalize()
+                if imp not in ("High", "Medium", "Low"):
+                    imp = "Medium"
+                mit = str(r.get("mitigation") or r.get("mitigation_or_resolution") or "").strip()
+                if mit.lower() in ("none", "n/a", "null", "under review"):
+                    mit = ""
+                risks.append({
+                    "risk_id": f"RSK-{len(risks)+1:02d}",
+                    "description": r_txt,
+                    "item_type": itype,
+                    "type": itype,
+                    "impact": imp,
+                    "severity": imp,
+                    "mitigation_or_resolution": mit,
+                    "mitigation": mit,
+                    "status": str(r.get("status") or "open").strip(),
+                    "raised_by": str(r.get("owner") or spk).strip(),
+                    "evidence_quote": matched_quote,
+                    "timestamp_sec": t_sec,
+                    "verified": True,
+                })
 
-            if not open_questions and not risks:
+            if not open_questions and not risks and not llm_analysis.get("call1b_ok"):
                 open_questions, risks = cls._stage6_extract_pending_and_risks(evidence_items)
 
-            # 5. Executive Summary & Detailed Summary
-            llm_brief = str(llm_analysis.get("brief_summary") or llm_analysis.get("executive_summary") or "").strip()
-            llm_detailed = str(llm_analysis.get("detailed_summary") or "").strip()
-            meeting_purpose = str(llm_analysis.get("meeting_purpose") or "").strip()
-            overall_outcome = str(llm_analysis.get("overall_outcome") or "").strip()
+            # 5. Executive Summary & Detailed Summary (clean user-perspective prose)
+            llm_brief = clean_user_facing_text(str(llm_analysis.get("brief_summary") or llm_analysis.get("executive_summary") or "").strip())
+            llm_detailed = clean_user_facing_text(str(llm_analysis.get("detailed_summary") or "").strip())
+            meeting_purpose = clean_user_facing_text(str(llm_analysis.get("meeting_purpose") or "").strip())
+            overall_outcome = clean_user_facing_text(str(llm_analysis.get("overall_outcome") or "").strip())
             if llm_brief:
-                executive_summary = (
-                    f"• **Overview:** {llm_brief}\n\n• **Participation & Outcomes:** "
-                    f"{len(participants['active_speakers'])} speaker(s) actively participated. "
-                    f"{len(decisions)} decision(s) logged and {len(action_items)} action item(s) designated."
-                )
+                executive_summary = llm_brief
             else:
                 executive_summary = cls._synthesize_executive_summary(evidence_items, participants, decisions, action_items)
                 llm_brief = executive_summary
@@ -2520,6 +3220,7 @@ class MeetingMinutesPipeline:
             {
                 "decision": d["decision"],
                 "status": d.get("status", "confirmed"),
+                "decision_state": d.get("decision_state", d.get("status", "confirmed")),
                 "category": d.get("category", "General"),
                 "evolution_relationship": d.get("evolution_relationship", "new"),
                 "supersedes_id": d.get("supersedes_id"),
@@ -2759,17 +3460,19 @@ class MeetingMinutesPipeline:
                         "outcomes": [],
                     })
 
-        # If few or no explicit agenda points, cluster semantically by time chunks
+        # If few or no explicit agenda points, cluster substantive turns semantically
         if len(agenda_items) < 2:
+            from voxlocal.engine.intelligence_verifier import is_greeting_or_chatter
+            substantive = [it for it in items if not is_greeting_or_chatter(it["text"])] or items
             agenda_items.clear()
             chunk_dur = max(90.0, total_sec / 3.5)
             curr_chunk: List[Dict[str, Any]] = []
-            chunk_start = items[0]["start"]
+            chunk_start = substantive[0]["start"]
 
-            for it in items:
+            for it in substantive:
                 if it["start"] - chunk_start >= chunk_dur and curr_chunk:
                     title = cls._extract_topic_title(curr_chunk)
-                    summary = " ".join(c["text"] for c in curr_chunk[:3])
+                    summary = " ".join(c["text"] for c in curr_chunk[:2])
                     points = [c["text"] for c in curr_chunk if len(c["words"]) >= 5][:4]
                     agenda_items.append({
                         "agenda_id": f"AG-{len(agenda_items)+1:02d}",
@@ -2788,7 +3491,7 @@ class MeetingMinutesPipeline:
 
             if curr_chunk:
                 title = cls._extract_topic_title(curr_chunk)
-                summary = " ".join(c["text"] for c in curr_chunk[:3])
+                summary = " ".join(c["text"] for c in curr_chunk[:2])
                 points = [c["text"] for c in curr_chunk if len(c["words"]) >= 5][:4]
                 agenda_items.append({
                     "agenda_id": f"AG-{len(agenda_items)+1:02d}",
@@ -3001,6 +3704,11 @@ class MeetingMinutesPipeline:
     def _stage6_extract_pending_and_risks(
         cls, items: List[Dict[str, Any]]
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        from voxlocal.engine.intelligence_verifier import (
+            classify_open_question,
+            is_non_substantive_question,
+        )
+
         questions: List[Dict[str, Any]] = []
         risks: List[Dict[str, Any]] = []
 
@@ -3009,23 +3717,26 @@ class MeetingMinutesPipeline:
             if len(it["words"]) < 4:
                 continue
 
-            # Questions & Discussion Queries
-            if "?" in txt or cls.QUESTION_PATTERNS.search(txt):
-                # Check if resolved in the immediately following turn
+            # Questions & Discussion Queries (skip greetings, context setups, and trivial turns)
+            if ("?" in txt or cls.QUESTION_PATTERNS.search(txt)) and not is_non_substantive_question(txt):
+                # Check if resolved in the immediately following turns
                 is_answered = False
-                if idx + 1 < len(items):
-                    next_txt = items[idx + 1]["text"].lower()
-                    if any(ans in next_txt for ans in ("because", "we will", "the reason is", "yes", "no", "we decided", "understood")):
-                        is_answered = True
-                status_str = "Resolved in meeting" if is_answered else "Unresolved — follow-up required"
-                questions.append({
-                    "question_id": f"Q-{len(questions)+1:02d}",
-                    "asked_by": it["speaker"],
-                    "question": txt,
-                    "context": f"Raised at {format_seconds_hms(it['start'])}",
-                    "timestamp_sec": it["start"],
-                    "status": status_str,
-                })
+                for look in range(1, 3):
+                    if idx + look < len(items):
+                        next_txt = items[idx + look]["text"].lower()
+                        if any(ans in next_txt for ans in ("because", "we will", "the reason is", "we decided", "agreed", "yes, let's", "that makes sense")):
+                            is_answered = True
+                            break
+                if not is_answered:
+                    questions.append({
+                        "question_id": f"Q-{len(questions)+1:02d}",
+                        "asked_by": it["speaker"],
+                        "question": txt,
+                        "category": classify_open_question(txt),
+                        "context": f"Raised at {format_seconds_hms(it['start'])}",
+                        "timestamp_sec": it["start"],
+                        "status": "Unresolved",
+                    })
 
             # Risks & Blockers
             if cls.RISK_PATTERNS.search(txt):

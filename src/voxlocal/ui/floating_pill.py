@@ -168,7 +168,7 @@ EMERALD_RGB = (16, 185, 129)
 
 
 def resolve_platform_badge(platform_name: str) -> str:
-    """Resolve normalized platform badge key for Teams, Zoom, Meet, Slack, or generic."""
+    """Resolve normalized platform badge key for Teams, Zoom, Meet, or generic."""
     p = (platform_name or "").lower().strip()
     if p in ("generic_meeting", "generic") or not p:
         return "generic_meeting"
@@ -178,8 +178,6 @@ def resolve_platform_badge(platform_name: str) -> str:
         return "zoom"
     elif "meet" in p and not p.endswith("meeting"):
         return "meet"
-    elif "slack" in p:
-        return "slack"
     return "generic_meeting"
 
 
@@ -532,7 +530,7 @@ class _RoundPillButton(QPushButton):
 
 class PlatformBadgeWidget(QWidget):
     """
-    Renders official colored badge for Microsoft Teams, Zoom, Google Meet, Slack, or generic.
+    Renders official colored badge for Microsoft Teams, Zoom, Google Meet, or generic.
     """
 
     def __init__(self, parent: Optional[QWidget] = None, badge_size: int = 24) -> None:
@@ -563,10 +561,6 @@ class PlatformBadgeWidget(QWidget):
             bg = QColor("#00AC47")  # Meet green
             fg = QColor("#FFFFFF")
             letter = "M"
-        elif self._platform == "slack":
-            bg = QColor("#4A154B")  # Slack aubergine
-            fg = QColor("#E01E5A")
-            letter = "#"
         else:
             bg = QColor("#30302F")
             fg = QColor("#FCFCFB")

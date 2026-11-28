@@ -225,9 +225,11 @@ class AppController(QObject):
     hotkey_transform_last_requested = pyqtSignal()
 
     # Ask Vox Semantic Intelligence Streaming Signals
+    ask_vox_status_changed = pyqtSignal(int, str)   # (query_id, state: submitted|retrieving_context|generating|validating|completed|failed|cancelled)
     ask_vox_token_streamed = pyqtSignal(int, str)   # (query_id, incremental chunk)
-    ask_vox_citations_ready = pyqtSignal(int, list) # (query_id, citations list)
+    ask_vox_citations_ready = pyqtSignal(int, list) # (query_id, internal citations list)
     ask_vox_stream_finished = pyqtSignal(int, dict) # (query_id, full response dict)
+    ask_vox_stream_cancelled = pyqtSignal(int)      # (query_id)
 
     # Commercial Entitlement & Usage Metering Signals (P0)
     entitlement_changed = pyqtSignal(dict)           # (entitlement_dict: plan, is_pro, limits, etc.)
@@ -3259,7 +3261,7 @@ class AppController(QObject):
 
             if should_rec_screen and strict_video and not allow_deferred_video and source_desc is None:
                 fail_msg = (
-                    "Audio + Video mode requires an active meeting window (Teams, Zoom, Google Meet, Webex, or Slack). "
+                    "Audio + Video mode requires an active meeting window (Teams, Zoom, Google Meet, or Webex). "
                     "Switch to Audio Only mode or open your meeting window."
                 )
                 self.set_meeting_lifecycle_state(MeetingLifecycleState.FAILED, fail_msg)
@@ -4635,18 +4637,17 @@ class AppController(QObject):
                             m_plat = "Zoom"
                         elif "meet" in tl:
                             m_plat = "Google Meet"
-                        elif "slack" in tl:
-                            m_plat = "Slack"
                         elif "webex" in tl:
                             m_plat = "Webex"
 
                         self._safe_emit_finalization_progress(
                             "transcribing",
-                            "Stage 4/5: Synthesizing MoM, detailed summary, decisions & actions (Qwen3.5-4B)...",
+                            "Stage 4/5: Extracting meeting insights & verifying evidence (Qwen3.5-4B)...",
                         )
                         if self.llm_engine is not None and hasattr(self.llm_engine, "set_preferred_device"):
                             self.llm_engine.set_preferred_device(getattr(self.config, "llm_device", "auto"))
 
+                        local_user_name = self._resolve_local_user_name()
                         analysis = LocalMeetingSummarizer.analyze_full(
                             segments,
                             full_txt,
@@ -4656,6 +4657,7 @@ class AppController(QObject):
                             llm_engine=self.llm_engine,
                             meeting_timestamp=meeting_obj.get("created_at") if meeting_obj else None,
                             timezone=(meeting_obj.get("timezone") if meeting_obj else None) or getattr(self.config, "timezone", "local"),
+                            local_user_name=local_user_name,
                         )
                         summary = analysis.get("mom_markdown", analysis.get("summary", ""))
                         brief_summary = str(analysis.get("brief_summary") or "").strip()
@@ -4683,7 +4685,7 @@ class AppController(QObject):
 
                         if analysis.get("action_items"):
                             actions_str = "\n".join(
-                                f"- [ ] [{a.get('owner') or 'Owner Unknown'}] {a['description']}"
+                                f"- [ ] [{a.get('owner') or 'Owner needed'}] {a['description']}"
                                 for a in analysis["action_items"]
                             )
                         else:
@@ -4714,6 +4716,7 @@ class AppController(QObject):
                                 rationale=dec.get("rationale", ""),
                                 timestamp_sec=float(dec.get("timestamp_sec", 0.0)),
                                 status=str(dec.get("status") or "confirmed"),
+                                decision_state=str(dec.get("decision_state") or dec.get("status") or "confirmed"),
                                 category=str(dec.get("category") or "General"),
                                 evolution_relationship=str(dec.get("evolution_relationship") or "new"),
                                 evidence_quote=str(dec.get("evidence_quote") or ""),
@@ -4734,16 +4737,24 @@ class AppController(QObject):
                                 for rk in analysis.get("risks", []):
                                     if isinstance(rk, dict) and str(rk.get("description") or "").strip():
                                         desc_r = str(rk["description"]).strip()
-                                        sev = str(rk.get("severity") or "medium").strip().lower()
+                                        itype = str(rk.get("item_type") or rk.get("type") or "risk").strip().lower()
+                                        if itype not in ("risk", "blocker"):
+                                            itype = "risk"
+                                        sev = str(rk.get("impact") or rk.get("severity") or "medium").strip().lower()
                                         if sev not in ("low", "medium", "high", "critical"):
                                             sev = "medium"
+                                        mit_r = str(rk.get("mitigation") or "").strip()
+                                        if mit_r.lower() in ("none", "n/a", "null"):
+                                            mit_r = ""
+                                        r_stat = "active" if itype == "blocker" else "identified"
                                         self.db.add_risk_or_blocker(
                                             meeting_id=meeting_id,
-                                            item_type="risk",
+                                            item_type=itype,
                                             title=desc_r[:120],
                                             description=desc_r,
                                             impact=sev,
-                                            status="identified",
+                                            status=r_stat,
+                                            mitigation_or_resolution=mit_r,
                                             source_timestamp_sec=float(rk.get("timestamp_sec") or 0.0),
                                             evidence_quote=str(rk.get("evidence_quote") or ""),
                                         )
@@ -5447,7 +5458,7 @@ class AppController(QObject):
             logger.debug("Could not display MeetingPromptPopup: %s", exc)
 
     def _poll_call_detector(self) -> None:
-        """Layered detection of active Teams, Zoom, Google Meet, Slack, or Webex meetings."""
+        """Layered detection of active Teams, Zoom, Google Meet, or Webex meetings."""
         if self._screen_rec_state in ("recording", "paused"):
             return
         is_rec_now = self._capture_state in ("recording", "paused")
@@ -5790,6 +5801,153 @@ class AppController(QObject):
         if key:
             self._dismissed_call_keys.add(key)
 
+    def _resolve_local_user_name(self) -> str:
+        """Return signed-in user's display name if set cleanly, else ''."""
+        try:
+            if hasattr(self, "get_account_status"):
+                st = self.get_account_status() or {}
+                if st.get("signed_in"):
+                    name = str(st.get("name") or "").strip()
+                    if name and name.lower() not in ("guest user", "guest", "user"):
+                        return name
+        except Exception:
+            pass
+        return ""
+
+    def reanalyze_meeting_intelligence(self, meeting_id: int) -> Tuple[bool, str]:
+        """Re-run Stages 4 & 5 intelligence extraction for an existing meeting without touching audio or transcript."""
+        mid = int(meeting_id)
+        with self._state_lock:
+            active_reanalysis = getattr(self, "_active_reanalysis_ids", set())
+            if mid in active_reanalysis:
+                return False, "AI insights regeneration is already running for this meeting."
+            active_reanalysis.add(mid)
+            self._active_reanalysis_ids = active_reanalysis
+
+        def _worker() -> None:
+            try:
+                m_obj = self.db.get_meeting(mid)
+                segs = self.db.get_meeting_segments(mid)
+                if not m_obj or not segs:
+                    self._safe_emit(self.notification_requested, "Re-run Skipped", "No saved transcript segments found for this meeting.")
+                    return
+                self._safe_emit_finalization_progress("transcribing", "Extracting meeting insights & verifying evidence...")
+                full_txt = "\n".join(str(s.get("text") or "").strip() for s in segs if str(s.get("text") or "").strip())
+                local_name = self._resolve_local_user_name()
+                if self.llm_engine is not None and hasattr(self.llm_engine, "set_preferred_device"):
+                    self.llm_engine.set_preferred_device(getattr(self.config, "llm_device", "auto"))
+                analysis = LocalMeetingSummarizer.analyze_full(
+                    segs,
+                    full_txt,
+                    duration_sec=float(m_obj.get("duration_sec") or 0.0),
+                    title=str(m_obj.get("title") or "Meeting Notes"),
+                    platform=str(m_obj.get("source_platform") or "Microsoft Teams"),
+                    llm_engine=self.llm_engine,
+                    meeting_timestamp=m_obj.get("created_at"),
+                    timezone=m_obj.get("timezone") or getattr(self.config, "timezone", "local"),
+                    local_user_name=local_name,
+                )
+                self.db.clear_meeting_outcomes(mid, preserve_completed=True)
+                for act in analysis.get("action_items", []):
+                    self.db.add_action_item(
+                        meeting_id=mid,
+                        description=act.get("description", ""),
+                        owner=act.get("owner"),
+                        due_date=act.get("due_date"),
+                        status="pending",
+                        timestamp_sec=float(act.get("timestamp_sec", 0.0)),
+                        due_date_resolution=str(act.get("due_date_resolution") or ""),
+                        evidence_quote=str(act.get("evidence_quote") or ""),
+                        priority=act.get("priority"),
+                        context=str(act.get("context") or ""),
+                        related_topic=str(act.get("related_topic") or ""),
+                        confirmation_state=str(act.get("confirmation_state") or "needs_confirmation"),
+                    )
+                for dec in analysis.get("decisions", []):
+                    self.db.add_decision(
+                        meeting_id=mid,
+                        decision=dec.get("decision", ""),
+                        rationale=dec.get("rationale", ""),
+                        timestamp_sec=float(dec.get("timestamp_sec", 0.0)),
+                        status=str(dec.get("status") or "confirmed"),
+                        decision_state=str(dec.get("decision_state") or dec.get("status") or "confirmed"),
+                        category=str(dec.get("category") or "General"),
+                        evolution_relationship=str(dec.get("evolution_relationship") or "new"),
+                        evidence_quote=str(dec.get("evidence_quote") or ""),
+                        speaker=str(dec.get("speaker") or ""),
+                        context=str(dec.get("context") or ""),
+                        participants=dec.get("participants") or [],
+                    )
+                with self.db._lock, self.db._connect() as conn:
+                    conn.execute("DELETE FROM risks_and_blockers WHERE meeting_id = ? AND is_manual = 0 AND user_edited = 0", (mid,))
+                    conn.commit()
+                for rk in analysis.get("risks", []):
+                    if isinstance(rk, dict) and str(rk.get("description") or "").strip():
+                        desc_r = str(rk["description"]).strip()
+                        itype = str(rk.get("item_type") or rk.get("type") or "risk").strip().lower()
+                        itype = itype if itype in ("risk", "blocker") else "risk"
+                        sev = str(rk.get("impact") or rk.get("severity") or "medium").strip().lower()
+                        sev = sev if sev in ("low", "medium", "high", "critical") else "medium"
+                        self.db.add_risk_or_blocker(
+                            meeting_id=mid,
+                            item_type=itype,
+                            title=desc_r[:120],
+                            description=desc_r,
+                            impact=sev,
+                            status=("active" if itype == "blocker" else "identified"),
+                            mitigation_or_resolution=str(rk.get("mitigation") or "").strip(),
+                            source_timestamp_sec=float(rk.get("timestamp_sec") or 0.0),
+                            evidence_quote=str(rk.get("evidence_quote") or ""),
+                        )
+                self._safe_emit_finalization_progress("transcribing", "Stage 5/5: Preparing knowledge...")
+                if getattr(self, "knowledge_store", None) is not None:
+                    if self.llm_engine is not None and self.llm_engine.is_available():
+                        k_items = self.llm_engine.extract_meeting_knowledge(segs, title=str(m_obj.get("title") or ""), meeting_date=str(m_obj.get("created_at") or "")[:10])
+                        if k_items:
+                            self.knowledge_store.ingest_meeting_knowledge(mid, k_items)
+                    self.knowledge_store.index_meeting(mid)
+                actions_str = "\n".join(
+                    f"- [ ] [{a.get('owner') or 'Owner needed'}] {a['description']}"
+                    for a in analysis.get("action_items", [])
+                ) or "- [ ] No explicit action items detected."
+                decisions_str = "\n".join(
+                    f"• [{d.get('timestamp_sec', 0.0):.1f}s] {d['decision']}"
+                    for d in analysis.get("decisions", [])
+                ) or "• No explicit decisions detected."
+                self.db.update_meeting(
+                    mid,
+                    summary=analysis.get("mom_markdown", analysis.get("summary", "")),
+                    brief_summary=str(analysis.get("brief_summary") or "").strip(),
+                    detailed_summary=str(analysis.get("detailed_summary") or "").strip(),
+                    meeting_purpose=str(analysis.get("meeting_purpose") or "").strip(),
+                    overall_outcome=str(analysis.get("overall_outcome") or "").strip(),
+                    topics_json=json.dumps(analysis.get("topics_structured") or [], ensure_ascii=False),
+                    key_points_json=json.dumps(analysis.get("key_discussion_points") or [], ensure_ascii=False),
+                    follow_ups_json=json.dumps(analysis.get("follow_ups") or [], ensure_ascii=False),
+                    open_questions_json=json.dumps(analysis.get("open_questions") or [], ensure_ascii=False),
+                    llm_model_used=str(analysis.get("llm_model") or ""),
+                    llm_device_used=str(analysis.get("llm_device") or ""),
+                    llm_fallback_reason=str(analysis.get("llm_fallback_reason") or ""),
+                    decisions=decisions_str,
+                    action_items=actions_str,
+                    topics=", ".join(analysis.get("topics", [])),
+                    post_call_stage="completed",
+                    post_call_status_message="Ready",
+                )
+                self._safe_emit_finalization_progress("completed", "Ready")
+                self._safe_emit(self.meeting_saved_and_transcribed, mid)
+                self._safe_emit(self.knowledge_updated)
+            except Exception as exc:
+                logger.warning("Re-analyze meeting #%d failed cleanly: %s", mid, exc)
+                self._safe_emit_finalization_progress("completed", "Ready")
+            finally:
+                with self._state_lock:
+                    if hasattr(self, "_active_reanalysis_ids"):
+                        self._active_reanalysis_ids.discard(mid)
+
+        threading.Thread(target=_worker, name=f"ReanalyzeMeeting_{mid}", daemon=True).start()
+        return True, "Re-running AI insights on preserved transcript."
+
     def query_meeting_memory(
         self,
         question: str,
@@ -5815,6 +5973,7 @@ class AppController(QObject):
                     "suggestions": ["Upgrade to VOX Pro (₹199/mo)", "View weekly usage"],
                 }
 
+        local_user_name = self._resolve_local_user_name()
         try:
             try:
                 res = self.intelligence.query(
@@ -5823,6 +5982,7 @@ class AppController(QObject):
                     conversation_history=conversation_history,
                     answer_depth=answer_depth,
                     meeting_ids=meeting_ids,
+                    local_user_name=local_user_name,
                 )
             except TypeError:
                 try:
@@ -5831,6 +5991,7 @@ class AppController(QObject):
                         meeting_id=meeting_id,
                         conversation_history=conversation_history,
                         answer_depth=answer_depth,
+                        meeting_ids=meeting_ids,
                     )
                 except TypeError:
                     res = self.intelligence.query(question, meeting_id=meeting_id)
@@ -5849,18 +6010,24 @@ class AppController(QObject):
             }
 
     def query_meeting_memory_stream(
-        self, question: str, meeting_id: Optional[int] = None
-    ) -> None:
+        self,
+        question: str,
+        meeting_id: Optional[int] = None,
+        conversation_history: Optional[List[Any]] = None,
+        answer_depth: str = "detailed",
+        meeting_ids: Optional[List[int]] = None,
+    ) -> int:
         """
         Ask Vox (Streaming): Process query in background thread, emitting:
-        - ask_vox_citations_ready(citations) immediately when search completes
-        - ask_vox_token_streamed(token_str) as each token is generated
-        - ask_vox_stream_finished(result_dict) upon completion
+        - ask_vox_status_changed(query_id, state) for real internal lifecycle transitions
+        - ask_vox_citations_ready(query_id, citations) internally when retrieval completes
+        - ask_vox_token_streamed(query_id, token_str) as each token is generated
+        - ask_vox_stream_finished(query_id, result_dict) or ask_vox_stream_cancelled(query_id)
         """
-        self._cancel_ask_vox = True
+        self.stop_ask_vox_stream()
         if hasattr(self, "_ask_vox_thread") and self._ask_vox_thread and self._ask_vox_thread.is_alive():
             try:
-                self._ask_vox_thread.join(timeout=0.25)
+                self._ask_vox_thread.join(timeout=0.35)
             except Exception:
                 pass
 
@@ -5875,47 +6042,100 @@ class AppController(QObject):
                 self.upgrade_dialog_requested.emit(msg)
                 err_dict = {
                     "question": question,
-                    "answer": f"### ⚠️ Ask VOX Weekly Limit Reached\n\n{msg}\n\nUpgrade to **VOX Pro** (₹199/mo) for unlimited cognitive queries across all your recorded meetings.",
+                    "answer": f"Weekly Ask VOX limit reached: {msg}",
                     "citations": [],
                     "intent": "quota_exceeded",
+                    "error": True,
                     "suggestions": ["Upgrade to VOX Pro (₹199/mo)", "View weekly usage"],
                 }
+                if hasattr(self, "ask_vox_status_changed"):
+                    self.ask_vox_status_changed.emit(current_qid, "failed")
                 self.ask_vox_stream_finished.emit(current_qid, err_dict)
-                return
+                return current_qid
+
+        local_user_name = self._resolve_local_user_name()
+        if hasattr(self, "ask_vox_status_changed"):
+            self.ask_vox_status_changed.emit(current_qid, "submitted")
+
+        def _is_cancelled() -> bool:
+            return bool(self._cancel_ask_vox or self._shutting_down or (self._ask_vox_query_id != current_qid))
+
+        def _on_status(st: str) -> None:
+            if not _is_cancelled() and hasattr(self, "ask_vox_status_changed"):
+                self.ask_vox_status_changed.emit(current_qid, str(st or ""))
 
         def _worker() -> None:
             try:
-                res = self.intelligence.query_stream(
-                    question=question,
-                    meeting_id=meeting_id,
-                    on_token=lambda tok: (self.ask_vox_token_streamed.emit(current_qid, tok) if self._ask_vox_query_id == current_qid and not self._cancel_ask_vox else None),
-                    on_citations=lambda cits: (self.ask_vox_citations_ready.emit(current_qid, cits) if self._ask_vox_query_id == current_qid and not self._cancel_ask_vox else None),
-                    cancel_check=lambda: self._cancel_ask_vox or (self._ask_vox_query_id != current_qid),
-                )
-                if self._ask_vox_query_id == current_qid and not self._cancel_ask_vox:
-                    if hasattr(self, "metering") and self.metering is not None:
-                        self.metering.record_ask_vox_query(question)
-                        self.usage_updated.emit(self.metering.get_weekly_usage())
-                    self.ask_vox_stream_finished.emit(current_qid, res)
+                try:
+                    res = self.intelligence.query_stream(
+                        question=question,
+                        meeting_id=meeting_id,
+                        on_token=lambda tok: (self.ask_vox_token_streamed.emit(current_qid, tok) if not _is_cancelled() else None),
+                        on_citations=lambda cits: (self.ask_vox_citations_ready.emit(current_qid, cits) if not _is_cancelled() else None),
+                        on_status=_on_status,
+                        cancel_check=_is_cancelled,
+                        conversation_history=conversation_history,
+                        answer_depth=answer_depth,
+                        meeting_ids=meeting_ids,
+                        local_user_name=local_user_name,
+                    )
+                except TypeError:
+                    res = self.intelligence.query_stream(
+                        question=question,
+                        meeting_id=meeting_id,
+                        on_token=lambda tok: (self.ask_vox_token_streamed.emit(current_qid, tok) if not _is_cancelled() else None),
+                        on_citations=lambda cits: (self.ask_vox_citations_ready.emit(current_qid, cits) if not _is_cancelled() else None),
+                        cancel_check=_is_cancelled,
+                    )
+                if _is_cancelled() or bool((res or {}).get("cancelled")):
+                    if not self._shutting_down and self._ask_vox_query_id == current_qid:
+                        if hasattr(self, "ask_vox_status_changed"):
+                            self.ask_vox_status_changed.emit(current_qid, "cancelled")
+                        if hasattr(self, "ask_vox_stream_cancelled"):
+                            self.ask_vox_stream_cancelled.emit(current_qid)
+                    return
+
+                if hasattr(self, "metering") and self.metering is not None:
+                    self.metering.record_ask_vox_query(question)
+                    self.usage_updated.emit(self.metering.get_weekly_usage())
+                if hasattr(self, "ask_vox_status_changed"):
+                    self.ask_vox_status_changed.emit(current_qid, "completed")
+                self.ask_vox_stream_finished.emit(current_qid, res)
             except Exception as exc:
+                if _is_cancelled():
+                    if not self._shutting_down and self._ask_vox_query_id == current_qid:
+                        if hasattr(self, "ask_vox_status_changed"):
+                            self.ask_vox_status_changed.emit(current_qid, "cancelled")
+                        if hasattr(self, "ask_vox_stream_cancelled"):
+                            self.ask_vox_stream_cancelled.emit(current_qid)
+                    return
                 logger.error("Error in query_meeting_memory_stream: %s", exc, exc_info=True)
                 err_dict = {
                     "question": question,
-                    "answer": f"### ⚠️ Analysis Notice\n\nCould not complete search across meetings: {exc}",
+                    "answer": "",
+                    "error": True,
+                    "error_message": str(exc),
                     "citations": [],
                     "intent": "error",
-                    "suggestions": ["Summarize recent meetings", "List all action items"],
+                    "suggestions": [],
                 }
-                if self._ask_vox_query_id == current_qid and not self._cancel_ask_vox:
-                    self.ask_vox_stream_finished.emit(current_qid, err_dict)
+                if hasattr(self, "ask_vox_status_changed"):
+                    self.ask_vox_status_changed.emit(current_qid, "failed")
+                self.ask_vox_stream_finished.emit(current_qid, err_dict)
 
         self._ask_vox_thread = threading.Thread(target=_worker, name="AskVoxStreamThread", daemon=True)
         self._ask_vox_thread.start()
         return current_qid
 
     def stop_ask_vox_stream(self) -> None:
-        """Cancel ongoing Ask Vox token streaming."""
+        """Cancel ongoing Ask Vox token streaming immediately."""
         self._cancel_ask_vox = True
+        llm = getattr(self, "llm_engine", None)
+        if llm is not None and hasattr(llm, "cancel_active_stream"):
+            try:
+                llm.cancel_active_stream()
+            except Exception:
+                pass
 
     def compare_meetings(self, meeting_id_a: int, meeting_id_b: int) -> Dict[str, Any]:
         """Compare two meetings side-by-side using MeetingIntelligenceEngine."""
@@ -6252,7 +6472,7 @@ class AppController(QObject):
             runner = getattr(self, "_active_postcall_runner", None)
 
         logger.info("Shutting down AppController...")
-        self._cancel_ask_vox = True
+        self.stop_ask_vox_stream()
         self._cancel_finalization_event.set()
         self._fin_queue_stop.set()
         self._interim_worker_running = False

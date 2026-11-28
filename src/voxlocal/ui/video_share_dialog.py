@@ -1,7 +1,7 @@
 """
 VOX Post-Recording Share & Export Modal (Core Feature 2).
 Provides instant preview, playback scrubber, metadata inspection, and
-one-click sharing to Teams/Slack/Outlook via Windows CF_HDROP clipboard file drop.
+one-click sharing to Teams/Outlook via Windows CF_HDROP clipboard file drop.
 """
 
 from __future__ import annotations
@@ -171,7 +171,7 @@ class VideoShareDialog(QDialog):
         btn_lay.setSpacing(10)
 
         self.btn_copy_file = QPushButton("📋 Copy Video (File Drop)", self)
-        self.btn_copy_file.setToolTip("Places video file on clipboard (CF_HDROP) for direct pasting into Teams/Slack/Outlook")
+        self.btn_copy_file.setToolTip("Places video file on clipboard (CF_HDROP) for direct pasting into Teams/Outlook")
         self.btn_copy_file.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_copy_file.setObjectName("primaryBtn")
         self.btn_copy_file.clicked.connect(self._copy_video_file)

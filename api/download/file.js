@@ -8,11 +8,25 @@
 const { supabase, authenticateUser } = require('../_lib/supabase');
 const { verifyDownloadTicket } = require('../_lib/token');
 
+const CONFIGURED_RELEASE_URL = (process.env.VOX_RELEASE_DOWNLOAD_URL || '').trim();
+
 const DEFAULT_PRIVATE_ARTIFACT_ORIGIN =
-  process.env.VOX_RELEASE_DOWNLOAD_URL ||
-  'https://github.com/milinddwivedi/vox-releases/releases/download/v2.1.0/VoxLocal-Setup.exe';
+  CONFIGURED_RELEASE_URL ||
+  'https://github.com/milinddwivedi/vox-releases/releases/download/v2.3.0/VoxLocal-Setup.exe';
+
+const RELEASE_DOWNLOAD_URLS = {
+  'releases/2.3.0/VoxLocal-Setup.exe':
+    CONFIGURED_RELEASE_URL ||
+    'https://github.com/milinddwivedi/vox-releases/releases/download/v2.3.0/VoxLocal-Setup.exe',
+  'VoxLocal-Setup.exe':
+    CONFIGURED_RELEASE_URL ||
+    'https://github.com/milinddwivedi/vox-releases/releases/download/v2.3.0/VoxLocal-Setup.exe',
+  'releases/2.1.0/VoxLocal-Setup.exe':
+    'https://github.com/milinddwivedi/vox-releases/releases/download/v2.1.0/VoxLocal-Setup.exe',
+};
 
 const ALLOWED_ARTIFACTS = new Set([
+  'releases/2.3.0/VoxLocal-Setup.exe',
   'releases/2.1.0/VoxLocal-Setup.exe',
   'releases/2.0.0/VoxLocal-Setup.exe',
   'releases/1.0.13/VoxLocal-Setup.exe',
@@ -61,7 +75,7 @@ module.exports = async function handler(req, res) {
     }
     authorizedClaims = {
       user_id: user.id,
-      artifact: requestedArtifact || 'releases/2.1.0/VoxLocal-Setup.exe',
+      artifact: requestedArtifact || 'releases/2.3.0/VoxLocal-Setup.exe',
     };
   } else {
     // Enforce ticket artifact scope binding
@@ -91,7 +105,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  const artifact = authorizedClaims.artifact || 'releases/2.1.0/VoxLocal-Setup.exe';
+  const artifact = authorizedClaims.artifact || 'releases/2.3.0/VoxLocal-Setup.exe';
   if (!ALLOWED_ARTIFACTS.has(artifact)) {
     return res.status(404).json({
       ok: false,
@@ -100,7 +114,8 @@ module.exports = async function handler(req, res) {
     });
   }
   const skipSupabaseStorage =
-    Boolean(process.env.VOX_RELEASE_DOWNLOAD_URL) ||
+    Boolean(CONFIGURED_RELEASE_URL) ||
+    artifact === 'releases/2.3.0/VoxLocal-Setup.exe' ||
     artifact === 'releases/2.1.0/VoxLocal-Setup.exe' ||
     artifact === 'VoxLocal-Setup.exe';
   let signedTarget = null;
@@ -119,7 +134,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  const targetUrl = signedTarget || DEFAULT_PRIVATE_ARTIFACT_ORIGIN;
+  const targetUrl = signedTarget || RELEASE_DOWNLOAD_URLS[artifact] || DEFAULT_PRIVATE_ARTIFACT_ORIGIN;
   res.setHeader('Content-Disposition', 'attachment; filename="VoxLocal-Setup.exe"');
   res.setHeader('Content-Type', 'application/vnd.microsoft.portable-executable');
   if (typeof res.redirect === 'function') {

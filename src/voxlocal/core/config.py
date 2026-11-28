@@ -165,7 +165,7 @@ class AppConfig:
     notetaker_library_width: int = 290
     notetaker_library_collapsed: bool = False
     notetaker_library_compact: bool = False
-    notetaker_ask_rail_open: bool = False
+    notetaker_ask_rail_open: bool = True
     notetaker_split_mode: str = "off"
     calendar_reminder_lead_min: int = 1
     calendar_provider: str = "none"

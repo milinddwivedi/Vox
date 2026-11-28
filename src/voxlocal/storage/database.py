@@ -370,6 +370,24 @@ class LocalDatabase:
                     resolution TEXT DEFAULT '1080p',
                     audio_mode TEXT DEFAULT 'both'
                 );
+
+                CREATE TABLE IF NOT EXISTS ask_vox_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_uid TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    meeting_id INTEGER NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    citations_json TEXT DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ask_vox_scope_session
+                    ON ask_vox_messages(scope_key, archived, id);
                 """
             )
             # Safe schema migrations for existing databases
@@ -580,6 +598,7 @@ class LocalDatabase:
                 "ALTER TABLE decisions ADD COLUMN speaker TEXT DEFAULT '';",
                 "ALTER TABLE decisions ADD COLUMN context TEXT DEFAULT '';",
                 "ALTER TABLE decisions ADD COLUMN participants_json TEXT DEFAULT '[]';",
+                "ALTER TABLE decisions ADD COLUMN decision_state TEXT DEFAULT '';",
                 # knowledge_items verification & entity fields
                 "ALTER TABLE knowledge_items ADD COLUMN verified INTEGER DEFAULT 0;",
                 "ALTER TABLE knowledge_items ADD COLUMN entity_name TEXT DEFAULT '';",
@@ -2015,6 +2034,8 @@ class LocalDatabase:
                             pass
         with self._lock, self._connect() as conn:
             with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("DELETE FROM ask_vox_messages WHERE meeting_id = ?", (meeting_id,))
+            with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("DELETE FROM meeting_markers WHERE meeting_id = ?", (meeting_id,))
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("DELETE FROM risks_and_blockers WHERE meeting_id = ?", (meeting_id,))
@@ -2361,6 +2382,7 @@ class LocalDatabase:
         speaker: str = "",
         context: str = "",
         participants: Optional[List[str]] = None,
+        decision_state: str = "",
     ) -> int:
         clean_dec = (decision or "").strip()
         if not clean_dec:
@@ -2368,6 +2390,17 @@ class LocalDatabase:
         norm_dec = " ".join(clean_dec.lower().split())
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         part_json = json.dumps(list(participants or []), ensure_ascii=False)
+        raw_state = str(decision_state or status or "unclassified").strip().lower()
+        db_status_map = {
+            "confirmed": "confirmed",
+            "proposed": "proposed",
+            "under_discussion": "proposed",
+            "rejected": "rejected",
+            "pending_confirmation": "unresolved",
+            "unresolved": "unresolved",
+            "unclassified": "unclassified",
+        }
+        db_status = db_status_map.get(raw_state, "unclassified")
         with self._lock, self._connect() as conn:
             existing_rows = conn.execute(
                 "SELECT id, decision FROM decisions WHERE meeting_id = ?",
@@ -2381,9 +2414,9 @@ class LocalDatabase:
                 """
                 INSERT INTO decisions (
                     meeting_id, decision, rationale, timestamp_sec, created_at,
-                    status, category, evolution_relationship, supersedes_id,
+                    status, decision_state, category, evolution_relationship, supersedes_id,
                     evidence_quote, is_manual, user_edited, speaker, context, participants_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     meeting_id,
@@ -2391,7 +2424,8 @@ class LocalDatabase:
                     (rationale or "").strip(),
                     round(float(timestamp_sec), 2),
                     now,
-                    status,
+                    db_status,
+                    raw_state,
                     category,
                     evolution_relationship,
                     supersedes_id,
@@ -2419,9 +2453,19 @@ class LocalDatabase:
         user_edited: int = 1,
         speaker: Optional[str] = None,
         context: Optional[str] = None,
+        decision_state: Optional[str] = None,
         **kwargs: Any,
     ) -> bool:
         """Update decision fields and mark user_edited = 1."""
+        db_status_map = {
+            "confirmed": "confirmed",
+            "proposed": "proposed",
+            "under_discussion": "proposed",
+            "rejected": "rejected",
+            "pending_confirmation": "unresolved",
+            "unresolved": "unresolved",
+            "unclassified": "unclassified",
+        }
         with self._lock, self._connect() as conn:
             fields: Dict[str, Any] = {"user_edited": user_edited}
             if decision is not None:
@@ -2430,8 +2474,11 @@ class LocalDatabase:
                     fields["decision"] = clean
             if rationale is not None:
                 fields["rationale"] = rationale.strip()
-            if status is not None:
-                fields["status"] = status.strip()
+            if status is not None or decision_state is not None:
+                raw_st = str(decision_state or status or "").strip().lower()
+                if raw_st:
+                    fields["decision_state"] = raw_st
+                    fields["status"] = db_status_map.get(raw_st, "unclassified")
             if category is not None:
                 fields["category"] = category.strip()
             if evolution_relationship is not None:
@@ -4840,6 +4887,119 @@ class LocalDatabase:
                     """
                 ).fetchall()
             return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Ask VOX Conversational History Persistence
+    # ------------------------------------------------------------------
+    def save_ask_vox_message(
+        self,
+        *,
+        message_uid: str,
+        session_id: str,
+        scope_key: str,
+        role: str,
+        content: str,
+        meeting_id: Optional[int] = None,
+        citations: Optional[List[Dict[str, Any]]] = None,
+        status: str = "completed",
+    ) -> int:
+        """Persist a single Ask VOX conversation turn message while preserving prior archived sessions."""
+        now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cit_json = json.dumps(list(citations or []), ensure_ascii=False)
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO ask_vox_messages
+                    (message_uid, session_id, scope_key, meeting_id, role, content, citations_json, status, archived, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    str(message_uid),
+                    str(session_id),
+                    str(scope_key),
+                    int(meeting_id) if meeting_id is not None else None,
+                    str(role),
+                    str(content or ""),
+                    cit_json,
+                    str(status or "completed"),
+                    now_s,
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def get_active_ask_vox_messages(self, scope_key: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """Load chronological unarchived Ask VOX messages for the latest active session of `scope_key`."""
+        skey = str(scope_key or "").strip()
+        if not skey:
+            return []
+        with self._read_connect() as conn:
+            latest = conn.execute(
+                """
+                SELECT session_id
+                FROM ask_vox_messages
+                WHERE scope_key = ? AND archived = 0
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (skey,),
+            ).fetchone()
+            if not latest:
+                return []
+            sid = str(latest["session_id"])
+            rows = conn.execute(
+                """
+                SELECT id, message_uid, session_id, scope_key, meeting_id, role, content, citations_json, status, created_at
+                FROM ask_vox_messages
+                WHERE scope_key = ? AND archived = 0 AND session_id = ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (skey, sid, int(limit)),
+            ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            try:
+                item["citations"] = json.loads(item.get("citations_json") or "[]")
+            except Exception:
+                item["citations"] = []
+            out.append(item)
+        return out
+
+    def archive_ask_vox_scope(self, scope_key: str) -> int:
+        """Archive active messages for `scope_key` so New Chat starts fresh without losing history."""
+        skey = str(scope_key or "").strip()
+        if not skey:
+            return 0
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE ask_vox_messages SET archived = 1 WHERE scope_key = ? AND archived = 0",
+                (skey,),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+
+    def count_ask_vox_messages(self, scope_key: Optional[str] = None, include_archived: bool = True) -> int:
+        """Count stored Ask VOX conversation messages for diagnostics and tests."""
+        with self._read_connect() as conn:
+            if scope_key is not None:
+                if include_archived:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM ask_vox_messages WHERE scope_key = ?",
+                        (str(scope_key),),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM ask_vox_messages WHERE scope_key = ? AND archived = 0",
+                        (str(scope_key),),
+                    ).fetchone()
+            else:
+                if include_archived:
+                    row = conn.execute("SELECT COUNT(*) FROM ask_vox_messages").fetchone()
+                else:
+                    row = conn.execute("SELECT COUNT(*) FROM ask_vox_messages WHERE archived = 0").fetchone()
+            return int(row[0] if row else 0)
 
 
 

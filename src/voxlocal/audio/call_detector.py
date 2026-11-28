@@ -4,7 +4,7 @@ Detects active meeting participation across:
 - Microsoft Teams (Desktop & Web): isolates dedicated Call Stage windows from hub chat/calendar tabs.
 - Zoom (Desktop): isolates meeting/webinar windows from launcher/home screen.
 - Google Meet (Chrome/Edge): detects live Meet tabs via LocalBrowserTabCaptureBridge or window title.
-- Webex and Slack Huddles.
+- Webex.
 State Machine transitions:
 NOT_RUNNING -> APPLICATION_DETECTED -> MEETING_SUSPECTED -> MEETING_CONFIRMED -> AWAITING_USER_DECISION -> RECORDING -> MEETING_ENDED
 Features:
@@ -98,7 +98,6 @@ CALL_APPS: List[Tuple[str, str, bool]] = [
     ("#teams.exe", "Microsoft Teams", False),
     ("webex", "Webex", False),
     ("ciscocollabhost", "Webex", False),
-    ("slack.exe", "Slack", False),
     ("skype", "Skype", False),
     ("discord.exe", "Discord", False),
     ("whatsapp", "WhatsApp", False),
@@ -183,7 +182,7 @@ def clean_meeting_title(raw_title: str, platform: str) -> str:
         return f"{platform} Meeting"
     # Strip common bracketed call prefixes, e.g. '[Microsoft Teams Call] Vox Testing - 2', '[Teams] Daily Sync'
     tl = re.sub(
-        r"^\[\s*(?:microsoft\s+teams|teams|zoom|google\s+meet|meet|webex|slack)?(?:\s*(?:call|meeting|huddle))?\s*\]\s*[-:\u2013\u2014]?\s*",
+        r"^\[\s*(?:microsoft\s+teams|teams|zoom|google\s+meet|meet|webex)?(?:\s*(?:call|meeting))?\s*\]\s*[-:\u2013\u2014]?\s*",
         "",
         tl,
         flags=re.IGNORECASE,
@@ -236,14 +235,61 @@ def clean_meeting_title(raw_title: str, platform: str) -> str:
         tl = f"Google Meet: {code_part}" if code_part else "Google Meet"
     return tl if tl else f"{platform} Meeting"
 
+_DOCUMENT_VIEWER_EXES: Set[str] = {
+    "acrobat.exe",
+    "acrord32.exe",
+    "foxitpdfreader.exe",
+    "foxitreader.exe",
+    "sumatrapdf.exe",
+    "winword.exe",
+    "excel.exe",
+    "powerpnt.exe",
+    "notepad.exe",
+    "notepad++.exe",
+    "code.exe",
+}
+
+_BROWSER_EXES: Set[str] = {
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "comet.exe",
+    "vivaldi.exe",
+    "arc.exe",
+}
+
+_NON_MEETING_DOC_TITLE_RE = re.compile(
+    r"(?:\.(?:pdf|html?|md|txt|docx?|xlsx?|pptx?|csv|json|png|jpe?g|mp4|wav)\b|"
+    r"file:///|\badobe\s+acrobat\b|\bfoxit\b|\bsumatrapdf\b|"
+    r"\bmeeting\s+minutes\b|\bmeeting\s+report\b|\u2014\s*vox\b|-\s*vox\b)",
+    re.IGNORECASE,
+)
+
+_MEET_CODE_TITLE_RE = re.compile(r"\bmeet\s*-\s*[a-z]{3}-[a-z]{4}-[a-z]{3}\b", re.IGNORECASE)
+
+
+def _is_non_meeting_document_window(title_lower: str, proc_name: str = "") -> bool:
+    """True when window is a PDF/document viewer, local exported file tab, or VOX report."""
+    proc = (proc_name or "").strip().lower()
+    if proc in _DOCUMENT_VIEWER_EXES:
+        return True
+    tl = (title_lower or "").strip().lower()
+    if not tl:
+        return False
+    return bool(_NON_MEETING_DOC_TITLE_RE.search(tl))
+
+
 def list_all_meeting_windows(
     include_minimized: bool = True,
     include_non_call_hubs: bool = False,
 ) -> List[Tuple[int, str, str, Tuple[int, int, int, int]]]:
     """
     Scans and returns all open meeting call windows across
-    Zoom, Microsoft Teams, Google Meet (in browsers), Webex, and Slack.
-    By default excludes non-call hubs (Chat/Calendar/Home) and includes minimized active call stages.
+    Zoom, Microsoft Teams, Google Meet (in browsers), and Webex.
+    By default excludes non-call hubs (Chat/Calendar/Home), document/PDF viewers,
+    and includes minimized active call stages.
     Returns list of (hwnd, platform_name, window_title, (left, top, width, height)).
     """
     candidates: List[Tuple[int, str, str, Tuple[int, int, int, int]]] = []
@@ -338,32 +384,45 @@ def list_all_meeting_windows(
             _pid, proc_name = get_window_pid_and_process_name(int(hwnd))
         except Exception:
             proc_name = ""
-        # Check Zoom
-        if (
-            proc_name in ("zoom.exe", "cpthost.exe")
-            or "zoom meeting" in title_lower
+        proc_low = (proc_name or "").strip().lower()
+        if _is_non_meeting_document_window(title_lower, proc_low):
+            return True
+        is_browser = proc_low in _BROWSER_EXES
+        # Check Zoom (never match arbitrary browser tabs/PDFs starting with 'Zoom...')
+        if proc_low in ("zoom.exe", "cpthost.exe"):
+            platform = "Zoom"
+        elif not is_browser and (
+            "zoom meeting" in title_lower
             or "zoom webinar" in title_lower
             or (title_lower.startswith("zoom") and "update" not in title_lower)
         ):
             platform = "Zoom"
-        # Check Microsoft Teams
-        elif (
-            proc_name in ("ms-teams.exe", "teams.exe", "msteams.exe")
-            or ("teams" in title_lower and any(kw in title_lower for kw in ("meeting", "call", "sharing", "|")))
+        elif is_browser and ("zoom.us" in title_lower or "zoom workplace" in title_lower):
+            platform = "Zoom"
+        # Check Microsoft Teams (strict URL/stage check on browsers to avoid PDFs/articles)
+        elif proc_low in ("ms-teams.exe", "teams.exe", "msteams.exe"):
+            if any(skip in title_lower for skip in ("sharing control bar", "microsoft teams notification")):
+                return True
+            platform = "Microsoft Teams"
+        elif not is_browser and (
+            ("teams" in title_lower and any(kw in title_lower for kw in ("meeting", "call", "sharing", "|")))
             or "microsoft teams" in title_lower
         ):
             if any(skip in title_lower for skip in ("sharing control bar", "microsoft teams notification")):
                 return True
             platform = "Microsoft Teams"
-        # Check Google Meet
-        elif "meet -" in title_lower or "meet.google.com" in title_lower or "google meet" in title_lower:
+        elif is_browser and any(tok in title_lower for tok in ("teams.microsoft.com", "teams.live.com", "| microsoft teams")):
+            if any(skip in title_lower for skip in ("sharing control bar", "microsoft teams notification")):
+                return True
+            platform = "Microsoft Teams"
+        # Check Google Meet (require explicit meet.google.com or 3-4-3 meeting code)
+        elif "meet.google.com" in title_lower or _MEET_CODE_TITLE_RE.search(title_lower):
             platform = "Google Meet"
         # Check Webex
-        elif proc_name in ("atmgr.exe", "ciscocollabhost.exe") or "webex" in title_lower or "cisco" in title_lower:
+        elif proc_low in ("atmgr.exe", "ciscocollabhost.exe") or (
+            not is_browser and ("webex" in title_lower or "cisco" in title_lower)
+        ):
             platform = "Webex"
-        # Check Slack
-        elif "slack" in title_lower and ("huddle" in title_lower or "call" in title_lower):
-            platform = "Slack"
         if platform:
             if is_iconic and (is_non_call_hub(platform, title) or is_leaving_title(title)):
                 return True
@@ -393,8 +452,10 @@ def list_all_meeting_windows(
     return candidates
 
 def is_non_call_hub(plat: str, t_title: str) -> bool:
-    """True if window is a main hub/launcher/chat/waiting-room rather than a live active call stage."""
+    """True if window is a main hub/launcher/chat/waiting-room or document/PDF rather than a live active call stage."""
     tl = (t_title or "").strip().lower()
+    if _is_non_meeting_document_window(tl, ""):
+        return True
     plat_norm = (plat or "").strip().lower()
     if any(skip in tl for skip in (
         "waiting in the lobby",
@@ -503,8 +564,6 @@ def find_meeting_window(app_name: str = "") -> Optional[Tuple[int, str, Tuple[in
         if ("meet" in app_lower or "browser" in app_lower) and "meet" in plat_lower:
             return (h, title, bounds)
         if "webex" in app_lower and "webex" in plat_lower:
-            return (h, title, bounds)
-        if "slack" in app_lower and "slack" in plat_lower:
             return (h, title, bounds)
     h, _plat, title, bounds = all_wins[0]
     return (h, title, bounds)
@@ -1140,7 +1199,6 @@ class CallDetector:
             "Zoom",
             "Google Meet",
             "Webex",
-            "Slack Huddles",
         ]
 
     def create_consent_prompt_data(

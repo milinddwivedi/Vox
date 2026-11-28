@@ -734,12 +734,14 @@ def _read_source_version(base_or_install: Path) -> str:
                     return line.split("=", 1)[1].strip().strip("\"'")
         except Exception:
             pass
-    ver_json = base_or_install / "version.json"
-    if ver_json.is_file():
-        try:
-            return str(json.loads(ver_json.read_text(encoding="utf-8")).get("version") or "")
-        except Exception:
-            pass
+    for ver_json in (base_or_install / "packaging" / "version.json", base_or_install / "version.json"):
+        if ver_json.is_file():
+            try:
+                val = str(json.loads(ver_json.read_text(encoding="utf-8")).get("version") or "").strip()
+                if val:
+                    return val
+            except Exception:
+                pass
     return ""
 
 

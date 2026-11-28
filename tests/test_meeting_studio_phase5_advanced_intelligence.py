@@ -276,8 +276,8 @@ class TestMeetingStudioPhase5AdvancedIntelligence(unittest.TestCase):
         self.assertGreaterEqual(dlg.combo_b.count(), 2)
         self.assertIn("Meeting Comparison", dlg.txt_report.toPlainText())
 
-        # Test Slack export formatting
-        dlg._copy_slack()
+        # Test plain summary export formatting
+        dlg._copy_plain_summary()
         clip_text = self._get_clipboard_text_flushed(expected_substring="Meeting Comparison", timeout=0.5, dlg=dlg)
         self.assertIn("Meeting Comparison", clip_text)
 
@@ -295,8 +295,8 @@ class TestMeetingStudioPhase5AdvancedIntelligence(unittest.TestCase):
         self.assertEqual(dlg.txt_topic.text(), "Everlane")
         self.assertIn("Executive Pre-Meeting Briefing", dlg.txt_report.toPlainText())
 
-        # Test Slack export formatting
-        dlg._copy_slack()
+        # Test plain summary export formatting
+        dlg._copy_plain_summary()
         clip_text = self._get_clipboard_text_flushed(expected_substring="Pre-Meeting Briefing", timeout=0.5, dlg=dlg)
         self.assertIn("Pre-Meeting Briefing", clip_text)
 
